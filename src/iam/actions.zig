@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub const Target = enum {
-    /// `*` (account-level operations such as ListBuckets).
+    /// `arn:aws:s3:::*` (account-level operations such as ListBuckets); matched by `*` too.
     service,
     /// `arn:aws:s3:::bucket`
     bucket,
@@ -168,7 +168,7 @@ pub const ArnError = error{ArnTooLong};
 /// Writes the resource ARN for `op` into `buf`. `key` is ignored for bucket targets.
 pub fn resourceArn(buf: []u8, op: Op, bucket: []const u8, key: []const u8) ArnError![]const u8 {
     return switch (mapping(op).target) {
-        .service => "*",
+        .service => "arn:aws:s3:::*",
         .bucket => std.fmt.bufPrint(buf, "arn:aws:s3:::{s}", .{bucket}) catch error.ArnTooLong,
         .object => std.fmt.bufPrint(buf, "arn:aws:s3:::{s}/{s}", .{ bucket, key }) catch error.ArnTooLong,
     };
@@ -177,7 +177,7 @@ pub fn resourceArn(buf: []u8, op: Op, bucket: []const u8, key: []const u8) ArnEr
 test "mapping table" {
     const Case = struct { op: Op, action: []const u8, arn: []const u8 };
     const cases = [_]Case{
-        .{ .op = .list_buckets, .action = "s3:ListAllMyBuckets", .arn = "*" },
+        .{ .op = .list_buckets, .action = "s3:ListAllMyBuckets", .arn = "arn:aws:s3:::*" },
         .{ .op = .list_objects_v2, .action = "s3:ListBucket", .arn = "arn:aws:s3:::photos" },
         .{ .op = .head_object, .action = "s3:GetObject", .arn = "arn:aws:s3:::photos/a/b.jpg" },
         .{ .op = .upload_part, .action = "s3:PutObject", .arn = "arn:aws:s3:::photos/a/b.jpg" },
