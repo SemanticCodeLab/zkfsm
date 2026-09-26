@@ -44,6 +44,8 @@ pub const ServiceAccount = struct {
     /// Optional session policy JSON narrowing the parent's rights.
     policy: ?[]const u8 = null,
     expires_s: ?i64 = null,
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
 };
 
 pub const PolicyDoc = struct { name: []const u8, document: []const u8 };
@@ -185,6 +187,7 @@ pub const StoreError = error{
     PolicyInUse,
     BuiltinPolicy,
     LimitExceeded,
+    GroupNotEmpty,
 };
 
 pub const Options = struct {
@@ -655,6 +658,158 @@ pub const Store = struct {
         try self.commit(next);
     }
 
+    pub const ServiceAccountUpdate = struct {
+        secret: ?[]const u8 = null,
+        enabled: ?bool = null,
+        /// Outer null keeps the policy; `.{ .set = null }` clears it.
+        policy: ?struct { set: ?[]const u8 } = null,
+        expires_s: ?i64 = null,
+        name: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+    };
+
+    pub fn updateServiceAccount(self: *Store, access_key: []const u8, u: ServiceAccountUpdate) StoreError!void {
+        if (u.secret) |s| try validSecret(s);
+        if (u.policy) |p| if (p.set) |doc| {
+            var check = try parsePolicy(self.gpa, doc);
+            check.deinit();
+        };
+        var m = self.begin();
+        defer m.end();
+        const i = self.state.service_accounts.get(access_key) orelse return error.NotFound;
+        var next = self.state.snap;
+        const sas = try m.a().dupe(ServiceAccount, next.service_accounts);
+        const sa = &sas[i];
+        if (u.secret) |s| sa.secret = s;
+        if (u.enabled) |e| sa.enabled = e;
+        if (u.policy) |p| sa.policy = p.set;
+        if (u.expires_s) |e| sa.expires_s = e;
+        if (u.name) |n| sa.name = n;
+        if (u.description) |d| sa.description = d;
+        next.service_accounts = sas;
+        try self.commit(next);
+    }
+
+    /// Replaces the full policy list of a user or group in one commit.
+    pub fn setPolicies(self: *Store, target: AttachTarget, name: []const u8, names: []const []const u8) StoreError!void {
+        if (names.len > limits.max_attached) return error.LimitExceeded;
+        var m = self.begin();
+        defer m.end();
+        const a = m.a();
+        var uniq: std.ArrayList([]const u8) = .empty;
+        for (names) |p| {
+            if (self.policyByName(p) == null) return error.PolicyNotFound;
+            if (!containsName(uniq.items, p)) try uniq.append(a, p);
+        }
+        var next = self.state.snap;
+        switch (target) {
+            .user => {
+                const i = self.state.users.get(name) orelse return error.NotFound;
+                const users = try a.dupe(User, next.users);
+                users[i].policies = uniq.items;
+                next.users = users;
+            },
+            .group => {
+                const i = self.state.groupIndex(name) orelse return error.NotFound;
+                const groups = try a.dupe(Group, next.groups);
+                groups[i].policies = uniq.items;
+                next.groups = groups;
+            },
+        }
+        try self.commit(next);
+    }
+
+    /// Creates the user, or replaces the secret and status of an existing one.
+    pub fn upsertUser(self: *Store, name: []const u8, secret: []const u8, enabled: bool) StoreError!void {
+        try validName(name);
+        try validSecret(secret);
+        var m = self.begin();
+        defer m.end();
+        var next = self.state.snap;
+        if (self.state.users.get(name)) |i| {
+            const users = try m.a().dupe(User, next.users);
+            users[i].secret = secret;
+            users[i].enabled = enabled;
+            next.users = users;
+        } else {
+            if (self.keyTaken(name)) return error.AlreadyExists;
+            next.users = try appendOne(m.a(), User, next.users, .{ .name = name, .secret = secret, .enabled = enabled });
+        }
+        try self.commit(next);
+    }
+
+    /// Adds members (creating the group), or removes them. Removing no members
+    /// deletes the group, which must then be empty. One commit either way.
+    pub fn updateGroupMembers(self: *Store, group: []const u8, members: []const []const u8, remove: bool) StoreError!void {
+        try validName(group);
+        var m = self.begin();
+        defer m.end();
+        const a = m.a();
+        var next = self.state.snap;
+        const idx = self.state.groupIndex(group);
+        if (remove) {
+            const i = idx orelse return error.NotFound;
+            if (members.len == 0) {
+                if (next.groups[i].members.len != 0) return error.GroupNotEmpty;
+                next.groups = try removeAt(a, Group, next.groups, i);
+                return self.commit(next);
+            }
+            const groups = try a.dupe(Group, next.groups);
+            for (members) |u| {
+                if (!containsName(groups[i].members, u)) return error.NotFound;
+                groups[i].members = try removeName(a, groups[i].members, u);
+            }
+            next.groups = groups;
+            return self.commit(next);
+        }
+        for (members) |u| if (self.state.user(u) == null) return error.NotFound;
+        var groups = next.groups;
+        const i = idx orelse blk: {
+            groups = try appendOne(a, Group, groups, .{ .name = group });
+            break :blk groups.len - 1;
+        };
+        const out = try a.dupe(Group, groups);
+        for (members) |u| if (!containsName(out[i].members, u)) {
+            out[i].members = try appendOne(a, []const u8, out[i].members, u);
+        };
+        next.groups = out;
+        try self.commit(next);
+    }
+
+    /// Read-locked access to the current snapshot; call `release` when done.
+    pub const View = struct {
+        store: *Store,
+        snap: *const Snapshot,
+
+        pub fn release(v: View) void {
+            v.store.lock.unlockShared();
+        }
+        pub fn user(v: View, name: []const u8) ?*const User {
+            return v.store.state.user(name);
+        }
+        pub fn serviceAccount(v: View, key: []const u8) ?*const ServiceAccount {
+            return v.store.state.serviceAccount(key);
+        }
+        pub fn group(v: View, name: []const u8) ?*const Group {
+            const i = v.store.state.groupIndex(name) orelse return null;
+            return &v.snap.groups[i];
+        }
+        /// Document of a canned or stored policy.
+        pub fn policyDocument(v: View, name: []const u8) ?[]const u8 {
+            if (cannedIndex(name)) |i| return canned[i].document;
+            for (v.snap.policies) |p| if (std.mem.eql(u8, p.name, name)) return p.document;
+            return null;
+        }
+        pub fn isRoot(v: View, key: []const u8) bool {
+            return v.store.isRoot(key);
+        }
+    };
+
+    pub fn view(self: *Store) View {
+        self.lock.lockShared();
+        return .{ .store = self, .snap = &self.state.snap };
+    }
+
     fn keyTaken(self: *Store, key: []const u8) bool {
         return self.isRoot(key) or self.state.users.contains(key) or self.state.service_accounts.contains(key);
     }
@@ -906,4 +1061,48 @@ test "file persistence is atomic and reloadable" {
     var files: usize = 0;
     while (try it.next()) |_| files += 1;
     try testing.expectEqual(@as(usize, 1), files);
+}
+
+test "admin mutations: upsert, group membership, policy sets, service account updates" {
+    var mem: MemoryPersistence = .{ .gpa = testing.allocator };
+    defer mem.deinit();
+    var s: Store = undefined;
+    try s.open(testing.allocator, mem.persistence(), root_opts);
+    defer s.deinit();
+    try s.upsertUser("bob", "bobsecret1", true);
+    try s.upsertUser("bob", "bobsecret2", false);
+    try testing.expectError(error.AlreadyExists, s.upsertUser("rootkey", "whatever1", true));
+    var sb: Store.SecretBuf = undefined;
+    try testing.expect(s.secretFor("bob", 0, &sb) == null);
+    try s.setUserEnabled("bob", true);
+    try testing.expectEqualStrings("bobsecret2", s.secretFor("bob", 0, &sb).?);
+
+    try s.updateGroupMembers("ops", &.{"bob"}, false);
+    try testing.expectError(error.NotFound, s.updateGroupMembers("ops", &.{"ghost"}, false));
+    try testing.expectError(error.GroupNotEmpty, s.updateGroupMembers("ops", &.{}, true));
+    try s.setPolicies(.group, "ops", &.{ "readonly", "readonly", "writeonly" });
+    {
+        const v = s.view();
+        defer v.release();
+        try testing.expectEqual(@as(usize, 2), v.group("ops").?.policies.len);
+    }
+    try testing.expectEqual(eval.Decision.allow, decide(&s, .{ .access_key = "bob" }, "s3:PutObject", "arn:aws:s3:::b/k"));
+    try s.updateGroupMembers("ops", &.{"bob"}, true);
+    try s.updateGroupMembers("ops", &.{}, true);
+    try testing.expectError(error.PolicyNotFound, s.setPolicies(.user, "bob", &.{"nope"}));
+
+    try s.createServiceAccount(.{ .access_key = "svcbob", .secret = "svcsecret1", .parent = "bob" });
+    try s.updateServiceAccount("svcbob", .{ .enabled = false, .name = "ci" });
+    try testing.expect(s.secretFor("svcbob", 0, &sb) == null);
+    try s.updateServiceAccount("svcbob", .{ .enabled = true, .secret = "svcsecret2", .policy = .{ .set = 
+        \\{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}
+    } });
+    try testing.expectEqualStrings("svcsecret2", s.secretFor("svcbob", 0, &sb).?);
+    try testing.expectError(error.InvalidPolicy, s.updateServiceAccount("svcbob", .{ .policy = .{ .set = "{}" } }));
+    try s.updateServiceAccount("svcbob", .{ .policy = .{ .set = null } });
+    try testing.expectError(error.NotFound, s.updateServiceAccount("ghost", .{}));
+    const v = s.view();
+    defer v.release();
+    try testing.expectEqualStrings("ci", v.serviceAccount("svcbob").?.name.?);
+    try testing.expect(v.serviceAccount("svcbob").?.policy == null);
 }

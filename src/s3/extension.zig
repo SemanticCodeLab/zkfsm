@@ -7,4 +7,6 @@ pub const Extension = struct {
     ctx: *anyopaque,
     /// Return true when the request was fully handled (response written).
     route: *const fn (ctx: *anyopaque, c: *handler.Ctx) handler.ConnError!bool,
+    /// Run after authentication but before S3 authorization; the extension authorizes itself.
+    before_authz: bool = false,
 };

@@ -10,6 +10,7 @@ pub const multipart = @import("multipart.zig");
 pub const versioning = @import("versioning.zig");
 pub const xml_read = @import("xml_read.zig");
 pub const extension = @import("extension.zig");
+pub const sts = @import("sts.zig");
 pub const Extension = extension.Extension;
 
 pub const Server = server.Server;
@@ -26,4 +27,5 @@ test {
     _ = versioning;
     _ = xml_read;
     _ = extension;
+    _ = sts;
 }

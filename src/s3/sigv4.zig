@@ -63,6 +63,8 @@ pub const Auth = struct {
     scope: sv.Scope = .{ .date = "", .region = "", .service = "" },
     /// Identity to authorize: the access key, or an STS session's parent.
     principal: []const u8 = "",
+    /// The key that signed the request (differs from `principal` for STS sessions).
+    access_key: []const u8 = "",
     session_policy: ?[]const u8 = null,
 };
 
@@ -195,6 +197,7 @@ fn check(
     var dbuf: iam.sts.DecodeBuffer = undefined;
     const ak = p.cred.access_key;
     auth.principal = ak;
+    auth.access_key = ak;
     const secret: []const u8 = if (token) |t| blk: {
         const issuer = src.cfg.sts orelse return deny(.InvalidToken);
         const claims = issuer.verify(ak, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
@@ -207,7 +210,7 @@ fn check(
         break :blk &sts_secret;
     } else src.store.secretFor(ak, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);
     const scope = p.cred.scope;
-    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !std.mem.eql(u8, scope.service, "s3"))
+    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !(std.mem.eql(u8, scope.service, "s3") or std.mem.eql(u8, scope.service, "sts")))
         return deny(.AuthorizationHeaderMalformed);
     var has_host = false;
     var hit = std.mem.splitScalar(u8, p.signed_headers, ';');

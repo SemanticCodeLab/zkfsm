@@ -8,6 +8,8 @@ const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
 const metrics = @import("metrics/root.zig");
 const iam = @import("iam/root.zig");
+const admin = @import("admin/root.zig");
+const admin_http = @import("admin_http.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -20,6 +22,9 @@ const usage =
     \\                   default: stored in the drive format, else replica:2 with 2+ drives
     \\  --scan-interval  seconds between background heal passes, 0 disables (default: 600)
     \\  --anonymous      serve without authentication when no credentials are set
+    \\  --admin-prefix   admin API path prefix (default: $ZKFSM_ADMIN_PREFIX, else /minio/admin);
+    \\                   /zkfsm/admin is always accepted too. Path-style keys under
+    \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -32,6 +37,7 @@ const Config = struct {
     protection: ?placement.Profile = null,
     scan_interval_s: u64 = 600,
     anonymous: bool = false,
+    admin_prefix: ?[]const u8 = null,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -76,6 +82,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.port = std.fmt.parseInt(u16, args[i][colon + 1 ..], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--protection")) {
             cfg.protection = placement.Profile.parse(args[i]) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--admin-prefix")) {
+            admin.api.validatePrefix(args[i]) catch return error.BadArgs;
+            cfg.admin_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (opts.extra_flag) |f| {
@@ -185,13 +194,31 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = opts.extensions };
+    const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
+    admin.api.validatePrefix(admin_prefix) catch {
+        std.log.err("invalid admin prefix {s}: need /seg[/seg...], no trailing slash, '?', '..' or '//'", .{admin_prefix});
+        return 2;
+    };
+    warnShadowedBucket(&svc, arena, admin_prefix);
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = extensions };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
     return 0;
+}
+
+/// The admin prefix takes precedence over path-style S3 keys that share it.
+fn warnShadowedBucket(svc: *object.ObjectService, arena: std.mem.Allocator, prefix: []const u8) void {
+    const buckets = svc.listBuckets(arena) catch return;
+    for ([_][]const u8{ prefix, admin.api.native_prefix }) |p| {
+        const name = admin.api.shadowedBucket(p);
+        for (buckets) |b| if (std.mem.eql(u8, b.name, name))
+            std.log.warn("bucket {s}: path-style keys under {s}/v3/ are served by the admin API", .{ name, p });
+    }
 }
 
 /// Aborts multipart uploads older than a week; runs at start, then hourly.
@@ -257,6 +284,8 @@ test "arg parsing" {
     try std.testing.expectEqual(@as(usize, 2), (try parseArgs(a, &.{"zkfsm"}, "/a /b", .{})).data.len);
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--protection", "replica:5" }, null, .{}));
     try std.testing.expect((try parseArgs(a, &.{ "zkfsm", "--anonymous", "--data", "d" }, null, .{})).anonymous);
+    try std.testing.expectEqualStrings("/ops/admin", (try parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/admin" }, null, .{})).admin_prefix.?);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/" }, null, .{}));
 }
 
 test {
@@ -272,4 +301,5 @@ test {
     _ = @import("metrics/root.zig");
     _ = s3;
     _ = iam;
+    _ = admin;
 }
