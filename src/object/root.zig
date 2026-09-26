@@ -13,6 +13,7 @@ pub const Error = service.Error;
 pub const ObjectInfo = service.ObjectInfo;
 pub const BucketInfo = service.BucketInfo;
 pub const PutInput = service.PutInput;
+pub const Finalizer = service.Finalizer;
 pub const ListParams = service.ListParams;
 pub const ListResult = service.ListResult;
 pub const Tag = versioning.Tag;

@@ -95,6 +95,16 @@ pub const PutInput = struct {
     /// clients see; the stored blob keeps its own size and MD5 for reads and healing.
     logical_size: ?u64 = null,
     etag_override: ?core.ETag = null,
+    /// Called after the body is stored, before commit; its non-null values win.
+    /// Lets a transforming reader report plaintext size/MD5 known only at the end.
+    finalize: ?Finalizer = null,
+};
+
+pub const Finalizer = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque) Final,
+
+    pub const Final = struct { logical_size: ?u64 = null, etag_override: ?core.ETag = null };
 };
 
 /// Encoded user and internal lists; free with `deinit`.
@@ -212,6 +222,13 @@ pub const ObjectService = struct {
 
         var digest: [16]u8 = undefined;
         hr.hasher.final(&digest);
+        var logical_size = in.logical_size;
+        var etag_override = in.etag_override;
+        if (in.finalize) |f| {
+            const fin = f.func(f.ctx);
+            if (fin.logical_size) |v| logical_size = v;
+            if (fin.etag_override) |v| etag_override = v;
+        }
         var rec: metadata.ObjectRecord = .{
             .object_id = oid,
             .bucket_id = bid,
@@ -226,8 +243,8 @@ pub const ObjectService = struct {
             .user_meta = meta.user,
             .internal_meta = meta.internal,
             .system = in.system,
-            .logical_size = in.logical_size,
-            .etag_override = in.etag_override,
+            .logical_size = logical_size,
+            .etag_override = etag_override,
         };
         const garbage = try versioning.commitPut(self, bucket, &rec, in);
         keep_blob = true;
@@ -439,4 +456,37 @@ test "service put/head/read/list/delete over local backend" {
     var bad: std.Io.Reader = .fixed("abc");
     try svc.createBucket("bkt2");
     try std.testing.expectError(error.IncompleteBody, svc.put("bkt2", "k", &bad, .{ .content_length = 10 }));
+}
+
+test "finalizer sets reported size and etag after streaming" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var lb = try backend.local.LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+    defer lb.close();
+    var svc = try ObjectService.init(gpa, lb.backend());
+    defer svc.deinit();
+    try svc.createBucket("fin");
+
+    const Probe = struct {
+        called: bool = false,
+        fn func(ctx: *anyopaque) Finalizer.Final {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.called = true;
+            return .{ .logical_size = 2, .etag_override = .{ .md5 = [_]u8{7} ** 16 } };
+        }
+    };
+    var probe: Probe = .{};
+    var body: std.Io.Reader = .fixed("ciphertext");
+    const info = try svc.put("fin", "k", &body, .{ .logical_size = 99, .finalize = .{ .ctx = &probe, .func = Probe.func } });
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(@as(u64, 2), info.size);
+    try std.testing.expectEqual([_]u8{7} ** 16, info.etag.md5);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const h = try svc.head(arena.allocator(), "fin", "k");
+    try std.testing.expectEqual(@as(u64, 2), h.size);
+    try std.testing.expectEqual(@as(u64, 10), h.blob_size);
 }
