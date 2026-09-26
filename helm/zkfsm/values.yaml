@@ -1,0 +1,68 @@
+image:
+  repository: ghcr.io/semanticcodelab/zkfsm
+  tag: ""          # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicas: 1
+
+# Drives per pod. Each drive gets its own PVC mounted at /data<N>.
+drives:
+  count: 1
+  size: 10Gi
+  storageClass: ""   # "" = cluster default; "-" = no storage class
+  accessModes: [ReadWriteOnce]
+
+# Root credentials. Use an existing Secret with keys accessKey/secretKey,
+# or let the chart create one from rootUser/rootPassword.
+auth:
+  existingSecret: ""
+  rootUser: ""
+  rootPassword: ""
+
+service:
+  type: ClusterIP
+  port: 9000
+  annotations: {}
+
+resources: {}
+#  requests: {cpu: 250m, memory: 256Mi}
+#  limits: {memory: 1Gi}
+
+probes:
+  liveness:
+    path: /health/live
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    path: /health/ready
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    failureThreshold: 3
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+extraArgs: []
+extraEnv: []
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]

@@ -18,13 +18,21 @@ pub const Code = enum {
     NotImplemented,
     InternalError,
     ServiceUnavailable,
+    PreconditionFailed,
+    AccessDenied,
+    NoSuchVersion,
+    InvalidRequest,
+    InvalidBucketState,
+    ObjectLockConfigurationNotFoundError,
+    NoSuchObjectLockConfiguration,
+    NoSuchTagSet,
+    InvalidTag,
+    MalformedXML,
     NoSuchUpload,
     InvalidPart,
     InvalidPartOrder,
     EntityTooSmall,
     EntityTooLarge,
-    MalformedXML,
-    InvalidRequest,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -36,8 +44,13 @@ pub const Code = enum {
             .NotImplemented => .not_implemented,
             .InternalError => .internal_server_error,
             .ServiceUnavailable => .service_unavailable,
+            .PreconditionFailed => .precondition_failed,
+            .AccessDenied => .forbidden,
+            .NoSuchVersion, .ObjectLockConfigurationNotFoundError, .NoSuchObjectLockConfiguration, .NoSuchTagSet => .not_found,
+            .InvalidRequest, .InvalidTag, .MalformedXML => .bad_request,
+            .InvalidBucketState => .conflict,
             .NoSuchUpload => .not_found,
-            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge, .MalformedXML, .InvalidRequest => .bad_request,
+            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge => .bad_request,
         };
     }
 
@@ -57,13 +70,21 @@ pub const Code = enum {
             .NotImplemented => "A header or query you provided implies functionality that is not implemented",
             .InternalError => "We encountered an internal error. Please try again.",
             .ServiceUnavailable => "Reduce your request rate or retry later.",
+            .PreconditionFailed => "At least one of the pre-conditions you specified did not hold",
+            .AccessDenied => "Access Denied because object protected by object lock.",
+            .NoSuchVersion => "The specified version does not exist.",
+            .InvalidRequest => "Invalid Request",
+            .InvalidBucketState => "The request is not valid with the current state of the bucket.",
+            .ObjectLockConfigurationNotFoundError => "Object Lock configuration does not exist for this bucket",
+            .NoSuchObjectLockConfiguration => "The specified object does not have a ObjectLock configuration",
+            .NoSuchTagSet => "The TagSet does not exist",
+            .InvalidTag => "The tag provided was not a valid tag.",
+            .MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
             .NoSuchUpload => "The specified multipart upload does not exist.",
             .InvalidPart => "One or more of the specified parts could not be found or its entity tag did not match.",
             .InvalidPartOrder => "The list of parts was not in ascending order.",
             .EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
             .EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
-            .MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
-            .InvalidRequest => "The request is not valid.",
         };
     }
 };
@@ -80,6 +101,15 @@ pub fn fromObject(e: object.Error) Code {
         error.IncompleteBody, error.ReadFailed => .IncompleteBody,
         error.NoSpace, error.OutOfMemory => .ServiceUnavailable,
         error.StorageFailed, error.Corrupt, error.WriteFailed => .InternalError,
+        error.PreconditionFailed => .PreconditionFailed,
+        error.ObjectLocked => .AccessDenied,
+        error.NoSuchVersion => .NoSuchVersion,
+        error.InvalidVersionId => .InvalidArgument,
+        error.InvalidRequest => .InvalidRequest,
+        error.InvalidBucketState => .InvalidBucketState,
+        error.MethodNotAllowed => .MethodNotAllowed,
+        error.NoSuchTagSet => .NoSuchTagSet,
+        error.InvalidTag => .InvalidTag,
     };
 }
 

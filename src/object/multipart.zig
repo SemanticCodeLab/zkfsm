@@ -8,8 +8,10 @@ const placement = @import("../placement/root.zig");
 const metadata = @import("../metadata/root.zig");
 const io = @import("../io/root.zig");
 const service = @import("service.zig");
+const lock = @import("lock.zig");
 const blob = @import("blob.zig");
 const copy = @import("copy.zig");
+const versioning = @import("versioning.zig");
 
 const ObjectService = service.ObjectService;
 const Md5 = core.checksum.Md5;
@@ -42,15 +44,27 @@ pub const CopyRange = struct { first: u64, last: u64 };
 /// A part as named by the client in CompleteMultipartUpload.
 pub const PartRef = struct { number: u16, md5: [16]u8 };
 
-pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, content_type: []const u8) Error!UploadId {
+/// Starts an upload. Content type, tags, retention and legal hold from `in` are
+/// applied to the object on complete; `in.conditions` are ignored.
+pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: service.PutInput) Error!UploadId {
     try service.validKey(key);
     const bid = try svc.bucketId(bucket);
+    if (in.retention != null or in.legal_hold) {
+        var arena = std.heap.ArenaAllocator.init(svc.gpa);
+        defer arena.deinit();
+        if (!(try versioning.getConfig(svc, arena.allocator(), bucket)).lock_enabled) return error.InvalidRequest;
+    }
+    const ret = in.retention orelse lock.Retention{};
     const rec: UploadRecord = .{
         .upload_id = UploadId.random(),
         .bucket_id = bid,
         .created_ns = core.time.nowNs(),
         .key = key,
-        .content_type = content_type,
+        .content_type = in.content_type,
+        .tags = in.tags,
+        .retention_mode = ret.mode,
+        .retain_until_ns = ret.until_ns,
+        .legal_hold = in.legal_hold,
     };
     try storeUpload(svc, rec);
     return rec.upload_id;
@@ -129,7 +143,7 @@ pub fn uploadPartCopy(
 ) Error!core.ETag {
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
-    const info = try svc.head(arena.allocator(), src.bucket, src.key);
+    const info = try copy.resolveSource(svc, arena.allocator(), src);
     var seg: blob.Segment = .{ .blob = info.object_id, .offset = 0, .length = info.size };
     if (range) |r| {
         if (r.last < r.first or r.last >= info.size) return error.InvalidRange;
@@ -177,7 +191,7 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     var full: [16]u8 = undefined;
     hr.hasher.final(&full);
 
-    const obj: metadata.ObjectRecord = .{
+    var obj: metadata.ObjectRecord = .{
         .object_id = oid,
         .bucket_id = bid,
         .version = core.VersionId.random(),
@@ -187,18 +201,19 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
         .created_ns = core.time.nowNs(),
         .key = key,
         .content_type = rec.content_type,
+        .tags = rec.tags,
     };
-    try svc.commitRecord(bucket, obj);
-    keep_blob = true;
-    dropUpload(svc, id);
-    return .{
-        .key = key,
-        .size = total,
-        .etag = etag,
-        .created_ns = obj.created_ns,
+    // Versioning assigns the version id and applies lock defaults.
+    const garbage = try versioning.commitPut(svc, bucket, &obj, .{
         .content_type = rec.content_type,
-        .object_id = oid,
-    };
+        .tags = rec.tags,
+        .retention = if (rec.retention_mode != .none) .{ .mode = rec.retention_mode, .until_ns = rec.retain_until_ns } else null,
+        .legal_hold = rec.legal_hold,
+    });
+    keep_blob = true;
+    garbage.collect(svc);
+    dropUpload(svc, id);
+    return service.infoFrom(obj);
 }
 
 /// Checks refs against the recorded parts and fills one segment per ref.
@@ -402,7 +417,7 @@ test "multipart upload, complete, and md5-of-md5s etag" {
     defer gpa.free(big);
     for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
 
-    const id = try create(&fx.svc, "bkt", "big", "application/x-test");
+    const id = try create(&fx.svc, "bkt", "big", .{ .content_type = "application/x-test" });
     _ = try fx.put(id, 2, "stale"); // replaced below
     const p2 = try fx.put(id, 2, "tail");
     const p1 = try fx.put(id, 1, big);
@@ -451,7 +466,7 @@ test "multipart abort, part number bounds, and stale sweep" {
     var fx: Fixture = undefined;
     try fx.init();
     defer fx.deinit();
-    const id = try create(&fx.svc, "bkt", "big", "");
+    const id = try create(&fx.svc, "bkt", "big", .{});
     _ = try fx.put(id, 1, "x");
     try testing.expectError(error.InvalidPartNumber, fx.put(id, 0, "x"));
     try testing.expectError(error.InvalidPartNumber, fx.put(id, max_part_number + 1, "x"));
@@ -470,7 +485,7 @@ test "multipart abort, part number bounds, and stale sweep" {
     try testing.expectError(error.NoSuchUpload, abort(&fx.svc, "bkt", "big", id));
     try testing.expectEqual(@as(usize, 1), try fx.dataBlobs()); // src/obj
 
-    const old = try create(&fx.svc, "bkt", "big", "");
+    const old = try create(&fx.svc, "bkt", "big", .{});
     _ = try fx.put(old, 1, "x");
     const now = core.time.nowNs();
     try testing.expectEqual(@as(usize, 0), try sweepStale(&fx.svc, now, std.time.ns_per_hour));

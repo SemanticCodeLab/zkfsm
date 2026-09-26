@@ -3,6 +3,7 @@ const std = @import("std");
 const backend = @import("backend/root.zig");
 const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
+const metrics = @import("metrics/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -64,6 +65,7 @@ pub fn main() u8 {
     std.log.info("data root {s}", .{cfg.data});
     if (std.Thread.spawn(.{}, sweepLoop, .{&svc})) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
     var server: s3.Server = .{ .gpa = gpa, .svc = &svc };
+    metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;

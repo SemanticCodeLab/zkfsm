@@ -29,6 +29,11 @@ pub const UploadRecord = struct {
     /// Borrowed; for decoded records these point into the input bytes.
     key: []const u8,
     content_type: []const u8 = "",
+    /// Applied to the object on complete: encoded tag set, retention, legal hold.
+    tags: []const u8 = "",
+    retention_mode: record.RetentionMode = .none,
+    retain_until_ns: i128 = 0,
+    legal_hold: bool = false,
     /// Sorted by part number, unique.
     parts: []const Part = &.{},
 
@@ -39,7 +44,8 @@ pub const UploadRecord = struct {
 };
 
 pub fn encode(r: UploadRecord, gpa: std.mem.Allocator) Error![]u8 {
-    if (r.key.len > record.max_key_len or r.content_type.len > std.math.maxInt(u16)) return error.KeyTooLong;
+    if (r.key.len > record.max_key_len or r.content_type.len > std.math.maxInt(u16) or r.tags.len > std.math.maxInt(u16))
+        return error.KeyTooLong;
     if (r.parts.len > max_parts) return error.OutOfMemory;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
@@ -57,6 +63,11 @@ fn encodeTo(r: UploadRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(r.key);
     try codec.putInt(w, u16, @intCast(r.content_type.len));
     try w.writeAll(r.content_type);
+    try codec.putInt(w, u16, @intCast(r.tags.len));
+    try w.writeAll(r.tags);
+    try w.writeByte(@intFromEnum(r.retention_mode));
+    try codec.putInt(w, i128, r.retain_until_ns);
+    try w.writeByte(@intFromBool(r.legal_hold));
     try codec.putInt(w, u16, @intCast(r.parts.len));
     for (r.parts) |p| {
         try codec.putInt(w, u16, p.number);
@@ -84,6 +95,14 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) Error!UploadRecord {
     r.key = try c.take(try c.int(u16));
     if (r.key.len > record.max_key_len) return error.Corrupt;
     r.content_type = try c.take(try c.int(u16));
+    r.tags = try c.take(try c.int(u16));
+    r.retention_mode = std.meta.intToEnum(record.RetentionMode, (try c.take(1))[0]) catch return error.Corrupt;
+    r.retain_until_ns = try c.int(i128);
+    r.legal_hold = switch ((try c.take(1))[0]) {
+        0 => false,
+        1 => true,
+        else => return error.Corrupt,
+    };
     const n = try c.int(u16);
     if (n > max_parts) return error.Corrupt;
     const parts = try arena.alloc(Part, n);
@@ -116,6 +135,10 @@ test "upload record roundtrip and truncation" {
         .created_ns = 42,
         .key = "a/b",
         .content_type = "text/plain",
+        .tags = "\x01",
+        .retention_mode = .governance,
+        .retain_until_ns = 5,
+        .legal_hold = true,
         .parts = &parts,
     };
     const bytes = try encode(r, gpa);
@@ -124,6 +147,8 @@ test "upload record roundtrip and truncation" {
     const d = try decode(arena.allocator(), bytes);
     try std.testing.expect(d.upload_id.eql(r.upload_id));
     try std.testing.expectEqualStrings("a/b", d.key);
+    try std.testing.expectEqualStrings("\x01", d.tags);
+    try std.testing.expect(d.legal_hold and d.retention_mode == .governance and d.retain_until_ns == 5);
     try std.testing.expectEqual(@as(usize, 2), d.parts.len);
     try std.testing.expectEqual(@as(u64, 9), d.findPart(3).?.size);
     try std.testing.expect(d.findPart(2) == null);

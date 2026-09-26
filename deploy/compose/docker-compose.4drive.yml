@@ -1,0 +1,26 @@
+# One node, four drives. Each drive is a separate volume; bind real disks by
+# replacing the named volumes with host paths (e.g. /mnt/disk1:/data1).
+# Requires multi-drive support in the server (`--data` with several paths).
+services:
+  zkfsm:
+    build:
+      context: ../..
+    image: ghcr.io/semanticcodelab/zkfsm:${ZKFSM_TAG:-latest}
+    command: ["--data", "/data1", "/data2", "/data3", "/data4", "--listen", "0.0.0.0:9000"]
+    environment:
+      ZKFSM_ACCESS_KEY: ${ZKFSM_ACCESS_KEY:-}
+      ZKFSM_SECRET_KEY: ${ZKFSM_SECRET_KEY:-}
+    ports:
+      - "${ZKFSM_PORT:-9000}:9000"
+    volumes:
+      - drive1:/data1
+      - drive2:/data2
+      - drive3:/data3
+      - drive4:/data4
+    restart: unless-stopped
+
+volumes:
+  drive1:
+  drive2:
+  drive3:
+  drive4:

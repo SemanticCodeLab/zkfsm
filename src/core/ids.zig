@@ -50,6 +50,26 @@ pub fn nameId(bucket: BucketId, key: []const u8) NameId {
     return .{ .bytes = d[0..16].* };
 }
 
+/// Version ids start with a big-endian timestamp so hex order is creation order.
+pub fn newVersionId(now_ns: i128) VersionId {
+    var v = VersionId.random();
+    const t: u64 = std.math.cast(u64, now_ns) orelse 0;
+    std.mem.writeInt(u64, v.bytes[0..8], t, .big);
+    return v;
+}
+
+/// Stable id for one version of a (bucket, key); addresses noncurrent versions.
+pub fn versionNameId(bucket: BucketId, key: []const u8, version: VersionId) NameId {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("version\x00");
+    h.update(&bucket.bytes);
+    h.update(&version.bytes);
+    h.update(key);
+    var d: [32]u8 = undefined;
+    h.final(&d);
+    return .{ .bytes = d[0..16].* };
+}
+
 test "id hex roundtrip" {
     const a = ObjectId.random();
     const h = a.toHex();
@@ -63,4 +83,7 @@ test "nameId depends on bucket and key" {
     const b2 = BucketId{ .bytes = [_]u8{2} ** 16 };
     try std.testing.expect(!nameId(b1, "k").eql(nameId(b2, "k")));
     try std.testing.expect(nameId(b1, "k").eql(nameId(b1, "k")));
+    const v = newVersionId(5);
+    try std.testing.expect(!versionNameId(b1, "k", v).eql(nameId(b1, "k")));
+    try std.testing.expect(std.mem.lessThan(u8, &newVersionId(5).toHex(), &newVersionId(6).toHex()));
 }

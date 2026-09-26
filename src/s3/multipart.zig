@@ -7,11 +7,14 @@ const router = @import("router.zig");
 const xml = @import("xml.zig");
 const xml_read = @import("xml_read.zig");
 const errors = @import("errors.zig");
+const s3v = @import("versioning.zig");
 
 const Ctx = handler.Ctx;
 const ConnError = handler.ConnError;
 const Code = errors.Code;
 const mp = object.multipart;
+const ov = object.versioning;
+const Header = std.http.Header;
 
 /// Upper bound for XML request bodies (10000 parts or 1000 delete keys fit).
 const max_xml_body = 4 * 1024 * 1024;
@@ -95,7 +98,9 @@ fn uploadId(c: *Ctx) OpError!mp.UploadId {
 }
 
 fn create(c: *Ctx) OpError!void {
-    const id = try mp.create(c.svc, c.route.bucket, c.route.key, c.content_type);
+    var in: object.PutInput = .{ .content_type = c.content_type };
+    if (!try s3v.putExtras(c, &in)) return;
+    const id = try mp.create(c.svc, c.route.bucket, c.route.key, in);
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "InitiateMultipartUploadResult");
@@ -115,6 +120,7 @@ const CopyHeaders = struct {
     source: ?[]const u8 = null,
     range: ?[]const u8 = null,
     directive: ?[]const u8 = null,
+    tagging_directive: ?[]const u8 = null,
 };
 
 /// Must run before the body is read; reading invalidates the header buffer.
@@ -125,12 +131,21 @@ fn copyHeaders(c: *Ctx) error{OutOfMemory}!CopyHeaders {
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-copy-source")) h.source = try c.arena.dupe(u8, f.value);
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-copy-source-range")) h.range = try c.arena.dupe(u8, f.value);
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-metadata-directive")) h.directive = try c.arena.dupe(u8, f.value);
+        if (std.ascii.eqlIgnoreCase(f.name, "x-amz-tagging-directive")) h.tagging_directive = try c.arena.dupe(u8, f.value);
     }
     return h;
 }
 
 /// `x-amz-copy-source`: `[/]bucket/key[?versionId=...]`, percent-encoded.
 fn parseCopySource(arena: std.mem.Allocator, raw: []const u8) OpError!object.copy.Source {
+    var version: ?core.VersionId = null;
+    if (std.mem.indexOfScalar(u8, raw, '?')) |q| {
+        const v = router.queryParam(arena, raw[q + 1 ..], "versionId") catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidUri => error.BadCopySource,
+        };
+        if (v) |vs| version = try ov.parseVersionId(vs);
+    }
     var s = std.mem.sliceTo(raw, '?');
     if (s.len > 0 and s[0] == '/') s = s[1..];
     const decoded = router.percentDecode(arena, s, false) catch |e| return switch (e) {
@@ -139,7 +154,7 @@ fn parseCopySource(arena: std.mem.Allocator, raw: []const u8) OpError!object.cop
     };
     const slash = std.mem.indexOfScalar(u8, decoded, '/') orelse return error.BadCopySource;
     if (slash == 0 or slash + 1 == decoded.len) return error.BadCopySource;
-    return .{ .bucket = decoded[0..slash], .key = decoded[slash + 1 ..] };
+    return .{ .bucket = decoded[0..slash], .key = decoded[slash + 1 ..], .version = version };
 }
 
 fn uploadPart(c: *Ctx) OpError!void {
@@ -155,7 +170,7 @@ fn uploadPart(c: *Ctx) OpError!void {
             range = .{ .first = spec.from_to.first, .last = spec.from_to.last };
         }
         const etag = try mp.uploadPartCopy(c.svc, c.route.bucket, c.route.key, id, n, src, range);
-        return copyResult(c, "CopyPartResult", etag, core.time.nowNs());
+        return copyResult(c, "CopyPartResult", etag, core.time.nowNs(), &.{});
     }
     if (c.content_sha256) |s| if (std.mem.startsWith(u8, s, "STREAMING-")) return handler.fail(c, .NotImplemented);
     const len = c.req.head.content_length;
@@ -166,7 +181,7 @@ fn uploadPart(c: *Ctx) OpError!void {
     try handler.respondEmpty(c, .ok, &.{.{ .name = "etag", .value = etag.quoted(&eb) }});
 }
 
-fn copyResult(c: *Ctx, root: []const u8, etag: core.ETag, mtime_ns: i128) OpError!void {
+fn copyResult(c: *Ctx, root: []const u8, etag: core.ETag, mtime_ns: i128, extra: []const Header) OpError!void {
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     var tb: [24]u8 = undefined;
@@ -175,24 +190,37 @@ fn copyResult(c: *Ctx, root: []const u8, etag: core.ETag, mtime_ns: i128) OpErro
     try xml.elem(w, "LastModified", core.time.iso8601(mtime_ns, &tb));
     try xml.elem(w, "ETag", etag.quoted(&eb));
     try xml.close(w, root);
-    try handler.respondXml(c, .ok, a.written());
+    try handler.respondXmlWith(c, .ok, a.written(), extra);
+}
+
+/// COPY (default) or REPLACE.
+fn isReplace(directive: ?[]const u8) OpError!bool {
+    const d = directive orelse return false;
+    if (std.ascii.eqlIgnoreCase(d, "REPLACE")) return true;
+    if (std.ascii.eqlIgnoreCase(d, "COPY")) return false;
+    return error.BadCopySource;
 }
 
 fn copyObject(c: *Ctx) OpError!void {
     const ch = try copyHeaders(c);
     const src = try parseCopySource(c.arena, ch.source orelse return error.BadCopySource);
-    const replace = if (ch.directive) |d| blk: {
-        if (std.ascii.eqlIgnoreCase(d, "REPLACE")) break :blk true;
-        if (std.ascii.eqlIgnoreCase(d, "COPY")) break :blk false;
-        return error.BadCopySource;
-    } else false;
+    const replace = try isReplace(ch.directive);
+    const replace_tags = try isReplace(ch.tagging_directive);
     // S3 rejects a same-key copy that changes nothing.
-    if (!replace and std.mem.eql(u8, src.bucket, c.route.bucket) and std.mem.eql(u8, src.key, c.route.key))
+    if (!replace and src.version == null and std.mem.eql(u8, src.bucket, c.route.bucket) and std.mem.eql(u8, src.key, c.route.key))
         return handler.fail(c, .InvalidRequest);
-    const info = try object.copy.copyObject(c.svc, src, c.route.bucket, c.route.key, .{
-        .content_type = if (replace) c.content_type else null,
-    });
-    try copyResult(c, "CopyObjectResult", info.etag, info.created_ns);
+    var in: object.copy.CopyInput = .{ .put = .{ .content_type = c.content_type }, .replace_metadata = replace, .replace_tags = replace_tags };
+    if (!try s3v.putExtras(c, &in.put)) return;
+    const info = try object.copy.copyObject(c.svc, src, c.route.bucket, c.route.key, in);
+    var hdrs: std.ArrayList(Header) = .empty;
+    if (src.version) |v| try hdrs.append(c.arena, try versionHeader(c, "x-amz-copy-source-version-id", v));
+    if (!info.version_id.eql(ov.null_version_id)) try hdrs.append(c.arena, try versionHeader(c, "x-amz-version-id", info.version_id));
+    try copyResult(c, "CopyObjectResult", info.etag, info.created_ns, hdrs.items);
+}
+
+fn versionHeader(c: *Ctx, name: []const u8, v: core.VersionId) error{OutOfMemory}!Header {
+    const buf = try c.arena.create([32]u8);
+    return .{ .name = name, .value = ov.formatVersionId(v, buf) };
 }
 
 fn readXmlBody(c: *Ctx) OpError![]const u8 {
@@ -241,7 +269,9 @@ fn complete(c: *Ctx) OpError!void {
     try xml.elem(w, "Key", c.route.key);
     try xml.elem(w, "ETag", info.etag.quoted(&eb));
     try w.writeAll("</CompleteMultipartUploadResult>");
-    try handler.respondXml(c, .ok, a.written());
+    var hdrs: std.ArrayList(Header) = .empty;
+    if (!info.version_id.eql(ov.null_version_id)) try hdrs.append(c.arena, try versionHeader(c, "x-amz-version-id", info.version_id));
+    try handler.respondXmlWith(c, .ok, a.written(), hdrs.items);
 }
 
 fn maxParam(c: *Ctx, name: []const u8) OpError!usize {
@@ -375,22 +405,40 @@ fn deleteObjects(c: *Ctx) OpError!void {
         if (n > max_delete_keys) return error.MalformedXML;
         var ks: xml_read.Scanner = .{ .s = o };
         const key = try xml_read.unescape(c.arena, (try ks.next("Key")) orelse return error.MalformedXML);
-        if (c.svc.delete(c.route.bucket, key)) {
+        ks.pos = 0;
+        const version_s: ?[]const u8 = if (try ks.next("VersionId")) |vs| std.mem.trim(u8, vs, " \t\r\n") else null;
+        var version: ?core.VersionId = null;
+        if (version_s) |vs| version = ov.parseVersionId(vs) catch {
+            try deleteError(w, key, vs, .InvalidArgument);
+            continue;
+        };
+        const opts: ov.DeleteOptions = .{ .version = version, .bypass_governance = c.ext.bypass_governance };
+        if (ov.deleteObject(c.svc, c.route.bucket, key, opts)) |res| {
             if (quiet) continue;
+            var vb: [32]u8 = undefined;
             try w.writeAll("<Deleted>");
             try xml.elem(w, "Key", key);
+            if (version) |v| try xml.elem(w, "VersionId", ov.formatVersionId(v, &vb));
+            if (res.delete_marker) {
+                try xml.elemBool(w, "DeleteMarker", true);
+                if (res.version) |v| try xml.elem(w, "DeleteMarkerVersionId", ov.formatVersionId(v, &vb));
+            }
             try w.writeAll("</Deleted>");
         } else |e| {
-            const ec = errors.fromObject(e);
-            try w.writeAll("<Error>");
-            try xml.elem(w, "Key", key);
-            try xml.elem(w, "Code", @tagName(ec));
-            try xml.elem(w, "Message", ec.message());
-            try w.writeAll("</Error>");
+            try deleteError(w, key, version_s, errors.fromObject(e));
         }
     }
     try w.writeAll("</DeleteResult>");
     try handler.respondXml(c, .ok, a.written());
+}
+
+fn deleteError(w: *std.Io.Writer, key: []const u8, version: ?[]const u8, ec: Code) std.Io.Writer.Error!void {
+    try w.writeAll("<Error>");
+    try xml.elem(w, "Key", key);
+    if (version) |v| try xml.elem(w, "VersionId", v);
+    try xml.elem(w, "Code", @tagName(ec));
+    try xml.elem(w, "Message", ec.message());
+    try w.writeAll("</Error>");
 }
 
 test "copy source parsing" {

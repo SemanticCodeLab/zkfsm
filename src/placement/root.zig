@@ -17,6 +17,16 @@ pub fn recordKey(id: core.NameId) PhysicalKey {
     return .{ .space = .record, .hex = id.toHex() };
 }
 
+/// Record key for a noncurrent version of a name.
+pub fn versionRecordKey(id: core.NameId) PhysicalKey {
+    return .{ .space = .record, .hex = id.toHex() };
+}
+
+/// Per-bucket configuration record (versioning, lock, tags).
+pub fn bucketConfigKey(id: core.BucketId) PhysicalKey {
+    return .{ .space = .system, .hex = id.toHex() };
+}
+
 /// Record key for an in-progress multipart upload. Upload ids are random, so they
 /// cannot collide with the hashed name ids in the same space.
 pub fn uploadKey(id: core.ObjectId) PhysicalKey {

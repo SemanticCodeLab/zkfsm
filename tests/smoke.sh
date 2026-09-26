@@ -138,6 +138,27 @@ check "delete objects" 4 "$(curl -s -X POST --data-binary "$DEL" "$EP/mpb?delete
 check "delete objects quiet" 0 "$(curl -s -X POST --data-binary '<Delete><Quiet>true</Quiet><Object><Key>x</Key></Object></Delete>' "$EP/mpb?delete" | grep -c '<Deleted>')"
 check "delete objects empty bucket" 204 "$(status -X DELETE "$EP/mpb")"
 
+# Multipart, copy, and multi-delete through versioning and object lock.
+MV="$EP/mpver"
+curl -s -o /dev/null -X PUT -H 'x-amz-bucket-object-lock-enabled: true' "$MV"
+curl -s -o /dev/null -X PUT --data-binary '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>' "$MV?object-lock"
+VUP=$(curl -s -X POST -H 'x-amz-tagging: t=1' "$MV/obj?uploads" | xmlval UploadId)
+VE1=$(echo -n "only" | curl -s -D - -o /dev/null -T - "$MV/obj?partNumber=1&uploadId=$VUP" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+VVER=$(printf '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>' "$VE1" | curl -s -D - -o /dev/null -X POST --data-binary @- "$MV/obj?uploadId=$VUP" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "mp complete version id" 32 "${#VVER}"
+check "mp complete lock default" "GOVERNANCE" "$(header x-amz-object-lock-mode -I "$MV/obj")"
+check "mp complete tags" "1" "$(header x-amz-tagging-count -I "$MV/obj")"
+CVER=$(curl -s -D - -o /dev/null -X PUT -H "x-amz-copy-source: /mpver/obj?versionId=$VVER" "$MV/copy" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "copy version id" 32 "${#CVER}"
+check "copy keeps tags" "1" "$(header x-amz-tagging-count -I "$MV/copy")"
+check "copy lock default" "GOVERNANCE" "$(header x-amz-object-lock-mode -I "$MV/copy")"
+DV=$(curl -s -X POST --data-binary "<Delete><Object><Key>obj</Key><VersionId>$VVER</VersionId></Object><Object><Key>copy</Key></Object></Delete>" "$MV?delete")
+check "multi-delete locked version" 1 "$(grep -c "<Error><Key>obj</Key><VersionId>$VVER</VersionId><Code>AccessDenied</Code>" <<<"$DV")"
+check "multi-delete marker" 1 "$(grep -c '<Deleted><Key>copy</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>' <<<"$DV")"
+DV2=$(curl -s -X POST -H 'x-amz-bypass-governance-retention: true' --data-binary "<Delete><Object><Key>obj</Key><VersionId>$VVER</VersionId></Object></Delete>" "$MV?delete")
+check "multi-delete bypass governance" 1 "$(grep -c "<Deleted><Key>obj</Key><VersionId>$VVER</VersionId></Deleted>" <<<"$DV2")"
+check "deleted version gone" 404 "$(status -I "$MV/obj?versionId=$VVER")"
+
 # aws cli (optional): a 50 MB `s3 cp` goes through multipart.
 if command -v aws >/dev/null && [[ -z "${ZKFSM_SMOKE_NO_AWS:-}" ]]; then
   export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
@@ -160,6 +181,105 @@ fi
 # Keep-alive: two requests on one connection.
 check "keep-alive" "200 200" "$(curl -s -o /dev/null -o /dev/null -w '%{http_code} ' "$EP/" "$EP/" | xargs)"
 
+# Conditional requests.
+curl -s -o /dev/null -X PUT "$EP/cond"
+echo -n "v1" | curl -s -o /dev/null -T - "$EP/cond/k"
+ET=$(header etag -I "$EP/cond/k")
+LM=$(header last-modified -I "$EP/cond/k")
+check "if-none-match create conflict" 412 "$(echo -n x | status -T - -H 'If-None-Match: *' "$EP/cond/k")"
+check "if-none-match create new" 200 "$(echo -n x | status -T - -H 'If-None-Match: *' "$EP/cond/new")"
+check "put if-match mismatch" 412 "$(echo -n x | status -T - -H 'If-Match: "nope"' "$EP/cond/k")"
+check "get if-match ok" 200 "$(status -H "If-Match: $ET" "$EP/cond/k")"
+check "get if-match fail" 412 "$(status -H 'If-Match: "nope"' "$EP/cond/k")"
+check "get if-none-match 304" 304 "$(status -H "If-None-Match: $ET" "$EP/cond/k")"
+check "head if-none-match 304" 304 "$(status -I -H "If-None-Match: $ET" "$EP/cond/k")"
+check "get if-modified-since 304" 304 "$(status -H "If-Modified-Since: $LM" "$EP/cond/k")"
+check "get if-modified-since old" 200 "$(status -H 'If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT' "$EP/cond/k")"
+check "get if-unmodified-since 412" 412 "$(status -H 'If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT' "$EP/cond/k")"
+
+# Tagging.
+TAGS='<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>'
+echo -n "t" | curl -s -o /dev/null -T - -H 'x-amz-tagging: a=1&b=2' "$EP/cond/tagged"
+check "put x-amz-tagging count" 2 "$(header x-amz-tagging-count -I "$EP/cond/tagged")"
+check "put object tagging" 200 "$(status -X PUT --data-binary "$TAGS" "$EP/cond/tagged?tagging")"
+check "get object tagging" 1 "$(curl -s "$EP/cond/tagged?tagging" | grep -c '<Key>env</Key><Value>prod</Value>')"
+check "delete object tagging" 204 "$(status -X DELETE "$EP/cond/tagged?tagging")"
+check "tagging emptied" 0 "$(curl -s "$EP/cond/tagged?tagging" | grep -c '<Tag>')"
+check "no bucket tagging" 404 "$(status "$EP/cond?tagging")"
+check "put bucket tagging" 204 "$(status -X PUT --data-binary "$TAGS" "$EP/cond?tagging")"
+check "get bucket tagging" 1 "$(curl -s "$EP/cond?tagging" | grep -c '<Key>env</Key>')"
+check "delete bucket tagging" 204 "$(status -X DELETE "$EP/cond?tagging")"
+
+# Versioning.
+V=$EP/ver
+curl -s -o /dev/null -X PUT "$V"
+check "versioning unset" 0 "$(curl -s "$V?versioning" | grep -c '<Status>')"
+echo -n "null-body" | curl -s -o /dev/null -T - "$V/k"
+check "enable versioning" 200 "$(status -X PUT --data-binary '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' "$V?versioning")"
+check "versioning enabled" 1 "$(curl -s "$V?versioning" | grep -c '<Status>Enabled</Status>')"
+V1=$(echo -n "one" | curl -s -D - -o /dev/null -T - "$V/k" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+V2=$(echo -n "two" | curl -s -D - -o /dev/null -T - "$V/k" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "version ids differ" 1 "$([[ -n "$V1" && "$V1" != "$V2" ]] && echo 1 || echo 0)"
+check "get latest" "two" "$(curl -s "$V/k")"
+check "get by version" "one" "$(curl -s "$V/k?versionId=$V1")"
+check "get null version" "null-body" "$(curl -s "$V/k?versionId=null")"
+check "head version header" "$V1" "$(header x-amz-version-id -I "$V/k?versionId=$V1")"
+check "bad version id" 400 "$(status "$V/k?versionId=zzz")"
+check "missing version" 404 "$(status "$V/k?versionId=0123456789abcdef0123456789abcdef")"
+check "delete makes marker" "true" "$(header x-amz-delete-marker -X DELETE "$V/k")"
+check "get after marker" 404 "$(status "$V/k")"
+check "marker header on get" "true" "$(header x-amz-delete-marker "$V/k")"
+check "list hides marked key" 0 "$(curl -s "$V?list-type=2" | grep -c '<Key>k</Key>')"
+VERS=$(curl -s "$V?versions")
+check "list versions count" 3 "$(grep -o '<Version>' <<<"$VERS" | wc -l)"
+check "list delete markers" 1 "$(grep -o '<DeleteMarker>' <<<"$VERS" | wc -l)"
+MARKER=$(sed -n 's/.*<DeleteMarker><Key>k<\/Key><VersionId>\([^<]*\)<.*/\1/p' <<<"$VERS")
+PAGE=$(curl -s "$V?versions&max-keys=2")
+check "versions truncated" 1 "$(grep -c '<IsTruncated>true</IsTruncated>' <<<"$PAGE")"
+NKM=$(sed -n 's/.*<NextKeyMarker>\([^<]*\)<.*/\1/p' <<<"$PAGE")
+NVM=$(sed -n 's/.*<NextVersionIdMarker>\([^<]*\)<.*/\1/p' <<<"$PAGE")
+PAGE2=$(curl -s "$V?versions&key-marker=$NKM&version-id-marker=$NVM")
+check "versions page 2" 2 "$(grep -o '<VersionId>' <<<"$PAGE2" | wc -l)"
+check "versions page 2 has null" 1 "$(grep -c '<VersionId>null</VersionId>' <<<"$PAGE2")"
+check "delete marker by id" 204 "$(status -X DELETE "$V/k?versionId=$MARKER")"
+check "latest restored" "two" "$(curl -s "$V/k")"
+check "delete version" "$V2" "$(header x-amz-version-id -X DELETE "$V/k?versionId=$V2")"
+check "previous promoted" "one" "$(curl -s "$V/k")"
+check "suspend versioning" 200 "$(status -X PUT --data-binary '<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>' "$V?versioning")"
+echo -n "susp" | curl -s -o /dev/null -T - "$V/k"
+check "suspended replaces null" "susp" "$(curl -s "$V/k?versionId=null")"
+check "suspended versions" 2 "$(curl -s "$V?versions" | grep -o '<Version>' | wc -l)"
+check "versioned bucket not empty" 409 "$(status -X DELETE "$V")"
+curl -s -o /dev/null -X DELETE "$V/k?versionId=null"
+curl -s -o /dev/null -X DELETE "$V/k?versionId=$V1"
+check "delete emptied versioned bucket" 204 "$(status -X DELETE "$V")"
+
+# Object lock.
+L=$EP/locked
+FUT=$(date -u -d '+1 day' +%Y-%m-%dT%H:%M:%SZ)
+check "create lock bucket" 200 "$(status -X PUT -H 'x-amz-bucket-object-lock-enabled: true' "$L")"
+check "lock bucket versioned" 1 "$(curl -s "$L?versioning" | grep -c '<Status>Enabled</Status>')"
+check "cannot suspend lock bucket" 409 "$(status -X PUT --data-binary '<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>' "$L?versioning")"
+check "no lock config on plain bucket" 404 "$(status "$EP/cond?object-lock")"
+check "put lock config" 200 "$(status -X PUT --data-binary '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>' "$L?object-lock")"
+check "get lock config" 1 "$(curl -s "$L?object-lock" | grep -c '<Mode>GOVERNANCE</Mode><Days>1</Days>')"
+GV=$(echo -n "g" | curl -s -D - -o /dev/null -T - "$L/g" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "default retention applied" "GOVERNANCE" "$(header x-amz-object-lock-mode -I "$L/g")"
+check "governance delete denied" 403 "$(status -X DELETE "$L/g?versionId=$GV")"
+check "access denied code" 1 "$(curl -s -X DELETE "$L/g?versionId=$GV" | grep -c '<Code>AccessDenied</Code>')"
+check "marker delete allowed" 204 "$(status -X DELETE "$L/g")"
+check "governance shorten denied" 403 "$(status -X PUT --data-binary '<Retention></Retention>' "$L/g?retention&versionId=$GV")"
+check "governance bypass delete" 204 "$(status -X DELETE -H 'x-amz-bypass-governance-retention: true' "$L/g?versionId=$GV")"
+CV=$(echo -n "c" | curl -s -D - -o /dev/null -T - -H 'x-amz-object-lock-mode: COMPLIANCE' -H "x-amz-object-lock-retain-until-date: $FUT" "$L/c" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "get retention" 1 "$(curl -s "$L/c?retention" | grep -c '<Mode>COMPLIANCE</Mode>')"
+check "compliance bypass denied" 403 "$(status -X DELETE -H 'x-amz-bypass-governance-retention: true' "$L/c?versionId=$CV")"
+check "compliance downgrade denied" 403 "$(status -X PUT -H 'x-amz-bypass-governance-retention: true' --data-binary "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>$FUT</RetainUntilDate></Retention>" "$L/c?retention")"
+HV=$(echo -n "h" | curl -s -D - -o /dev/null -T - "$L/h" | tr -d '\r' | awk 'tolower($1)=="x-amz-version-id:"{print $2}')
+check "put legal hold" 200 "$(status -X PUT --data-binary '<LegalHold><Status>ON</Status></LegalHold>' "$L/h?legal-hold")"
+check "get legal hold" 1 "$(curl -s "$L/h?legal-hold" | grep -c '<Status>ON</Status>')"
+check "legal hold blocks delete" 403 "$(status -X DELETE -H 'x-amz-bypass-governance-retention: true' "$L/h?versionId=$HV")"
+check "retention on plain bucket" 400 "$(status -X PUT --data-binary "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>$FUT</RetainUntilDate></Retention>" "$EP/cond/k?retention")"
+
 # Persistence across restart.
 curl -s -o /dev/null -X PUT "$EP/persist"
 echo -n "durable" | curl -s -o /dev/null -T - "$EP/persist/k"
@@ -168,6 +288,8 @@ kill "$PID"; wait "$PID" 2>/dev/null || true
 PID=$!
 wait_up
 check "survives restart" "durable" "$(curl -s "$EP/persist/k")"
+check "versions survive restart" "$CV" "$(header x-amz-version-id -I "$EP/locked/c")"
+check "lock survives restart" 403 "$(status -X DELETE "$EP/locked/c?versionId=$CV")"
 
 echo "smoke: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
