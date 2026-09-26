@@ -4,6 +4,7 @@ const std = @import("std");
 const core = @import("../core/root.zig");
 const router = @import("router.zig");
 const errors = @import("errors.zig");
+const iam = @import("../iam/root.zig");
 
 const sv = core.sigv4;
 const Code = errors.Code;
@@ -13,8 +14,17 @@ const Header = std.http.Header;
 
 pub const Credentials = struct { access_key: []const u8, secret_key: []const u8 };
 
-/// Null credentials mean anonymous mode: no signature is required or checked.
-pub const Config = struct { creds: ?Credentials };
+/// Where secrets come from. A null store means anonymous mode: nothing is checked.
+pub const Config = struct {
+    iam: ?*iam.Store = null,
+    /// Validates STS session tokens and derives their secrets.
+    sts: ?iam.sts.Issuer = null,
+};
+
+/// STS issuer key derived from the root secret, so tokens survive restarts.
+pub fn stsIssuerKey(root_secret: []const u8) [32]u8 {
+    return sv.hmac(root_secret, "zkfsm-sts-issuer");
+}
 
 pub const max_skew_s = 15 * 60;
 pub const max_presign_expires_s = 7 * 24 * 3600;
@@ -51,6 +61,9 @@ pub const Auth = struct {
     seed: sv.Hex = undefined,
     amz_date: []const u8 = "",
     scope: sv.Scope = .{ .date = "", .region = "", .service = "" },
+    /// Identity to authorize: the access key, or an STS session's parent.
+    principal: []const u8 = "",
+    session_policy: ?[]const u8 = null,
 };
 
 pub const Outcome = union(enum) { ok: Auth, denied: Code };
@@ -83,7 +96,8 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
             auth.decoded_length = std.fmt.parseInt(u64, d, 10) catch return deny(.InvalidArgument);
     }
 
-    const creds = cfg.creds orelse return .{ .ok = auth };
+    const store = cfg.iam orelse return .{ .ok = auth };
+    const src: Source = .{ .cfg = cfg, .store = store, .now_s = now_s };
     const query = if (std.mem.indexOfScalar(u8, in.target, '?')) |i| in.target[i + 1 ..] else "";
     if (in.header("authorization")) |h| {
         const p = parseAuthorization(h) orelse return deny(.AuthorizationHeaderMalformed);
@@ -94,7 +108,7 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
             auth.mode = .sha256;
             sv.Sha256.hash("", &auth.sha256, .{});
         }
-        return check(arena, creds, in, p, amz_date, payload orelse sv.empty_sha256_hex, false, &auth);
+        return check(arena, src, in.header("x-amz-security-token"), in, p, amz_date, payload orelse sv.empty_sha256_hex, false, &auth);
     }
     const qp = struct {
         fn get(a: std.mem.Allocator, q: []const u8, name: []const u8) error{OutOfMemory}!?[]const u8 {
@@ -121,7 +135,8 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
         .signature = sig,
     };
     const ph = try qp(arena, query, "X-Amz-Content-Sha256") orelse sv.unsigned_payload;
-    return check(arena, creds, in, p, amz_date, ph, true, &auth);
+    const token = try qp(arena, query, "X-Amz-Security-Token");
+    return check(arena, src, token, in, p, amz_date, ph, true, &auth);
 }
 
 const Credential = struct { access_key: []const u8, scope: sv.Scope };
@@ -162,9 +177,12 @@ fn parseAuthorization(h: []const u8) ?Parsed {
     return .{ .cred = cred orelse return null, .signed_headers = signed orelse return null, .signature = sig orelse return null };
 }
 
+const Source = struct { cfg: Config, store: *iam.Store, now_s: i64 };
+
 fn check(
     arena: std.mem.Allocator,
-    creds: Credentials,
+    src: Source,
+    token: ?[]const u8,
     in: Input,
     p: Parsed,
     amz_date: []const u8,
@@ -172,7 +190,22 @@ fn check(
     presigned: bool,
     auth: *Auth,
 ) error{OutOfMemory}!Outcome {
-    if (!std.mem.eql(u8, p.cred.access_key, creds.access_key)) return deny(.InvalidAccessKeyId);
+    var sbuf: iam.Store.SecretBuf = undefined;
+    var sts_secret: [iam.sts.secret_key_len]u8 = undefined;
+    var dbuf: iam.sts.DecodeBuffer = undefined;
+    const ak = p.cred.access_key;
+    auth.principal = ak;
+    const secret: []const u8 = if (token) |t| blk: {
+        const issuer = src.cfg.sts orelse return deny(.InvalidToken);
+        const claims = issuer.verify(ak, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
+            error.Expired => .ExpiredToken,
+            else => .InvalidToken,
+        });
+        auth.principal = try arena.dupe(u8, claims.parent);
+        auth.session_policy = if (claims.session_policy) |sp| try arena.dupe(u8, sp) else null;
+        sts_secret = issuer.secretFor(ak);
+        break :blk &sts_secret;
+    } else src.store.secretFor(ak, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);
     const scope = p.cred.scope;
     if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !std.mem.eql(u8, scope.service, "s3"))
         return deny(.AuthorizationHeaderMalformed);
@@ -187,7 +220,7 @@ fn check(
     };
     var sts: Writer.Allocating = .init(arena);
     sv.writeStringToSign(&sts.writer, amz_date, scope, creq) catch return error.OutOfMemory;
-    const key = sv.signingKey(creds.secret_key, scope.date, scope.region, scope.service);
+    const key = sv.signingKey(secret, scope.date, scope.region, scope.service);
     const want = sv.sign(key, sts.written());
     if (p.signature.len != want.len or !std.crypto.timing_safe.eql(sv.Hex, want, p.signature[0..64].*))
         return deny(.SignatureDoesNotMatch);
@@ -436,7 +469,17 @@ pub const BodyReader = struct {
 
 // Examples from the AWS S3 SigV4 documentation.
 const ex_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-const ex_cfg: Config = .{ .creds = .{ .access_key = "AKIAIOSFODNN7EXAMPLE", .secret_key = ex_secret } };
+const ex_ak = "AKIAIOSFODNN7EXAMPLE";
+
+/// verify() against an IAM store whose root is `ak`/`sk`; null `ak` is anonymous mode.
+fn tverify(a: std.mem.Allocator, ak: ?[]const u8, sk: []const u8, in: Input, now_s: i64) !Outcome {
+    var mem: iam.store.MemoryPersistence = .{ .gpa = std.testing.allocator };
+    defer mem.deinit();
+    var st: iam.Store = undefined;
+    try st.open(std.testing.allocator, mem.persistence(), .{ .root_access_key = ak orelse "", .root_secret = sk });
+    defer st.deinit();
+    return verify(a, .{ .iam = if (ak != null) &st else null }, in, now_s);
+}
 const ex_now: i64 = 1369353600; // 20130524T000000Z
 
 fn expectDenied(want: Code, got: Outcome) !void {
@@ -457,25 +500,25 @@ test "header auth: GET object example" {
         .{ .name = "x-amz-date", .value = "20130524T000000Z" },
     };
     const in: Input = .{ .method = "GET", .target = "/test.txt", .headers = &hdrs };
-    const out = try verify(arena.allocator(), ex_cfg, in, ex_now + 60);
+    const out = try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now + 60);
     try std.testing.expect(out == .ok);
     try std.testing.expectEqual(PayloadMode.sha256, out.ok.mode);
 
-    try expectDenied(.RequestTimeTooSkewed, try verify(arena.allocator(), ex_cfg, in, ex_now + 16 * 60));
-    try expectDenied(.InvalidAccessKeyId, try verify(arena.allocator(), .{ .creds = .{ .access_key = "OTHER", .secret_key = ex_secret } }, in, ex_now));
-    try expectDenied(.SignatureDoesNotMatch, try verify(arena.allocator(), .{ .creds = .{ .access_key = "AKIAIOSFODNN7EXAMPLE", .secret_key = "wrong" } }, in, ex_now));
+    try expectDenied(.RequestTimeTooSkewed, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now + 16 * 60));
+    try expectDenied(.InvalidAccessKeyId, try tverify(arena.allocator(), "OTHER", ex_secret, in, ex_now));
+    try expectDenied(.SignatureDoesNotMatch, try tverify(arena.allocator(), ex_ak, "wrongwrong", in, ex_now));
     hdrs[2].value = "bytes=0-10";
-    try expectDenied(.SignatureDoesNotMatch, try verify(arena.allocator(), ex_cfg, in, ex_now));
+    try expectDenied(.SignatureDoesNotMatch, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now));
     hdrs[1].value = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3";
-    try expectDenied(.AuthorizationHeaderMalformed, try verify(arena.allocator(), ex_cfg, in, ex_now));
+    try expectDenied(.AuthorizationHeaderMalformed, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now));
 }
 
 test "anonymous and unauthenticated requests" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const in: Input = .{ .method = "GET", .target = "/b/k", .headers = &.{.{ .name = "host", .value = "h" }} };
-    try std.testing.expect((try verify(arena.allocator(), .{ .creds = null }, in, 0)) == .ok);
-    try expectDenied(.AccessDenied, try verify(arena.allocator(), ex_cfg, in, ex_now));
+    try std.testing.expect((try tverify(arena.allocator(), null, "", in, 0)) == .ok);
+    try expectDenied(.AccessDenied, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now));
 }
 
 test "presigned GET example" {
@@ -487,10 +530,10 @@ test "presigned GET example" {
         "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
     const in: Input = .{ .method = "GET", .target = target, .headers = &.{.{ .name = "Host", .value = "examplebucket.s3.amazonaws.com" }} };
     const a = arena.allocator();
-    try std.testing.expect((try verify(a, ex_cfg, in, ex_now + 3600)) == .ok);
-    try expectDenied(.AccessDenied, try verify(a, ex_cfg, in, ex_now + 86401));
+    try std.testing.expect((try tverify(a, ex_ak, ex_secret, in, ex_now + 3600)) == .ok);
+    try expectDenied(.AccessDenied, try tverify(a, ex_ak, ex_secret, in, ex_now + 86401));
     const bad: Input = .{ .method = "PUT", .target = target, .headers = in.headers };
-    try expectDenied(.SignatureDoesNotMatch, try verify(a, ex_cfg, bad, ex_now));
+    try expectDenied(.SignatureDoesNotMatch, try tverify(a, ex_ak, ex_secret, bad, ex_now));
 }
 
 fn chunkedExample(a: std.mem.Allocator, final_sig: []const u8) ![]u8 {
@@ -533,7 +576,7 @@ test "aws-chunked PUT example with per-chunk signatures" {
         .{ .name = "x-amz-decoded-content-length", .value = "66560" },
         .{ .name = "Content-Length", .value = "66824" },
     } };
-    const out = try verify(a, ex_cfg, in, ex_now);
+    const out = try tverify(a, ex_ak, ex_secret, in, ex_now);
     try std.testing.expect(out == .ok);
     const auth = out.ok;
     try std.testing.expectEqual(@as(?u64, 66560), auth.decoded_length);
@@ -553,7 +596,7 @@ test "aws-chunked PUT example with per-chunk signatures" {
     try std.testing.expectEqual(@as(?Code, .IncompleteBody), (try decode(a, auth, good[0..66000])).failure);
 
     // Anonymous mode still strips the framing.
-    const anon = try verify(a, .{ .creds = null }, in, 0);
+    const anon = try tverify(a, null, "", in, 0);
     const plain = try decode(a, anon.ok, good);
     try std.testing.expectEqual(@as(usize, 66560), plain.data.len);
 }
@@ -578,4 +621,61 @@ test "x-amz-content-sha256 verified at end of body" {
     try std.testing.expectEqual(@as(?Code, null), ok.failure);
     try std.testing.expectEqualStrings("hello world", ok.data);
     try std.testing.expectEqual(@as(?Code, .XAmzContentSHA256Mismatch), (try decode(a, auth, "hello worle")).failure);
+}
+
+/// Header-signs a GET /b/k at 20130524T000000Z, for round-trip tests.
+fn signedGet(a: std.mem.Allocator, ak: []const u8, sk: []const u8, token: []const u8) !Input {
+    var hdrs: std.ArrayList(Header) = .empty;
+    try hdrs.appendSlice(a, &.{
+        .{ .name = "Host", .value = "localhost" },
+        .{ .name = "x-amz-content-sha256", .value = sv.empty_sha256_hex },
+        .{ .name = "x-amz-date", .value = "20130524T000000Z" },
+        .{ .name = "x-amz-security-token", .value = token },
+    });
+    const signed = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token";
+    const in: Input = .{ .method = "GET", .target = "/b/k", .headers = hdrs.items };
+    const creq = try canonicalRequest(a, in, signed, sv.empty_sha256_hex, false);
+    const scope: sv.Scope = .{ .date = "20130524", .region = "us-east-1", .service = "s3" };
+    var sts: Writer.Allocating = .init(a);
+    try sv.writeStringToSign(&sts.writer, "20130524T000000Z", scope, creq);
+    const sig = sv.sign(sv.signingKey(sk, scope.date, scope.region, scope.service), sts.written());
+    try hdrs.append(a, .{ .name = "Authorization", .value = try std.fmt.allocPrint(
+        a,
+        "AWS4-HMAC-SHA256 Credential={s}/{f}, SignedHeaders={s}, Signature={s}",
+        .{ ak, scope, signed, &sig },
+    ) });
+    return .{ .method = in.method, .target = in.target, .headers = hdrs.items };
+}
+
+test "STS session credentials" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem: iam.store.MemoryPersistence = .{ .gpa = gpa };
+    defer mem.deinit();
+    var st: iam.Store = undefined;
+    try st.open(gpa, mem.persistence(), .{ .root_access_key = "rootkey", .root_secret = "rootsecret" });
+    defer st.deinit();
+    try st.createUser("alice", "alicesecret");
+    const issuer: iam.sts.Issuer = .{ .key = stsIssuerKey("rootsecret") };
+    var prng = std.Random.DefaultPrng.init(1);
+    var live = try issuer.issue(gpa, .{ .parent = "alice", .session_policy = 
+        \\{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}
+    }, ex_now - 60, prng.random());
+    defer live.deinit(gpa);
+    const in = try signedGet(a, &live.access_key, &live.secret_key, live.session_token);
+    const cfg: Config = .{ .iam = &st, .sts = issuer };
+
+    const out = try verify(a, cfg, in, ex_now);
+    try std.testing.expect(out == .ok);
+    try std.testing.expectEqualStrings("alice", out.ok.principal);
+    try std.testing.expect(out.ok.session_policy != null);
+    try expectDenied(.InvalidToken, try verify(a, .{ .iam = &st }, in, ex_now));
+    const forged = try signedGet(a, &live.access_key, &live.secret_key, "Zm9v");
+    try expectDenied(.InvalidToken, try verify(a, cfg, forged, ex_now));
+
+    var old = try issuer.issue(gpa, .{ .parent = "alice", .duration_s = 900 }, ex_now - 900, prng.random());
+    defer old.deinit(gpa);
+    try expectDenied(.ExpiredToken, try verify(a, cfg, try signedGet(a, &old.access_key, &old.secret_key, old.session_token), ex_now));
 }

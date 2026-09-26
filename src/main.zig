@@ -4,6 +4,7 @@ const backend = @import("backend/root.zig");
 const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
 const metrics = @import("metrics/root.zig");
+const iam = @import("iam/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -66,6 +67,10 @@ pub fn main() u8 {
         std.log.err("no credentials: set ZKFSM_ACCESS_KEY and ZKFSM_SECRET_KEY, or pass --anonymous", .{});
         return 2;
     }
+    if (creds) |c| if (c.access_key.len < 3 or c.secret_key.len < iam.store.limits.min_secret or c.secret_key.len > iam.store.limits.max_secret) {
+        std.log.err("access key needs at least 3 characters and secret key 8 to 40", .{});
+        return 2;
+    };
     if (creds == null) std.log.warn("anonymous mode: requests are not authenticated", .{});
     const addr = std.net.Address.parseIp(cfg.host, cfg.port) catch {
         std.log.err("invalid listen address {s}", .{cfg.host});
@@ -82,13 +87,37 @@ pub fn main() u8 {
     };
     defer svc.deinit();
     std.log.info("data root {s}", .{cfg.data});
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = .{ .creds = creds } };
+    var auth: s3.sigv4.Config = .{};
+    var iam_dir: ?std.fs.Dir = null;
+    defer if (iam_dir) |*d| d.close();
+    var iam_file: iam.store.FilePersistence = undefined;
+    var iam_store: iam.Store = undefined;
+    if (creds) |c| {
+        iam_dir = openIamDir(cfg.data) catch |e| {
+            std.log.err("cannot open {s}/.zkfsm: {t}", .{ cfg.data, e });
+            return 1;
+        };
+        iam_file = .{ .dir = iam_dir.? };
+        iam_store.open(gpa, iam_file.persistence(), .{ .root_access_key = c.access_key, .root_secret = c.secret_key }) catch |e| {
+            std.log.err("cannot load IAM store: {t}", .{e});
+            return 1;
+        };
+        auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
+    }
+    defer if (auth.iam) |st| st.deinit();
+    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
     return 0;
+}
+
+fn openIamDir(data: []const u8) error{CannotOpen}!std.fs.Dir {
+    var root = std.fs.cwd().openDir(data, .{}) catch return error.CannotOpen;
+    defer root.close();
+    return root.makeOpenPath(".zkfsm", .{}) catch error.CannotOpen;
 }
 
 /// Root credentials from the environment; process-lifetime, never freed.
@@ -134,4 +163,5 @@ test {
     _ = object;
     _ = @import("metrics/root.zig");
     _ = s3;
+    _ = iam;
 }

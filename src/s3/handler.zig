@@ -6,6 +6,7 @@ const router = @import("router.zig");
 const xml = @import("xml.zig");
 const errors = @import("errors.zig");
 const sigv4 = @import("sigv4.zig");
+const authz = @import("authz.zig");
 const multipart = @import("multipart.zig");
 const metrics = @import("../metrics/root.zig");
 const versioning = @import("versioning.zig");
@@ -36,7 +37,7 @@ pub const Ctx = struct {
     ext: versioning.Headers = .{},
 };
 
-pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request, arena: std.mem.Allocator) ConnError!void {
+pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
     // No length and no chunking means an empty body (RFC 9112 6.3); std asserts otherwise.
     if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
     var ctx: Ctx = .{
@@ -62,10 +63,13 @@ pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request,
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
     };
-    switch (try sigv4.verify(arena, auth_cfg, try sigv4.Input.fromRequest(arena, req), std.time.timestamp())) {
+    const now_s = std.time.timestamp();
+    switch (try sigv4.verify(arena, env.auth, try sigv4.Input.fromRequest(arena, req), now_s)) {
         .ok => |a| ctx.auth = a,
         .denied => |code| return fail(&ctx, code),
     }
+    const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
+    if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
     if (multipart.isMultipartRequest(ctx.route.query)) return fail(&ctx, .NotImplemented);
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,

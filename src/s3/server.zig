@@ -3,6 +3,7 @@ const std = @import("std");
 const object = @import("../object/root.zig");
 const handler = @import("handler.zig");
 const sigv4 = @import("sigv4.zig");
+const authz = @import("authz.zig");
 const metrics = @import("../metrics/root.zig");
 
 pub const RunError = error{ListenFailed};
@@ -69,7 +70,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
-                const res = handler.handle(self.svc, self.auth, &req, arena.allocator());
+                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
                     _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);
