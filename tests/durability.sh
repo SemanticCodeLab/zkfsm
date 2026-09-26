@@ -20,8 +20,11 @@ check() { # name expected actual
   else fail=$((fail + 1)); echo "FAIL $1: expected [$2] got [$3]"; fi
 }
 
+NDRIVES=4
+PROFILE=replica:2
+COPIES=2
 start() {
-  "$BIN" --data "$DATA/d{1...4}" --protection replica:2 --scan-interval 1 \
+  "$BIN" --data "$DATA/d{1...$NDRIVES}" --protection "$PROFILE" --scan-interval 1 \
     --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
   PID=$!
   for _ in $(seq 50); do curl -s -o /dev/null "$EP/" && return 0; sleep 0.1; done
@@ -41,12 +44,12 @@ reads_ok() {
   echo "$good"
 }
 
-# Full redundancy: every data blob and record on exactly 2 drives with identical
-# bytes, and the catalog on all 4 drives.
+# Full redundancy: every data blob/shard and record on exactly COPIES drives
+# (replicas byte-identical; EC shards differ), and the catalog on every drive.
 redundancy() {
-  python3 - "$DATA" "$N" <<'EOF'
+  python3 - "$DATA" "$N" "$COPIES" "$NDRIVES" "$PROFILE" <<'EOF'
 import collections, hashlib, os, sys
-root, n = sys.argv[1], int(sys.argv[2])
+root, n, want, ndrives, profile = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 copies = collections.defaultdict(list)
 drives = sorted(os.listdir(root))
 for d in drives:
@@ -55,10 +58,11 @@ for d in drives:
             for f in fs:
                 with open(os.path.join(dp, f), "rb") as fh:
                     copies[(sp, f)].append(hashlib.md5(fh.read()).hexdigest())
-bad = [k for k, v in copies.items() if len(v) != 2 or len(set(v)) != 1]
+identical = lambda k: k[0] == "record" or profile.startswith("replica")
+bad = [k for k, v in copies.items() if len(v) != want or (identical(k) and len(set(v)) != 1)]
 data = sum(1 for k in copies if k[0] == "data")
 cat = sum(os.path.exists(os.path.join(root, d, "system", "0" * 32 + ".meta")) for d in drives)
-print("full" if not bad and data == n and cat == 4 else f"degraded bad={len(bad)} data={data} catalog={cat}")
+print("full" if not bad and data == n and cat == ndrives else f"degraded bad={len(bad)} data={data} catalog={cat}")
 EOF
 }
 
@@ -133,6 +137,41 @@ check "foreign drive refused" 1 "$?"
 check "reordered drives refused" 1 "$?"
 set -e
 check "foreign reason" 1 "$(grep -c ForeignDrive "$WORK/foreign.log")"
+
+# EC:4+2 on 6 drives: lose any 2 and keep serving, then heal.
+rm -rf "${DATA:?}"/*
+NDRIVES=6
+PROFILE=EC:4+2
+COPIES=6
+start
+curl -s -o /dev/null -X PUT "$EP/dur"
+for i in $(seq $N); do
+  head -c $((RANDOM * 64 + i)) /dev/urandom >"$WORK/obj$i"
+  curl -s -o /dev/null -T "$WORK/obj$i" "$EP/dur/obj$i"
+done
+check "EC initial reads" $N "$(reads_ok)"
+check "EC initial redundancy" full "$(redundancy)"
+rm -rf "${DATA:?}/d2" "${DATA:?}/d5"
+check "EC reads with 2 drives gone" $N "$(reads_ok)"
+check "EC heal rebuilds 2 drives" full "$(wait_full)"
+SHARD="$(find "$DATA/d3/data" -type f -size +100k | head -1)"
+ORIG="$(md5sum <"$SHARD")"
+python3 - "$SHARD" <<'EOF'
+import sys
+with open(sys.argv[1], "r+b") as f:
+    f.seek(5000); b = f.read(1); f.seek(5000); f.write(bytes([b[0] ^ 0xff]))
+EOF
+rm -rf "${DATA:?}/d6"
+check "EC reads with bitrot and a drive gone" $N "$(reads_ok)"
+check "EC heal after bitrot and loss" full "$(wait_full)"
+for _ in $(seq 50); do [[ "$(md5sum <"$SHARD")" == "$ORIG" ]] && break; sleep 0.2; done
+check "EC corrupt shard rebuilt byte-exact" "$ORIG" "$(md5sum <"$SHARD")"
+stop
+rm -rf "${DATA:?}/d1" "${DATA:?}/d4" "${DATA:?}/d6"
+set +e
+"$BIN" heal --data "$DATA/d{1...6}" 2>"$WORK/heal-ec.log"
+check "EC loss of 3 drives reported as data loss" 3 "$?"
+set -e
 
 echo "durability: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
