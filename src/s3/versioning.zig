@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("../core/root.zig");
 const object = @import("../object/root.zig");
 const handler = @import("handler.zig");
+const sigv4 = @import("sigv4.zig");
 const router = @import("router.zig");
 const xml = @import("xml.zig");
 
@@ -443,10 +444,14 @@ fn listVersions(c: *Ctx) DispatchError!void {
 
 fn readBody(c: *Ctx) DispatchError!?[]const u8 {
     var buf: [4096]u8 = undefined;
-    const r = try c.req.readerExpectContinue(&buf);
-    return r.allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
+    var check_buf: [4096]u8 = undefined;
+    var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&buf), &check_buf);
+    return br.body().allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
-        error.ReadFailed => error.ReadFailed,
+        error.ReadFailed => {
+            try handler.fail(c, br.failure orelse return error.ReadFailed);
+            return null;
+        },
         error.StreamTooLong => {
             try handler.fail(c, .MalformedXML);
             return null;

@@ -6,6 +6,7 @@ const router = @import("router.zig");
 const xml = @import("xml.zig");
 const errors = @import("errors.zig");
 const sigv4 = @import("sigv4.zig");
+const authz = @import("authz.zig");
 const multipart = @import("multipart.zig");
 const metrics = @import("../metrics/root.zig");
 const versioning = @import("versioning.zig");
@@ -30,13 +31,13 @@ pub const Ctx = struct {
     route: router.Target,
     range: ?[]const u8,
     content_type: []const u8,
-    content_sha256: ?[]const u8,
     copy_source: bool,
+    auth: sigv4.Auth,
     request_id: [16]u8,
     ext: versioning.Headers = .{},
 };
 
-pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocator) ConnError!void {
+pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
     // No length and no chunking means an empty body (RFC 9112 6.3); std asserts otherwise.
     if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
     var ctx: Ctx = .{
@@ -48,14 +49,13 @@ pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocato
         .route = undefined,
         .range = null,
         .content_type = try arena.dupe(u8, req.head.content_type orelse ""),
-        .content_sha256 = null,
         .copy_source = false,
+        .auth = .{},
         .request_id = std.fmt.bytesToHex(core.ObjectId.random().bytes[0..8].*, .upper),
     };
     var hit = req.iterateHeaders();
     while (hit.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
-        if (std.ascii.eqlIgnoreCase(h.name, "x-amz-content-sha256")) ctx.content_sha256 = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
         try ctx.ext.capture(arena, h);
     }
@@ -63,7 +63,13 @@ pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocato
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
     };
-    if (!sigv4.authorize(req)) return fail(&ctx, .InternalError);
+    const now_s = std.time.timestamp();
+    switch (try sigv4.verify(arena, env.auth, try sigv4.Input.fromRequest(arena, req), now_s)) {
+        .ok => |a| ctx.auth = a,
+        .denied => |code| return fail(&ctx, code),
+    }
+    const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
+    if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
     if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
@@ -193,13 +199,15 @@ fn listObjects(c: *Ctx) DispatchError!void {
 
 fn putObject(c: *Ctx) DispatchError!void {
     if (c.copy_source) return fail(c, .NotImplemented);
-    if (c.content_sha256) |s| if (std.mem.startsWith(u8, s, "STREAMING-")) return fail(c, .NotImplemented);
-    const len = c.req.head.content_length;
     var body_buf: [io_buf_len]u8 = undefined;
-    const body = try c.req.readerExpectContinue(&body_buf);
-    var in: object.PutInput = .{ .content_type = c.content_type, .content_length = len };
+    var check_buf: [io_buf_len]u8 = undefined;
+    var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    var in: object.PutInput = .{ .content_type = c.content_type, .content_length = br.contentLength(c.req.head.content_length) };
     if (!try versioning.putExtras(c, &in)) return;
-    const info = try c.svc.put(c.route.bucket, c.route.key, body, in);
+    const info = c.svc.put(c.route.bucket, c.route.key, br.body(), in) catch |e| {
+        if (br.failure) |code| return fail(c, code);
+        return e;
+    };
     var eb: [core.ETag.quoted_max]u8 = undefined;
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.append(c.arena, .{ .name = "etag", .value = info.etag.quoted(&eb) });

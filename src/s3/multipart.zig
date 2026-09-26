@@ -8,6 +8,7 @@ const xml = @import("xml.zig");
 const xml_read = @import("xml_read.zig");
 const errors = @import("errors.zig");
 const s3v = @import("versioning.zig");
+const sigv4 = @import("sigv4.zig");
 
 const Ctx = handler.Ctx;
 const ConnError = handler.ConnError;
@@ -172,11 +173,14 @@ fn uploadPart(c: *Ctx) OpError!void {
         const etag = try mp.uploadPartCopy(c.svc, c.route.bucket, c.route.key, id, n, src, range);
         return copyResult(c, "CopyPartResult", etag, core.time.nowNs(), &.{});
     }
-    if (c.content_sha256) |s| if (std.mem.startsWith(u8, s, "STREAMING-")) return handler.fail(c, .NotImplemented);
-    const len = c.req.head.content_length;
     var body_buf: [handler.io_buf_len]u8 = undefined;
-    const body = try c.req.readerExpectContinue(&body_buf);
-    const etag = try mp.uploadPart(c.svc, c.route.bucket, c.route.key, id, n, body, len);
+    var check_buf: [handler.io_buf_len]u8 = undefined;
+    var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    const len = br.contentLength(c.req.head.content_length);
+    const etag = mp.uploadPart(c.svc, c.route.bucket, c.route.key, id, n, br.body(), len) catch |e| {
+        if (br.failure) |fc| return handler.fail(c, fc);
+        return e;
+    };
     var eb: [core.ETag.quoted_max]u8 = undefined;
     try handler.respondEmpty(c, .ok, &.{.{ .name = "etag", .value = etag.quoted(&eb) }});
 }
@@ -225,10 +229,15 @@ fn versionHeader(c: *Ctx, name: []const u8, v: core.VersionId) error{OutOfMemory
 
 fn readXmlBody(c: *Ctx) OpError![]const u8 {
     var body_buf: [handler.io_buf_len]u8 = undefined;
-    const body = try c.req.readerExpectContinue(&body_buf);
-    return body.allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
+    var check_buf: [handler.io_buf_len]u8 = undefined;
+    var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    return br.body().allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
         error.StreamTooLong => error.EntityTooLarge,
-        error.ReadFailed => error.ReadFailed,
+        error.ReadFailed => {
+            // Signature/payload failure: answer it, then drop the connection.
+            if (br.failure) |fc| try handler.fail(c, fc);
+            return error.ReadFailed;
+        },
         error.OutOfMemory => error.OutOfMemory,
     };
 }
