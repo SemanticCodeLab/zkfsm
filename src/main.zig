@@ -86,6 +86,7 @@ test {
     _ = backend;
     _ = @import("placement/root.zig");
     _ = @import("protection/root.zig");
+    _ = @import("heal/root.zig");
     _ = object;
     _ = @import("metrics/root.zig");
     _ = s3;

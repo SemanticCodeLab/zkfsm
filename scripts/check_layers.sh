@@ -10,8 +10,8 @@ rank() {
     io | device | metadata) echo 1 ;;
     backend) echo 2 ;;
     placement) echo 3 ;;
-    protection | heal) echo 4 ;;
-    object) echo 5 ;;
+    protection) echo 4 ;;
+    heal | object) echo 5 ;;
     metrics) echo 6 ;;
     s3 | admin) echo 7 ;;
     *) echo -1 ;;
