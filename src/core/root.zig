@@ -4,6 +4,7 @@ pub const checksum = @import("checksum.zig");
 pub const range = @import("range.zig");
 pub const time = @import("time.zig");
 pub const errors = @import("errors.zig");
+pub const license = @import("license.zig");
 
 pub const ObjectId = ids.ObjectId;
 pub const BucketId = ids.BucketId;
@@ -15,6 +16,7 @@ pub const Range = range.Range;
 pub const RangeSpec = range.RangeSpec;
 
 test {
+    _ = license;
     _ = ids;
     _ = checksum;
     _ = range;
