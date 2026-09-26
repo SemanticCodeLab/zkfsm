@@ -4,6 +4,7 @@ const service = @import("service.zig");
 const blob = @import("blob.zig");
 const versioning = @import("versioning.zig");
 const core = @import("../core/root.zig");
+const conditional = @import("conditional.zig");
 
 const ObjectService = service.ObjectService;
 const Error = service.Error;
@@ -23,6 +24,8 @@ pub const CopyInput = struct {
     replace_metadata: bool = false,
     /// Tagging directive REPLACE: take `put.tags` instead of the source's.
     replace_tags: bool = false,
+    /// x-amz-copy-source-if-*: evaluated against the source; any failure is PreconditionFailed.
+    source_conditions: conditional.Conditions = .{},
 };
 
 /// Resolves a copy source to a readable (non-delete-marker) version.
@@ -37,6 +40,8 @@ pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const info = try resolveSource(svc, arena.allocator(), src);
+    var eb: [core.ETag.quoted_max]u8 = undefined;
+    if (conditional.evalRead(in.source_conditions, info.etag.quoted(&eb), info.created_ns) != .proceed) return error.PreconditionFailed;
     const segs = [_]blob.Segment{.{ .blob = info.object_id, .offset = 0, .length = info.blob_size }};
     var buf: [64 * 1024]u8 = undefined;
     var br = blob.BlobReader.init(svc.store, &segs, &buf);
@@ -111,4 +116,7 @@ test "copy object keeps or replaces content type" {
     try std.testing.expectEqualStrings("copy me", out.written());
 
     try std.testing.expectError(error.NoSuchKey, copyObject(&svc, .{ .bucket = "src", .key = "nope" }, "dst", "x", .{}));
+    try std.testing.expectError(error.PreconditionFailed, copyObject(&svc, .{ .bucket = "src", .key = "k" }, "dst", "x", .{
+        .source_conditions = .{ .if_match = "\"0123\"" },
+    }));
 }

@@ -122,6 +122,7 @@ const CopyHeaders = struct {
     range: ?[]const u8 = null,
     directive: ?[]const u8 = null,
     tagging_directive: ?[]const u8 = null,
+    conditions: s3v.Headers = .{},
 };
 
 /// Must run before the body is read; reading invalidates the header buffer.
@@ -133,6 +134,9 @@ fn copyHeaders(c: *Ctx) error{OutOfMemory}!CopyHeaders {
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-copy-source-range")) h.range = try c.arena.dupe(u8, f.value);
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-metadata-directive")) h.directive = try c.arena.dupe(u8, f.value);
         if (std.ascii.eqlIgnoreCase(f.name, "x-amz-tagging-directive")) h.tagging_directive = try c.arena.dupe(u8, f.value);
+        const cond_prefix = "x-amz-copy-source-";
+        if (f.name.len > cond_prefix.len and std.ascii.startsWithIgnoreCase(f.name, cond_prefix))
+            try h.conditions.capture(c.arena, .{ .name = f.name[cond_prefix.len..], .value = f.value });
     }
     return h;
 }
@@ -213,7 +217,12 @@ fn copyObject(c: *Ctx) OpError!void {
     // S3 rejects a same-key copy that changes nothing.
     if (!replace and src.version == null and std.mem.eql(u8, src.bucket, c.route.bucket) and std.mem.eql(u8, src.key, c.route.key))
         return handler.fail(c, .InvalidRequest);
-    var in: object.copy.CopyInput = .{ .put = .{ .content_type = c.content_type }, .replace_metadata = replace, .replace_tags = replace_tags };
+    var in: object.copy.CopyInput = .{
+        .put = .{ .content_type = c.content_type },
+        .replace_metadata = replace,
+        .replace_tags = replace_tags,
+        .source_conditions = ch.conditions.conditions(),
+    };
     if (!try s3v.putExtras(c, &in.put)) return;
     const info = try object.copy.copyObject(c.svc, src, c.route.bucket, c.route.key, in);
     var hdrs: std.ArrayList(Header) = .empty;
