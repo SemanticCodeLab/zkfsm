@@ -89,7 +89,7 @@ pub fn isPublic(arena: std.mem.Allocator, doc: []const u8) error{OutOfMemory}!bo
         if (s.effect != .allow or s.not_principal or s.conditions.len > 0) continue;
         const pr = s.principal orelse continue;
         if (pr.any) return true;
-        for (pr.values) |v| if (v.kind == .aws and std.mem.eql(u8, v.value, "*")) return true;
+        for (pr.values) |v| if (v.kind == .account and std.mem.eql(u8, v.value, "*")) return true;
     }
     return false;
 }

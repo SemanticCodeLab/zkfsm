@@ -97,8 +97,8 @@ test "acl bodies" {
     try writePrivate(&w);
     try std.testing.expectEqual(Verdict.private, try bodyVerdict(w.buffered()));
     const public =
-        \\<AccessControlPolicy><Owner><ID>zkfsm</ID></Owner><AccessControlList><Grant><Grantee xsi:type="Group">
-        \\<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>
+        \\<AccessControlPolicy><Owner><ID>zkfsm</ID></Owner><AccessControlList><Grant><Grantee xsi:type="CanonicalUser">
+        \\<ID>someone</ID></Grantee><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>
     ;
     try std.testing.expectEqual(Verdict.unsupported, try bodyVerdict(public));
     try std.testing.expectEqual(Verdict.malformed, try bodyVerdict("<Nope/>"));

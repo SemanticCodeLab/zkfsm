@@ -98,7 +98,7 @@ pub const Request = struct {
     key: []const u8,
     query: []const u8,
     copy_source: bool = false,
-    /// Policy JSON of the target bucket, combined with identity policies per AWS rules.
+    /// Policy JSON of the target bucket: explicit denies win, then any allow (identity or bucket).
     bucket_policy: ?[]const u8 = null,
 };
 

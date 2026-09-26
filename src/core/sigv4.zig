@@ -1,4 +1,4 @@
-//! AWS Signature Version 4 primitives: pure functions shared by request
+//! Signature Version 4 primitives: pure functions shared by request
 //! verification (s3/) and any future outbound S3 client.
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -186,7 +186,7 @@ test "canonical query sorts encoded params" {
     try std.testing.expectEqualStrings("acl=&list-type=2&prefix=a%20b%2F", a.written());
 }
 
-// AWS SigV4 test suite, "get-vanilla".
+// SigV4 reference vector "get-vanilla".
 test "reference vector get-vanilla" {
     const creq = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\n" ++ empty_sha256_hex;
     try std.testing.expectEqualStrings("bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63", &sha256Hex(creq));
