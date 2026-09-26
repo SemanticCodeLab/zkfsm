@@ -1,0 +1,7 @@
+.git
+.zig-cache
+zig-cache
+zig-out
+data
+helm
+deploy

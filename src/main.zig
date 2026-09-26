@@ -6,6 +6,7 @@ const protection = @import("protection/root.zig");
 const heal = @import("heal/root.zig");
 const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
+const metrics = @import("metrics/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -127,6 +128,7 @@ pub fn main() u8 {
     }
     defer if (cfg.scan_interval_s > 0) healer.stop();
     var server: s3.Server = .{ .gpa = gpa, .svc = &svc };
+    metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;

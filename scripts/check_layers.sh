@@ -12,7 +12,7 @@ rank() {
     placement) echo 3 ;;
     protection) echo 4 ;;
     heal | object) echo 5 ;;
-    metrics) echo 6 ;;
+    metrics | iam) echo 6 ;;
     s3 | admin) echo 7 ;;
     *) echo -1 ;;
   esac
