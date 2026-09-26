@@ -5,6 +5,7 @@ pub const condition = @import("condition.zig");
 pub const policy = @import("policy.zig");
 pub const eval = @import("eval.zig");
 pub const actions = @import("actions.zig");
+pub const sts = @import("sts.zig");
 
 pub const Policy = policy.Policy;
 pub const Context = context.Context;
@@ -19,4 +20,5 @@ test {
     _ = policy;
     _ = eval;
     _ = actions;
+    _ = sts;
 }
