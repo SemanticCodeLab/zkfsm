@@ -4,6 +4,7 @@ pub const checksum = @import("checksum.zig");
 pub const range = @import("range.zig");
 pub const time = @import("time.zig");
 pub const errors = @import("errors.zig");
+pub const sigv4 = @import("sigv4.zig");
 
 pub const ObjectId = ids.ObjectId;
 pub const BucketId = ids.BucketId;
@@ -19,4 +20,5 @@ test {
     _ = checksum;
     _ = range;
     _ = time;
+    _ = sigv4;
 }
