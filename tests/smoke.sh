@@ -78,10 +78,84 @@ check "get deleted" 404 "$(status "$EP/smoke/dir/obj.bin")"
 check "no such key code" 1 "$(curl -s "$EP/smoke/dir/obj.bin" | grep -c '<Code>NoSuchKey</Code>')"
 check "no such bucket code" 1 "$(curl -s "$EP/nope-bucket?list-type=2" | grep -c '<Code>NoSuchBucket</Code>')"
 check "method not allowed" 405 "$(status -X POST "$EP/")"
-check "multipart not implemented" 501 "$(status -X POST "$EP/smoke/k?uploads")"
 curl -s -o /dev/null -X DELETE "$EP/smoke/top.txt"
 curl -s -o /dev/null -X DELETE "$EP/smoke/empty"
 check "delete bucket" 204 "$(status -X DELETE "$EP/smoke")"
+
+# Multipart uploads.
+xmlval() { sed -n "s/.*<$1>\([^<]*\)<\/$1>.*/\1/p"; }
+check "mp bucket" 200 "$(status -X PUT "$EP/mpb")"
+head -c 6000000 /dev/urandom > "$WORK/p1"
+head -c 1234 /dev/urandom > "$WORK/p2"
+cat "$WORK/p1" "$WORK/p2" > "$WORK/whole"
+UPID=$(curl -s -X POST -H 'Content-Type: application/x-mp' "$EP/mpb/big?uploads" | xmlval UploadId)
+check "mp create" 32 "${#UPID}"
+E1=$(header etag -T "$WORK/p1" "$EP/mpb/big?partNumber=1&uploadId=$UPID")
+E2=$(header etag -T "$WORK/p2" "$EP/mpb/big?partNumber=2&uploadId=$UPID")
+check "mp part etag" "\"$(md5sum "$WORK/p2" | cut -d' ' -f1)\"" "$E2"
+check "mp list parts" 2 "$(curl -s "$EP/mpb/big?uploadId=$UPID" | grep -o '<Part>' | wc -l)"
+check "mp list parts max" 1 "$(curl -s "$EP/mpb/big?uploadId=$UPID&max-parts=1" | grep -c '<IsTruncated>true</IsTruncated>')"
+check "mp list uploads" 1 "$(curl -s "$EP/mpb?uploads" | grep -c "<UploadId>$UPID</UploadId>")"
+cbody() { printf '<CompleteMultipartUpload>'; while [[ $# -gt 0 ]]; do printf '<Part><PartNumber>%s</PartNumber><ETag>%s</ETag></Part>' "$1" "$2"; shift 2; done; printf '</CompleteMultipartUpload>'; }
+complete() { curl -s -X POST --data-binary @- "$EP/mpb/big?uploadId=$UPID"; }
+check "mp bad order" 1 "$(cbody 2 "$E2" 1 "$E1" | complete | grep -c '<Code>InvalidPartOrder</Code>')"
+check "mp bad etag" 1 "$(cbody 1 "$E2" 2 "$E2" | complete | grep -c '<Code>InvalidPart</Code>')"
+check "mp missing part" 1 "$(cbody 1 "$E1" 3 "$E2" | complete | grep -c '<Code>InvalidPart</Code>')"
+check "mp malformed" 1 "$(echo 'junk' | complete | grep -c '<Code>MalformedXML</Code>')"
+WANT_ETAG="\"$(echo -n "${E1//\"/}${E2//\"/}" | xxd -r -p | md5sum | cut -d' ' -f1)-2\""
+check "mp complete etag" "$WANT_ETAG" "$(cbody 1 "$E1" 2 "$E2" | complete | xmlval ETag | sed 's/&quot;/"/g')"
+check "mp head etag" "$WANT_ETAG" "$(header etag -I "$EP/mpb/big")"
+check "mp content-type" "application/x-mp" "$(header content-type -I "$EP/mpb/big")"
+check "mp body" "$(md5sum < "$WORK/whole")" "$(curl -s "$EP/mpb/big" | md5sum)"
+check "mp range across parts" "$(tail -c +5999991 "$WORK/whole" | head -c 20 | md5sum)" "$(curl -s -r 5999990-6000009 "$EP/mpb/big" | md5sum)"
+check "mp upload gone" 404 "$(status "$EP/mpb/big?uploadId=$UPID")"
+check "mp no uploads left" 0 "$(curl -s "$EP/mpb?uploads" | grep -c '<Upload>')"
+
+UP2=$(curl -s -X POST "$EP/mpb/small?uploads" | xmlval UploadId)
+S1=$(echo -n "tiny" | curl -s -D - -o /dev/null -T - "$EP/mpb/small?partNumber=1&uploadId=$UP2" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+S2=$(echo -n "tail" | curl -s -D - -o /dev/null -T - "$EP/mpb/small?partNumber=2&uploadId=$UP2" | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+check "mp entity too small" 1 "$(cbody 1 "$S1" 2 "$S2" | curl -s -X POST --data-binary @- "$EP/mpb/small?uploadId=$UP2" | grep -c '<Code>EntityTooSmall</Code>')"
+check "mp bad part number" 400 "$(echo -n x | status -T - "$EP/mpb/small?partNumber=0&uploadId=$UP2")"
+check "mp upload part copy" 1 "$(curl -s -X PUT -H 'x-amz-copy-source: /mpb/big' -H 'x-amz-copy-source-range: bytes=10-19' "$EP/mpb/small?partNumber=3&uploadId=$UP2" | grep -c "<ETag>&quot;$(head -c 20 "$WORK/whole" | tail -c 10 | md5sum | cut -d' ' -f1)&quot;</ETag>")"
+check "mp copy bad range" 416 "$(status -X PUT -H 'x-amz-copy-source: mpb/big' -H 'x-amz-copy-source-range: bytes=10-99999999' "$EP/mpb/small?partNumber=4&uploadId=$UP2")"
+check "mp abort" 204 "$(status -X DELETE "$EP/mpb/small?uploadId=$UP2")"
+check "mp abort again" 1 "$(curl -s -X DELETE "$EP/mpb/small?uploadId=$UP2" | grep -c '<Code>NoSuchUpload</Code>')"
+check "mp bad upload id" 404 "$(status "$EP/mpb/small?uploadId=nothex")"
+
+# CopyObject.
+check "copy object" 1 "$(curl -s -X PUT -H 'x-amz-copy-source: /mpb/big' "$EP/mpb/copy%20of%20big" | grep -c '<CopyObjectResult')"
+check "copy body" "$(md5sum < "$WORK/whole")" "$(curl -s "$EP/mpb/copy%20of%20big" | md5sum)"
+check "copy keeps type" "application/x-mp" "$(header content-type -I "$EP/mpb/copy%20of%20big")"
+check "copy replace type" 200 "$(status -X PUT -H 'x-amz-copy-source: mpb/big' -H 'x-amz-metadata-directive: REPLACE' -H 'Content-Type: text/x-new' "$EP/mpb/big")"
+check "copy replaced type" "text/x-new" "$(header content-type -I "$EP/mpb/big")"
+check "copy self without replace" 400 "$(status -X PUT -H 'x-amz-copy-source: mpb/big' "$EP/mpb/big")"
+check "copy missing source" 404 "$(status -X PUT -H 'x-amz-copy-source: mpb/nope' "$EP/mpb/x")"
+
+# DeleteObjects.
+echo -n a | curl -s -o /dev/null -T - "$EP/mpb/a&b"
+DEL='<Delete><Object><Key>big</Key></Object><Object><Key>copy of big</Key></Object><Object><Key>a&amp;b</Key></Object><Object><Key>never</Key></Object></Delete>'
+check "delete objects" 4 "$(curl -s -X POST --data-binary "$DEL" "$EP/mpb?delete" | grep -o '<Deleted>' | wc -l)"
+check "delete objects quiet" 0 "$(curl -s -X POST --data-binary '<Delete><Quiet>true</Quiet><Object><Key>x</Key></Object></Delete>' "$EP/mpb?delete" | grep -c '<Deleted>')"
+check "delete objects empty bucket" 204 "$(status -X DELETE "$EP/mpb")"
+
+# aws cli (optional): a 50 MB `s3 cp` goes through multipart.
+if command -v aws >/dev/null && [[ -z "${ZKFSM_SMOKE_NO_AWS:-}" ]]; then
+  export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
+  export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+  awss3() { aws --no-sign-request --endpoint-url "$EP" "$@"; }
+  head -c 50000000 /dev/urandom > "$WORK/fifty"
+  awss3 s3 mb s3://awsmp >/dev/null
+  check "aws cp 50MB" 0 "$(awss3 s3 cp --quiet "$WORK/fifty" s3://awsmp/fifty >/dev/null 2>"$WORK/aws.err"; echo $?)"
+  check "aws multipart etag" 1 "$(header etag -I "$EP/awsmp/fifty" | grep -c -- '-[0-9]*"$')"
+  awss3 s3 cp --quiet s3://awsmp/fifty "$WORK/fifty.back" 2>>"$WORK/aws.err" || true
+  check "aws roundtrip" "$(md5sum < "$WORK/fifty")" "$(md5sum < "$WORK/fifty.back" 2>/dev/null)"
+  # --copy-props none: object tagging (GetObjectTagging) is not implemented.
+  check "aws server copy" 0 "$(awss3 s3 cp --quiet --copy-props none s3://awsmp/fifty s3://awsmp/fifty2 2>>"$WORK/aws.err"; echo $?)"
+  check "aws server copy body" "$(md5sum < "$WORK/fifty")" "$(curl -s "$EP/awsmp/fifty2" | md5sum)"
+  check "aws rm recursive" 0 "$(awss3 s3 rm --quiet --recursive s3://awsmp 2>>"$WORK/aws.err"; echo $?)"
+  check "aws rb" 0 "$(awss3 s3 rb s3://awsmp >/dev/null 2>>"$WORK/aws.err"; echo $?)"
+  [[ -s "$WORK/aws.err" ]] && cat "$WORK/aws.err"
+fi
 
 # Keep-alive: two requests on one connection.
 check "keep-alive" "200 200" "$(curl -s -o /dev/null -o /dev/null -w '%{http_code} ' "$EP/" "$EP/" | xargs)"
