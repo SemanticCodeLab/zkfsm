@@ -19,4 +19,10 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+
+    // Live remote-backend tests; they skip unless ZKFSM_S3_* / ZKFSM_AZURE_* / ZKFSM_GCS_* are set.
+    const live = b.addTest(.{ .root_module = mod, .filters = &.{"remote live"} });
+    const live_run = b.addRunArtifact(live);
+    live_run.has_side_effects = true;
+    b.step("test-remote", "Run live remote backend tests").dependOn(&live_run.step);
 }

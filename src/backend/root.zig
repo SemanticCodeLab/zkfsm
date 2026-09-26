@@ -4,6 +4,8 @@ const core = @import("../core/root.zig");
 
 pub const local = @import("local.zig");
 pub const remote = @import("remote.zig");
+pub const s3 = @import("s3.zig");
+pub const azure = @import("azure.zig");
 
 pub const Range = core.Range;
 
@@ -105,4 +107,9 @@ pub const StorageBackend = struct {
 test {
     _ = local;
     _ = remote;
+    _ = s3;
+    _ = azure;
+    _ = @import("s3/sign.zig");
+    _ = @import("remote/http.zig");
+    _ = @import("remote/xml.zig");
 }

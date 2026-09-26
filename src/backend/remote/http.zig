@@ -132,7 +132,7 @@ pub const Exchange = struct {
             else => error.Transient,
         };
         errdefer x.req.deinit();
-        const payload = o.body orelse if (o.method.requestHasBody()) "" else null;
+        const payload: ?[]const u8 = o.body orelse if (o.method.requestHasBody()) @as([]const u8, "") else null;
         if (payload) |b| {
             x.req.transfer_encoding = .{ .content_length = b.len };
             var bw = x.req.sendBodyUnflushed(&.{}) catch return error.Transient;
@@ -185,10 +185,17 @@ pub const Exchange = struct {
     }
 
     pub fn deinit(x: *Exchange) void {
-        // Drain unread bodies so keep-alive connections return to the pool.
-        if (x.req.reader.state == .received_head and x.hasBody() and x.info.content_length != null) {
-            const r = x.req.reader.bodyReader(&.{}, x.te, x.info.content_length);
-            _ = r.discardRemaining() catch {};
+        // Drain unread bodies so keep-alive connections return to the pool; std would
+        // otherwise read a bodiless 204 until EOF.
+        const rd = &x.req.reader;
+        if (rd.state == .received_head) {
+            if (!x.hasBody()) {
+                _ = rd.bodyReader(&.{}, .none, 0).discardRemaining() catch {};
+            } else if (x.info.content_length != null or x.te == .chunked) {
+                _ = rd.bodyReader(&.{}, x.te, x.info.content_length).discardRemaining() catch {};
+            }
+        } else if (rd.state == .body_remaining_content_length and rd.state.body_remaining_content_length == 0) {
+            rd.state = .ready;
         }
         x.req.deinit();
     }
