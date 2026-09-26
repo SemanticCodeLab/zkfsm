@@ -338,8 +338,7 @@ pub const AzureClient = struct {
                     std.fmt.bufPrint(&rb, "bytes={d}-", .{from_byte})) catch unreachable }; // two u64 fit
                 nh += 1;
             }
-            // Azure conditions on If-Match live in the standard slot; pin via x-ms-if-tags is not
-            // equivalent, so a resumed read re-checks the ETag from the response instead.
+            // Resumed reads compare the response ETag instead of sending If-Match.
             var b: Built = .{};
             var x: rhttp.Exchange = undefined;
             try self.call(&x, .{ .method = .GET, .blob = name, .ms_headers = hs[0..nh] }, &b);
