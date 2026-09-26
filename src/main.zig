@@ -85,6 +85,7 @@ test {
     _ = @import("metadata/root.zig");
     _ = backend;
     _ = @import("placement/root.zig");
+    _ = @import("protection/root.zig");
     _ = object;
     _ = @import("metrics/root.zig");
     _ = s3;
