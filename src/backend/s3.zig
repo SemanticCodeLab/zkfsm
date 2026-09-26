@@ -1,4 +1,4 @@
-//! Remote S3 provider (AWS S3, MinIO, GCS XML interop): SigV4 header auth,
+//! Remote S3 provider (any S3-compatible endpoint, GCS XML interop): SigV4 header auth,
 //! multipart upload for large puts, ranged gets with resume, ListObjectsV2 paging,
 //! retries with exponential backoff and jitter.
 const std = @import("std");
@@ -605,7 +605,7 @@ test "path and virtual-host request construction" {
     vcfg.addressing = .virtual_host;
     var v = try S3Client.init(gpa, vcfg);
     defer v.deinit();
-    // Reproduces the AWS doc GET example through the full builder.
+    // Reproduces the reference GET signing example through the full builder.
     try v.build(.{ .method = .GET, .key = "test.txt", .headers = &.{.{ .name = "range", .value = "bytes=0-9" }} }, t, &b);
     try std.testing.expectEqualStrings("/test.txt", b.path);
     try std.testing.expectEqualStrings("examplebucket.s3.amazonaws.com", b.host);
