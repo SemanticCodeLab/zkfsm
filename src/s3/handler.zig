@@ -126,7 +126,7 @@ fn listBuckets(c: *Ctx) DispatchError!void {
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "ListAllMyBucketsResult");
-    try w.writeAll("<Owner><ID>zkfsm</ID><DisplayName>zkfsm</DisplayName></Owner><Buckets>");
+    try w.writeAll(owner_xml ++ "<Buckets>");
     for (buckets) |b| {
         var tb: [24]u8 = undefined;
         try w.writeAll("<Bucket>");
@@ -145,57 +145,92 @@ fn getLocation(c: *Ctx) DispatchError!void {
 }
 
 fn listObjects(c: *Ctx) DispatchError!void {
+    // ListObjects V1 pages with marker/NextMarker, V2 with opaque continuation tokens.
+    const v2 = if (try param(c, "list-type")) |lt| std.mem.eql(u8, lt, "2") else false;
+    const url = if (try param(c, "encoding-type")) |et| blk: {
+        if (!std.ascii.eqlIgnoreCase(et, "url")) return fail(c, .InvalidArgument);
+        break :blk true;
+    } else false;
     var p: object.ListParams = .{
         .prefix = (try param(c, "prefix")) orelse "",
         .delimiter = (try param(c, "delimiter")) orelse "",
-        .start_after = (try param(c, "start-after")) orelse "",
+        .start_after = (try param(c, if (v2) "start-after" else "marker")) orelse "",
         .max_keys = max_list_keys,
     };
     if (try param(c, "max-keys")) |mk| {
         const n = std.fmt.parseInt(usize, mk, 10) catch return fail(c, .InvalidArgument);
         p.max_keys = @min(n, max_list_keys);
     }
-    const token = try param(c, "continuation-token");
+    const token = if (v2) try param(c, "continuation-token") else null;
     if (token) |t| {
         if (t.len % 2 != 0) return fail(c, .InvalidArgument);
         const raw = try c.arena.alloc(u8, t.len / 2);
         p.start_after = std.fmt.hexToBytes(raw, t) catch return fail(c, .InvalidArgument);
     }
+    const fetch_owner = !v2 or if (try param(c, "fetch-owner")) |f| std.mem.eql(u8, f, "true") else false;
     const res = try c.svc.list(c.arena, c.route.bucket, p);
 
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "ListBucketResult");
     try xml.elem(w, "Name", c.route.bucket);
-    try xml.elem(w, "Prefix", p.prefix);
-    if (p.delimiter.len > 0) try xml.elem(w, "Delimiter", p.delimiter);
-    if (token) |t| try xml.elem(w, "ContinuationToken", t);
-    if (try param(c, "start-after")) |sa| try xml.elem(w, "StartAfter", sa);
-    try xml.elemInt(w, "KeyCount", res.contents.len + res.common_prefixes.len);
+    try keyElem(w, url, "Prefix", p.prefix);
+    if (p.delimiter.len > 0) try keyElem(w, url, "Delimiter", p.delimiter);
+    if (url) try xml.elem(w, "EncodingType", "url");
+    if (v2) {
+        if (token) |t| try xml.elem(w, "ContinuationToken", t);
+        if (try param(c, "start-after")) |sa| try keyElem(w, url, "StartAfter", sa);
+        try xml.elemInt(w, "KeyCount", res.contents.len + res.common_prefixes.len);
+    } else {
+        try keyElem(w, url, "Marker", p.start_after);
+    }
     try xml.elemInt(w, "MaxKeys", p.max_keys);
     try xml.elemBool(w, "IsTruncated", res.is_truncated);
     if (res.is_truncated) if (res.next_marker) |m| {
-        const hex = try c.arena.alloc(u8, m.len * 2);
-        for (m, 0..) |byte, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable; // 2 hex chars fit
-        try xml.elem(w, "NextContinuationToken", hex);
+        if (v2) {
+            const hex = try c.arena.alloc(u8, m.len * 2);
+            for (m, 0..) |byte, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable; // 2 hex chars fit
+            try xml.elem(w, "NextContinuationToken", hex);
+        } else try keyElem(w, url, "NextMarker", m);
     };
     for (res.contents) |e| {
         var tb: [24]u8 = undefined;
         try w.writeAll("<Contents>");
-        try xml.elem(w, "Key", e.key);
+        try keyElem(w, url, "Key", e.key);
         try xml.elem(w, "LastModified", core.time.iso8601(e.mtime_ns, &tb));
         var eb: [core.ETag.quoted_max]u8 = undefined;
         try xml.elem(w, "ETag", e.etag.quoted(&eb));
         try xml.elemInt(w, "Size", e.size);
+        if (fetch_owner) try w.writeAll(owner_xml);
         try w.writeAll("<StorageClass>STANDARD</StorageClass></Contents>");
     }
     for (res.common_prefixes) |cp| {
         try w.writeAll("<CommonPrefixes>");
-        try xml.elem(w, "Prefix", cp);
+        try keyElem(w, url, "Prefix", cp);
         try w.writeAll("</CommonPrefixes>");
     }
     try w.writeAll("</ListBucketResult>");
     try respondXml(c, .ok, a.written());
+}
+
+pub const owner_xml = "<Owner><ID>zkfsm</ID><DisplayName>zkfsm</DisplayName></Owner>";
+
+/// A key-like element, percent-encoded when the client asked for encoding-type=url.
+pub fn keyElem(w: *std.Io.Writer, url: bool, name: []const u8, text: []const u8) std.Io.Writer.Error!void {
+    if (!url) return xml.elem(w, name, text);
+    try xml.open(w, name);
+    for (text) |ch| switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '/' => try w.writeByte(ch),
+        else => try w.print("%{X:0>2}", .{ch}),
+    };
+    try xml.close(w, name);
+}
+
+test "keyElem url encoding" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try keyElem(&w, true, "Key", "a b+c/\xc3\xbc%");
+    try std.testing.expectEqualStrings("<Key>a%20b%2Bc/%C3%BC%25</Key>", w.buffered());
 }
 
 fn putObject(c: *Ctx) DispatchError!void {
