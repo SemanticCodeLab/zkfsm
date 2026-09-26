@@ -66,23 +66,23 @@ pub const ReplicaStore = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    fn stripe(self: *ReplicaStore, key: PhysicalKey) *std.Thread.Mutex {
+    pub fn stripe(self: *ReplicaStore, key: PhysicalKey) *std.Thread.Mutex {
         return &self.stripes[std.hash.Wyhash.hash(@intFromEnum(key.space), &key.hex) % stripe_count];
     }
 
     /// Shared holds on a list of drives; null slots are offline. Lock order: drives, then stripe.
-    const Holds = struct {
+    pub const Holds = struct {
         set: *DriveSet,
         idx: []const u8,
         lbs: [max_drives]?*LocalBackend = @splat(null),
 
-        fn acquire(set: *DriveSet, idx: []const u8) Holds {
+        pub fn acquire(set: *DriveSet, idx: []const u8) Holds {
             var h: Holds = .{ .set = set, .idx = idx };
             for (idx, 0..) |d, j| h.lbs[j] = set.acquire(d);
             return h;
         }
 
-        fn release(h: *Holds) void {
+        pub fn release(h: *Holds) void {
             for (h.idx, 0..) |d, j| if (h.lbs[j] != null) h.set.release(d);
         }
     };
@@ -162,7 +162,7 @@ pub const ReplicaStore = struct {
     }
 
     /// Reads until `buf` is full or the source ends, never asking for more than `buf.len`.
-    fn fill(source: *std.Io.Reader, buf: []u8) Error!usize {
+    pub fn fill(source: *std.Io.Reader, buf: []u8) Error!usize {
         var w: std.Io.Writer = .fixed(buf);
         while (w.end < buf.len) {
             _ = source.stream(&w, .limited(buf.len - w.end)) catch |e| switch (e) {
@@ -181,7 +181,7 @@ pub const ReplicaStore = struct {
         worst.* = worse(worst.*, e);
     }
 
-    fn worse(a: Error, b: Error) Error {
+    pub fn worse(a: Error, b: Error) Error {
         return if (b == error.NoSpace or b == error.OutOfMemory) b else a;
     }
 
@@ -401,7 +401,7 @@ pub const ReplicaStore = struct {
     }
 
     /// Deletes all placed replicas; data or record depending on the key space.
-    fn delete(ctx: *anyopaque, key: PhysicalKey) Error!void {
+    pub fn delete(ctx: *anyopaque, key: PhysicalKey) Error!void {
         const self = cast(ctx);
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);

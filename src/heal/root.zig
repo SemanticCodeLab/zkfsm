@@ -11,7 +11,7 @@ pub const executor = @import("executor.zig");
 pub const Config = scanner.Config;
 pub const Report = executor.Report;
 
-pub const Error = error{ OutOfMemory, Stopped, NotImplemented };
+pub const Error = error{ OutOfMemory, Stopped };
 
 pub const Healer = struct {
     gpa: std.mem.Allocator,
@@ -100,9 +100,9 @@ test "heal pass restores a wiped drive, fixes bitrot, and sweeps stale temps" {
     }
     var set = try placement.DriveSet.open(gpa, &paths, .{ .replica = 2 });
     defer set.deinit();
-    var store: protection.ReplicaStore = undefined;
-    const strat = try protection.Strategy.init(gpa, &set, &store);
-    const b = try strat.backend();
+    var stores: protection.Stores = .{};
+    const strat = try protection.Strategy.init(gpa, &set, &stores);
+    const b = strat.backend();
 
     var keys: [20]iface.PhysicalKey = undefined;
     for (&keys, 0..) |*k, i| {

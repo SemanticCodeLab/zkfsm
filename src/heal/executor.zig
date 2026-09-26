@@ -5,7 +5,7 @@ const protection = @import("../protection/root.zig");
 const scanner = @import("scanner.zig");
 const planner = @import("planner.zig");
 
-pub const Error = error{ Stopped, NotImplemented };
+pub const Error = error{Stopped};
 
 pub const Report = struct {
     entries_scanned: u64 = 0,
@@ -50,7 +50,7 @@ pub const HealExecutor = struct {
             },
             .repair_key, .verify_key => |k| {
                 self.throttle.tick() catch return error.Stopped;
-                const r = try self.strategy.healKey(k);
+                const r = self.strategy.healKey(k);
                 report.keys_checked += 1;
                 report.replicas_repaired += r.repaired;
                 report.replicas_unrepaired += r.unrepaired;
