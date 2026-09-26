@@ -13,6 +13,8 @@ pub const Server = struct {
     svc: *object.ObjectService,
     auth: sigv4.Config,
     extensions: []const @import("extension.zig").Extension = &.{},
+    routing: @import("router.zig").Routing = .{},
+    ops: metrics.Paths = .{},
 
     pub fn run(self: *Server, addr: std.net.Address) RunError!void {
         var listener = addr.listen(.{ .reuse_address = true }) catch return error.ListenFailed;
@@ -66,12 +68,12 @@ pub const Server = struct {
                 .head = sigv4.parseHead(arena.allocator(), head_buffer) catch return,
             };
             const keep_alive = req.head.keep_alive;
-            if (metrics.match(req.head.target)) |ep| {
+            if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
-                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions }, &req, arena.allocator());
+                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .routing = self.routing }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
                     _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);

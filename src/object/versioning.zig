@@ -40,7 +40,7 @@ fn slotKey(bid: core.BucketId, key: []const u8, v: core.VersionId) backend.Physi
     return placement.versionRecordKey(core.ids.versionNameId(bid, key, v));
 }
 
-fn isCurrentSlot(pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8) bool {
+pub fn isCurrentSlot(pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8) bool {
     return std.mem.eql(u8, &pk.hex, &currentKey(bid, key).hex);
 }
 
@@ -124,7 +124,7 @@ pub fn getConfig(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8) Error!
     return loadConfigLocked(svc, arena, bid);
 }
 
-fn updateConfig(svc: *Svc, bucket: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), *BucketConfig) Error!void) Error!void {
+pub fn updateConfig(svc: *Svc, bucket: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), *BucketConfig) Error!void) Error!void {
     const bid = try svc.bucketId(bucket);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();

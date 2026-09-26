@@ -41,6 +41,10 @@ pub const Code = enum {
     EntityTooSmall,
     EntityTooLarge,
     MetadataTooLarge,
+    NoSuchLifecycleConfiguration,
+    NoSuchBucketPolicy,
+    MalformedPolicy,
+    InvalidPartNumber,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -60,6 +64,9 @@ pub const Code = enum {
             .InvalidBucketState => .conflict,
             .NoSuchUpload => .not_found,
             .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge, .MetadataTooLarge => .bad_request,
+            .NoSuchLifecycleConfiguration, .NoSuchBucketPolicy => .not_found,
+            .MalformedPolicy => .bad_request,
+            .InvalidPartNumber => .range_not_satisfiable,
         };
     }
 
@@ -102,6 +109,10 @@ pub const Code = enum {
             .EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
             .EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
             .MetadataTooLarge => "Your metadata headers exceed the maximum allowed metadata size.",
+            .NoSuchLifecycleConfiguration => "The lifecycle configuration does not exist",
+            .NoSuchBucketPolicy => "The bucket policy does not exist",
+            .MalformedPolicy => "Policies must be valid JSON and the first byte must be '{'",
+            .InvalidPartNumber => "The requested partnumber is not satisfiable",
         };
     }
 };

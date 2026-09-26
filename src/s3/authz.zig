@@ -14,6 +14,7 @@ pub const Env = struct {
     auth: sigv4.Config = .{},
     peer: ?std.net.Address = null,
     extensions: []const @import("extension.zig").Extension = &.{},
+    routing: router.Routing = .{},
 };
 
 /// Action for requests no S3 operation covers; only root (or `*` grants) pass.
@@ -97,14 +98,23 @@ pub const Request = struct {
     key: []const u8,
     query: []const u8,
     copy_source: bool = false,
+    /// Policy JSON of the target bucket, combined with identity policies per AWS rules.
+    bucket_policy: ?[]const u8 = null,
 };
 
 /// True when the verified caller may perform the request. Anonymous mode allows all.
+/// Unsigned requests on an authenticated server are allowed only by a bucket policy.
 pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request, now_s: i64) error{OutOfMemory}!bool {
     const store = env.auth.iam orelse return true;
     var session: ?iam.Policy = null;
     if (auth.session_policy) |doc| session = iam.policy.parse(arena, doc) catch return false;
     const who: iam.Identity = .{ .access_key = auth.principal, .session_policy = if (session) |*p| p else null };
+    // Stored policies were validated on PUT; one that no longer parses grants nothing.
+    var bucket_policy: ?iam.Policy = null;
+    if (r.bucket_policy) |doc| bucket_policy = iam.policy.parse(arena, doc) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
 
     var arn_buf: [2048]u8 = undefined;
     const op = classify(r.method, r.bucket, r.key, r.query, r.copy_source);
@@ -113,7 +123,15 @@ pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request,
         iam.actions.resourceArn(&arn_buf, o, r.bucket, r.key) catch return false
     else
         "arn:aws:s3:::*";
-    const ctx: iam.Context = .{ .entries = try entries(arena, env, r, now_s), .now_s = now_s };
+    const ctx: iam.Context = .{
+        .entries = try entries(arena, env, r, now_s),
+        .now_s = now_s,
+        .resource_policy = if (bucket_policy) |*p| p else null,
+    };
+    if (auth.anonymous) {
+        const nobody: iam.Principal = .{};
+        return iam.authorize(&nobody, action, arn, &ctx).allowed();
+    }
     return store.authorize(who, action, arn, &ctx).allowed();
 }
 
@@ -201,4 +219,49 @@ test "readonly service account can read but not write" {
     try std.testing.expect(!try allowed(a, env, sa, list_all, 1000));
     const wan: Env = .{ .auth = env.auth, .peer = try std.net.Address.parseIp("192.0.2.1", 1) };
     try std.testing.expect(!try allowed(a, wan, sa, list_pub, 1000));
+}
+
+test "bucket policy: public read, anonymous access, and explicit deny" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mem: iam.store.MemoryPersistence = .{ .gpa = gpa };
+    defer mem.deinit();
+    var st: iam.Store = undefined;
+    try st.open(gpa, mem.persistence(), .{ .root_access_key = "rootkey", .root_secret = "rootsecret" });
+    defer st.deinit();
+    try st.createUser("writer", "writersecret");
+    try st.attachPolicy(.user, "writer", "readwrite");
+    const env: Env = .{ .auth = .{ .iam = &st } };
+    const anon: sigv4.Auth = .{ .anonymous = true };
+    const writer: sigv4.Auth = .{ .principal = "writer" };
+    const policy =
+        \\{"Version":"2012-10-17","Statement":[
+        \\{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"},
+        \\{"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::pub/keep/*"}]}
+    ;
+    const get: Request = .{ .method = .GET, .bucket = "pub", .key = "k", .query = "", .bucket_policy = policy };
+    try std.testing.expect(try allowed(a, env, anon, get, 1000));
+    var no_policy = get;
+    no_policy.bucket_policy = null;
+    try std.testing.expect(!try allowed(a, env, anon, no_policy, 1000));
+    const put: Request = .{ .method = .PUT, .bucket = "pub", .key = "k", .query = "", .bucket_policy = policy };
+    try std.testing.expect(!try allowed(a, env, anon, put, 1000));
+    try std.testing.expect(!try allowed(a, env, anon, .{ .method = .GET, .bucket = "pub", .key = "", .query = "", .bucket_policy = policy }, 1000));
+    // Identity allow is overridden by an explicit bucket-policy deny.
+    const del_keep: Request = .{ .method = .DELETE, .bucket = "pub", .key = "keep/x", .query = "", .bucket_policy = policy };
+    const del_other: Request = .{ .method = .DELETE, .bucket = "pub", .key = "tmp/x", .query = "", .bucket_policy = policy };
+    try std.testing.expect(!try allowed(a, env, writer, del_keep, 1000));
+    try std.testing.expect(try allowed(a, env, writer, del_other, 1000));
+    try std.testing.expect(try allowed(a, env, .{ .principal = "rootkey" }, del_keep, 1000));
+    // A bucket policy can grant an identity without identity policies.
+    try st.createUser("plain", "plainsecret");
+    const grant =
+        \\{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/plain"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::pub/*"}]}
+    ;
+    var put_plain = put;
+    put_plain.bucket_policy = grant;
+    try std.testing.expect(try allowed(a, env, .{ .principal = "plain" }, put_plain, 1000));
+    try std.testing.expect(!try allowed(a, env, .{ .principal = "plain" }, put, 1000));
 }

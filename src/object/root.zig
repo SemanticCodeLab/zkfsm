@@ -7,6 +7,8 @@ pub const conditional = @import("conditional.zig");
 pub const blob = @import("blob.zig");
 pub const copy = @import("copy.zig");
 pub const multipart = @import("multipart.zig");
+pub const lifecycle = @import("lifecycle.zig");
+pub const policy = @import("policy.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -21,6 +23,7 @@ pub const Header = service.Header;
 pub const SystemHeaders = service.SystemHeaders;
 pub const user_meta_limit = @import("../metadata/root.zig").headers.user_limit;
 pub const internal_prefix = @import("../metadata/root.zig").headers.internal_prefix;
+pub const partSize = @import("../metadata/root.zig").record.partSize;
 
 /// Decodes an encoded tag set (ObjectInfo.tags) into `arena`.
 pub fn decodeTags(arena: @import("std").mem.Allocator, bytes: []const u8) Error![]Tag {
@@ -39,4 +42,6 @@ test {
     _ = blob;
     _ = copy;
     _ = multipart;
+    _ = lifecycle;
+    _ = policy;
 }

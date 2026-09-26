@@ -75,6 +75,8 @@ pub const ObjectInfo = struct {
     system: SystemHeaders = .{},
     logical_size: ?u64 = null,
     etag_override: ?core.ETag = null,
+    /// Multipart part sizes (metadata.record.partSize); empty for single-part objects.
+    part_sizes: []const u8 = "",
 };
 
 pub const PutInput = struct {
@@ -373,6 +375,7 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .retain_until_ns = r.retain_until_ns,
         .legal_hold = r.flags.legal_hold,
         .tags = r.tags,
+        .part_sizes = r.part_sizes,
     };
 }
 

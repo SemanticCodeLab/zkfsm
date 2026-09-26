@@ -63,6 +63,8 @@ pub const Auth = struct {
     scope: sv.Scope = .{ .date = "", .region = "", .service = "" },
     /// Identity to authorize: the access key, or an STS session's parent.
     principal: []const u8 = "",
+    /// No credentials were presented; only bucket policies can grant access.
+    anonymous: bool = false,
     session_policy: ?[]const u8 = null,
 };
 
@@ -118,7 +120,11 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
             };
         }
     }.get;
-    const sig = try qp(arena, query, "X-Amz-Signature") orelse return deny(.AccessDenied);
+    const sig = try qp(arena, query, "X-Amz-Signature") orelse {
+        if (try qp(arena, query, "X-Amz-Credential") != null or try qp(arena, query, "X-Amz-Algorithm") != null) return deny(.AccessDenied);
+        auth.anonymous = true;
+        return .{ .ok = auth };
+    };
     const alg = try qp(arena, query, "X-Amz-Algorithm") orelse return deny(.AuthorizationHeaderMalformed);
     const cred = try qp(arena, query, "X-Amz-Credential") orelse return deny(.AuthorizationHeaderMalformed);
     const amz_date = try qp(arena, query, "X-Amz-Date") orelse return deny(.AuthorizationHeaderMalformed);
@@ -279,14 +285,26 @@ fn canonicalRequest(
 
 /// Parses an HTTP head, tolerating `Content-Encoding: aws-chunked`, which
 /// std.http rejects. The raw head (and so the signed header) is left intact.
+/// An absolute-form target (RFC 9112 3.2.2) is reduced to its path and query.
 pub fn parseHead(arena: std.mem.Allocator, head: []const u8) std.http.Server.Request.Head.ParseError!std.http.Server.Request.Head {
     const Head = std.http.Server.Request.Head;
-    return Head.parse(head) catch |e| {
+    var h = Head.parse(head) catch |e| blk: {
         if (e != error.HttpTransferEncodingUnsupported) return e;
         var a: Writer.Allocating = .init(arena);
         stripAwsChunked(&a.writer, head) catch return e;
-        return Head.parse(a.written());
+        break :blk try Head.parse(a.written());
     };
+    h.target = originForm(h.target);
+    return h;
+}
+
+fn originForm(target: []const u8) []const u8 {
+    inline for (.{ "http://", "https://" }) |scheme| if (std.ascii.startsWithIgnoreCase(target, scheme)) {
+        const rest = target[scheme.len..];
+        const i = std.mem.indexOfAny(u8, rest, "/?") orelse return "/";
+        return rest[i..];
+    };
+    return target;
 }
 
 fn stripAwsChunked(w: *Writer, head: []const u8) Writer.Error!void {
@@ -319,6 +337,9 @@ test "head with aws-chunked content encoding" {
     try std.testing.expectEqual(std.http.ContentEncoding.identity, h.transfer_compression);
     const g = try parseHead(arena.allocator(), "PUT / HTTP/1.1\r\ncontent-encoding: aws-chunked,gzip\r\n\r\n");
     try std.testing.expectEqual(std.http.ContentEncoding.gzip, g.transfer_compression);
+    const p = try parseHead(arena.allocator(), "GET http://b.s3.local:9000/k?acl HTTP/1.1\r\nHost: b.s3.local:9000\r\n\r\n");
+    try std.testing.expectEqualStrings("/k?acl", p.target);
+    try std.testing.expectEqualStrings("/", originForm("http://host"));
 }
 
 /// Wraps a request body per `Auth`: verifies a declared sha256 at EOF, or
@@ -518,7 +539,11 @@ test "anonymous and unauthenticated requests" {
     defer arena.deinit();
     const in: Input = .{ .method = "GET", .target = "/b/k", .headers = &.{.{ .name = "host", .value = "h" }} };
     try std.testing.expect((try tverify(arena.allocator(), null, "", in, 0)) == .ok);
-    try expectDenied(.AccessDenied, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now));
+    // Unsigned requests pass authentication as anonymous; authorization decides.
+    const anon = try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now);
+    try std.testing.expect(anon == .ok and anon.ok.anonymous and anon.ok.principal.len == 0);
+    const partial: Input = .{ .method = "GET", .target = "/b/k?X-Amz-Credential=x", .headers = in.headers };
+    try expectDenied(.AccessDenied, try tverify(arena.allocator(), ex_ak, ex_secret, partial, ex_now));
 }
 
 test "presigned GET example" {
