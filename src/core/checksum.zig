@@ -3,6 +3,9 @@ const std = @import("std");
 
 pub const Md5 = std.crypto.hash.Md5;
 
+/// CRC32C (Castagnoli), used for per-chunk bitrot detection.
+pub const Crc32c = std.hash.crc.Crc32Iscsi;
+
 pub const ETag = struct {
     /// Object MD5, or for multipart objects the MD5 of the part MD5s.
     md5: [16]u8,
@@ -39,4 +42,8 @@ test "etag quoted" {
     var buf: [ETag.quoted_max]u8 = undefined;
     try std.testing.expectEqualStrings("\"d41d8cd98f00b204e9800998ecf8427e\"", (ETag{ .md5 = d }).quoted(&buf));
     try std.testing.expectEqualStrings("\"d41d8cd98f00b204e9800998ecf8427e-12\"", (ETag{ .md5 = d, .parts = 12 }).quoted(&buf));
+}
+
+test "crc32c check value" {
+    try std.testing.expectEqual(@as(u32, 0xE3069283), Crc32c.hash("123456789"));
 }

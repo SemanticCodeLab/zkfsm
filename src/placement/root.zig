@@ -1,7 +1,17 @@
-//! placement: maps object identity to backend physical keys. 0.1 is local-only.
+//! placement: maps object identity to physical keys and keys to drives.
 const std = @import("std");
 const core = @import("../core/root.zig");
 const backend = @import("../backend/root.zig");
+
+pub const profile = @import("profile.zig");
+pub const rendezvous = @import("rendezvous.zig");
+pub const drives = @import("drives.zig");
+pub const ellipsis = @import("ellipsis.zig");
+
+pub const Profile = profile.Profile;
+pub const StorageClassConfig = profile.StorageClassConfig;
+pub const DriveSet = drives.DriveSet;
+pub const max_drives = drives.max_drives;
 
 pub const PhysicalKey = backend.PhysicalKey;
 
@@ -41,4 +51,11 @@ test "data and record keys use distinct spaces" {
     const k = dataKey(id);
     try std.testing.expectEqual(backend.KeySpace.data, k.space);
     try std.testing.expectEqualStrings("abab", k.hex[0..4]);
+}
+
+test {
+    _ = profile;
+    _ = rendezvous;
+    _ = drives;
+    _ = ellipsis;
 }
