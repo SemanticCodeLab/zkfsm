@@ -68,6 +68,20 @@ aws_ s3api get-object --bucket awsb --key dir/big.bin "$WORK/got.bin" >/dev/null
 check "aws get-object md5" "$MD5" "$(md5sum "$WORK/got.bin" | cut -d' ' -f1)"
 check "aws cp download" "hello zkfsm" "$(aws_ s3 cp s3://awsb/small.txt -)"
 
+# User metadata: put, head, copy with REPLACE, multipart via s3 cp.
+aws_ s3api put-object --bucket awsb --key meta.txt --body "$WORK/small.txt" --metadata k=v,Other=x --cache-control no-cache >/dev/null
+check "aws head metadata" "v" "$(aws_ s3api head-object --bucket awsb --key meta.txt --query Metadata.k --output text)"
+check "aws head cache-control" "no-cache" "$(aws_ s3api head-object --bucket awsb --key meta.txt --query CacheControl --output text)"
+aws_ s3api copy-object --bucket awsb --key meta.txt --copy-source awsb/meta.txt --metadata-directive REPLACE --metadata k=w >/dev/null
+check "aws copy replace metadata" "w" "$(aws_ s3api head-object --bucket awsb --key meta.txt --query Metadata.k --output text)"
+check "aws copy replace drops old" "None" "$(aws_ s3api head-object --bucket awsb --key meta.txt --query Metadata.other --output text)"
+head -c 12000000 /dev/urandom >"$WORK/mp.bin" # over the CLI's 8 MB multipart threshold
+aws_ s3 cp "$WORK/mp.bin" s3://awsb/mp.bin --metadata mk=mv >/dev/null
+check "aws multipart etag" 1 "$(aws_ s3api head-object --bucket awsb --key mp.bin --query ETag --output text | grep -c -- '-')"
+check "aws multipart metadata" "mv" "$(aws_ s3api head-object --bucket awsb --key mp.bin --query Metadata.mk --output text)"
+aws_ s3 rm s3://awsb/meta.txt >/dev/null
+aws_ s3 rm s3://awsb/mp.bin >/dev/null
+
 URL=$(aws_ s3 presign s3://awsb/small.txt --expires-in 300)
 check "presigned curl" "hello zkfsm" "$(curl -s "$URL")"
 check "presigned tampered" SignatureDoesNotMatch "$(code "${URL/small.txt/other.txt}")"

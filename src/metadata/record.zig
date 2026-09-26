@@ -2,14 +2,15 @@
 const std = @import("std");
 const core = @import("../core/root.zig");
 const codec = @import("codec.zig");
+const headers = @import("headers.zig");
 
 pub const magic = "ZKOR";
-/// v2 adds flags, retention, and tags; v3 adds the multipart part count.
-/// Older records still decode (v1 as null versions).
-pub const format_version: u16 = 3;
+/// v2 adds flags, retention, and tags; v3 the multipart part count; v4 user and
+/// internal metadata, system headers, and size/ETag overrides. Older records still decode.
+pub const format_version: u16 = 4;
 pub const max_key_len = 1024;
 
-pub const Error = codec.DecodeError || error{ KeyTooLong, OutOfMemory };
+pub const Error = codec.DecodeError || error{ KeyTooLong, MetadataTooLarge, OutOfMemory };
 
 pub const StorageClass = enum(u8) { standard = 0, _ };
 pub const PlacementKind = enum(u8) { local_single = 0, _ };
@@ -42,6 +43,21 @@ pub const ObjectRecord = struct {
     retain_until_ns: i128 = 0,
     /// Encoded tag set (see tags.zig); borrowed like `key`.
     tags: []const u8 = "",
+    /// Encoded header lists (see headers.zig); borrowed like `key`.
+    user_meta: []const u8 = "",
+    internal_meta: []const u8 = "",
+    system: headers.System = .{},
+    /// Reported size/ETag when they differ from the stored blob's.
+    logical_size: ?u64 = null,
+    etag_override: ?core.ETag = null,
+
+    pub fn reportedSize(r: ObjectRecord) u64 {
+        return r.logical_size orelse r.size;
+    }
+
+    pub fn reportedEtag(r: ObjectRecord) core.ETag {
+        return r.etag_override orelse r.etag;
+    }
 
     /// The id S3 clients see; all zeros stands for "null".
     pub fn versionId(r: ObjectRecord) core.VersionId {
@@ -53,6 +69,12 @@ pub const null_version_id: core.VersionId = .{ .bytes = [_]u8{0} ** 16 };
 
 pub fn encode(r: ObjectRecord, gpa: std.mem.Allocator) Error![]u8 {
     if (r.key.len > max_key_len or r.content_type.len > std.math.maxInt(u16) or r.tags.len > std.math.maxInt(u16)) return error.KeyTooLong;
+    // Lists come from headers.encode; recheck so decode never rejects what we wrote.
+    for ([_]struct { []const u8, headers.Kind }{ .{ r.user_meta, .user }, .{ r.internal_meta, .internal } }) |l| {
+        var c: codec.Cursor = .{ .bytes = l[0] };
+        if (l[0].len > 0 and ((headers.take(&c, l[1]) catch return error.MetadataTooLarge).len != l[0].len)) return error.MetadataTooLarge;
+    }
+    r.system.validate() catch return error.MetadataTooLarge;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(r, &a.writer) catch return error.OutOfMemory;
@@ -78,13 +100,21 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(r.key);
     try codec.putInt(w, u16, @intCast(r.content_type.len));
     try w.writeAll(r.content_type);
-    try codec.putInt(w, u16, 0); // user metadata count
+    try headers.put(w, r.user_meta);
     try w.writeByte(@bitCast(r.flags));
     try w.writeByte(@intFromEnum(r.retention_mode));
     try codec.putInt(w, i128, r.retain_until_ns);
     try codec.putInt(w, u16, @intCast(r.tags.len));
     try w.writeAll(r.tags);
     try codec.putInt(w, u32, r.etag.parts);
+    try headers.put(w, r.internal_meta);
+    try headers.putSystem(w, r.system);
+    try w.writeByte(@as(u8, @intFromBool(r.logical_size != null)) | @as(u8, @intFromBool(r.etag_override != null)) << 1);
+    if (r.logical_size) |n| try codec.putInt(w, u64, n);
+    if (r.etag_override) |e| {
+        try w.writeAll(&e.md5);
+        try codec.putInt(w, u32, e.parts);
+    }
 }
 
 pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
@@ -119,7 +149,9 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
     r.key = try c.take(try c.int(u16));
     if (r.key.len > max_key_len) return error.Corrupt;
     r.content_type = try c.take(try c.int(u16));
-    if (try c.int(u16) != 0) return error.Corrupt;
+    if (ver >= 4) {
+        r.user_meta = try headers.take(&c, .user);
+    } else if (try c.int(u16) != 0) return error.Corrupt;
     if (ver == 1) {
         r.flags = .{ .null_version = true };
     } else {
@@ -130,6 +162,14 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         r.tags = try c.take(try c.int(u16));
     }
     if (ver >= 3) r.etag.parts = try c.int(u32);
+    if (ver >= 4) {
+        r.internal_meta = try headers.take(&c, .internal);
+        r.system = try headers.takeSystem(&c);
+        const has = (try c.take(1))[0];
+        if (has & ~@as(u8, 3) != 0) return error.Corrupt;
+        if (has & 1 != 0) r.logical_size = try c.int(u64);
+        if (has & 2 != 0) r.etag_override = .{ .md5 = try c.fixed(16), .parts = try c.int(u32) };
+    }
     if (c.pos != bytes.len) return error.Corrupt;
     return r;
 }
@@ -194,8 +234,8 @@ test "v2 fields roundtrip and v1 records still decode" {
     try std.testing.expectEqual(@as(i128, 99), d.retain_until_ns);
     try std.testing.expectEqualStrings("\x01", d.tags);
 
-    // A v1 record is the v2 prefix up to the user-metadata count.
-    const v1_len = bytes.len - (1 + 1 + 16 + 2 + 1 + 4);
+    // A v1 record is the v4 prefix up to the user-metadata count (empty v4 tail: 2 + 10 + 1).
+    const v1_len = bytes.len - (1 + 1 + 16 + 2 + 1 + 4) - (2 + 10 + 1);
     const v1 = try gpa.dupe(u8, bytes[0..v1_len]);
     defer gpa.free(v1);
     v1[4] = 1;
@@ -203,4 +243,68 @@ test "v2 fields roundtrip and v1 records still decode" {
     try std.testing.expect(o.flags.null_version and !o.flags.delete_marker);
     try std.testing.expect(o.versionId().eql(null_version_id));
     try std.testing.expectEqualStrings("k", o.key);
+}
+
+test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" {
+    const gpa = std.testing.allocator;
+    const user = try headers.encode(gpa, &.{ .{ .name = "k", .value = "v" }, .{ .name = "owner", .value = "me" } }, .user);
+    defer gpa.free(user);
+    const internal = try headers.encode(gpa, &.{.{ .name = headers.internal_prefix ++ "alg", .value = "x" }}, .internal);
+    defer gpa.free(internal);
+    var r: ObjectRecord = .{
+        .object_id = core.ObjectId.random(),
+        .bucket_id = core.BucketId.random(),
+        .version = core.VersionId.random(),
+        .size = 100,
+        .etag = .{ .md5 = [_]u8{1} ** 16 },
+        .checksum = .{},
+        .created_ns = 7,
+        .key = "k",
+        .user_meta = user,
+        .internal_meta = internal,
+        .system = .{ .cache_control = "no-cache", .expires = "Thu, 01 Jan 2030 00:00:00 GMT" },
+        .logical_size = 42,
+        .etag_override = .{ .md5 = [_]u8{2} ** 16, .parts = 3 },
+    };
+    const bytes = try encode(r, gpa);
+    defer gpa.free(bytes);
+    const d = try decode(bytes);
+    try std.testing.expectEqualSlices(u8, user, d.user_meta);
+    try std.testing.expectEqualSlices(u8, internal, d.internal_meta);
+    try std.testing.expectEqualStrings("no-cache", d.system.cache_control);
+    try std.testing.expectEqual(@as(u64, 42), d.reportedSize());
+    try std.testing.expectEqual(@as(u64, 100), d.size);
+    try std.testing.expectEqual(@as(u32, 3), d.reportedEtag().parts);
+    for (0..bytes.len) |n| try std.testing.expectError(error.Corrupt, decode(bytes[0..n]));
+    const again = try encode(d, gpa);
+    defer gpa.free(again);
+    try std.testing.expectEqualSlices(u8, bytes, again);
+
+    // A v3 record is a v4 record without metadata, minus the tail, with version 3.
+    r.user_meta = "";
+    r.internal_meta = "";
+    r.system = .{};
+    r.logical_size = null;
+    r.etag_override = null;
+    const plain = try encode(r, gpa);
+    defer gpa.free(plain);
+    const v3 = try gpa.dupe(u8, plain[0 .. plain.len - (2 + 10 + 1)]);
+    defer gpa.free(v3);
+    v3[4] = 3;
+    const o = try decode(v3);
+    try std.testing.expectEqual(@as(u64, 100), o.reportedSize());
+    try std.testing.expectEqualStrings("", o.user_meta);
+    v3[4] = 5;
+    try std.testing.expectError(error.Corrupt, decode(v3));
+
+    // A list over the user limit neither encodes nor decodes.
+    var big: std.Io.Writer.Allocating = .init(gpa);
+    defer big.deinit();
+    try codec.putInt(&big.writer, u16, 1);
+    try codec.putInt(&big.writer, u16, 1);
+    try big.writer.writeAll("a");
+    try codec.putInt(&big.writer, u16, headers.user_limit);
+    try big.writer.splatByteAll('x', headers.user_limit);
+    r.user_meta = big.written();
+    try std.testing.expectError(error.MetadataTooLarge, encode(r, gpa));
 }

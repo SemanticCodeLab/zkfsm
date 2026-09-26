@@ -3,12 +3,14 @@ const std = @import("std");
 const core = @import("../core/root.zig");
 const codec = @import("codec.zig");
 const record = @import("record.zig");
+const headers = @import("headers.zig");
 
 pub const magic = "ZKMU";
-pub const format_version: u16 = 1;
+/// v2 adds user/internal metadata and system headers; v1 still decodes.
+pub const format_version: u16 = 2;
 pub const max_parts = 10000;
 
-pub const Error = codec.DecodeError || error{ KeyTooLong, OutOfMemory };
+pub const Error = codec.DecodeError || error{ KeyTooLong, MetadataTooLarge, OutOfMemory };
 
 /// Upload ids share the 128-bit id shape; they also address the upload record.
 pub const UploadId = core.ids.ObjectId;
@@ -34,6 +36,10 @@ pub const UploadRecord = struct {
     retention_mode: record.RetentionMode = .none,
     retain_until_ns: i128 = 0,
     legal_hold: bool = false,
+    /// Encoded header lists and system headers, as in ObjectRecord.
+    user_meta: []const u8 = "",
+    internal_meta: []const u8 = "",
+    system: headers.System = .{},
     /// Sorted by part number, unique.
     parts: []const Part = &.{},
 
@@ -47,6 +53,11 @@ pub fn encode(r: UploadRecord, gpa: std.mem.Allocator) Error![]u8 {
     if (r.key.len > record.max_key_len or r.content_type.len > std.math.maxInt(u16) or r.tags.len > std.math.maxInt(u16))
         return error.KeyTooLong;
     if (r.parts.len > max_parts) return error.OutOfMemory;
+    for ([_]struct { []const u8, headers.Kind }{ .{ r.user_meta, .user }, .{ r.internal_meta, .internal } }) |l| {
+        var c: codec.Cursor = .{ .bytes = l[0] };
+        if (l[0].len > 0 and ((headers.take(&c, l[1]) catch return error.MetadataTooLarge).len != l[0].len)) return error.MetadataTooLarge;
+    }
+    r.system.validate() catch return error.MetadataTooLarge;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(r, &a.writer) catch return error.OutOfMemory;
@@ -68,6 +79,9 @@ fn encodeTo(r: UploadRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte(@intFromEnum(r.retention_mode));
     try codec.putInt(w, i128, r.retain_until_ns);
     try w.writeByte(@intFromBool(r.legal_hold));
+    try headers.put(w, r.user_meta);
+    try headers.put(w, r.internal_meta);
+    try headers.putSystem(w, r.system);
     try codec.putInt(w, u16, @intCast(r.parts.len));
     for (r.parts) |p| {
         try codec.putInt(w, u16, p.number);
@@ -87,8 +101,9 @@ pub fn isUpload(bytes: []const u8) bool {
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) Error!UploadRecord {
     var c: codec.Cursor = .{ .bytes = bytes };
     if (!std.mem.eql(u8, try c.take(4), magic)) return error.Corrupt;
-    if (try c.int(u16) != format_version) return error.Corrupt;
-    var r: UploadRecord = undefined;
+    const ver = try c.int(u16);
+    if (ver < 1 or ver > format_version) return error.Corrupt;
+    var r: UploadRecord = .{ .upload_id = undefined, .bucket_id = undefined, .created_ns = undefined, .key = undefined };
     r.upload_id = .{ .bytes = try c.fixed(16) };
     r.bucket_id = .{ .bytes = try c.fixed(16) };
     r.created_ns = try c.int(i128);
@@ -103,6 +118,11 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) Error!UploadRecord {
         1 => true,
         else => return error.Corrupt,
     };
+    if (ver >= 2) {
+        r.user_meta = try headers.take(&c, .user);
+        r.internal_meta = try headers.take(&c, .internal);
+        r.system = try headers.takeSystem(&c);
+    }
     const n = try c.int(u16);
     if (n > max_parts) return error.Corrupt;
     const parts = try arena.alloc(Part, n);
@@ -139,6 +159,8 @@ test "upload record roundtrip and truncation" {
         .retention_mode = .governance,
         .retain_until_ns = 5,
         .legal_hold = true,
+        .user_meta = "\x01\x00\x01\x00k\x01\x00v",
+        .system = .{ .content_language = "en" },
         .parts = &parts,
     };
     const bytes = try encode(r, gpa);
@@ -152,5 +174,20 @@ test "upload record roundtrip and truncation" {
     try std.testing.expectEqual(@as(usize, 2), d.parts.len);
     try std.testing.expectEqual(@as(u64, 9), d.findPart(3).?.size);
     try std.testing.expect(d.findPart(2) == null);
+    try std.testing.expectEqualStrings(r.user_meta, d.user_meta);
+    try std.testing.expectEqualStrings("en", d.system.content_language);
     for (0..bytes.len) |n| try std.testing.expectError(error.Corrupt, decode(arena.allocator(), bytes[0..n]));
+
+    // v1: no metadata section.
+    const plain = try encode(.{ .upload_id = r.upload_id, .bucket_id = r.bucket_id, .created_ns = 1, .key = "k" }, gpa);
+    defer gpa.free(plain);
+    var v1: std.ArrayList(u8) = .empty;
+    defer v1.deinit(gpa);
+    const meta_at = plain.len - 2 - (2 + 2 + 10);
+    try v1.appendSlice(gpa, plain[0..meta_at]);
+    try v1.appendSlice(gpa, plain[plain.len - 2 ..]);
+    v1.items[4] = 1;
+    const o = try decode(arena.allocator(), v1.items);
+    try std.testing.expectEqualStrings("k", o.key);
+    try std.testing.expectEqualStrings("", o.user_meta);
 }

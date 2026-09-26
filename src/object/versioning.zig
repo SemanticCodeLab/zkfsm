@@ -58,6 +58,7 @@ fn loadAt(svc: *Svc, arena: std.mem.Allocator, pk: backend.PhysicalKey, bid: cor
 fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
     const bytes = metadata.record.encode(rec, svc.gpa) catch |e| return switch (e) {
         error.KeyTooLong => error.KeyTooLong,
+        error.MetadataTooLarge => error.MetadataTooLarge,
         else => error.OutOfMemory,
     };
     defer svc.gpa.free(bytes);
@@ -234,7 +235,7 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     const ck = currentKey(bid, rec.key);
     const cur = try loadAt(svc, a, ck, bid, rec.key);
     var etag_buf: [core.ETag.quoted_max]u8 = undefined;
-    const live_etag: ?[]const u8 = if (cur) |c| (if (c.flags.delete_marker) null else c.etag.quoted(&etag_buf)) else null;
+    const live_etag: ?[]const u8 = if (cur) |c| (if (c.flags.delete_marker) null else c.reportedEtag().quoted(&etag_buf)) else null;
     conditional.evalWrite(in.conditions, live_etag) catch |e| return e;
 
     switch (cfg.versioning) {
@@ -398,7 +399,7 @@ pub fn headVersion(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, key:
     svc.mutex.lock();
     defer svc.mutex.unlock();
     const l = try locate(svc, arena, bid, key, version);
-    var info = service.infoFrom(l.rec);
+    var info = try service.decodeInfo(arena, l.rec);
     info.is_latest = isCurrentSlot(l.pk, bid, key);
     return info;
 }
@@ -491,8 +492,8 @@ pub fn listVersions(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, p: 
             .version = rec.versionId(),
             .is_latest = isCurrentSlot(it.lastKey(), bid, rec.key),
             .delete_marker = rec.flags.delete_marker,
-            .size = rec.size,
-            .etag = rec.etag,
+            .size = rec.reportedSize(),
+            .etag = rec.reportedEtag(),
             .mtime_ns = rec.created_ns,
         });
     }

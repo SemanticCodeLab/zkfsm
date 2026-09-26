@@ -39,14 +39,24 @@ pub const Error = error{
     MethodNotAllowed,
     NoSuchTagSet,
     InvalidTag,
+    /// User, internal, or system headers over their size bounds.
+    MetadataTooLarge,
+    /// Malformed header name/value, or a name in the wrong namespace.
+    InvalidMetadata,
 };
+
+pub const Header = metadata.headers.Header;
+pub const SystemHeaders = metadata.headers.System;
 
 pub const BucketInfo = struct { name: []const u8, created_ns: i128 };
 
 pub const ObjectInfo = struct {
     key: []const u8,
+    /// Reported size and ETag: the overrides when set, else the stored blob's.
     size: u64,
     etag: core.ETag,
+    /// Bytes in the stored data blob.
+    blob_size: u64 = 0,
     created_ns: i128,
     content_type: []const u8,
     object_id: core.ObjectId,
@@ -59,6 +69,12 @@ pub const ObjectInfo = struct {
     legal_hold: bool = false,
     /// Encoded tag set; decode with `object.decodeTags`.
     tags: []const u8 = "",
+    /// Filled by head/headVersion; put echoes the input.
+    metadata: []const Header = &.{},
+    internal: []const Header = &.{},
+    system: SystemHeaders = .{},
+    logical_size: ?u64 = null,
+    etag_override: ?core.ETag = null,
 };
 
 pub const PutInput = struct {
@@ -71,7 +87,42 @@ pub const PutInput = struct {
     retention: ?lock.Retention = null,
     legal_hold: bool = false,
     conditions: conditional.Conditions = .{},
+    /// User metadata (names without `x-amz-meta-`) and reserved `x-zkfsm-internal-*` headers.
+    metadata: []const Header = &.{},
+    internal: []const Header = &.{},
+    system: SystemHeaders = .{},
+    /// Embedding builds that transform the blob (e.g. encryption) set the size and ETag
+    /// clients see; the stored blob keeps its own size and MD5 for reads and healing.
+    logical_size: ?u64 = null,
+    etag_override: ?core.ETag = null,
 };
+
+/// Encoded user and internal lists; free with `deinit`.
+pub const EncodedMeta = struct {
+    user: []u8,
+    internal: []u8,
+
+    pub fn init(gpa: std.mem.Allocator, user: []const Header, internal: []const Header, system: SystemHeaders) Error!EncodedMeta {
+        system.validate() catch |e| return mapMeta(e);
+        const u = metadata.headers.encode(gpa, user, .user) catch |e| return mapMeta(e);
+        errdefer gpa.free(u);
+        const i = metadata.headers.encode(gpa, internal, .internal) catch |e| return mapMeta(e);
+        return .{ .user = u, .internal = i };
+    }
+
+    pub fn deinit(m: EncodedMeta, gpa: std.mem.Allocator) void {
+        gpa.free(m.user);
+        gpa.free(m.internal);
+    }
+};
+
+fn mapMeta(e: metadata.headers.Error) Error {
+    return switch (e) {
+        error.MetadataTooLarge => error.MetadataTooLarge,
+        error.InvalidMetadata => error.InvalidMetadata,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
 
 pub const ListParams = list_mod.Params;
 pub const ListResult = list_mod.Result;
@@ -147,6 +198,8 @@ pub const ObjectService = struct {
     pub fn put(self: *ObjectService, bucket: []const u8, key: []const u8, source: *std.Io.Reader, in: PutInput) Error!ObjectInfo {
         try validKey(key);
         const bid = try self.bucketId(bucket);
+        const meta = try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system);
+        defer meta.deinit(self.gpa);
         const oid = core.ObjectId.random();
         const data_key = placement.dataKey(oid);
 
@@ -170,11 +223,19 @@ pub const ObjectService = struct {
             .key = key,
             .content_type = in.content_type,
             .tags = in.tags,
+            .user_meta = meta.user,
+            .internal_meta = meta.internal,
+            .system = in.system,
+            .logical_size = in.logical_size,
+            .etag_override = in.etag_override,
         };
         const garbage = try versioning.commitPut(self, bucket, &rec, in);
         keep_blob = true;
         garbage.collect(self);
-        return infoFrom(rec);
+        var info = infoFrom(rec);
+        info.metadata = in.metadata;
+        info.internal = in.internal;
+        return info;
     }
 
     /// Returns object metadata; strings are duplicated into `arena`.
@@ -189,7 +250,7 @@ pub const ObjectService = struct {
         const rec = metadata.record.decode(bytes) catch return error.Corrupt;
         if (!rec.bucket_id.eql(bid) or !std.mem.eql(u8, rec.key, key)) return error.NoSuchKey;
         if (rec.flags.delete_marker) return error.NoSuchKey;
-        return infoFrom(rec);
+        return decodeInfo(arena, rec);
     }
 
     /// Streams the object's bytes (or `range` of them) into `sink`.
@@ -214,7 +275,7 @@ pub const ObjectService = struct {
             if (!std.mem.startsWith(u8, rec.key, p.prefix)) continue;
             if (rec.flags.delete_marker) continue;
             if (!std.mem.eql(u8, &it.lastKey().hex, &placement.recordKey(core.ids.nameId(bid, rec.key)).hex)) continue;
-            try entries.append(arena, .{ .key = rec.key, .size = rec.size, .etag = rec.etag, .mtime_ns = rec.created_ns });
+            try entries.append(arena, .{ .key = rec.key, .size = rec.reportedSize(), .etag = rec.reportedEtag(), .mtime_ns = rec.created_ns });
         }
         return list_mod.apply(arena, entries.items, p);
     }
@@ -276,11 +337,16 @@ pub const ObjectService = struct {
     }
 };
 
+/// Header lists are left empty; see `decodeInfo`.
 pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
     return .{
         .key = r.key,
-        .size = r.size,
-        .etag = r.etag,
+        .size = r.reportedSize(),
+        .etag = r.reportedEtag(),
+        .blob_size = r.size,
+        .system = r.system,
+        .logical_size = r.logical_size,
+        .etag_override = r.etag_override,
         .created_ns = r.created_ns,
         .content_type = r.content_type,
         .object_id = r.object_id,
@@ -291,6 +357,14 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .legal_hold = r.flags.legal_hold,
         .tags = r.tags,
     };
+}
+
+/// `infoFrom` plus the decoded header lists (allocated in `arena`, borrowing from `r`).
+pub fn decodeInfo(arena: std.mem.Allocator, r: metadata.ObjectRecord) Error!ObjectInfo {
+    var info = infoFrom(r);
+    info.metadata = metadata.headers.decode(arena, r.user_meta) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Corrupt;
+    info.internal = metadata.headers.decode(arena, r.internal_meta) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Corrupt;
+    return info;
 }
 
 pub fn mapBackend(e: backend.Error) Error {

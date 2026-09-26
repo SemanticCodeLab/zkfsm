@@ -78,6 +78,9 @@ for i in $(seq $N); do
   head -c $((RANDOM * 8 + i)) /dev/urandom >"$WORK/obj$i"
   curl -s -o /dev/null -T "$WORK/obj$i" "$EP/dur/obj$i"
 done
+BIGMETA="$(head -c 2000 /dev/zero | tr '\0' m)"
+meta_of() { curl -s -I "$EP/dur/$1" | tr -d '\r' | sed -n 's/^x-amz-meta-big: //Ip'; }
+curl -s -o /dev/null -T "$WORK/obj1" -H "x-amz-meta-big: $BIGMETA" "$EP/dur/obj1" # near the 2 KB limit
 check "initial reads" $N "$(reads_ok)"
 check "initial redundancy" full "$(redundancy)"
 check "format files" 4 "$(ls "$DATA"/d*/format.zkfsm | wc -l)"
@@ -86,6 +89,7 @@ check "format files" 4 "$(ls "$DATA"/d*/format.zkfsm | wc -l)"
 rm -rf "$DATA"/d2/*
 check "(a) reads after wipe" $N "$(reads_ok)"
 check "(a) heal restores redundancy" full "$(wait_full)"
+check "(a) large metadata survives heal" "$BIGMETA" "$(meta_of obj1)"
 
 # (b) Flip bytes inside a stored shard.
 SHARD="$(find "$DATA/d3/data" -type f -size +1k | head -1)"
@@ -149,11 +153,13 @@ for i in $(seq $N); do
   head -c $((RANDOM * 64 + i)) /dev/urandom >"$WORK/obj$i"
   curl -s -o /dev/null -T "$WORK/obj$i" "$EP/dur/obj$i"
 done
+curl -s -o /dev/null -T "$WORK/obj1" -H "x-amz-meta-big: $BIGMETA" "$EP/dur/obj1"
 check "EC initial reads" $N "$(reads_ok)"
 check "EC initial redundancy" full "$(redundancy)"
 rm -rf "${DATA:?}/d2" "${DATA:?}/d5"
 check "EC reads with 2 drives gone" $N "$(reads_ok)"
 check "EC heal rebuilds 2 drives" full "$(wait_full)"
+check "EC large metadata survives heal" "$BIGMETA" "$(meta_of obj1)"
 SHARD="$(find "$DATA/d3/data" -type f -size +100k | head -1)"
 ORIG="$(md5sum <"$SHARD")"
 python3 - "$SHARD" <<'EOF'

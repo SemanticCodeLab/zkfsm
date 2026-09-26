@@ -25,8 +25,12 @@ pub const Headers = struct {
     legal_hold: ?[]const u8 = null,
     bypass_governance: bool = false,
     bucket_lock: bool = false,
+    /// x-amz-meta-* with the prefix stripped and names lowercased; repeats joined by ",".
+    meta: std.ArrayList(object.Header) = .empty,
+    system: object.SystemHeaders = .{},
 
     pub fn capture(self: *Headers, arena: std.mem.Allocator, h: Header) error{OutOfMemory}!void {
+        try self.captureMeta(arena, h);
         const fields = .{
             .{ "if-match", "if_match" },
             .{ "if-none-match", "if_none_match" },
@@ -44,6 +48,22 @@ pub const Headers = struct {
             self.bypass_governance = std.ascii.eqlIgnoreCase(std.mem.trim(u8, h.value, " "), "true");
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-bucket-object-lock-enabled"))
             self.bucket_lock = std.ascii.eqlIgnoreCase(std.mem.trim(u8, h.value, " "), "true");
+    }
+
+    fn captureMeta(self: *Headers, arena: std.mem.Allocator, h: Header) error{OutOfMemory}!void {
+        inline for (object.SystemHeaders.fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[1])) {
+            @field(self.system, f[0]) = try arena.dupe(u8, h.value);
+        };
+        const prefix = "x-amz-meta-";
+        if (h.name.len <= prefix.len or !std.ascii.startsWithIgnoreCase(h.name, prefix)) return;
+        const name = try std.ascii.allocLowerString(arena, h.name[prefix.len..]);
+        // The internal namespace is never accepted from clients.
+        if (std.mem.startsWith(u8, name, object.internal_prefix)) return;
+        for (self.meta.items) |*m| if (std.mem.eql(u8, m.name, name)) {
+            m.value = try std.fmt.allocPrint(arena, "{s},{s}", .{ m.value, h.value });
+            return;
+        };
+        try self.meta.append(arena, .{ .name = name, .value = try arena.dupe(u8, h.value) });
     }
 
     /// Unparseable dates are ignored, as HTTP requires.
@@ -142,6 +162,8 @@ fn versionHeader(c: *Ctx, v: core.VersionId) error{OutOfMemory}!Header {
 pub fn putExtras(c: *Ctx, in: *object.PutInput) DispatchError!bool {
     const h = c.ext;
     in.conditions = h.conditions();
+    in.metadata = h.meta.items;
+    in.system = h.system;
     if (h.tagging) |t| {
         const tags = parseTagQuery(c.arena, t) catch {
             try handler.fail(c, .InvalidTag);
@@ -179,10 +201,27 @@ pub fn objectHeaders(c: *Ctx, info: object.ObjectInfo, asked_version: bool, out:
         });
     }
     if (info.legal_hold) try out.append(c.arena, .{ .name = "x-amz-object-lock-legal-hold", .value = "ON" });
+    for (info.metadata) |m| try out.append(c.arena, .{ .name = try std.fmt.allocPrint(c.arena, "x-amz-meta-{s}", .{m.name}), .value = m.value });
+    inline for (object.SystemHeaders.fields) |f| {
+        const v = @field(info.system, f[0]);
+        if (v.len > 0) try out.append(c.arena, .{ .name = f[1], .value = v });
+    }
     if (info.tags.len > 0) {
         const tags = object.decodeTags(c.arena, info.tags) catch return;
         try out.append(c.arena, .{ .name = "x-amz-tagging-count", .value = try std.fmt.allocPrint(c.arena, "{d}", .{tags.len}) });
     }
+}
+
+/// GET `response-*` query parameters replace the matching response headers.
+pub fn applyResponseOverrides(c: *Ctx, out: *std.ArrayList(Header)) error{OutOfMemory}!void {
+    const names = [_][]const u8{ "content-type", "content-language", "expires", "cache-control", "content-disposition", "content-encoding" };
+    inline for (names) |n| if (try handler.param(c, "response-" ++ n)) |v| {
+        var i: usize = 0;
+        while (i < out.items.len) {
+            if (std.ascii.eqlIgnoreCase(out.items[i].name, n)) _ = out.orderedRemove(i) else i += 1;
+        }
+        try out.append(c.arena, .{ .name = n, .value = v });
+    };
 }
 
 /// Looks up the version to serve; answers delete markers itself (returns null).

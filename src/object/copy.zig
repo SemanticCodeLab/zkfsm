@@ -18,7 +18,8 @@ pub const Source = struct {
 pub const CopyInput = struct {
     /// Destination fields; lock settings and conditions always come from here.
     put: service.PutInput = .{},
-    /// Metadata directive REPLACE: take `put.content_type` instead of the source's.
+    /// Metadata directive REPLACE: take content type, user metadata, and system headers
+    /// from `put` instead of the source. Internal headers and overrides always follow the blob.
     replace_metadata: bool = false,
     /// Tagging directive REPLACE: take `put.tags` instead of the source's.
     replace_tags: bool = false,
@@ -36,12 +37,19 @@ pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const info = try resolveSource(svc, arena.allocator(), src);
-    const segs = [_]blob.Segment{.{ .blob = info.object_id, .offset = 0, .length = info.size }};
+    const segs = [_]blob.Segment{.{ .blob = info.object_id, .offset = 0, .length = info.blob_size }};
     var buf: [64 * 1024]u8 = undefined;
     var br = blob.BlobReader.init(svc.store, &segs, &buf);
     var put_in = in.put;
-    put_in.content_length = info.size;
-    if (!in.replace_metadata) put_in.content_type = info.content_type;
+    put_in.content_length = info.blob_size;
+    put_in.internal = info.internal;
+    put_in.logical_size = info.logical_size;
+    put_in.etag_override = info.etag_override;
+    if (!in.replace_metadata) {
+        put_in.content_type = info.content_type;
+        put_in.metadata = info.metadata;
+        put_in.system = info.system;
+    }
     if (!in.replace_tags) put_in.tags = info.tags;
     return svc.put(dst_bucket, dst_key, &br.reader, put_in) catch |e| switch (e) {
         // The source vanished mid-copy (overwritten or deleted).
@@ -70,16 +78,33 @@ test "copy object keeps or replaces content type" {
     try svc.createBucket("src");
     try svc.createBucket("dst");
     var body: std.Io.Reader = .fixed("copy me");
-    const orig = try svc.put("src", "k", &body, .{ .content_type = "text/plain" });
+    const orig = try svc.put("src", "k", &body, .{
+        .content_type = "text/plain",
+        .metadata = &.{.{ .name = "color", .value = "red" }},
+        .internal = &.{.{ .name = "x-zkfsm-internal-k", .value = "i" }},
+        .system = .{ .cache_control = "max-age=1" },
+        .logical_size = 3,
+    });
 
     const c1 = try copyObject(&svc, .{ .bucket = "src", .key = "k" }, "dst", "k2", .{});
     try std.testing.expectEqual(@as(u32, 0), c1.etag.parts);
     try std.testing.expectEqualSlices(u8, &orig.etag.md5, &c1.etag.md5);
-    try std.testing.expectEqualStrings("text/plain", (try svc.head(a, "dst", "k2")).content_type);
+    const h1 = try svc.head(a, "dst", "k2");
+    try std.testing.expectEqualStrings("text/plain", h1.content_type);
+    try std.testing.expectEqualStrings("red", h1.metadata[0].value);
+    try std.testing.expectEqualStrings("max-age=1", h1.system.cache_control);
+    try std.testing.expectEqual(@as(u64, 3), h1.size);
+    try std.testing.expectEqual(@as(u64, 7), h1.blob_size);
 
-    _ = try copyObject(&svc, .{ .bucket = "src", .key = "k" }, "src", "k", .{ .put = .{ .content_type = "app/x" }, .replace_metadata = true });
+    _ = try copyObject(&svc, .{ .bucket = "src", .key = "k" }, "src", "k", .{
+        .put = .{ .content_type = "app/x", .metadata = &.{.{ .name = "color", .value = "blue" }} },
+        .replace_metadata = true,
+    });
     const h = try svc.head(a, "src", "k");
     try std.testing.expectEqualStrings("app/x", h.content_type);
+    try std.testing.expectEqualStrings("blue", h.metadata[0].value);
+    try std.testing.expectEqualStrings("", h.system.cache_control);
+    try std.testing.expectEqualStrings("i", h.internal[0].value);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try svc.read(h, null, &out.writer);

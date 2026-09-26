@@ -44,8 +44,8 @@ pub const CopyRange = struct { first: u64, last: u64 };
 /// A part as named by the client in CompleteMultipartUpload.
 pub const PartRef = struct { number: u16, md5: [16]u8 };
 
-/// Starts an upload. Content type, tags, retention and legal hold from `in` are
-/// applied to the object on complete; `in.conditions` are ignored.
+/// Starts an upload. Content type, tags, lock settings, and metadata from `in` are
+/// applied to the object on complete; `in.conditions` and overrides are ignored.
 pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: service.PutInput) Error!UploadId {
     try service.validKey(key);
     const bid = try svc.bucketId(bucket);
@@ -55,6 +55,8 @@ pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: serv
         if (!(try versioning.getConfig(svc, arena.allocator(), bucket)).lock_enabled) return error.InvalidRequest;
     }
     const ret = in.retention orelse lock.Retention{};
+    const meta = try service.EncodedMeta.init(svc.gpa, in.metadata, in.internal, in.system);
+    defer meta.deinit(svc.gpa);
     const rec: UploadRecord = .{
         .upload_id = UploadId.random(),
         .bucket_id = bid,
@@ -65,6 +67,9 @@ pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: serv
         .retention_mode = ret.mode,
         .retain_until_ns = ret.until_ns,
         .legal_hold = in.legal_hold,
+        .user_meta = meta.user,
+        .internal_meta = meta.internal,
+        .system = in.system,
     };
     try storeUpload(svc, rec);
     return rec.upload_id;
@@ -202,6 +207,9 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
         .key = key,
         .content_type = rec.content_type,
         .tags = rec.tags,
+        .user_meta = rec.user_meta,
+        .internal_meta = rec.internal_meta,
+        .system = rec.system,
     };
     // Versioning assigns the version id and applies lock defaults.
     const garbage = try versioning.commitPut(svc, bucket, &obj, .{
@@ -213,7 +221,12 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     keep_blob = true;
     garbage.collect(svc);
     dropUpload(svc, id);
-    return service.infoFrom(obj);
+    // Strings in `obj` die with the arena.
+    var info = service.infoFrom(obj);
+    info.content_type = "";
+    info.tags = "";
+    info.system = .{};
+    return info;
 }
 
 /// Checks refs against the recorded parts and fills one segment per ref.
@@ -341,6 +354,7 @@ fn loadUpload(svc: *ObjectService, arena: std.mem.Allocator, bid: core.BucketId,
 fn storeUpload(svc: *ObjectService, rec: UploadRecord) Error!void {
     const bytes = upload.encode(rec, svc.gpa) catch |e| return switch (e) {
         error.KeyTooLong => error.KeyTooLong,
+        error.MetadataTooLarge => error.MetadataTooLarge,
         else => error.OutOfMemory,
     };
     defer svc.gpa.free(bytes);
@@ -417,7 +431,11 @@ test "multipart upload, complete, and md5-of-md5s etag" {
     defer gpa.free(big);
     for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
 
-    const id = try create(&fx.svc, "bkt", "big", .{ .content_type = "application/x-test" });
+    const id = try create(&fx.svc, "bkt", "big", .{
+        .content_type = "application/x-test",
+        .metadata = &.{.{ .name = "k", .value = "v" }},
+        .system = .{ .content_disposition = "inline" },
+    });
     _ = try fx.put(id, 2, "stale"); // replaced below
     const p2 = try fx.put(id, 2, "tail");
     const p1 = try fx.put(id, 1, big);
@@ -451,6 +469,8 @@ test "multipart upload, complete, and md5-of-md5s etag" {
     try testing.expectEqual(@as(u64, min_part_size + 4), hd.size);
     try testing.expectEqual(@as(u32, 2), hd.etag.parts);
     try testing.expectEqualStrings("application/x-test", hd.content_type);
+    try testing.expectEqualStrings("v", hd.metadata[0].value);
+    try testing.expectEqualStrings("inline", hd.system.content_disposition);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try fx.svc.read(hd, .{ .offset = min_part_size - 2, .length = 6 }, &out.writer);

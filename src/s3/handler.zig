@@ -237,6 +237,7 @@ fn getObject(c: *Ctx) DispatchError!void {
         .{ .name = "content-type", .value = if (info.content_type.len > 0) info.content_type else "binary/octet-stream" },
     });
     try versioning.objectHeaders(c, info, (try param(c, "versionId")) != null, &hdrs);
+    if (c.method == .GET) try versioning.applyResponseOverrides(c, &hdrs);
     if (!try versioning.checkRead(c, info, etag, hdrs.items)) return;
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     if (range) |r| try hdrs.append(c.arena, .{

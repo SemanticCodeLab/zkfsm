@@ -40,6 +40,7 @@ pub const Code = enum {
     InvalidPartOrder,
     EntityTooSmall,
     EntityTooLarge,
+    MetadataTooLarge,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -58,7 +59,7 @@ pub const Code = enum {
             .InvalidRequest, .InvalidTag, .MalformedXML => .bad_request,
             .InvalidBucketState => .conflict,
             .NoSuchUpload => .not_found,
-            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge => .bad_request,
+            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge, .MetadataTooLarge => .bad_request,
         };
     }
 
@@ -100,6 +101,7 @@ pub const Code = enum {
             .InvalidPartOrder => "The list of parts was not in ascending order.",
             .EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
             .EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
+            .MetadataTooLarge => "Your metadata headers exceed the maximum allowed metadata size.",
         };
     }
 };
@@ -125,6 +127,8 @@ pub fn fromObject(e: object.Error) Code {
         error.MethodNotAllowed => .MethodNotAllowed,
         error.NoSuchTagSet => .NoSuchTagSet,
         error.InvalidTag => .InvalidTag,
+        error.MetadataTooLarge => .MetadataTooLarge,
+        error.InvalidMetadata => .InvalidArgument,
     };
 }
 

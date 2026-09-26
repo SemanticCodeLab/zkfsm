@@ -82,13 +82,31 @@ curl -s -o /dev/null -X DELETE "$EP/smoke/top.txt"
 curl -s -o /dev/null -X DELETE "$EP/smoke/empty"
 check "delete bucket" 204 "$(status -X DELETE "$EP/smoke")"
 
+# User metadata and system headers.
+check "meta bucket" 200 "$(status -X PUT "$EP/metab")"
+check "meta put" 200 "$(echo -n m | status -T - -H 'x-amz-meta-Color: red' -H 'x-amz-meta-x-zkfsm-internal-k: sneaky' -H 'x-zkfsm-internal-j: sneaky' \
+  -H 'Cache-Control: max-age=60' -H 'Content-Disposition: attachment; filename="a.txt"' -H 'Content-Language: en' "$EP/metab/m")"
+check "meta head" "red" "$(header x-amz-meta-color -I "$EP/metab/m")"
+check "meta cache-control" "max-age=60" "$(header cache-control "$EP/metab/m")"
+check "meta content-language" "en" "$(header content-language -I "$EP/metab/m")"
+check "meta internal stripped" 0 "$(curl -s -D - -o /dev/null -I "$EP/metab/m" | grep -ci 'zkfsm-internal')"
+check "response override" "text/x-over" "$(header content-type "$EP/metab/m?response-content-type=text/x-over")"
+check "response override disposition" "inline" "$(header content-disposition "$EP/metab/m?response-content-disposition=inline")"
+check "meta too large" 400 "$(echo -n m | status -T - -H "x-amz-meta-big: $(head -c 2100 /dev/zero | tr '\0' a)" "$EP/metab/big")"
+check "meta copy keeps" "red" "$(curl -s -o /dev/null -X PUT -H 'x-amz-copy-source: metab/m' "$EP/metab/c1"; header x-amz-meta-color -I "$EP/metab/c1")"
+curl -s -o /dev/null -X PUT -H 'x-amz-copy-source: metab/m' -H 'x-amz-metadata-directive: REPLACE' -H 'x-amz-meta-color: blue' "$EP/metab/c2"
+check "meta copy replace" "blue" "$(header x-amz-meta-color -I "$EP/metab/c2")"
+check "meta copy replace drops system" "" "$(header cache-control -I "$EP/metab/c2")"
+for k in m c1 c2; do curl -s -o /dev/null -X DELETE "$EP/metab/$k"; done
+check "meta bucket delete" 204 "$(status -X DELETE "$EP/metab")"
+
 # Multipart uploads.
 xmlval() { sed -n "s/.*<$1>\([^<]*\)<\/$1>.*/\1/p"; }
 check "mp bucket" 200 "$(status -X PUT "$EP/mpb")"
 head -c 6000000 /dev/urandom > "$WORK/p1"
 head -c 1234 /dev/urandom > "$WORK/p2"
 cat "$WORK/p1" "$WORK/p2" > "$WORK/whole"
-UPID=$(curl -s -X POST -H 'Content-Type: application/x-mp' "$EP/mpb/big?uploads" | xmlval UploadId)
+UPID=$(curl -s -X POST -H 'Content-Type: application/x-mp' -H 'x-amz-meta-mp: yes' "$EP/mpb/big?uploads" | xmlval UploadId)
 check "mp create" 32 "${#UPID}"
 E1=$(header etag -T "$WORK/p1" "$EP/mpb/big?partNumber=1&uploadId=$UPID")
 E2=$(header etag -T "$WORK/p2" "$EP/mpb/big?partNumber=2&uploadId=$UPID")
@@ -106,6 +124,7 @@ WANT_ETAG="\"$(echo -n "${E1//\"/}${E2//\"/}" | xxd -r -p | md5sum | cut -d' ' -
 check "mp complete etag" "$WANT_ETAG" "$(cbody 1 "$E1" 2 "$E2" | complete | xmlval ETag | sed 's/&quot;/"/g')"
 check "mp head etag" "$WANT_ETAG" "$(header etag -I "$EP/mpb/big")"
 check "mp content-type" "application/x-mp" "$(header content-type -I "$EP/mpb/big")"
+check "mp metadata" "yes" "$(header x-amz-meta-mp -I "$EP/mpb/big")"
 check "mp body" "$(md5sum < "$WORK/whole")" "$(curl -s "$EP/mpb/big" | md5sum)"
 check "mp range across parts" "$(tail -c +5999991 "$WORK/whole" | head -c 20 | md5sum)" "$(curl -s -r 5999990-6000009 "$EP/mpb/big" | md5sum)"
 check "mp upload gone" 404 "$(status "$EP/mpb/big?uploadId=$UPID")"

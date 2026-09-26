@@ -16,6 +16,10 @@ pub const PutInput = service.PutInput;
 pub const ListParams = service.ListParams;
 pub const ListResult = service.ListResult;
 pub const Tag = versioning.Tag;
+pub const Header = service.Header;
+pub const SystemHeaders = service.SystemHeaders;
+pub const user_meta_limit = @import("../metadata/root.zig").headers.user_limit;
+pub const internal_prefix = @import("../metadata/root.zig").headers.internal_prefix;
 
 /// Decodes an encoded tag set (ObjectInfo.tags) into `arena`.
 pub fn decodeTags(arena: @import("std").mem.Allocator, bytes: []const u8) Error![]Tag {
