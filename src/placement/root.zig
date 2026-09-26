@@ -17,6 +17,16 @@ pub fn recordKey(id: core.NameId) PhysicalKey {
     return .{ .space = .record, .hex = id.toHex() };
 }
 
+/// Record key for a noncurrent version of a name.
+pub fn versionRecordKey(id: core.NameId) PhysicalKey {
+    return .{ .space = .record, .hex = id.toHex() };
+}
+
+/// Per-bucket configuration record (versioning, lock, tags).
+pub fn bucketConfigKey(id: core.BucketId) PhysicalKey {
+    return .{ .space = .system, .hex = id.toHex() };
+}
+
 /// Fixed key holding the bucket catalog.
 pub const catalog_key: PhysicalKey = .{ .space = .system, .hex = [_]u8{'0'} ** 32 };
 
