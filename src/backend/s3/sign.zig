@@ -1,4 +1,4 @@
-//! Client-side AWS SigV4 header signing for the remote S3 backend.
+//! Client-side SigV4 header signing for the remote S3 backend.
 //! Self-contained (std only); can be deduplicated with a shared core signer later.
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -162,8 +162,8 @@ fn expectSig(req: Request, want: []const u8) !void {
     try std.testing.expectEqualStrings(want, auth[idx + 10 ..]);
 }
 
-// Examples from the AWS S3 "Signature Calculations for the Authorization Header" docs.
-test "sigv4 aws doc example: GET object with range" {
+// Published SigV4 header-signing reference examples.
+test "sigv4 reference example: GET object with range" {
     try expectSig(.{
         .method = "GET",
         .canonical_uri = "/test.txt",
@@ -179,13 +179,13 @@ test "sigv4 aws doc example: GET object with range" {
     }, "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
 }
 
-test "sigv4 aws doc example: PUT object" {
+test "sigv4 reference example: PUT object" {
     var ub: [64]u8 = undefined;
     var uw: Writer = .fixed(&ub);
     try uw.writeByte('/');
     try uriEncode(&uw, "test$file.text", false);
     try std.testing.expectEqualStrings("/test%24file.text", uw.buffered());
-    const payload = hashHex("Welcome to Amazon S3.");
+    const payload: [64]u8 = "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072".*;
     try expectSig(.{
         .method = "PUT",
         .canonical_uri = uw.buffered(),
@@ -202,7 +202,7 @@ test "sigv4 aws doc example: PUT object" {
     }, "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd");
 }
 
-test "sigv4 aws doc example: list objects" {
+test "sigv4 reference example: list objects" {
     var qb: [64]u8 = undefined;
     var qw: Writer = .fixed(&qb);
     try canonicalQuery(&qw, &.{ .{ .name = "prefix", .value = "J" }, .{ .name = "max-keys", .value = "2" } });
