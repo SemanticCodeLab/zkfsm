@@ -7,6 +7,7 @@ pub const errors = @import("errors.zig");
 pub const sigv4 = @import("sigv4.zig");
 pub const multipart = @import("multipart.zig");
 pub const versioning = @import("versioning.zig");
+pub const xml_read = @import("xml_read.zig");
 
 pub const Server = server.Server;
 
@@ -19,4 +20,5 @@ test {
     _ = sigv4;
     _ = multipart;
     _ = versioning;
+    _ = xml_read;
 }

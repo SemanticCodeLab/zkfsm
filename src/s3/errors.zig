@@ -28,6 +28,11 @@ pub const Code = enum {
     NoSuchTagSet,
     InvalidTag,
     MalformedXML,
+    NoSuchUpload,
+    InvalidPart,
+    InvalidPartOrder,
+    EntityTooSmall,
+    EntityTooLarge,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -44,6 +49,8 @@ pub const Code = enum {
             .NoSuchVersion, .ObjectLockConfigurationNotFoundError, .NoSuchObjectLockConfiguration, .NoSuchTagSet => .not_found,
             .InvalidRequest, .InvalidTag, .MalformedXML => .bad_request,
             .InvalidBucketState => .conflict,
+            .NoSuchUpload => .not_found,
+            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge => .bad_request,
         };
     }
 
@@ -73,6 +80,11 @@ pub const Code = enum {
             .NoSuchTagSet => "The TagSet does not exist",
             .InvalidTag => "The tag provided was not a valid tag.",
             .MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
+            .NoSuchUpload => "The specified multipart upload does not exist.",
+            .InvalidPart => "One or more of the specified parts could not be found or its entity tag did not match.",
+            .InvalidPartOrder => "The list of parts was not in ascending order.",
+            .EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
+            .EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
         };
     }
 };

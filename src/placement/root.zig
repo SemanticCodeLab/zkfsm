@@ -27,6 +27,12 @@ pub fn bucketConfigKey(id: core.BucketId) PhysicalKey {
     return .{ .space = .system, .hex = id.toHex() };
 }
 
+/// Record key for an in-progress multipart upload. Upload ids are random, so they
+/// cannot collide with the hashed name ids in the same space.
+pub fn uploadKey(id: core.ObjectId) PhysicalKey {
+    return .{ .space = .record, .hex = id.toHex() };
+}
+
 /// Fixed key holding the bucket catalog.
 pub const catalog_key: PhysicalKey = .{ .space = .system, .hex = [_]u8{'0'} ** 32 };
 

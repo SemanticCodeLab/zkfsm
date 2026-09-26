@@ -233,11 +233,8 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
 
     const ck = currentKey(bid, rec.key);
     const cur = try loadAt(svc, a, ck, bid, rec.key);
-    var etag_buf: [34]u8 = undefined;
-    const live_etag: ?[]const u8 = if (cur) |c| (if (c.flags.delete_marker) null else blk: {
-        etag_buf = c.etag.quoted();
-        break :blk &etag_buf;
-    }) else null;
+    var etag_buf: [core.ETag.quoted_max]u8 = undefined;
+    const live_etag: ?[]const u8 = if (cur) |c| (if (c.flags.delete_marker) null else c.etag.quoted(&etag_buf)) else null;
     conditional.evalWrite(in.conditions, live_etag) catch |e| return e;
 
     switch (cfg.versioning) {
@@ -771,7 +768,8 @@ test "tags and conditional put" {
     const p = try env.put("t", "x", .{ .tags = enc, .conditions = .{ .if_none_match = "*" } });
     try std.testing.expectError(error.PreconditionFailed, env.put("t", "y", .{ .conditions = .{ .if_none_match = "*" } }));
     try std.testing.expectError(error.NoSuchKey, env.put("u", "y", .{ .conditions = .{ .if_match = "\"x\"" } }));
-    _ = try env.put("t", "x2", .{ .tags = enc, .conditions = .{ .if_match = &p.etag.quoted() } });
+    var qb: [core.ETag.quoted_max]u8 = undefined;
+    _ = try env.put("t", "x2", .{ .tags = enc, .conditions = .{ .if_match = p.etag.quoted(&qb) } });
     try std.testing.expectEqualStrings(enc, (try svc.head(a, "bkt", "t")).tags);
     _ = try setObjectTags(svc, "bkt", "t", null, null);
     try std.testing.expectEqualStrings("", (try svc.head(a, "bkt", "t")).tags);
