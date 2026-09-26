@@ -7,6 +7,8 @@ const xml = @import("xml.zig");
 const errors = @import("errors.zig");
 const sigv4 = @import("sigv4.zig");
 const multipart = @import("multipart.zig");
+const metrics = @import("../metrics/root.zig");
+const versioning = @import("versioning.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -19,7 +21,7 @@ const io_buf_len = 64 * 1024;
 const max_list_keys = 1000;
 
 /// Request fields copied out of the head before the body reader invalidates it.
-const Ctx = struct {
+pub const Ctx = struct {
     req: *Request,
     arena: std.mem.Allocator,
     svc: *object.ObjectService,
@@ -31,6 +33,7 @@ const Ctx = struct {
     copy_source: bool,
     auth: sigv4.Auth,
     request_id: [16]u8,
+    ext: versioning.Headers = .{},
 };
 
 pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -53,6 +56,7 @@ pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request,
     while (hit.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
+        try ctx.ext.capture(arena, h);
     }
     ctx.route = router.parse(arena, ctx.target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -69,7 +73,7 @@ pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request,
     };
 }
 
-const DispatchError = ConnError || object.Error;
+pub const DispatchError = ConnError || object.Error;
 
 fn dispatch(c: *Ctx) DispatchError!void {
     const r = c.route;
@@ -77,6 +81,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
         .GET => listBuckets(c),
         else => fail(c, .MethodNotAllowed),
     };
+    if (try versioning.route(c)) return;
     if (r.key.len == 0) return switch (c.method) {
         .PUT => {
             try c.svc.createBucket(r.bucket);
@@ -104,7 +109,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
     };
 }
 
-fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
+pub fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
     return router.queryParam(c.arena, c.route.query, name) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidUri => null,
@@ -192,17 +197,21 @@ fn putObject(c: *Ctx) DispatchError!void {
     var body_buf: [io_buf_len]u8 = undefined;
     var check_buf: [io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
-    const len = br.contentLength(c.req.head.content_length);
-    const info = c.svc.put(c.route.bucket, c.route.key, br.body(), .{ .content_type = c.content_type, .content_length = len }) catch |e| {
+    var in: object.PutInput = .{ .content_type = c.content_type, .content_length = br.contentLength(c.req.head.content_length) };
+    if (!try versioning.putExtras(c, &in)) return;
+    const info = c.svc.put(c.route.bucket, c.route.key, br.body(), in) catch |e| {
         if (br.failure) |code| return fail(c, code);
         return e;
     };
     const etag = info.etag.quoted();
-    try respondEmpty(c, .ok, &.{.{ .name = "etag", .value = &etag }});
+    var hdrs: std.ArrayList(Header) = .empty;
+    try hdrs.append(c.arena, .{ .name = "etag", .value = &etag });
+    try versioning.putResponseHeaders(c, info, &hdrs);
+    try respondEmpty(c, .ok, hdrs.items);
 }
 
 fn getObject(c: *Ctx) DispatchError!void {
-    const info = try c.svc.head(c.arena, c.route.bucket, c.route.key);
+    const info = try versioning.lookupForRead(c) orelse return;
     var range: ?core.Range = null;
     if (c.range) |h| if (core.RangeSpec.parse(h)) |spec| {
         range = spec.resolve(info.size) catch {
@@ -219,14 +228,17 @@ fn getObject(c: *Ctx) DispatchError!void {
         .{ .name = "last-modified", .value = core.time.httpDate(info.created_ns, &db) },
         .{ .name = "accept-ranges", .value = "bytes" },
         .{ .name = "content-type", .value = if (info.content_type.len > 0) info.content_type else "binary/octet-stream" },
-        .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
+    try versioning.objectHeaders(c, info, (try param(c, "versionId")) != null, &hdrs);
+    if (!try versioning.checkRead(c, info, &etag, hdrs.items)) return;
+    try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     if (range) |r| try hdrs.append(c.arena, .{
         .name = "content-range",
         .value = try std.fmt.allocPrint(c.arena, "bytes {d}-{d}/{d}", .{ r.offset, r.last(), info.size }),
     });
     const len = if (range) |r| r.length else info.size;
     var out_buf: [io_buf_len]u8 = undefined;
+    metrics.global.last_status = if (range != null) 206 else 200;
     var bw = try c.req.respondStreaming(&out_buf, .{
         .content_length = len,
         .respond_options = .{ .status = if (range != null) .partial_content else .ok, .extra_headers = hdrs.items },
@@ -237,25 +249,28 @@ fn getObject(c: *Ctx) DispatchError!void {
     try bw.end();
 }
 
-fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
+pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
+    metrics.global.last_status = @intFromEnum(status);
     try c.req.respond(body, .{ .status = status, .extra_headers = &.{
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     } });
 }
 
-fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
+pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
+    metrics.global.last_status = @intFromEnum(status);
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items });
 }
 
-fn fail(c: *Ctx, code: Code) ConnError!void {
+pub fn fail(c: *Ctx, code: Code) ConnError!void {
     return failWith(c, code, &.{});
 }
 
-fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
+pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
+    metrics.global.last_status = @intFromEnum(code.status());
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const resource = std.mem.sliceTo(c.target, '?');
     errors.writeBody(&a.writer, code, resource, &c.request_id) catch return error.OutOfMemory;

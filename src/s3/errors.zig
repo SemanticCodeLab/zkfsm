@@ -24,6 +24,15 @@ pub const Code = enum {
     RequestTimeTooSkewed,
     AuthorizationHeaderMalformed,
     XAmzContentSHA256Mismatch,
+    PreconditionFailed,
+    NoSuchVersion,
+    InvalidRequest,
+    InvalidBucketState,
+    ObjectLockConfigurationNotFoundError,
+    NoSuchObjectLockConfiguration,
+    NoSuchTagSet,
+    InvalidTag,
+    MalformedXML,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -37,6 +46,10 @@ pub const Code = enum {
             .ServiceUnavailable => .service_unavailable,
             .AccessDenied, .SignatureDoesNotMatch, .InvalidAccessKeyId, .RequestTimeTooSkewed => .forbidden,
             .AuthorizationHeaderMalformed, .XAmzContentSHA256Mismatch => .bad_request,
+            .PreconditionFailed => .precondition_failed,
+            .NoSuchVersion, .ObjectLockConfigurationNotFoundError, .NoSuchObjectLockConfiguration, .NoSuchTagSet => .not_found,
+            .InvalidRequest, .InvalidTag, .MalformedXML => .bad_request,
+            .InvalidBucketState => .conflict,
         };
     }
 
@@ -62,6 +75,15 @@ pub const Code = enum {
             .RequestTimeTooSkewed => "The difference between the request time and the server's time is too large.",
             .AuthorizationHeaderMalformed => "The authorization header or query parameters are malformed.",
             .XAmzContentSHA256Mismatch => "The provided 'x-amz-content-sha256' header does not match what was computed.",
+            .PreconditionFailed => "At least one of the pre-conditions you specified did not hold",
+            .NoSuchVersion => "The specified version does not exist.",
+            .InvalidRequest => "Invalid Request",
+            .InvalidBucketState => "The request is not valid with the current state of the bucket.",
+            .ObjectLockConfigurationNotFoundError => "Object Lock configuration does not exist for this bucket",
+            .NoSuchObjectLockConfiguration => "The specified object does not have a ObjectLock configuration",
+            .NoSuchTagSet => "The TagSet does not exist",
+            .InvalidTag => "The tag provided was not a valid tag.",
+            .MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
         };
     }
 };
@@ -78,6 +100,15 @@ pub fn fromObject(e: object.Error) Code {
         error.IncompleteBody, error.ReadFailed => .IncompleteBody,
         error.NoSpace, error.OutOfMemory => .ServiceUnavailable,
         error.StorageFailed, error.Corrupt, error.WriteFailed => .InternalError,
+        error.PreconditionFailed => .PreconditionFailed,
+        error.ObjectLocked => .AccessDenied,
+        error.NoSuchVersion => .NoSuchVersion,
+        error.InvalidVersionId => .InvalidArgument,
+        error.InvalidRequest => .InvalidRequest,
+        error.InvalidBucketState => .InvalidBucketState,
+        error.MethodNotAllowed => .MethodNotAllowed,
+        error.NoSuchTagSet => .NoSuchTagSet,
+        error.InvalidTag => .InvalidTag,
     };
 }
 

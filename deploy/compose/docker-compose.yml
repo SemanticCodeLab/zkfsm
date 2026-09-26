@@ -1,0 +1,18 @@
+# Single-node zkfsm. Usage: docker compose -f deploy/compose/docker-compose.yml up -d
+services:
+  zkfsm:
+    build:
+      context: ../..
+    image: ghcr.io/semanticcodelab/zkfsm:${ZKFSM_TAG:-latest}
+    command: ["--data", "/data", "--listen", "0.0.0.0:9000"]
+    environment:
+      ZKFSM_ACCESS_KEY: ${ZKFSM_ACCESS_KEY:-}
+      ZKFSM_SECRET_KEY: ${ZKFSM_SECRET_KEY:-}
+    ports:
+      - "${ZKFSM_PORT:-9000}:9000"
+    volumes:
+      - data:/data
+    restart: unless-stopped
+
+volumes:
+  data:

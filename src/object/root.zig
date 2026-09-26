@@ -1,6 +1,9 @@
-//! object: ObjectService, the protocol-neutral object API. Multipart lands here in step 9.
+//! object: ObjectService, the protocol-neutral object API, plus versioning and object lock.
 pub const service = @import("service.zig");
 pub const list = @import("list.zig");
+pub const versioning = @import("versioning.zig");
+pub const lock = @import("lock.zig");
+pub const conditional = @import("conditional.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -9,8 +12,20 @@ pub const BucketInfo = service.BucketInfo;
 pub const PutInput = service.PutInput;
 pub const ListParams = service.ListParams;
 pub const ListResult = service.ListResult;
+pub const Tag = versioning.Tag;
+
+/// Decodes an encoded tag set (ObjectInfo.tags) into `arena`.
+pub fn decodeTags(arena: @import("std").mem.Allocator, bytes: []const u8) Error![]Tag {
+    return @import("../metadata/root.zig").tags.decode(arena, bytes) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+    };
+}
 
 test {
     _ = service;
     _ = list;
+    _ = versioning;
+    _ = lock;
+    _ = conditional;
 }
