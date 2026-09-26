@@ -48,4 +48,12 @@ pub fn build(b: *std.Build) void {
     }));
     const bench = b.addExecutable(.{ .name = "erasure-bench", .root_module = bench_mod });
     b.step("bench", "Erasure codec throughput (ReleaseFast)").dependOn(&b.addRunArtifact(bench).step);
+
+    // IAM is not wired into main.zig yet; test it as its own root.
+    const iam_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/iam/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(iam_tests).step);
 }
