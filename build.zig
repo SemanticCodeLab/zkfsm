@@ -9,6 +9,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    _ = b.addModule("zkfsm", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{ .name = "zkfsm", .root_module = mod });
     b.installArtifact(exe);
 
