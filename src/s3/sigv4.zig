@@ -375,15 +375,20 @@ pub const BodyReader = struct {
     fn streamPlain(self: *BodyReader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
-        const n = try self.in.readSliceShort(dest);
+        // std's content-length reader panics if read again after EndOfStream, and
+        // readSliceShort swallows it; stream once and stop at the first EndOfStream.
+        var fw: Writer = .fixed(dest);
+        const n = self.in.stream(&fw, .limited(dest.len)) catch |e| switch (e) {
+            error.ReadFailed => return error.ReadFailed,
+            error.WriteFailed => unreachable, // limited to dest.len
+            error.EndOfStream => {
+                if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
+                self.state = .done;
+                return error.EndOfStream;
+            },
+        };
         self.hasher.update(dest[0..n]);
         w.advance(n);
-        if (n < dest.len) {
-            // Short read means the body ended; never read it again.
-            if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
-            self.state = .done;
-            if (n == 0) return error.EndOfStream;
-        }
         return n;
     }
 
