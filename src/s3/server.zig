@@ -12,6 +12,7 @@ pub const Server = struct {
     gpa: std.mem.Allocator,
     svc: *object.ObjectService,
     auth: sigv4.Config,
+    extensions: []const @import("extension.zig").Extension = &.{},
 
     pub fn run(self: *Server, addr: std.net.Address) RunError!void {
         var listener = addr.listen(.{ .reuse_address = true }) catch return error.ListenFailed;
@@ -70,7 +71,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
-                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address }, &req, arena.allocator());
+                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
                     _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);

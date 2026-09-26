@@ -10,6 +10,8 @@ pub const object = @import("object/root.zig");
 pub const s3 = @import("s3/root.zig");
 pub const metrics = @import("metrics/root.zig");
 pub const license = core.license;
+/// Full server entry: `app.run(.{ .extensions = ... })`.
+pub const app = @import("main.zig");
 
 test {
     _ = core;

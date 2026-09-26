@@ -20,9 +20,18 @@ const usage =
 
 const Config = struct { data: []const u8, host: []const u8, port: u16, anonymous: bool = false };
 
+/// Hooks for builds that embed zkfsm (see lib.zig `app`).
+pub const Options = struct {
+    extensions: []const s3.Extension = &.{},
+    /// Consumes an unknown `--flag value` pair; return false to reject it.
+    extra_flag: ?*const fn (ctx: ?*anyopaque, flag: []const u8, value: []const u8) bool = null,
+    extra_ctx: ?*anyopaque = null,
+    extra_usage: []const u8 = "",
+};
+
 const ConfigError = error{ BadArgs, HelpRequested };
 
-fn parseArgs(args: []const []const u8, env_data: ?[]const u8) ConfigError!Config {
+fn parseArgs(args: []const []const u8, env_data: ?[]const u8, opts: Options) ConfigError!Config {
     var cfg: Config = .{ .data = env_data orelse "./data", .host = "0.0.0.0", .port = 9000 };
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -40,20 +49,26 @@ fn parseArgs(args: []const []const u8, env_data: ?[]const u8) ConfigError!Config
             const colon = std.mem.lastIndexOfScalar(u8, args[i], ':') orelse return error.BadArgs;
             cfg.host = args[i][0..colon];
             cfg.port = std.fmt.parseInt(u16, args[i][colon + 1 ..], 10) catch return error.BadArgs;
+        } else if (opts.extra_flag) |f| {
+            if (!f(opts.extra_ctx, a, args[i])) return error.BadArgs;
         } else return error.BadArgs;
     }
     return cfg;
 }
 
 pub fn main() u8 {
+    return run(.{});
+}
+
+pub fn run(opts: Options) u8 {
     const gpa = std.heap.smp_allocator;
     const args = std.process.argsAlloc(gpa) catch return 1;
     defer std.process.argsFree(gpa, args);
     const env_data = std.process.getEnvVarOwned(gpa, "ZKFSM_DATA") catch null;
     defer if (env_data) |d| gpa.free(d);
 
-    const cfg = parseArgs(args, env_data) catch |e| {
-        std.debug.print("{s}", .{usage});
+    const cfg = parseArgs(args, env_data, opts) catch |e| {
+        std.debug.print("{s}{s}", .{ usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     const creds = loadCredentials(gpa) catch |e| {
@@ -106,7 +121,7 @@ pub fn main() u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth };
+    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = opts.extensions };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
@@ -159,12 +174,12 @@ fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const 
 }
 
 test "arg parsing" {
-    const c = try parseArgs(&.{ "zkfsm", "--data", "/tmp/x", "--listen", "127.0.0.1:9100" }, null);
+    const c = try parseArgs(&.{ "zkfsm", "--data", "/tmp/x", "--listen", "127.0.0.1:9100" }, null, .{});
     try std.testing.expectEqualStrings("/tmp/x", c.data);
     try std.testing.expectEqual(@as(u16, 9100), c.port);
-    try std.testing.expectEqualStrings("env", (try parseArgs(&.{"zkfsm"}, "env")).data);
-    try std.testing.expectError(error.BadArgs, parseArgs(&.{ "zkfsm", "--listen", "nope" }, null));
-    try std.testing.expect((try parseArgs(&.{ "zkfsm", "--anonymous", "--data", "d" }, null)).anonymous);
+    try std.testing.expectEqualStrings("env", (try parseArgs(&.{"zkfsm"}, "env", .{})).data);
+    try std.testing.expectError(error.BadArgs, parseArgs(&.{ "zkfsm", "--listen", "nope" }, null, .{}));
+    try std.testing.expect((try parseArgs(&.{ "zkfsm", "--anonymous", "--data", "d" }, null, .{})).anonymous);
 }
 
 test {

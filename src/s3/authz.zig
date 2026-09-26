@@ -13,6 +13,7 @@ const Method = std.http.Method;
 pub const Env = struct {
     auth: sigv4.Config = .{},
     peer: ?std.net.Address = null,
+    extensions: []const @import("extension.zig").Extension = &.{},
 };
 
 /// Action for requests no S3 operation covers; only root (or `*` grants) pass.

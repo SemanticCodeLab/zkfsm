@@ -70,6 +70,7 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     }
     const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
     if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
+    for (env.extensions) |x| if (try x.route(x.ctx, &ctx)) return;
     if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
