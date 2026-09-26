@@ -340,6 +340,7 @@ fn listUploads(c: *Ctx) OpError!void {
     const prefix = (try handler.param(c, "prefix")) orelse "";
     const key_marker = (try handler.param(c, "key-marker")) orelse "";
     const id_marker = (try handler.param(c, "upload-id-marker")) orelse "";
+    const delimiter = (try handler.param(c, "delimiter")) orelse "";
     const max = try maxParam(c, "max-uploads");
     const all = try mp.listUploads(c.svc, c.arena, c.route.bucket, prefix);
 
@@ -350,16 +351,21 @@ fn listUploads(c: *Ctx) OpError!void {
     try xml.elem(w, "KeyMarker", key_marker);
     try xml.elem(w, "UploadIdMarker", id_marker);
     try xml.elem(w, "Prefix", prefix);
+    if (delimiter.len > 0) try xml.elem(w, "Delimiter", delimiter);
     try xml.elemInt(w, "MaxUploads", max);
     var body: std.Io.Writer.Allocating = .init(c.arena);
+    var prefixes: std.Io.Writer.Allocating = .init(c.arena);
+    var last_prefix: []const u8 = "";
     var shown: usize = 0;
     var truncated = false;
     var next_key: []const u8 = "";
     var next_id: [32]u8 = @splat('0');
     // Without an upload-id marker, the key marker excludes that key entirely.
     var past_marker = key_marker.len == 0;
+    const marker_is_prefix = delimiter.len > 0 and std.mem.endsWith(u8, key_marker, delimiter);
     for (all) |u| {
         const hex = u.upload_id.toHex();
+        if (marker_is_prefix and std.mem.startsWith(u8, u.key, key_marker)) continue;
         if (!past_marker) {
             const ord = std.mem.order(u8, u.key, key_marker);
             if (ord == .lt) continue;
@@ -370,9 +376,25 @@ fn listUploads(c: *Ctx) OpError!void {
             }
             past_marker = true;
         }
+        // Keys with the delimiter past the prefix roll up into one CommonPrefixes entry.
+        const cp: ?[]const u8 = if (delimiter.len == 0) null else if (std.mem.indexOf(u8, u.key[prefix.len..], delimiter)) |i|
+            u.key[0 .. prefix.len + i + delimiter.len]
+        else
+            null;
+        if (cp) |p| if (std.mem.eql(u8, p, last_prefix)) continue;
         if (shown == max) {
             truncated = true;
             break;
+        }
+        if (cp) |p| {
+            try prefixes.writer.writeAll("<CommonPrefixes>");
+            try xml.elem(&prefixes.writer, "Prefix", p);
+            try prefixes.writer.writeAll("</CommonPrefixes>");
+            last_prefix = p;
+            shown += 1;
+            next_key = p;
+            next_id = hex;
+            continue;
         }
         var tb: [24]u8 = undefined;
         const bw = &body.writer;
@@ -392,6 +414,7 @@ fn listUploads(c: *Ctx) OpError!void {
     }
     try xml.elemBool(w, "IsTruncated", truncated);
     try w.writeAll(body.written());
+    try w.writeAll(prefixes.written());
     try w.writeAll("</ListMultipartUploadsResult>");
     try handler.respondXml(c, .ok, a.written());
 }
