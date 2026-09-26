@@ -87,7 +87,7 @@ pub const ReplicaStore = struct {
         }
     };
 
-    fn put(ctx: *anyopaque, key: PhysicalKey, source: *std.Io.Reader, _: iface.PutOptions) Error!ObjectMeta {
+    fn put(ctx: *anyopaque, key: PhysicalKey, source: *std.Io.Reader, opts: iface.PutOptions) Error!ObjectMeta {
         const self = cast(ctx);
         if (key.space != .data) return error.InvalidKey;
         var pbuf: [max_drives]u8 = undefined;
@@ -121,7 +121,10 @@ pub const ReplicaStore = struct {
         defer self.gpa.free(buf);
         var total: u64 = 0;
         while (true) {
-            const n = source.readSliceShort(buf) catch return error.ReadFailed;
+            // Never read past a known length: HTTP body readers must not be polled after their end.
+            const want: usize = if (opts.size_hint) |h| @intCast(@min(buf.len, h -| total)) else buf.len;
+            if (want == 0) break;
+            const n = try fill(source, buf[0..want]);
             if (n == 0) break;
             const crc = shard.chunkCrc(buf[0..n]);
             for (&pend) |*slot| if (slot.*) |*w| {
@@ -133,7 +136,7 @@ pub const ReplicaStore = struct {
             };
             if (live < need) return worst;
             total += n;
-            if (n < buf.len) break;
+            if (n < want) break;
         }
 
         const m = self.stripe(key);
@@ -156,6 +159,19 @@ pub const ReplicaStore = struct {
             return worst;
         }
         return .{ .size = total, .mtime_ns = core.time.nowNs() };
+    }
+
+    /// Reads until `buf` is full or the source ends, never asking for more than `buf.len`.
+    fn fill(source: *std.Io.Reader, buf: []u8) Error!usize {
+        var w: std.Io.Writer = .fixed(buf);
+        while (w.end < buf.len) {
+            _ = source.stream(&w, .limited(buf.len - w.end)) catch |e| switch (e) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.ReadFailed,
+                error.WriteFailed => break,
+            };
+        }
+        return w.end;
     }
 
     fn dropWriter(slot: *?LocalBackend.PendingWrite, live: *usize, worst: *Error, e: Error) void {
@@ -337,6 +353,7 @@ pub const ReplicaStore = struct {
                     nbad += 1;
                 },
                 .corrupt => {
+                    std.log.warn("drive {s}: corrupt {t} {s}", .{ self.drives.drives[placed[j]].path, key.space, &key.hex });
                     corrupt = true;
                     bad[nbad] = @intCast(j);
                     nbad += 1;
