@@ -1,0 +1,8 @@
+.{
+    .name = .zkfsm,
+    .version = "0.0.1",
+    .fingerprint = 0xe22cff33426d70ac,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },
+}
