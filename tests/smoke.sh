@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test: builds zkfsm, starts it on a temp dir, drives it with curl.
 set -euo pipefail
+S3CLI_BIN="${S3CLI_BIN:-aws}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${ZKFSM_SMOKE_PORT:-$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')}"
 EP="http://127.0.0.1:$PORT"
@@ -178,23 +179,23 @@ DV2=$(curl -s -X POST -H 'x-amz-bypass-governance-retention: true' --data-binary
 check "multi-delete bypass governance" 1 "$(grep -c "<Deleted><Key>obj</Key><VersionId>$VVER</VersionId></Deleted>" <<<"$DV2")"
 check "deleted version gone" 404 "$(status -I "$MV/obj?versionId=$VVER")"
 
-# aws cli (optional): a 50 MB `s3 cp` goes through multipart.
-if command -v aws >/dev/null && [[ -z "${ZKFSM_SMOKE_NO_AWS:-}" ]]; then
+# S3 CLI (optional): a 50 MB `s3 cp` goes through multipart.
+if command -v "$S3CLI_BIN" >/dev/null && [[ -z "${ZKFSM_SMOKE_NO_CLI:-}" ]]; then
   export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
   export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
-  awss3() { aws --no-sign-request --endpoint-url "$EP" "$@"; }
+  s3cli() { "$S3CLI_BIN" --no-sign-request --endpoint-url "$EP" "$@"; }
   head -c 50000000 /dev/urandom > "$WORK/fifty"
-  awss3 s3 mb s3://awsmp >/dev/null
-  check "aws cp 50MB" 0 "$(awss3 s3 cp --quiet "$WORK/fifty" s3://awsmp/fifty >/dev/null 2>"$WORK/aws.err"; echo $?)"
-  check "aws multipart etag" 1 "$(header etag -I "$EP/awsmp/fifty" | grep -c -- '-[0-9]*"$')"
-  awss3 s3 cp --quiet s3://awsmp/fifty "$WORK/fifty.back" 2>>"$WORK/aws.err" || true
-  check "aws roundtrip" "$(md5sum < "$WORK/fifty")" "$(md5sum < "$WORK/fifty.back" 2>/dev/null)"
+  s3cli s3 mb s3://climp >/dev/null
+  check "cli cp 50MB" 0 "$(s3cli s3 cp --quiet "$WORK/fifty" s3://climp/fifty >/dev/null 2>"$WORK/cli.err"; echo $?)"
+  check "cli multipart etag" 1 "$(header etag -I "$EP/climp/fifty" | grep -c -- '-[0-9]*"$')"
+  s3cli s3 cp --quiet s3://climp/fifty "$WORK/fifty.back" 2>>"$WORK/cli.err" || true
+  check "cli roundtrip" "$(md5sum < "$WORK/fifty")" "$(md5sum < "$WORK/fifty.back" 2>/dev/null)"
   # --copy-props none: object tagging (GetObjectTagging) is not implemented.
-  check "aws server copy" 0 "$(awss3 s3 cp --quiet --copy-props none s3://awsmp/fifty s3://awsmp/fifty2 2>>"$WORK/aws.err"; echo $?)"
-  check "aws server copy body" "$(md5sum < "$WORK/fifty")" "$(curl -s "$EP/awsmp/fifty2" | md5sum)"
-  check "aws rm recursive" 0 "$(awss3 s3 rm --quiet --recursive s3://awsmp 2>>"$WORK/aws.err"; echo $?)"
-  check "aws rb" 0 "$(awss3 s3 rb s3://awsmp >/dev/null 2>>"$WORK/aws.err"; echo $?)"
-  [[ -s "$WORK/aws.err" ]] && cat "$WORK/aws.err"
+  check "cli server copy" 0 "$(s3cli s3 cp --quiet --copy-props none s3://climp/fifty s3://climp/fifty2 2>>"$WORK/cli.err"; echo $?)"
+  check "cli server copy body" "$(md5sum < "$WORK/fifty")" "$(curl -s "$EP/climp/fifty2" | md5sum)"
+  check "cli rm recursive" 0 "$(s3cli s3 rm --quiet --recursive s3://climp 2>>"$WORK/cli.err"; echo $?)"
+  check "cli rb" 0 "$(s3cli s3 rb s3://climp >/dev/null 2>>"$WORK/cli.err"; echo $?)"
+  [[ -s "$WORK/cli.err" ]] && cat "$WORK/cli.err"
 fi
 
 # Keep-alive: two requests on one connection.

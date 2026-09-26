@@ -35,7 +35,7 @@ pub const Version = enum {
 
 pub const Effect = enum { allow, deny };
 
-pub const PrincipalKind = enum { aws, service, federated, canonical_user };
+pub const PrincipalKind = enum { account, service, federated, canonical_user };
 
 pub const PrincipalValue = struct { kind: PrincipalKind, value: []const u8 };
 
@@ -174,7 +174,7 @@ fn parsePrincipal(a: std.mem.Allocator, v: Value) ParseError!Principal {
             while (it.next()) |kv| {
                 const k = kv.key_ptr.*;
                 const kind: PrincipalKind = if (std.mem.eql(u8, k, "AWS"))
-                    .aws
+                    .account
                 else if (std.mem.eql(u8, k, "Service"))
                     .service
                 else if (std.mem.eql(u8, k, "Federated"))
