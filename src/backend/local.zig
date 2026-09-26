@@ -95,6 +95,76 @@ pub const LocalBackend = struct {
         std.posix.fsync(d.fd) catch |e| return mapFs(e);
     }
 
+    /// Name of the drive identity file at the root of a drive.
+    pub const format_file = "format.zkfsm";
+
+    /// An uncommitted blob in tmp/; `commit` moves it into place atomically.
+    pub const PendingWrite = struct {
+        lb: *LocalBackend,
+        file: std.fs.File,
+        tmp_buf: [48]u8,
+        tmp_len: usize,
+
+        pub fn writeAll(self: *PendingWrite, bytes: []const u8) Error!void {
+            self.file.writeAll(bytes) catch |e| return mapFs(e);
+        }
+
+        pub fn commit(self: *PendingWrite, key: PhysicalKey) Error!void {
+            const tmp = self.tmp_buf[0..self.tmp_len];
+            errdefer self.lb.root.deleteFile(tmp) catch {};
+            const synced = self.file.sync();
+            self.file.close();
+            synced catch |e| return mapFs(e);
+            var path_buf: [path_max]u8 = undefined;
+            try self.lb.commit(tmp, try keyPath(key, &path_buf));
+        }
+
+        pub fn abort(self: *PendingWrite) void {
+            self.file.close();
+            self.lb.root.deleteFile(self.tmp_buf[0..self.tmp_len]) catch {};
+        }
+    };
+
+    pub fn begin(self: *LocalBackend) Error!PendingWrite {
+        var p: PendingWrite = .{ .lb = self, .file = undefined, .tmp_buf = undefined, .tmp_len = 0 };
+        p.tmp_len = tempPath(&p.tmp_buf).len;
+        p.file = self.root.createFile(p.tmp_buf[0..p.tmp_len], .{ .exclusive = true }) catch |e| return mapFs(e);
+        return p;
+    }
+
+    /// Opens a stored data blob for positional reads.
+    pub fn openRead(self: *LocalBackend, key: PhysicalKey) Error!std.fs.File {
+        var path_buf: [path_max]u8 = undefined;
+        return self.root.openFile(try keyPath(key, &path_buf), .{}) catch |e| mapFs(e);
+    }
+
+    /// Reads the drive identity file into `buf`.
+    pub fn readFormat(self: *LocalBackend, buf: []u8) Error![]u8 {
+        return self.root.readFile(format_file, buf) catch |e| mapFs(e);
+    }
+
+    pub fn writeFormat(self: *LocalBackend, bytes: []const u8) Error!void {
+        var p = try self.begin();
+        p.writeAll(bytes) catch |e| {
+            p.abort();
+            return e;
+        };
+        const tmp = p.tmp_buf[0..p.tmp_len];
+        errdefer self.root.deleteFile(tmp) catch {};
+        const synced = p.file.sync();
+        p.file.close();
+        synced catch |e| return mapFs(e);
+        try self.commit(tmp, format_file);
+    }
+
+    /// Removes a leftover file from tmp/; `name` is the bare file name.
+    pub fn removeTemp(self: *LocalBackend, name: []const u8) Error!void {
+        if (!std.mem.endsWith(u8, name, ".tmp") or std.mem.indexOfScalar(u8, name, '/') != null) return error.InvalidKey;
+        var d = self.root.openDir("tmp", .{}) catch |e| return mapFs(e);
+        defer d.close();
+        d.deleteFile(name) catch |e| return mapFs(e);
+    }
+
     fn get(ctx: *anyopaque, key: PhysicalKey, range: ?iface.Range, sink: *std.Io.Writer) Error!ObjectMeta {
         const self = self_(ctx);
         var path_buf: [path_max]u8 = undefined;
@@ -291,4 +361,32 @@ test "local backend put, ranged get, list, delete" {
     const got = try b.getRecord(rk, std.testing.allocator);
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("rec", got);
+}
+
+test "pending write commit and abort, format file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var lb = try LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+    defer lb.close();
+    const key: PhysicalKey = .{ .space = .data, .hex = "00112233445566778899aabbccddeeff".* };
+
+    var p = try lb.begin();
+    try p.writeAll("abc");
+    p.abort();
+    try std.testing.expectError(error.NotFound, lb.backend().stat(key));
+
+    var q = try lb.begin();
+    try q.writeAll("abc");
+    try q.commit(key);
+    var f = try lb.openRead(key);
+    defer f.close();
+    var b: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try f.preadAll(&b, 0));
+
+    var fb: [16]u8 = undefined;
+    try std.testing.expectError(error.NotFound, lb.readFormat(&fb));
+    try lb.writeFormat("id");
+    try std.testing.expectEqualStrings("id", try lb.readFormat(&fb));
+    try std.testing.expectError(error.InvalidKey, lb.removeTemp("../x.tmp"));
 }

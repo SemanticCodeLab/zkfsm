@@ -37,6 +37,9 @@ fn Id128(comptime tag: []const u8) type {
 pub const ObjectId = Id128("object");
 pub const BucketId = Id128("bucket");
 pub const VersionId = Id128("version");
+/// Identity of one drive and of the drive set it was formatted into.
+pub const DriveId = Id128("drive");
+pub const SetId = Id128("set");
 
 /// Stable id for a (bucket, key) name; addresses the object record.
 pub const NameId = Id128("name");
