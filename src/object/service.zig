@@ -141,13 +141,21 @@ pub const ObjectService = struct {
             .key = key,
             .content_type = in.content_type,
         };
+        try self.commitRecord(bucket, rec);
+        keep_blob = true;
+        return infoFrom(rec);
+    }
+
+    /// Swaps `rec` in as the current version of its name; its blob must already exist.
+    /// On success the previous version's blob is deleted.
+    pub fn commitRecord(self: *ObjectService, bucket: []const u8, rec: metadata.ObjectRecord) Error!void {
         const bytes = metadata.record.encode(rec, self.gpa) catch |e| return switch (e) {
             error.KeyTooLong => error.KeyTooLong,
             else => error.OutOfMemory,
         };
         defer self.gpa.free(bytes);
 
-        const rkey = placement.recordKey(core.ids.nameId(bid, key));
+        const rkey = placement.recordKey(core.ids.nameId(rec.bucket_id, rec.key));
         var old: ?core.ObjectId = null;
         {
             self.mutex.lock();
@@ -156,9 +164,7 @@ pub const ObjectService = struct {
             old = self.loadOldId(rkey);
             self.store.putRecord(rkey, bytes) catch |e| return mapBackend(e);
         }
-        keep_blob = true;
-        if (old) |o| self.store.delete(placement.dataKey(o)) catch {};
-        return infoFrom(rec);
+        if (old) |o| if (!o.eql(rec.object_id)) self.store.delete(placement.dataKey(o)) catch {};
     }
 
     /// Returns object metadata; strings are duplicated into `arena`.
@@ -213,7 +219,7 @@ pub const ObjectService = struct {
         return list_mod.apply(arena, entries.items, p);
     }
 
-    fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
+    pub fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
         self.mutex.lock();
         defer self.mutex.unlock();
         const b = self.catalog.find(name) orelse return error.NoSuchBucket;
@@ -283,7 +289,7 @@ fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
     };
 }
 
-fn mapBackend(e: backend.Error) Error {
+pub fn mapBackend(e: backend.Error) Error {
     return switch (e) {
         error.NoSpace => error.NoSpace,
         error.ReadFailed => error.ReadFailed,
@@ -293,7 +299,7 @@ fn mapBackend(e: backend.Error) Error {
     };
 }
 
-fn validKey(key: []const u8) Error!void {
+pub fn validKey(key: []const u8) Error!void {
     if (key.len == 0) return error.InvalidKey;
     if (key.len > metadata.record.max_key_len) return error.KeyTooLong;
 }

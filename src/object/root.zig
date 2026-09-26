@@ -1,6 +1,9 @@
-//! object: ObjectService, the protocol-neutral object API. Multipart lands here in step 9.
+//! object: ObjectService, the protocol-neutral object API.
 pub const service = @import("service.zig");
 pub const list = @import("list.zig");
+pub const blob = @import("blob.zig");
+pub const copy = @import("copy.zig");
+pub const multipart = @import("multipart.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -13,4 +16,7 @@ pub const ListResult = service.ListResult;
 test {
     _ = service;
     _ = list;
+    _ = blob;
+    _ = copy;
+    _ = multipart;
 }
