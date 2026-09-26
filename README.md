@@ -13,7 +13,7 @@ zig build test             # unit tests
 scripts/check_layers.sh    # enforces the downward-only import rule
 tests/smoke.sh             # end-to-end curl test against a temp data dir
 tests/durability.sh        # drive loss, bitrot, and heal (replica:2 and EC:4+2)
-tests/aws_cli.sh           # SigV4 + IAM with aws CLI and MinIO client (set MC=/path/to/mc)
+tests/s3cli.sh             # SigV4 + IAM with an S3 CLI and the MinIO client (set MC=/path/to/mc)
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 ```
 
@@ -58,9 +58,9 @@ zkfsm heal --data /mnt/disk{1...4}     # one scan/heal pass, exit 0 when fully r
   files older than an hour left by interrupted writes.
 
 ```sh
-aws --endpoint-url http://localhost:9000 s3 mb s3://photos
-aws --endpoint-url http://localhost:9000 s3 cp dog.jpg s3://photos/
-mc alias set z http://localhost:9000 admin change-me-please && mc ls z/photos
+mc alias set z http://localhost:9000 admin change-me-please
+mc mb z/photos
+mc cp dog.jpg z/photos/
 ```
 
 ## Status
@@ -81,8 +81,8 @@ Pre-1.0. Working today and covered by tests:
 - **Operations**: `/health/live`, `/health/ready`, Prometheus `/metrics`
   (MinIO-compatible aliases), Docker image, compose files, Helm chart, CI.
 
-Verified clients: aws CLI (including 200 MB multipart over EC:4+2) and the
-MinIO client (`mc cp`, `mirror`, `rm`, `share`).
+Verified clients: standard S3 command-line clients (including 200 MB
+multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: multi-node clustering, IAM admin HTTP API, SSE, bucket
 notifications, lifecycle rules, virtual-host-style addressing, TLS

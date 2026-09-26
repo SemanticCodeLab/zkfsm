@@ -123,7 +123,7 @@ fn anyResource(patterns: []const []const u8, resource: []const u8, env: *context
 fn principalMatches(pr: policy.Principal, who: *const Principal) bool {
     if (pr.any) return true;
     for (pr.values) |v| {
-        if (v.kind != .aws) continue;
+        if (v.kind != .account) continue;
         const s = v.value;
         if (std.mem.eql(u8, s, "*")) return true;
         if (s.len == 0) continue;

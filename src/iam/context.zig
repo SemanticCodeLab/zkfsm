@@ -29,7 +29,7 @@ pub fn keyEql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a[split..], b[split..]);
 }
 
-/// Identity attributes exposed as aws:* keys during evaluation.
+/// Identity attributes exposed as global condition keys during evaluation.
 pub const PrincipalKeys = struct {
     username: []const u8 = "",
     userid: []const u8 = "",

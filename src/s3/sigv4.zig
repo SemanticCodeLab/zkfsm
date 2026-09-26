@@ -284,12 +284,12 @@ pub fn parseHead(arena: std.mem.Allocator, head: []const u8) std.http.Server.Req
     return Head.parse(head) catch |e| {
         if (e != error.HttpTransferEncodingUnsupported) return e;
         var a: Writer.Allocating = .init(arena);
-        stripAwsChunked(&a.writer, head) catch return e;
+        stripChunkedEncoding(&a.writer, head) catch return e;
         return Head.parse(a.written());
     };
 }
 
-fn stripAwsChunked(w: *Writer, head: []const u8) Writer.Error!void {
+fn stripChunkedEncoding(w: *Writer, head: []const u8) Writer.Error!void {
     const name = "content-encoding:";
     var lines = std.mem.splitScalar(u8, head, '\n');
     while (lines.next()) |l| {
