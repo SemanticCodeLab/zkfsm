@@ -1,4 +1,4 @@
-//! Client-side AWS SigV4 header signing for the remote S3 backend.
+//! Client-side SigV4 header signing for the remote S3 backend.
 //! Self-contained (std only); can be deduplicated with a shared core signer later.
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -162,7 +162,7 @@ fn expectSig(req: Request, want: []const u8) !void {
     try std.testing.expectEqualStrings(want, auth[idx + 10 ..]);
 }
 
-// Examples from the AWS S3 "Signature Calculations for the Authorization Header" docs.
+// Published SigV4 header-signing reference examples.
 test "sigv4 aws doc example: GET object with range" {
     try expectSig(.{
         .method = "GET",

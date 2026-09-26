@@ -467,7 +467,7 @@ pub const BodyReader = struct {
     }
 };
 
-// Examples from the AWS S3 SigV4 documentation.
+// Published SigV4 reference examples.
 const ex_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const ex_ak = "AKIAIOSFODNN7EXAMPLE";
 

@@ -72,7 +72,7 @@ Pre-1.0. Working today and covered by tests:
   delete markers and ListObjectVersions, object lock (governance, compliance,
   legal hold), object and bucket tagging, conditional requests.
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
-  hash checks; IAM users, groups, service accounts, AWS-style policy
+  hash checks; IAM users, groups, service accounts, S3 policy
   evaluation, STS session tokens.
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot

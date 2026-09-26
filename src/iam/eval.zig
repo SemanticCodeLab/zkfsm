@@ -1,4 +1,4 @@
-//! Policy evaluation matching AWS: explicit deny > allow > implicit deny.
+//! Policy evaluation: explicit deny > allow > implicit deny.
 //! Identity and bucket policies are unioned; session policies intersect.
 const std = @import("std");
 const policy = @import("policy.zig");
@@ -119,7 +119,7 @@ fn anyResource(patterns: []const []const u8, resource: []const u8, env: *context
     return false;
 }
 
-/// AWS principals match by exact ARN, account id, account root ARN, or `*`.
+/// Principals match by exact ARN, account id, account root ARN, or `*`.
 fn principalMatches(pr: policy.Principal, who: *const Principal) bool {
     if (pr.any) return true;
     for (pr.values) |v| {
