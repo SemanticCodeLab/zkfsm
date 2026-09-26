@@ -6,6 +6,7 @@ pub const local = @import("local.zig");
 pub const remote = @import("remote.zig");
 pub const s3 = @import("s3.zig");
 pub const azure = @import("azure.zig");
+pub const gcs = @import("gcs.zig");
 
 pub const Range = core.Range;
 
@@ -109,6 +110,7 @@ test {
     _ = remote;
     _ = s3;
     _ = azure;
+    _ = gcs;
     _ = @import("s3/sign.zig");
     _ = @import("remote/http.zig");
     _ = @import("remote/xml.zig");
