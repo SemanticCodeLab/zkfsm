@@ -62,12 +62,26 @@ pub fn main() u8 {
     };
     defer svc.deinit();
     std.log.info("data root {s}", .{cfg.data});
+    if (std.Thread.spawn(.{}, sweepLoop, .{&svc})) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
     var server: s3.Server = .{ .gpa = gpa, .svc = &svc };
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
     return 0;
+}
+
+/// Aborts multipart uploads older than a week; runs at start, then hourly.
+fn sweepLoop(svc: *object.ObjectService) void {
+    const max_age: i128 = 7 * std.time.ns_per_day;
+    while (true) {
+        const n = object.multipart.sweepStale(svc, std.time.nanoTimestamp(), max_age) catch |e| blk: {
+            std.log.warn("upload sweep failed: {t}", .{e});
+            break :blk 0;
+        };
+        if (n > 0) std.log.info("aborted {d} stale multipart uploads", .{n});
+        std.Thread.sleep(std.time.ns_per_hour);
+    }
 }
 
 test "arg parsing" {
