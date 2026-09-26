@@ -35,7 +35,8 @@ RUN set -eu; \
     esac; \
     zig build -Dtarget="$t" -Doptimize=ReleaseSafe --prefix /out; \
     mkdir -p /rootfs/data /rootfs/tmp; \
-    chown 10001:10001 /rootfs/data; chmod 1777 /rootfs/tmp
+    for i in $(seq 1 16); do mkdir -p /rootfs/data$i; done; \
+    chown 10001:10001 /rootfs/data /rootfs/data*; chmod 1777 /rootfs/tmp
 
 # Static busybox gives the healthcheck an HTTP client; the runtime has no shell otherwise.
 FROM busybox:1.36-musl AS busybox
