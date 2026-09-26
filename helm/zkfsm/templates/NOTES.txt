@@ -1,0 +1,2 @@
+zkfsm S3 endpoint: http://{{ include "zkfsm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+Credentials: kubectl get secret {{ include "zkfsm.secretName" . }} -o jsonpath='{.data.accessKey}' | base64 -d

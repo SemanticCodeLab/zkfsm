@@ -1,0 +1,9 @@
+apiVersion: v2
+name: zkfsm
+description: S3-compatible object store
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/SemanticCodeLab/zkfsm
+sources:
+  - https://github.com/SemanticCodeLab/zkfsm
