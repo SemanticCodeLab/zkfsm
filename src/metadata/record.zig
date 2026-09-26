@@ -4,7 +4,8 @@ const core = @import("../core/root.zig");
 const codec = @import("codec.zig");
 
 pub const magic = "ZKOR";
-pub const format_version: u16 = 1;
+/// v2 adds the multipart part count after the ETag; v1 records still decode.
+pub const format_version: u16 = 2;
 pub const max_key_len = 1024;
 
 pub const Error = codec.DecodeError || error{ KeyTooLong, OutOfMemory };
@@ -43,6 +44,7 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(&r.version.bytes);
     try codec.putInt(w, u64, r.size);
     try w.writeAll(&r.etag.md5);
+    try codec.putInt(w, u32, r.etag.parts);
     try w.writeByte(@intFromEnum(r.checksum.algorithm));
     try w.writeByte(r.checksum.len);
     try w.writeAll(r.checksum.digest[0..r.checksum.len]);
@@ -60,13 +62,15 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
 pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
     var c: codec.Cursor = .{ .bytes = bytes };
     if (!std.mem.eql(u8, try c.take(4), magic)) return error.Corrupt;
-    if (try c.int(u16) != format_version) return error.Corrupt;
+    const ver = try c.int(u16);
+    if (ver != 1 and ver != format_version) return error.Corrupt;
     var r: ObjectRecord = undefined;
     r.object_id = .{ .bytes = try c.fixed(16) };
     r.bucket_id = .{ .bytes = try c.fixed(16) };
     r.version = .{ .bytes = try c.fixed(16) };
     r.size = try c.int(u64);
     r.etag = .{ .md5 = try c.fixed(16) };
+    if (ver >= 2) r.etag.parts = try c.int(u32);
     const alg = std.meta.intToEnum(core.checksum.ChecksumAlgorithm, (try c.take(1))[0]) catch return error.Corrupt;
     const clen = (try c.take(1))[0];
     if (clen > 32) return error.Corrupt;
@@ -92,7 +96,7 @@ test "record encode/decode roundtrip" {
         .bucket_id = core.BucketId.random(),
         .version = core.VersionId.random(),
         .size = 1,
-        .etag = .{ .md5 = md5 },
+        .etag = .{ .md5 = md5, .parts = 3 },
         .checksum = core.Checksum.fromMd5(md5),
         .created_ns = 1234567890123,
         .key = "photos/dog.jpg",
@@ -105,6 +109,7 @@ test "record encode/decode roundtrip" {
     try std.testing.expectEqualStrings(r.key, d.key);
     try std.testing.expectEqualStrings(r.content_type, d.content_type);
     try std.testing.expectEqual(r.size, d.size);
+    try std.testing.expectEqual(@as(u32, 3), d.etag.parts);
     try std.testing.expectEqual(r.created_ns, d.created_ns);
     try std.testing.expectEqualSlices(u8, &md5, d.checksum.digest[0..16]);
 

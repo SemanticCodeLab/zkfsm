@@ -172,7 +172,8 @@ fn listObjects(c: *Ctx) DispatchError!void {
         try w.writeAll("<Contents>");
         try xml.elem(w, "Key", e.key);
         try xml.elem(w, "LastModified", core.time.iso8601(e.mtime_ns, &tb));
-        try xml.elem(w, "ETag", &e.etag.quoted());
+        var eb: [core.ETag.quoted_max]u8 = undefined;
+        try xml.elem(w, "ETag", e.etag.quoted(&eb));
         try xml.elemInt(w, "Size", e.size);
         try w.writeAll("<StorageClass>STANDARD</StorageClass></Contents>");
     }
@@ -192,8 +193,8 @@ fn putObject(c: *Ctx) DispatchError!void {
     var body_buf: [io_buf_len]u8 = undefined;
     const body = try c.req.readerExpectContinue(&body_buf);
     const info = try c.svc.put(c.route.bucket, c.route.key, body, .{ .content_type = c.content_type, .content_length = len });
-    const etag = info.etag.quoted();
-    try respondEmpty(c, .ok, &.{.{ .name = "etag", .value = &etag }});
+    var eb: [core.ETag.quoted_max]u8 = undefined;
+    try respondEmpty(c, .ok, &.{.{ .name = "etag", .value = info.etag.quoted(&eb) }});
 }
 
 fn getObject(c: *Ctx) DispatchError!void {
@@ -206,11 +207,12 @@ fn getObject(c: *Ctx) DispatchError!void {
         };
     } else |_| {}; // malformed Range is ignored, as S3 does
 
-    const etag = info.etag.quoted();
+    var eb: [core.ETag.quoted_max]u8 = undefined;
+    const etag = info.etag.quoted(&eb);
     var db: [29]u8 = undefined;
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, &.{
-        .{ .name = "etag", .value = &etag },
+        .{ .name = "etag", .value = etag },
         .{ .name = "last-modified", .value = core.time.httpDate(info.created_ns, &db) },
         .{ .name = "accept-ranges", .value = "bytes" },
         .{ .name = "content-type", .value = if (info.content_type.len > 0) info.content_type else "binary/octet-stream" },
