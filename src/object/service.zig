@@ -399,10 +399,11 @@ pub fn validKey(key: []const u8) Error!void {
     if (key.len > metadata.record.max_key_len) return error.KeyTooLong;
 }
 
-/// S3 naming rules: 3-63 chars of [a-z0-9.-], alnum at both ends.
+/// S3 naming rules: 3-63 chars of [a-z0-9.-], alnum at both ends, not an IPv4 address.
 pub fn validBucketName(name: []const u8) bool {
     if (name.len < 3 or name.len > 63) return false;
     for (name) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '.' or c == '-')) return false;
+    if (std.net.Address.parseIp4(name, 0)) |_| return false else |_| {}
     return std.ascii.isAlphanumeric(name[0]) and std.ascii.isAlphanumeric(name[name.len - 1]) and
         std.mem.indexOf(u8, name, "..") == null;
 }
@@ -413,6 +414,8 @@ test "bucket name rules" {
     try std.testing.expect(!validBucketName("Upper"));
     try std.testing.expect(!validBucketName("-lead"));
     try std.testing.expect(!validBucketName("a..b"));
+    try std.testing.expect(!validBucketName("192.168.1.1"));
+    try std.testing.expect(validBucketName("192.168.1.1.x"));
 }
 
 test "service put/head/read/list/delete over local backend" {
