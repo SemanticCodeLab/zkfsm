@@ -15,11 +15,11 @@ const Code = errors.Code;
 /// Errors that end the connection; S3-level failures become XML responses instead.
 pub const ConnError = error{ WriteFailed, ReadFailed, HttpExpectationFailed, OutOfMemory, StreamAborted };
 
-const io_buf_len = 64 * 1024;
+pub const io_buf_len = 64 * 1024;
 const max_list_keys = 1000;
 
 /// Request fields copied out of the head before the body reader invalidates it.
-const Ctx = struct {
+pub const Ctx = struct {
     req: *Request,
     arena: std.mem.Allocator,
     svc: *object.ObjectService,
@@ -60,7 +60,7 @@ pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocato
         error.InvalidUri => return fail(&ctx, .InvalidURI),
     };
     if (!sigv4.authorize(req)) return fail(&ctx, .InternalError);
-    if (multipart.isMultipartRequest(ctx.route.query)) return fail(&ctx, .NotImplemented);
+    if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
         else => |oe| return fail(&ctx, errors.fromObject(oe)),
@@ -102,7 +102,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
     };
 }
 
-fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
+pub fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
     return router.queryParam(c.arena, c.route.query, name) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidUri => null,
@@ -234,25 +234,25 @@ fn getObject(c: *Ctx) DispatchError!void {
     try bw.end();
 }
 
-fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
+pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
     try c.req.respond(body, .{ .status = status, .extra_headers = &.{
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     } });
 }
 
-fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
+pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items });
 }
 
-fn fail(c: *Ctx, code: Code) ConnError!void {
+pub fn fail(c: *Ctx, code: Code) ConnError!void {
     return failWith(c, code, &.{});
 }
 
-fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
+pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const resource = std.mem.sliceTo(c.target, '?');
     errors.writeBody(&a.writer, code, resource, &c.request_id) catch return error.OutOfMemory;

@@ -18,6 +18,13 @@ pub const Code = enum {
     NotImplemented,
     InternalError,
     ServiceUnavailable,
+    NoSuchUpload,
+    InvalidPart,
+    InvalidPartOrder,
+    EntityTooSmall,
+    EntityTooLarge,
+    MalformedXML,
+    InvalidRequest,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -29,6 +36,8 @@ pub const Code = enum {
             .NotImplemented => .not_implemented,
             .InternalError => .internal_server_error,
             .ServiceUnavailable => .service_unavailable,
+            .NoSuchUpload => .not_found,
+            .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge, .MalformedXML, .InvalidRequest => .bad_request,
         };
     }
 
@@ -48,6 +57,13 @@ pub const Code = enum {
             .NotImplemented => "A header or query you provided implies functionality that is not implemented",
             .InternalError => "We encountered an internal error. Please try again.",
             .ServiceUnavailable => "Reduce your request rate or retry later.",
+            .NoSuchUpload => "The specified multipart upload does not exist.",
+            .InvalidPart => "One or more of the specified parts could not be found or its entity tag did not match.",
+            .InvalidPartOrder => "The list of parts was not in ascending order.",
+            .EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.",
+            .EntityTooLarge => "Your proposed upload exceeds the maximum allowed size.",
+            .MalformedXML => "The XML you provided was not well-formed or did not validate against our published schema.",
+            .InvalidRequest => "The request is not valid.",
         };
     }
 };
