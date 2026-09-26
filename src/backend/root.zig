@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("../core/root.zig");
 
 pub const local = @import("local.zig");
+pub const remote = @import("remote.zig");
 
 pub const Range = core.Range;
 
@@ -103,4 +104,5 @@ pub const StorageBackend = struct {
 
 test {
     _ = local;
+    _ = remote;
 }
