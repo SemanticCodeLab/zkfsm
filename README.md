@@ -13,17 +13,23 @@ zig build test             # unit tests
 scripts/check_layers.sh    # enforces the downward-only import rule
 tests/smoke.sh             # end-to-end curl test against a temp data dir
 tests/durability.sh        # drive loss, bitrot, and heal (replica:2 and EC:4+2)
+tests/aws_cli.sh           # SigV4 + IAM with aws CLI and MinIO client (set MC=/path/to/mc)
+tests/remote_backend.sh    # remote S3/Azure backends against local containers
 ```
 
 ## Run
 
 ```sh
+export ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=change-me-please
 zig-out/bin/zkfsm --data /var/lib/zkfsm --listen 0.0.0.0:9000
-# or: ZKFSM_DATA=/var/lib/zkfsm zig-out/bin/zkfsm
 ```
 
-Defaults: data root `$ZKFSM_DATA`, else `./data`; listen `0.0.0.0:9000`.
-Path-style addressing only (`http://host:9000/bucket/key`).
+Root credentials come from `ZKFSM_ACCESS_KEY`/`ZKFSM_SECRET_KEY` (or
+`MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`). Without them the server refuses to
+start unless `--anonymous` is passed. Defaults: data root `$ZKFSM_DATA`, else
+`./data`; listen `0.0.0.0:9000`. Path-style addressing
+(`http://host:9000/bucket/key`). Containers: `Dockerfile`,
+`deploy/compose/`, and the Helm chart in `helm/zkfsm`.
 
 ### Multiple drives
 
@@ -52,28 +58,32 @@ zkfsm heal --data /mnt/disk{1...4}     # one scan/heal pass, exit 0 when fully r
   files older than an hour left by interrupted writes.
 
 ```sh
-curl -X PUT http://localhost:9000/photos
-curl -T dog.jpg http://localhost:9000/photos/dog.jpg
-curl http://localhost:9000/photos?list-type=2
-curl -r 0-99 http://localhost:9000/photos/dog.jpg
+aws --endpoint-url http://localhost:9000 s3 mb s3://photos
+aws --endpoint-url http://localhost:9000 s3 cp dog.jpg s3://photos/
+mc alias set z http://localhost:9000 admin change-me-please && mc ls z/photos
 ```
 
 ## Status
 
-0.1 in progress:
+Pre-1.0. Working today and covered by tests:
 
-- Local filesystem backend: two-level fanout, data file + `.meta` record,
-  write-temp + fsync + atomic rename, range reads.
-- ObjectService: buckets, put/get/head/delete, ListObjectsV2 semantics
-  (prefix, delimiter, start-after, continuation token, max-keys), MD5 ETag
-  computed while streaming.
-- S3 API: ListBuckets, CreateBucket, DeleteBucket, HeadBucket, GetBucketLocation,
-  ListObjectsV2, PutObject, GetObject (single `Range`), HeadObject,
-  DeleteObject, S3 XML error bodies. One thread per connection.
-- `tests/smoke.sh`: 35/35 curl checks pass.
+- **S3 API**: buckets, objects, ListObjectsV2, ranges, CopyObject,
+  DeleteObjects, multipart uploads (incl. UploadPartCopy), versioning with
+  delete markers and ListObjectVersions, object lock (governance, compliance,
+  legal hold), object and bucket tagging, conditional requests.
+- **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
+  hash checks; IAM users, groups, service accounts, AWS-style policy
+  evaluation, STS session tokens.
+- **Storage**: local drives with atomic writes; multiple drives with
+  replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
+  detection; background scan and heal; remote S3, GCS and Azure backends and
+  a NAS profile.
+- **Operations**: `/health/live`, `/health/ready`, Prometheus `/metrics`
+  (MinIO-compatible aliases), Docker image, compose files, Helm chart, CI.
 
-Not yet: **authentication is anonymous** (SigV4 is step 8, stub in
-`src/s3/sigv4.zig`), multipart (step 9, requests return `NotImplemented`),
-`/metrics` and health endpoints (step 10), CopyObject, aws-chunked uploads,
-and the aws-cli/mc/rclone conformance suite (step 11). Do not expose this
-build to untrusted networks.
+Verified clients: aws CLI (including 200 MB multipart over EC:4+2) and the
+MinIO client (`mc cp`, `mirror`, `rm`, `share`).
+
+Not yet: multi-node clustering, IAM admin HTTP API, SSE, bucket
+notifications, lifecycle rules, virtual-host-style addressing, TLS
+termination (run behind a proxy).
