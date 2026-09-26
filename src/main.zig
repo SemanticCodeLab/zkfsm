@@ -3,6 +3,7 @@ const std = @import("std");
 const backend = @import("backend/root.zig");
 const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
+const metrics = @import("metrics/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -63,6 +64,7 @@ pub fn main() u8 {
     defer svc.deinit();
     std.log.info("data root {s}", .{cfg.data});
     var server: s3.Server = .{ .gpa = gpa, .svc = &svc };
+    metrics.global.counters.started_ns = std.time.nanoTimestamp();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;

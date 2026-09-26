@@ -7,6 +7,7 @@ const xml = @import("xml.zig");
 const errors = @import("errors.zig");
 const sigv4 = @import("sigv4.zig");
 const multipart = @import("multipart.zig");
+const metrics = @import("../metrics/root.zig");
 const versioning = @import("versioning.zig");
 
 const Request = std.http.Server.Request;
@@ -233,6 +234,7 @@ fn getObject(c: *Ctx) DispatchError!void {
     });
     const len = if (range) |r| r.length else info.size;
     var out_buf: [io_buf_len]u8 = undefined;
+    metrics.global.last_status = if (range != null) 206 else 200;
     var bw = try c.req.respondStreaming(&out_buf, .{
         .content_length = len,
         .respond_options = .{ .status = if (range != null) .partial_content else .ok, .extra_headers = hdrs.items },
@@ -244,6 +246,7 @@ fn getObject(c: *Ctx) DispatchError!void {
 }
 
 pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
+    metrics.global.last_status = @intFromEnum(status);
     try c.req.respond(body, .{ .status = status, .extra_headers = &.{
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
@@ -251,6 +254,7 @@ pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!
 }
 
 pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
+    metrics.global.last_status = @intFromEnum(status);
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
@@ -262,6 +266,7 @@ pub fn fail(c: *Ctx, code: Code) ConnError!void {
 }
 
 pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
+    metrics.global.last_status = @intFromEnum(code.status());
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const resource = std.mem.sliceTo(c.target, '?');
     errors.writeBody(&a.writer, code, resource, &c.request_id) catch return error.OutOfMemory;
