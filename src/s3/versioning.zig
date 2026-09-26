@@ -23,6 +23,7 @@ pub const Headers = struct {
     lock_mode: ?[]const u8 = null,
     lock_until: ?[]const u8 = null,
     legal_hold: ?[]const u8 = null,
+    content_md5: ?[]const u8 = null,
     bypass_governance: bool = false,
     bucket_lock: bool = false,
     /// x-amz-meta-* with the prefix stripped and names lowercased; repeats joined by ",".
@@ -40,6 +41,7 @@ pub const Headers = struct {
             .{ "x-amz-object-lock-mode", "lock_mode" },
             .{ "x-amz-object-lock-retain-until-date", "lock_until" },
             .{ "x-amz-object-lock-legal-hold", "legal_hold" },
+            .{ "content-md5", "content_md5" },
         };
         inline for (fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[0])) {
             @field(self, f[1]) = try arena.dupe(u8, h.value);
@@ -183,6 +185,16 @@ pub fn putExtras(c: *Ctx, in: *object.PutInput) DispatchError!bool {
         in.retention = .{ .mode = mode, .until_ns = until };
     }
     if (h.legal_hold) |l| in.legal_hold = std.ascii.eqlIgnoreCase(l, "ON");
+    if (h.content_md5) |b64| {
+        var md5: [16]u8 = undefined;
+        const dec = std.base64.standard.Decoder;
+        const ok = if (dec.calcSizeForSlice(b64)) |n| n == 16 and if (dec.decode(&md5, b64)) |_| true else |_| false else |_| false;
+        if (!ok) {
+            try handler.fail(c, .InvalidDigest);
+            return false;
+        }
+        in.content_md5 = md5;
+    }
     return true;
 }
 

@@ -43,6 +43,8 @@ pub const Error = error{
     MetadataTooLarge,
     /// Malformed header name/value, or a name in the wrong namespace.
     InvalidMetadata,
+    /// The body's MD5 differs from the client's Content-MD5.
+    BadDigest,
 };
 
 pub const Header = metadata.headers.Header;
@@ -87,6 +89,8 @@ pub const PutInput = struct {
     retention: ?lock.Retention = null,
     legal_hold: bool = false,
     conditions: conditional.Conditions = .{},
+    /// Content-MD5 the stored body must match.
+    content_md5: ?[16]u8 = null,
     /// User metadata (names without `x-amz-meta-`) and reserved `x-zkfsm-internal-*` headers.
     metadata: []const Header = &.{},
     internal: []const Header = &.{},
@@ -222,6 +226,7 @@ pub const ObjectService = struct {
 
         var digest: [16]u8 = undefined;
         hr.hasher.final(&digest);
+        if (in.content_md5) |want| if (!std.mem.eql(u8, &want, &digest)) return error.BadDigest;
         var logical_size = in.logical_size;
         var etag_override = in.etag_override;
         if (in.finalize) |f| {
@@ -459,6 +464,8 @@ test "service put/head/read/list/delete over local backend" {
     var bad: std.Io.Reader = .fixed("abc");
     try svc.createBucket("bkt2");
     try std.testing.expectError(error.IncompleteBody, svc.put("bkt2", "k", &bad, .{ .content_length = 10 }));
+    var md5_src: std.Io.Reader = .fixed("hello");
+    try std.testing.expectError(error.BadDigest, svc.put("bkt2", "md5", &md5_src, .{ .content_md5 = @splat(0) }));
 }
 
 test "finalizer sets reported size and etag after streaming" {
