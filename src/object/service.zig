@@ -6,6 +6,9 @@ const placement = @import("../placement/root.zig");
 const metadata = @import("../metadata/root.zig");
 const io = @import("../io/root.zig");
 const list_mod = @import("list.zig");
+const versioning = @import("versioning.zig");
+const lock = @import("lock.zig");
+const conditional = @import("conditional.zig");
 
 const Md5 = core.checksum.Md5;
 
@@ -26,6 +29,16 @@ pub const Error = error{
     /// The caller's sink writer failed.
     WriteFailed,
     OutOfMemory,
+    PreconditionFailed,
+    /// Retention or legal hold forbids the change.
+    ObjectLocked,
+    NoSuchVersion,
+    InvalidVersionId,
+    InvalidRequest,
+    InvalidBucketState,
+    MethodNotAllowed,
+    NoSuchTagSet,
+    InvalidTag,
 };
 
 pub const BucketInfo = struct { name: []const u8, created_ns: i128 };
@@ -37,12 +50,27 @@ pub const ObjectInfo = struct {
     created_ns: i128,
     content_type: []const u8,
     object_id: core.ObjectId,
+    /// All zeros is the null version.
+    version_id: core.VersionId,
+    delete_marker: bool = false,
+    is_latest: bool = true,
+    retention_mode: lock.Mode = .none,
+    retain_until_ns: i128 = 0,
+    legal_hold: bool = false,
+    /// Encoded tag set; decode with `object.decodeTags`.
+    tags: []const u8 = "",
 };
 
 pub const PutInput = struct {
     content_type: []const u8 = "",
     /// When set, the body must be exactly this long.
     content_length: ?u64 = null,
+    /// Encoded tag set (versioning.encodeObjectTags).
+    tags: []const u8 = "",
+    /// Explicit retention; otherwise the bucket default applies.
+    retention: ?lock.Retention = null,
+    legal_hold: bool = false,
+    conditions: conditional.Conditions = .{},
 };
 
 pub const ListParams = list_mod.Params;
@@ -99,6 +127,7 @@ pub const ObjectService = struct {
             self.catalog.add(.{ .name = name_copy, .id = saved.id, .created_ns = saved.created_ns }) catch {};
             return e;
         };
+        self.store.deleteRecord(placement.bucketConfigKey(saved.id)) catch {};
     }
 
     pub fn headBucket(self: *ObjectService, name: []const u8) Error!void {
@@ -130,7 +159,7 @@ pub const ObjectService = struct {
 
         var digest: [16]u8 = undefined;
         hr.hasher.final(&digest);
-        const rec: metadata.ObjectRecord = .{
+        var rec: metadata.ObjectRecord = .{
             .object_id = oid,
             .bucket_id = bid,
             .version = core.VersionId.random(),
@@ -140,24 +169,11 @@ pub const ObjectService = struct {
             .created_ns = core.time.nowNs(),
             .key = key,
             .content_type = in.content_type,
+            .tags = in.tags,
         };
-        const bytes = metadata.record.encode(rec, self.gpa) catch |e| return switch (e) {
-            error.KeyTooLong => error.KeyTooLong,
-            else => error.OutOfMemory,
-        };
-        defer self.gpa.free(bytes);
-
-        const rkey = placement.recordKey(core.ids.nameId(bid, key));
-        var old: ?core.ObjectId = null;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.catalog.find(bucket) == null) return error.NoSuchBucket;
-            old = self.loadOldId(rkey);
-            self.store.putRecord(rkey, bytes) catch |e| return mapBackend(e);
-        }
+        const garbage = try versioning.commitPut(self, bucket, &rec, in);
         keep_blob = true;
-        if (old) |o| self.store.delete(placement.dataKey(o)) catch {};
+        garbage.collect(self);
         return infoFrom(rec);
     }
 
@@ -172,6 +188,7 @@ pub const ObjectService = struct {
         };
         const rec = metadata.record.decode(bytes) catch return error.Corrupt;
         if (!rec.bucket_id.eql(bid) or !std.mem.eql(u8, rec.key, key)) return error.NoSuchKey;
+        if (rec.flags.delete_marker) return error.NoSuchKey;
         return infoFrom(rec);
     }
 
@@ -183,22 +200,9 @@ pub const ObjectService = struct {
         };
     }
 
-    /// Deleting a missing key succeeds, as in S3.
+    /// Deleting a missing key succeeds, as in S3. Versioned buckets get a delete marker.
     pub fn delete(self: *ObjectService, bucket: []const u8, key: []const u8) Error!void {
-        try validKey(key);
-        const bid = try self.bucketId(bucket);
-        const rkey = placement.recordKey(core.ids.nameId(bid, key));
-        var old: ?core.ObjectId = null;
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            old = self.loadOldId(rkey);
-            self.store.deleteRecord(rkey) catch |e| switch (e) {
-                error.NotFound => {},
-                else => return mapBackend(e),
-            };
-        }
-        if (old) |o| self.store.delete(placement.dataKey(o)) catch {};
+        _ = try versioning.deleteObject(self, bucket, key, .{});
     }
 
     /// Full scan of the record space; fine for 0.1, indexed later.
@@ -208,23 +212,18 @@ pub const ObjectService = struct {
         var it = try self.scanRecords(arena);
         while (try it.next(self, bid)) |rec| {
             if (!std.mem.startsWith(u8, rec.key, p.prefix)) continue;
+            if (rec.flags.delete_marker) continue;
+            if (!std.mem.eql(u8, &it.lastKey().hex, &placement.recordKey(core.ids.nameId(bid, rec.key)).hex)) continue;
             try entries.append(arena, .{ .key = rec.key, .size = rec.size, .etag = rec.etag, .mtime_ns = rec.created_ns });
         }
         return list_mod.apply(arena, entries.items, p);
     }
 
-    fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
+    pub fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
         self.mutex.lock();
         defer self.mutex.unlock();
         const b = self.catalog.find(name) orelse return error.NoSuchBucket;
         return b.id;
-    }
-
-    fn loadOldId(self: *ObjectService, rkey: backend.PhysicalKey) ?core.ObjectId {
-        const bytes = self.store.getRecord(rkey, self.gpa) catch return null;
-        defer self.gpa.free(bytes);
-        const rec = metadata.record.decode(bytes) catch return null;
-        return rec.object_id;
     }
 
     fn persistCatalog(self: *ObjectService) Error!void {
@@ -233,13 +232,13 @@ pub const ObjectService = struct {
         self.store.putRecord(placement.catalog_key, bytes) catch |e| return mapBackend(e);
     }
 
-    const RecordIter = struct {
+    pub const RecordIter = struct {
         keys: []const backend.PhysicalKey,
         i: usize = 0,
         arena: std.mem.Allocator,
 
         /// Next record belonging to `bid`; records deleted mid-scan are skipped.
-        fn next(it: *RecordIter, svc: *ObjectService, bid: core.BucketId) Error!?metadata.ObjectRecord {
+        pub fn next(it: *RecordIter, svc: *ObjectService, bid: core.BucketId) Error!?metadata.ObjectRecord {
             while (it.i < it.keys.len) {
                 const k = it.keys[it.i];
                 it.i += 1;
@@ -252,9 +251,14 @@ pub const ObjectService = struct {
             }
             return null;
         }
+
+        /// Physical key of the record last returned by `next`.
+        pub fn lastKey(it: *const RecordIter) backend.PhysicalKey {
+            return it.keys[it.i - 1];
+        }
     };
 
-    fn scanRecords(self: *ObjectService, arena: std.mem.Allocator) Error!RecordIter {
+    pub fn scanRecords(self: *ObjectService, arena: std.mem.Allocator) Error!RecordIter {
         const Collect = struct {
             arena: std.mem.Allocator,
             keys: std.ArrayList(backend.PhysicalKey) = .empty,
@@ -272,7 +276,7 @@ pub const ObjectService = struct {
     }
 };
 
-fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
+pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
     return .{
         .key = r.key,
         .size = r.size,
@@ -280,10 +284,16 @@ fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .created_ns = r.created_ns,
         .content_type = r.content_type,
         .object_id = r.object_id,
+        .version_id = r.versionId(),
+        .delete_marker = r.flags.delete_marker,
+        .retention_mode = r.retention_mode,
+        .retain_until_ns = r.retain_until_ns,
+        .legal_hold = r.flags.legal_hold,
+        .tags = r.tags,
     };
 }
 
-fn mapBackend(e: backend.Error) Error {
+pub fn mapBackend(e: backend.Error) Error {
     return switch (e) {
         error.NoSpace => error.NoSpace,
         error.ReadFailed => error.ReadFailed,
@@ -293,7 +303,7 @@ fn mapBackend(e: backend.Error) Error {
     };
 }
 
-fn validKey(key: []const u8) Error!void {
+pub fn validKey(key: []const u8) Error!void {
     if (key.len == 0) return error.InvalidKey;
     if (key.len > metadata.record.max_key_len) return error.KeyTooLong;
 }
