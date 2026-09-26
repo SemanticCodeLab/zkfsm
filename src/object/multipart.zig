@@ -9,6 +9,7 @@ const metadata = @import("../metadata/root.zig");
 const io = @import("../io/root.zig");
 const service = @import("service.zig");
 const blob = @import("blob.zig");
+const copy = @import("copy.zig");
 
 const ObjectService = service.ObjectService;
 const Md5 = core.checksum.Md5;
@@ -28,10 +29,15 @@ pub const Error = service.Error || error{
     EntityTooSmall,
     /// Part number outside 1..10000, or an empty part list.
     InvalidPartNumber,
+    /// Copy source range outside the source object.
+    InvalidRange,
 };
 
 pub const min_part_size: u64 = 5 * 1024 * 1024;
 pub const max_part_number: u16 = upload.max_parts;
+
+/// Inclusive byte range of a copy source.
+pub const CopyRange = struct { first: u64, last: u64 };
 
 /// A part as named by the client in CompleteMultipartUpload.
 pub const PartRef = struct { number: u16, md5: [16]u8 };
@@ -108,6 +114,33 @@ pub fn uploadPart(
     keep_blob = true;
     if (replaced) |r| svc.store.delete(placement.dataKey(r)) catch {};
     return .{ .md5 = digest };
+}
+
+/// UploadPartCopy: the part's bytes come from an existing object, optionally a
+/// byte range `first..last` (inclusive) of it.
+pub fn uploadPartCopy(
+    svc: *ObjectService,
+    bucket: []const u8,
+    key: []const u8,
+    id: UploadId,
+    number: u16,
+    src: copy.Source,
+    range: ?CopyRange,
+) Error!core.ETag {
+    var arena = std.heap.ArenaAllocator.init(svc.gpa);
+    defer arena.deinit();
+    const info = try svc.head(arena.allocator(), src.bucket, src.key);
+    var seg: blob.Segment = .{ .blob = info.object_id, .offset = 0, .length = info.size };
+    if (range) |r| {
+        if (r.last < r.first or r.last >= info.size) return error.InvalidRange;
+        seg = .{ .blob = info.object_id, .offset = r.first, .length = r.last - r.first + 1 };
+    }
+    var buf: [64 * 1024]u8 = undefined;
+    var br = blob.BlobReader.init(svc.store, (&seg)[0..1], &buf);
+    return uploadPart(svc, bucket, key, id, number, &br.reader, seg.length) catch |e| switch (e) {
+        error.ReadFailed => if (br.err) |be| (if (be == error.NotFound) error.NoSuchKey else service.mapBackend(be)) else error.ReadFailed,
+        else => e,
+    };
 }
 
 /// Validates the client's part list, concatenates the parts into the final object,
@@ -423,15 +456,27 @@ test "multipart abort, part number bounds, and stale sweep" {
     try testing.expectError(error.InvalidPartNumber, fx.put(id, 0, "x"));
     try testing.expectError(error.InvalidPartNumber, fx.put(id, max_part_number + 1, "x"));
     try testing.expectError(error.NoSuchUpload, fx.put(UploadId.random(), 1, "x"));
+    try fx.svc.createBucket("src");
+    var body: std.Io.Reader = .fixed("0123456789");
+    _ = try fx.svc.put("src", "obj", &body, .{});
+    const cp = try uploadPartCopy(&fx.svc, "bkt", "big", id, 2, .{ .bucket = "src", .key = "obj" }, .{ .first = 2, .last = 4 });
+    var want: [16]u8 = undefined;
+    Md5.hash("234", &want, .{});
+    try testing.expectEqualSlices(u8, &want, &cp.md5);
+    const src: copy.Source = .{ .bucket = "src", .key = "obj" };
+    try testing.expectError(error.InvalidRange, uploadPartCopy(&fx.svc, "bkt", "big", id, 3, src, .{ .first = 5, .last = 10 }));
+    try testing.expectError(error.NoSuchKey, uploadPartCopy(&fx.svc, "bkt", "big", id, 3, .{ .bucket = "src", .key = "no" }, null));
     try abort(&fx.svc, "bkt", "big", id);
     try testing.expectError(error.NoSuchUpload, abort(&fx.svc, "bkt", "big", id));
-    try testing.expectEqual(@as(usize, 0), try fx.dataBlobs());
+    try testing.expectEqual(@as(usize, 1), try fx.dataBlobs()); // src/obj
 
     const old = try create(&fx.svc, "bkt", "big", "");
     _ = try fx.put(old, 1, "x");
     const now = core.time.nowNs();
     try testing.expectEqual(@as(usize, 0), try sweepStale(&fx.svc, now, std.time.ns_per_hour));
     try testing.expectEqual(@as(usize, 1), try sweepStale(&fx.svc, now + 2 * std.time.ns_per_hour, std.time.ns_per_hour));
-    try testing.expectEqual(@as(usize, 0), try fx.dataBlobs());
-    try testing.expectEqual(@as(usize, 0), (try listUploads(&fx.svc, testing.allocator, "bkt", "")).len);
+    try testing.expectEqual(@as(usize, 1), try fx.dataBlobs()); // src/obj
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(@as(usize, 0), (try listUploads(&fx.svc, arena.allocator(), "bkt", "")).len);
 }
