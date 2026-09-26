@@ -17,7 +17,7 @@ const Code = errors.Code;
 /// Errors that end the connection; S3-level failures become XML responses instead.
 pub const ConnError = error{ WriteFailed, ReadFailed, HttpExpectationFailed, OutOfMemory, StreamAborted };
 
-const io_buf_len = 64 * 1024;
+pub const io_buf_len = 64 * 1024;
 const max_list_keys = 1000;
 
 /// Request fields copied out of the head before the body reader invalidates it.
@@ -64,7 +64,7 @@ pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocato
         error.InvalidUri => return fail(&ctx, .InvalidURI),
     };
     if (!sigv4.authorize(req)) return fail(&ctx, .InternalError);
-    if (multipart.isMultipartRequest(ctx.route.query)) return fail(&ctx, .NotImplemented);
+    if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
         else => |oe| return fail(&ctx, errors.fromObject(oe)),
@@ -177,7 +177,8 @@ fn listObjects(c: *Ctx) DispatchError!void {
         try w.writeAll("<Contents>");
         try xml.elem(w, "Key", e.key);
         try xml.elem(w, "LastModified", core.time.iso8601(e.mtime_ns, &tb));
-        try xml.elem(w, "ETag", &e.etag.quoted());
+        var eb: [core.ETag.quoted_max]u8 = undefined;
+        try xml.elem(w, "ETag", e.etag.quoted(&eb));
         try xml.elemInt(w, "Size", e.size);
         try w.writeAll("<StorageClass>STANDARD</StorageClass></Contents>");
     }
@@ -199,9 +200,9 @@ fn putObject(c: *Ctx) DispatchError!void {
     var in: object.PutInput = .{ .content_type = c.content_type, .content_length = len };
     if (!try versioning.putExtras(c, &in)) return;
     const info = try c.svc.put(c.route.bucket, c.route.key, body, in);
-    const etag = info.etag.quoted();
+    var eb: [core.ETag.quoted_max]u8 = undefined;
     var hdrs: std.ArrayList(Header) = .empty;
-    try hdrs.append(c.arena, .{ .name = "etag", .value = &etag });
+    try hdrs.append(c.arena, .{ .name = "etag", .value = info.etag.quoted(&eb) });
     try versioning.putResponseHeaders(c, info, &hdrs);
     try respondEmpty(c, .ok, hdrs.items);
 }
@@ -216,17 +217,18 @@ fn getObject(c: *Ctx) DispatchError!void {
         };
     } else |_| {}; // malformed Range is ignored, as S3 does
 
-    const etag = info.etag.quoted();
+    var eb: [core.ETag.quoted_max]u8 = undefined;
+    const etag = info.etag.quoted(&eb);
     var db: [29]u8 = undefined;
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, &.{
-        .{ .name = "etag", .value = &etag },
+        .{ .name = "etag", .value = etag },
         .{ .name = "last-modified", .value = core.time.httpDate(info.created_ns, &db) },
         .{ .name = "accept-ranges", .value = "bytes" },
         .{ .name = "content-type", .value = if (info.content_type.len > 0) info.content_type else "binary/octet-stream" },
     });
     try versioning.objectHeaders(c, info, (try param(c, "versionId")) != null, &hdrs);
-    if (!try versioning.checkRead(c, info, &etag, hdrs.items)) return;
+    if (!try versioning.checkRead(c, info, etag, hdrs.items)) return;
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     if (range) |r| try hdrs.append(c.arena, .{
         .name = "content-range",
@@ -246,11 +248,18 @@ fn getObject(c: *Ctx) DispatchError!void {
 }
 
 pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {
+    return respondXmlWith(c, status, body, &.{});
+}
+
+pub fn respondXmlWith(c: *Ctx, status: std.http.Status, body: []const u8, extra: []const Header) ConnError!void {
     metrics.global.last_status = @intFromEnum(status);
-    try c.req.respond(body, .{ .status = status, .extra_headers = &.{
+    var hdrs: std.ArrayList(Header) = .empty;
+    try hdrs.appendSlice(c.arena, extra);
+    try hdrs.appendSlice(c.arena, &.{
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
-    } });
+    });
+    try c.req.respond(body, .{ .status = status, .extra_headers = hdrs.items });
 }
 
 pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {

@@ -422,7 +422,8 @@ fn listVersions(c: *Ctx) DispatchError!void {
         try xml.elemBool(w, "IsLatest", e.is_latest);
         try xml.elem(w, "LastModified", core.time.iso8601(e.mtime_ns, &tb));
         if (!e.delete_marker) {
-            try xml.elem(w, "ETag", &e.etag.quoted());
+            var eb: [core.ETag.quoted_max]u8 = undefined;
+            try xml.elem(w, "ETag", e.etag.quoted(&eb));
             try xml.elemInt(w, "Size", e.size);
             try xml.elem(w, "StorageClass", "STANDARD");
         }

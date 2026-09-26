@@ -4,8 +4,9 @@ const core = @import("../core/root.zig");
 const codec = @import("codec.zig");
 
 pub const magic = "ZKOR";
-/// v2 adds flags, retention, and tags; v1 records still decode (as null versions).
-pub const format_version: u16 = 2;
+/// v2 adds flags, retention, and tags; v3 adds the multipart part count.
+/// Older records still decode (v1 as null versions).
+pub const format_version: u16 = 3;
 pub const max_key_len = 1024;
 
 pub const Error = codec.DecodeError || error{ KeyTooLong, OutOfMemory };
@@ -83,13 +84,14 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try codec.putInt(w, i128, r.retain_until_ns);
     try codec.putInt(w, u16, @intCast(r.tags.len));
     try w.writeAll(r.tags);
+    try codec.putInt(w, u32, r.etag.parts);
 }
 
 pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
     var c: codec.Cursor = .{ .bytes = bytes };
     if (!std.mem.eql(u8, try c.take(4), magic)) return error.Corrupt;
     const ver = try c.int(u16);
-    if (ver != 1 and ver != 2) return error.Corrupt;
+    if (ver < 1 or ver > format_version) return error.Corrupt;
     var r: ObjectRecord = .{
         .object_id = undefined,
         .bucket_id = undefined,
@@ -127,6 +129,7 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         r.retain_until_ns = try c.int(i128);
         r.tags = try c.take(try c.int(u16));
     }
+    if (ver >= 3) r.etag.parts = try c.int(u32);
     if (c.pos != bytes.len) return error.Corrupt;
     return r;
 }
@@ -140,7 +143,7 @@ test "record encode/decode roundtrip" {
         .bucket_id = core.BucketId.random(),
         .version = core.VersionId.random(),
         .size = 1,
-        .etag = .{ .md5 = md5 },
+        .etag = .{ .md5 = md5, .parts = 3 },
         .checksum = core.Checksum.fromMd5(md5),
         .created_ns = 1234567890123,
         .key = "photos/dog.jpg",
@@ -154,6 +157,7 @@ test "record encode/decode roundtrip" {
     try std.testing.expectEqualStrings(r.content_type, d.content_type);
     try std.testing.expectEqual(r.size, d.size);
     try std.testing.expectEqual(r.created_ns, d.created_ns);
+    try std.testing.expectEqual(@as(u32, 3), d.etag.parts);
     try std.testing.expectEqualSlices(u8, &md5, d.checksum.digest[0..16]);
 
     try std.testing.expect(!d.flags.null_version);
@@ -191,7 +195,7 @@ test "v2 fields roundtrip and v1 records still decode" {
     try std.testing.expectEqualStrings("\x01", d.tags);
 
     // A v1 record is the v2 prefix up to the user-metadata count.
-    const v1_len = bytes.len - (1 + 1 + 16 + 2 + 1);
+    const v1_len = bytes.len - (1 + 1 + 16 + 2 + 1 + 4);
     const v1 = try gpa.dupe(u8, bytes[0..v1_len]);
     defer gpa.free(v1);
     v1[4] = 1;

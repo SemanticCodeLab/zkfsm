@@ -4,6 +4,9 @@ pub const list = @import("list.zig");
 pub const versioning = @import("versioning.zig");
 pub const lock = @import("lock.zig");
 pub const conditional = @import("conditional.zig");
+pub const blob = @import("blob.zig");
+pub const copy = @import("copy.zig");
+pub const multipart = @import("multipart.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -28,4 +31,7 @@ test {
     _ = versioning;
     _ = lock;
     _ = conditional;
+    _ = blob;
+    _ = copy;
+    _ = multipart;
 }
