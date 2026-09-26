@@ -7,13 +7,16 @@ const s3 = @import("s3/root.zig");
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
-    \\usage: zkfsm [--data DIR] [--listen HOST:PORT]
-    \\  --data     data root (default: $ZKFSM_DATA, else ./data)
-    \\  --listen   listen address (default: 0.0.0.0:9000)
+    \\usage: zkfsm [--data DIR] [--listen HOST:PORT] [--anonymous]
+    \\  --data       data root (default: $ZKFSM_DATA, else ./data)
+    \\  --listen     listen address (default: 0.0.0.0:9000)
+    \\  --anonymous  serve without authentication when no credentials are set
+    \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY
+    \\             (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
 
-const Config = struct { data: []const u8, host: []const u8, port: u16 };
+const Config = struct { data: []const u8, host: []const u8, port: u16, anonymous: bool = false };
 
 const ConfigError = error{ BadArgs, HelpRequested };
 
@@ -23,6 +26,10 @@ fn parseArgs(args: []const []const u8, env_data: ?[]const u8) ConfigError!Config
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.HelpRequested;
+        if (std.mem.eql(u8, a, "--anonymous")) {
+            cfg.anonymous = true;
+            continue;
+        }
         if (i + 1 >= args.len) return error.BadArgs;
         i += 1;
         if (std.mem.eql(u8, a, "--data")) {
@@ -47,6 +54,18 @@ pub fn main() u8 {
         std.debug.print("{s}", .{usage});
         return if (e == error.HelpRequested) 0 else 2;
     };
+    const creds = loadCredentials(gpa) catch |e| {
+        std.log.err("{s}", .{switch (e) {
+            error.Incomplete => "access key and secret key must be set together",
+            error.OutOfMemory => "out of memory",
+        }});
+        return 2;
+    };
+    if (creds == null and !cfg.anonymous) {
+        std.log.err("no credentials: set ZKFSM_ACCESS_KEY and ZKFSM_SECRET_KEY, or pass --anonymous", .{});
+        return 2;
+    }
+    if (creds == null) std.log.warn("anonymous mode: requests are not authenticated", .{});
     const addr = std.net.Address.parseIp(cfg.host, cfg.port) catch {
         std.log.err("invalid listen address {s}", .{cfg.host});
         return 2;
@@ -62,12 +81,36 @@ pub fn main() u8 {
     };
     defer svc.deinit();
     std.log.info("data root {s}", .{cfg.data});
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc };
+    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = .{ .creds = creds } };
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
     return 0;
+}
+
+/// Root credentials from the environment; process-lifetime, never freed.
+fn loadCredentials(gpa: std.mem.Allocator) error{ Incomplete, OutOfMemory }!?s3.sigv4.Credentials {
+    const pairs = [_][2][]const u8{
+        .{ "ZKFSM_ACCESS_KEY", "ZKFSM_SECRET_KEY" },
+        .{ "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD" },
+    };
+    for (pairs) |p| {
+        const ak = envVar(gpa, p[0]) catch return error.OutOfMemory;
+        const sk = envVar(gpa, p[1]) catch return error.OutOfMemory;
+        if (ak == null and sk == null) continue;
+        return .{ .access_key = ak orelse return error.Incomplete, .secret_key = sk orelse return error.Incomplete };
+    }
+    return null;
+}
+
+fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {
+    const v = std.process.getEnvVarOwned(gpa, name) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    if (v.len == 0) return null;
+    return v;
 }
 
 test "arg parsing" {
@@ -76,6 +119,7 @@ test "arg parsing" {
     try std.testing.expectEqual(@as(u16, 9100), c.port);
     try std.testing.expectEqualStrings("env", (try parseArgs(&.{"zkfsm"}, "env")).data);
     try std.testing.expectError(error.BadArgs, parseArgs(&.{ "zkfsm", "--listen", "nope" }, null));
+    try std.testing.expect((try parseArgs(&.{ "zkfsm", "--anonymous", "--data", "d" }, null)).anonymous);
 }
 
 test {

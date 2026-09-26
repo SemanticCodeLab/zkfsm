@@ -28,12 +28,12 @@ const Ctx = struct {
     route: router.Target,
     range: ?[]const u8,
     content_type: []const u8,
-    content_sha256: ?[]const u8,
     copy_source: bool,
+    auth: sigv4.Auth,
     request_id: [16]u8,
 };
 
-pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocator) ConnError!void {
+pub fn handle(svc: *object.ObjectService, auth_cfg: sigv4.Config, req: *Request, arena: std.mem.Allocator) ConnError!void {
     // No length and no chunking means an empty body (RFC 9112 6.3); std asserts otherwise.
     if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
     var ctx: Ctx = .{
@@ -45,21 +45,23 @@ pub fn handle(svc: *object.ObjectService, req: *Request, arena: std.mem.Allocato
         .route = undefined,
         .range = null,
         .content_type = try arena.dupe(u8, req.head.content_type orelse ""),
-        .content_sha256 = null,
         .copy_source = false,
+        .auth = .{},
         .request_id = std.fmt.bytesToHex(core.ObjectId.random().bytes[0..8].*, .upper),
     };
     var hit = req.iterateHeaders();
     while (hit.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
-        if (std.ascii.eqlIgnoreCase(h.name, "x-amz-content-sha256")) ctx.content_sha256 = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
     }
     ctx.route = router.parse(arena, ctx.target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
     };
-    if (!sigv4.authorize(req)) return fail(&ctx, .InternalError);
+    switch (try sigv4.verify(arena, auth_cfg, try sigv4.Input.fromRequest(arena, req), std.time.timestamp())) {
+        .ok => |a| ctx.auth = a,
+        .denied => |code| return fail(&ctx, code),
+    }
     if (multipart.isMultipartRequest(ctx.route.query)) return fail(&ctx, .NotImplemented);
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
@@ -187,11 +189,14 @@ fn listObjects(c: *Ctx) DispatchError!void {
 
 fn putObject(c: *Ctx) DispatchError!void {
     if (c.copy_source) return fail(c, .NotImplemented);
-    if (c.content_sha256) |s| if (std.mem.startsWith(u8, s, "STREAMING-")) return fail(c, .NotImplemented);
-    const len = c.req.head.content_length;
     var body_buf: [io_buf_len]u8 = undefined;
-    const body = try c.req.readerExpectContinue(&body_buf);
-    const info = try c.svc.put(c.route.bucket, c.route.key, body, .{ .content_type = c.content_type, .content_length = len });
+    var check_buf: [io_buf_len]u8 = undefined;
+    var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    const len = br.contentLength(c.req.head.content_length);
+    const info = c.svc.put(c.route.bucket, c.route.key, br.body(), .{ .content_type = c.content_type, .content_length = len }) catch |e| {
+        if (br.failure) |code| return fail(c, code);
+        return e;
+    };
     const etag = info.etag.quoted();
     try respondEmpty(c, .ok, &.{.{ .name = "etag", .value = &etag }});
 }

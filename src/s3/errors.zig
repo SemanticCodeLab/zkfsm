@@ -18,6 +18,12 @@ pub const Code = enum {
     NotImplemented,
     InternalError,
     ServiceUnavailable,
+    AccessDenied,
+    SignatureDoesNotMatch,
+    InvalidAccessKeyId,
+    RequestTimeTooSkewed,
+    AuthorizationHeaderMalformed,
+    XAmzContentSHA256Mismatch,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -29,6 +35,8 @@ pub const Code = enum {
             .NotImplemented => .not_implemented,
             .InternalError => .internal_server_error,
             .ServiceUnavailable => .service_unavailable,
+            .AccessDenied, .SignatureDoesNotMatch, .InvalidAccessKeyId, .RequestTimeTooSkewed => .forbidden,
+            .AuthorizationHeaderMalformed, .XAmzContentSHA256Mismatch => .bad_request,
         };
     }
 
@@ -48,6 +56,12 @@ pub const Code = enum {
             .NotImplemented => "A header or query you provided implies functionality that is not implemented",
             .InternalError => "We encountered an internal error. Please try again.",
             .ServiceUnavailable => "Reduce your request rate or retry later.",
+            .AccessDenied => "Access Denied",
+            .SignatureDoesNotMatch => "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
+            .InvalidAccessKeyId => "The AWS Access Key Id you provided does not exist in our records.",
+            .RequestTimeTooSkewed => "The difference between the request time and the server's time is too large.",
+            .AuthorizationHeaderMalformed => "The authorization header or query parameters are malformed.",
+            .XAmzContentSHA256Mismatch => "The provided 'x-amz-content-sha256' header does not match what was computed.",
         };
     }
 };

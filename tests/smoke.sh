@@ -28,7 +28,7 @@ wait_up() {
 }
 
 (cd "$ROOT" && zig build)
-"$ROOT/zig-out/bin/zkfsm" --data "$DATA" --listen "127.0.0.1:$PORT" 2>"$WORK/server.log" &
+"$ROOT/zig-out/bin/zkfsm" --anonymous --data "$DATA" --listen "127.0.0.1:$PORT" 2>"$WORK/server.log" &
 PID=$!
 wait_up
 
@@ -90,7 +90,7 @@ check "keep-alive" "200 200" "$(curl -s -o /dev/null -o /dev/null -w '%{http_cod
 curl -s -o /dev/null -X PUT "$EP/persist"
 echo -n "durable" | curl -s -o /dev/null -T - "$EP/persist/k"
 kill "$PID"; wait "$PID" 2>/dev/null || true
-"$ROOT/zig-out/bin/zkfsm" --data "$DATA" --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
+"$ROOT/zig-out/bin/zkfsm" --anonymous --data "$DATA" --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
 PID=$!
 wait_up
 check "survives restart" "durable" "$(curl -s "$EP/persist/k")"

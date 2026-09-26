@@ -2,12 +2,14 @@
 const std = @import("std");
 const object = @import("../object/root.zig");
 const handler = @import("handler.zig");
+const sigv4 = @import("sigv4.zig");
 
 pub const RunError = error{ListenFailed};
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
     svc: *object.ObjectService,
+    auth: sigv4.Config,
 
     pub fn run(self: *Server, addr: std.net.Address) RunError!void {
         var listener = addr.listen(.{ .reuse_address = true }) catch return error.ListenFailed;
@@ -34,11 +36,16 @@ pub const Server = struct {
         var sw = conn.stream.writer(&wbuf);
         var http = std.http.Server.init(sr.interface(), &sw.interface);
         while (true) {
-            var req = http.receiveHead() catch return;
-            const keep_alive = req.head.keep_alive;
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();
-            handler.handle(self.svc, &req, arena.allocator()) catch |e| {
+            const head_buffer = http.reader.receiveHead() catch return;
+            var req: std.http.Server.Request = .{
+                .server = &http,
+                .head_buffer = head_buffer,
+                .head = sigv4.parseHead(arena.allocator(), head_buffer) catch return,
+            };
+            const keep_alive = req.head.keep_alive;
+            handler.handle(self.svc, self.auth, &req, arena.allocator()) catch |e| {
                 std.log.debug("connection closed: {t}", .{e});
                 return;
             };
