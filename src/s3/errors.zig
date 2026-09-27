@@ -43,6 +43,10 @@ pub const Code = enum {
     MetadataTooLarge,
     BadDigest,
     InvalidDigest,
+    NoSuchLifecycleConfiguration,
+    NoSuchBucketPolicy,
+    MalformedPolicy,
+    InvalidPartNumber,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -62,6 +66,9 @@ pub const Code = enum {
             .InvalidBucketState => .conflict,
             .NoSuchUpload => .not_found,
             .InvalidPart, .InvalidPartOrder, .EntityTooSmall, .EntityTooLarge, .MetadataTooLarge, .BadDigest, .InvalidDigest => .bad_request,
+            .NoSuchLifecycleConfiguration, .NoSuchBucketPolicy => .not_found,
+            .MalformedPolicy => .bad_request,
+            .InvalidPartNumber => .range_not_satisfiable,
         };
     }
 
@@ -106,6 +113,10 @@ pub const Code = enum {
             .MetadataTooLarge => "Your metadata headers exceed the maximum allowed metadata size.",
             .BadDigest => "The Content-MD5 you specified did not match what we received.",
             .InvalidDigest => "The Content-MD5 you specified is not valid.",
+            .NoSuchLifecycleConfiguration => "The lifecycle configuration does not exist",
+            .NoSuchBucketPolicy => "The bucket policy does not exist",
+            .MalformedPolicy => "Policies must be valid JSON and the first byte must be '{'",
+            .InvalidPartNumber => "The requested partnumber is not satisfiable",
         };
     }
 };

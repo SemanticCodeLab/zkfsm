@@ -29,7 +29,7 @@ wait_up() {
 }
 
 (cd "$ROOT" && zig build)
-"$ROOT/zig-out/bin/zkfsm" --anonymous --data "$DATA" --listen "127.0.0.1:$PORT" 2>"$WORK/server.log" &
+"$ROOT/zig-out/bin/zkfsm" --anonymous --domain s3.local --data "$DATA" --listen "127.0.0.1:$PORT" 2>"$WORK/server.log" &
 PID=$!
 wait_up
 
@@ -128,6 +128,16 @@ check "mp content-type" "application/x-mp" "$(header content-type -I "$EP/mpb/bi
 check "mp metadata" "yes" "$(header x-amz-meta-mp -I "$EP/mpb/big")"
 check "mp body" "$(md5sum < "$WORK/whole")" "$(curl -s "$EP/mpb/big" | md5sum)"
 check "mp range across parts" "$(tail -c +5999991 "$WORK/whole" | head -c 20 | md5sum)" "$(curl -s -r 5999990-6000009 "$EP/mpb/big" | md5sum)"
+check "part 2 status" 206 "$(status "$EP/mpb/big?partNumber=2")"
+check "part 2 body" "$(md5sum < "$WORK/p2")" "$(curl -s "$EP/mpb/big?partNumber=2" | md5sum)"
+check "part 1 body" "$(md5sum < "$WORK/p1")" "$(curl -s "$EP/mpb/big?partNumber=1" | md5sum)"
+check "part content-range" "bytes 6000000-6001233/6001234" "$(header content-range "$EP/mpb/big?partNumber=2")"
+check "part parts count" 2 "$(header x-amz-mp-parts-count -I "$EP/mpb/big?partNumber=1")"
+check "part head length" 1234 "$(header content-length -I "$EP/mpb/big?partNumber=2")"
+check "part out of range" 416 "$(status "$EP/mpb/big?partNumber=3")"
+check "part out of range code" 1 "$(curl -s "$EP/mpb/big?partNumber=3" | grep -c '<Code>InvalidPartNumber</Code>')"
+check "part with range" 400 "$(status -r 0-1 "$EP/mpb/big?partNumber=1")"
+check "part zero" 400 "$(status "$EP/mpb/big?partNumber=0")"
 check "mp upload gone" 404 "$(status "$EP/mpb/big?uploadId=$UPID")"
 check "mp no uploads left" 0 "$(curl -s "$EP/mpb?uploads" | grep -c '<Upload>')"
 
@@ -300,15 +310,78 @@ check "get legal hold" 1 "$(curl -s "$L/h?legal-hold" | grep -c '<Status>ON</Sta
 check "legal hold blocks delete" 403 "$(status -X DELETE -H 'x-amz-bypass-governance-retention: true' "$L/h?versionId=$HV")"
 check "retention on plain bucket" 400 "$(status -X PUT --data-binary "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>$FUT</RetainUntilDate></Retention>" "$EP/cond/k?retention")"
 
+# ACLs: canned private only.
+curl -s -o /dev/null -X PUT "$EP/aclb"
+echo -n a | curl -s -o /dev/null -T - "$EP/aclb/k"
+check "get bucket acl" 1 "$(curl -s "$EP/aclb?acl" | grep -c '<Permission>FULL_CONTROL</Permission>')"
+check "get object acl" 1 "$(curl -s "$EP/aclb/k?acl" | grep -c '<Owner><ID>zkfsm</ID>')"
+check "get acl missing object" 404 "$(status "$EP/aclb/nope?acl")"
+check "put bucket acl private" 200 "$(status -X PUT -H 'x-amz-acl: private' "$EP/aclb?acl")"
+check "put object acl private" 200 "$(status -X PUT -H 'x-amz-acl: private' "$EP/aclb/k?acl")"
+check "put object acl public" 501 "$(status -X PUT -H 'x-amz-acl: public-read' "$EP/aclb/k?acl")"
+check "put acl grant header" 501 "$(status -X PUT -H 'x-amz-grant-read: id=x' "$EP/aclb?acl")"
+check "put acl owner body" 200 "$(curl -s "$EP/aclb?acl" | status -X PUT --data-binary @- "$EP/aclb/k?acl")"
+check "single part partNumber=1" 200 "$(status "$EP/aclb/k?partNumber=1")"
+check "single part partNumber=2" 416 "$(status "$EP/aclb/k?partNumber=2")"
+
+# ListObjects v1 (marker pagination).
+for k in a b c/d c/e; do echo -n x | curl -s -o /dev/null -T - "$EP/aclb/v1-$k"; done
+V1=$(curl -s "$EP/aclb?prefix=v1-&max-keys=2")
+check "v1 list keys" 2 "$(grep -o '<Key>' <<<"$V1" | wc -l)"
+check "v1 no key count" 0 "$(grep -c '<KeyCount>' <<<"$V1")"
+check "v1 truncated" 1 "$(grep -c '<IsTruncated>true</IsTruncated>' <<<"$V1")"
+check "v1 next marker" "v1-b" "$(sed -n 's/.*<NextMarker>\([^<]*\)<.*/\1/p' <<<"$V1")"
+V1B=$(curl -s "$EP/aclb?prefix=v1-&marker=v1-b&delimiter=/")
+check "v1 marker page" 1 "$(grep -c '<Marker>v1-b</Marker>' <<<"$V1B")"
+check "v1 common prefix" 1 "$(grep -c '<CommonPrefixes><Prefix>v1-c/</Prefix></CommonPrefixes>' <<<"$V1B")"
+check "v1 owner" 1 "$(curl -s "$EP/aclb?prefix=v1-a" | grep -c '<Owner><ID>zkfsm</ID>')"
+check "v1 url encoding" 1 "$(curl -s "$EP/aclb?prefix=v1-c/&encoding-type=url" | grep -c '<Key>v1-c/d</Key>')"
+
+# Virtual-host-style addressing (--domain s3.local).
+VH=(-H "Host: aclb.s3.local:$PORT")
+check "vhost get" "a" "$(curl -s "${VH[@]}" "$EP/k")"
+check "vhost list" 1 "$(curl -s "${VH[@]}" "$EP/?list-type=2&prefix=k" | grep -c '<Key>k</Key>')"
+check "vhost put" 200 "$(echo -n vh | status -T - "${VH[@]}" "$EP/dir/vh.txt")"
+check "vhost path-style read" "vh" "$(curl -s "$EP/aclb/dir/vh.txt")"
+check "vhost resolve" "vh" "$(curl -s --resolve "aclb.s3.local:$PORT:127.0.0.1" "http://aclb.s3.local:$PORT/dir/vh.txt")"
+check "bare domain is path style" 1 "$(curl -s -H "Host: s3.local:$PORT" "$EP/aclb?list-type=2&prefix=k" | grep -c '<Key>k</Key>')"
+check "absolute-form target" "vh" "$(curl -s --proxy "$EP" "http://aclb.s3.local:$PORT/dir/vh.txt")"
+
+# Bucket policy and lifecycle configuration (anonymous mode stores them; see s3cli.sh for enforcement).
+POL='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::aclb/*"}]}'
+check "no bucket policy" 1 "$(curl -s "$EP/aclb?policy" | grep -c '<Code>NoSuchBucketPolicy</Code>')"
+check "put bucket policy" 204 "$(status -X PUT --data-binary "$POL" "$EP/aclb?policy")"
+check "get bucket policy" "$POL" "$(curl -s "$EP/aclb?policy")"
+check "policy status" 1 "$(curl -s "$EP/aclb?policyStatus" | grep -c '<IsPublic>true</IsPublic>')"
+check "malformed policy" 1 "$(curl -s -X PUT --data-binary '{"nope":1}' "$EP/aclb?policy" | grep -c '<Code>MalformedPolicy</Code>')"
+check "policy other bucket" 400 "$(status -X PUT --data-binary "${POL/aclb/other}" "$EP/aclb?policy")"
+check "delete bucket policy" 204 "$(status -X DELETE "$EP/aclb?policy")"
+check "policy gone" 404 "$(status "$EP/aclb?policy")"
+LC='<LifecycleConfiguration><Rule><ID>tmp</ID><Filter><And><Prefix>tmp/</Prefix><Tag><Key>t</Key><Value>1</Value></Tag></And></Filter><Status>Enabled</Status><Expiration><Days>3</Days></Expiration></Rule><Rule><ID>mpu</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload><NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays><NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>'
+check "no lifecycle" 1 "$(curl -s "$EP/aclb?lifecycle" | grep -c '<Code>NoSuchLifecycleConfiguration</Code>')"
+check "put lifecycle" 200 "$(status -X PUT --data-binary "$LC" "$EP/aclb?lifecycle")"
+GLC=$(curl -s "$EP/aclb?lifecycle")
+check "get lifecycle rules" 2 "$(grep -o '<Rule>' <<<"$GLC" | wc -l)"
+check "get lifecycle and filter" 1 "$(grep -c '<Filter><And><Prefix>tmp/</Prefix><Tag><Key>t</Key><Value>1</Value></Tag></And></Filter>' <<<"$GLC")"
+check "get lifecycle noncurrent" 1 "$(grep -c '<NoncurrentDays>30</NoncurrentDays><NewerNoncurrentVersions>2</NewerNoncurrentVersions>' <<<"$GLC")"
+check "lifecycle transition" 501 "$(status -X PUT --data-binary '<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>COLD</StorageClass></Transition></Rule></LifecycleConfiguration>' "$EP/aclb?lifecycle")"
+check "lifecycle bad days" 400 "$(status -X PUT --data-binary '<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>' "$EP/aclb?lifecycle")"
+check "lifecycle malformed" 1 "$(curl -s -X PUT --data-binary 'junk' "$EP/aclb?lifecycle" | grep -c '<Code>MalformedXML</Code>')"
+check "lifecycle kept after bad put" 2 "$(curl -s "$EP/aclb?lifecycle" | grep -o '<Rule>' | wc -l)"
+check "delete lifecycle" 204 "$(status -X DELETE "$EP/aclb?lifecycle")"
+check "lifecycle gone" 404 "$(status "$EP/aclb?lifecycle")"
+
 # Persistence across restart.
 curl -s -o /dev/null -X PUT "$EP/persist"
 echo -n "durable" | curl -s -o /dev/null -T - "$EP/persist/k"
+curl -s -o /dev/null -X PUT --data-binary "$LC" "$EP/persist?lifecycle"
 kill "$PID"; wait "$PID" 2>/dev/null || true
-"$ROOT/zig-out/bin/zkfsm" --anonymous --data "$DATA" --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
+"$ROOT/zig-out/bin/zkfsm" --anonymous --domain s3.local --data "$DATA" --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
 PID=$!
 wait_up
 check "survives restart" "durable" "$(curl -s "$EP/persist/k")"
 check "versions survive restart" "$CV" "$(header x-amz-version-id -I "$EP/locked/c")"
+check "lifecycle survives restart" 2 "$(curl -s "$EP/persist?lifecycle" | grep -o '<Rule>' | wc -l)"
 check "lock survives restart" 403 "$(status -X DELETE "$EP/locked/c?versionId=$CV")"
 
 echo "smoke: $pass passed, $fail failed"

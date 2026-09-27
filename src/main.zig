@@ -8,11 +8,16 @@ const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
 const metrics = @import("metrics/root.zig");
 const iam = @import("iam/root.zig");
+const admin = @import("admin/root.zig");
+const admin_http = @import("admin_http.zig");
+const tls = @import("tls/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
     \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
+    \\             [--domain D]... [--path-prefix P] [--health-prefix P] [--metrics-path P] [--no-minio-compat]
+    \\             [--lifecycle-interval S]
     \\  heal             run one scan/heal pass over the drives and exit
     \\  --data           one or more drives; /data{1...4} expands (default: $ZKFSM_DATA, else ./data)
     \\  --listen         listen address (default: 0.0.0.0:9000)
@@ -20,6 +25,25 @@ const usage =
     \\                   default: stored in the drive format, else replica:2 with 2+ drives
     \\  --scan-interval  seconds between background heal passes, 0 disables (default: 600)
     \\  --anonymous      serve without authentication when no credentials are set
+    \\  --domain         virtual-host domain: Host {bucket}.D addresses the bucket; repeatable
+    \\                   (default: $ZKFSM_DOMAIN, comma-separated)
+    \\  --path-prefix    base path of the S3 API, e.g. /s3 (default: $ZKFSM_PATH_PREFIX, else /)
+    \\  --health-prefix  health endpoints at P/live and P/ready (default: /health)
+    \\  --metrics-path   Prometheus metrics path (default: /metrics)
+    \\  --no-minio-compat  do not serve /minio/health/* and /minio/v2/metrics/cluster
+    \\  --lifecycle-interval  seconds between lifecycle passes, 0 disables (default: 3600)
+    \\  --admin-prefix   admin API path prefix (default: $ZKFSM_ADMIN_PREFIX, else /minio/admin);
+    \\                   /zkfsm/admin is always accepted too. Path-style keys under
+    \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
+    \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
+    \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
+    \\                   SIGHUP reloads the certificate and key
+    \\  --max-conns      open connections before new ones get 503 (default: 1024)
+    \\  --workers        connections served concurrently (default: 256)
+    \\  --idle-timeout   seconds a connection may idle or a socket op may stall (default: 30)
+    \\  --header-timeout seconds to receive a request head once it starts (default: 10)
+    \\  --shutdown-timeout seconds SIGINT/SIGTERM waits for in-flight requests (default: 30)
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -32,6 +56,17 @@ const Config = struct {
     protection: ?placement.Profile = null,
     scan_interval_s: u64 = 600,
     anonymous: bool = false,
+    domains: []const []const u8 = &.{},
+    path_prefix: ?[]const u8 = null,
+    health_prefix: []const u8 = "/health",
+    metrics_path: []const u8 = "/metrics",
+    minio_compat: bool = true,
+    lifecycle_interval_s: u64 = 3600,
+    admin_prefix: ?[]const u8 = null,
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    certs_dir: ?[]const u8 = null,
+    limits: s3.server.Limits = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -49,10 +84,24 @@ fn isFlag(a: []const u8) bool {
     return std.mem.startsWith(u8, a, "-");
 }
 
+const limit_flags = [_][2][]const u8{
+    .{ "--max-conns", "max_conns" },
+    .{ "--workers", "workers" },
+    .{ "--idle-timeout", "idle_timeout_s" },
+    .{ "--header-timeout", "header_timeout_s" },
+    .{ "--shutdown-timeout", "shutdown_timeout_s" },
+};
+
+fn limitField(flag: []const u8) ?[]const u8 {
+    for (limit_flags) |lf| if (std.mem.eql(u8, flag, lf[0])) return lf[1];
+    return null;
+}
+
 /// Strings in the result point into `args`, `env_data`, or `arena`.
 fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]const u8, opts: Options) ConfigError!Config {
     var cfg: Config = .{ .data = &.{} };
     var specs: std.ArrayList([]const u8) = .empty;
+    var domains: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     if (args.len > 1 and std.mem.eql(u8, args[1], "heal")) {
         cfg.heal_only = true;
@@ -63,6 +112,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.HelpRequested;
         if (std.mem.eql(u8, a, "--anonymous")) {
             cfg.anonymous = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-minio-compat")) {
+            cfg.minio_compat = false;
             continue;
         }
         if (i + 1 >= args.len) return error.BadArgs;
@@ -76,8 +129,33 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.port = std.fmt.parseInt(u16, args[i][colon + 1 ..], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--protection")) {
             cfg.protection = placement.Profile.parse(args[i]) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--admin-prefix")) {
+            admin.api.validatePrefix(args[i]) catch return error.BadArgs;
+            cfg.admin_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-cert")) {
+            cfg.tls_cert = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-key")) {
+            cfg.tls_key = args[i];
+        } else if (std.mem.eql(u8, a, "--certs-dir")) {
+            cfg.certs_dir = args[i];
+        } else if (limitField(a)) |field| {
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return error.BadArgs;
+            if (v == 0) return error.BadArgs;
+            inline for (limit_flags) |lf| if (std.mem.eql(u8, field, lf[1])) {
+                @field(cfg.limits, lf[1]) = v;
+            };
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--lifecycle-interval")) {
+            cfg.lifecycle_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--domain")) {
+            try domains.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--path-prefix")) {
+            cfg.path_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--health-prefix")) {
+            cfg.health_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--metrics-path")) {
+            cfg.metrics_path = args[i];
         } else if (opts.extra_flag) |f| {
             if (!f(opts.extra_ctx, a, args[i])) return error.BadArgs;
         } else return error.BadArgs;
@@ -92,7 +170,17 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         else => error.BadArgs,
     };
     cfg.data = paths.items;
+    cfg.domains = domains.items;
+    for (cfg.domains) |d| if (!validDomain(d)) return error.BadArgs;
+    if (cfg.path_prefix) |p| if (p.len > 0 and !s3.router.validBasePath(p)) return error.BadArgs;
+    if (!s3.router.validBasePath(cfg.health_prefix) or !s3.router.validBasePath(cfg.metrics_path)) return error.BadArgs;
     return cfg;
+}
+
+fn validDomain(d: []const u8) bool {
+    if (d.len == 0 or d[0] == '.' or d[d.len - 1] == '.') return false;
+    for (d) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return false;
+    return true;
 }
 
 pub fn main() u8 {
@@ -107,9 +195,13 @@ pub fn run(opts: Options) u8 {
     const args = std.process.argsAlloc(arena) catch return 1;
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
-    const cfg = parseArgs(arena, args, env_data, opts) catch |e| {
+    var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
         std.debug.print("{s}{s}", .{ usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
+    };
+    applyEnv(arena, &cfg) catch {
+        std.log.err("invalid ZKFSM_PATH_PREFIX or ZKFSM_DOMAIN", .{});
+        return 2;
     };
     const creds = loadCredentials(gpa) catch |e| {
         std.log.err("{s}", .{switch (e) {
@@ -167,6 +259,9 @@ pub fn run(opts: Options) u8 {
     }
     defer if (cfg.scan_interval_s > 0) healer.stop();
     if (std.Thread.spawn(.{}, sweepLoop, .{&svc})) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
+    if (cfg.lifecycle_interval_s > 0) {
+        if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s })) |t| t.detach() else |e| std.log.warn("lifecycle worker not started: {t}", .{e});
+    }
     var auth: s3.sigv4.Config = .{};
     var iam_dir: ?std.fs.Dir = null;
     defer if (iam_dir) |*d| d.close();
@@ -185,13 +280,91 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = opts.extensions };
+    const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
+    admin.api.validatePrefix(admin_prefix) catch {
+        std.log.err("invalid admin prefix {s}: need /seg[/seg...], no trailing slash, '?', '..' or '//'", .{admin_prefix});
+        return 2;
+    };
+    warnShadowedBucket(&svc, arena, admin_prefix);
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    var tls_ctx: tls.Context = undefined;
+    const tls_paths = tlsPaths(arena, cfg) catch {
+        std.log.err("--tls-cert and --tls-key must be set together", .{});
+        return 2;
+    };
+    if (tls_paths) |tp| {
+        tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
+            std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
+            return 2;
+        };
+        tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        std.log.info("tls enabled ({s})", .{tp[0]});
+    }
+    defer if (tls_paths != null) tls_ctx.deinit();
+    var server: s3.Server = .{
+        .gpa = gpa,
+        .svc = &svc,
+        .auth = auth,
+        .extensions = extensions,
+        .tls = if (tls_paths != null) &tls_ctx else null,
+        .limits = cfg.limits,
+        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
+        .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+    };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
+    active_server = &server;
+    installStopSignals();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
+    svc.flush() catch |e| std.log.warn("key index not saved ({t}); it is rebuilt on next start", .{e});
+    be.sync() catch |e| std.log.warn("final sync failed: {t}", .{e});
+    std.log.info("stopped", .{});
     return 0;
+}
+
+/// The admin prefix takes precedence over path-style S3 keys that share it.
+fn warnShadowedBucket(svc: *object.ObjectService, arena: std.mem.Allocator, prefix: []const u8) void {
+    const buckets = svc.listBuckets(arena) catch return;
+    for ([_][]const u8{ prefix, admin.api.native_prefix }) |p| {
+        const name = admin.api.shadowedBucket(p);
+        for (buckets) |b| if (std.mem.eql(u8, b.name, name))
+            std.log.warn("bucket {s}: path-style keys under {s}/v3/ are served by the admin API", .{ name, p });
+    }
+}
+
+/// Certificate and key paths from flags, else environment; null when TLS is off.
+fn tlsPaths(arena: std.mem.Allocator, cfg: Config) error{ Incomplete, OutOfMemory }!?[2][]const u8 {
+    const env = struct {
+        fn get(a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+            const v = std.process.getEnvVarOwned(a, name) catch return null;
+            return if (v.len == 0) null else v;
+        }
+    };
+    var cert = cfg.tls_cert orelse env.get(arena, "ZKFSM_TLS_CERT");
+    var key = cfg.tls_key orelse env.get(arena, "ZKFSM_TLS_KEY");
+    if (cert == null and key == null) {
+        const dir = cfg.certs_dir orelse env.get(arena, "ZKFSM_CERTS_DIR") orelse return null;
+        cert = try std.fs.path.join(arena, &.{ dir, "public.crt" });
+        key = try std.fs.path.join(arena, &.{ dir, "private.key" });
+    }
+    return .{ cert orelse return error.Incomplete, key orelse return error.Incomplete };
+}
+
+var active_server: ?*s3.Server = null;
+
+fn onStopSignal(_: i32) callconv(.c) void {
+    const s = active_server orelse return;
+    // A second signal skips the drain.
+    if (!s.requestStop()) std.posix.exit(1);
+}
+
+fn installStopSignals() void {
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStopSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
 /// Aborts multipart uploads older than a week; runs at start, then hourly.
@@ -204,6 +377,41 @@ fn sweepLoop(svc: *object.ObjectService) void {
         };
         if (n > 0) std.log.info("aborted {d} stale multipart uploads", .{n});
         std.Thread.sleep(std.time.ns_per_hour);
+    }
+}
+
+/// Applies bucket lifecycle rules: first pass after one interval, then every interval.
+fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64) void {
+    while (true) {
+        std.Thread.sleep(interval_s * std.time.ns_per_s);
+        const st = object.lifecycle.runOnce(svc, std.time.nanoTimestamp()) catch |e| {
+            std.log.warn("lifecycle pass failed: {t}", .{e});
+            continue;
+        };
+        const n = st.expired + st.noncurrent_expired + st.markers_removed + st.uploads_aborted;
+        if (n > 0 or st.locked > 0) std.log.info("lifecycle: {d} expired, {d} noncurrent, {d} markers, {d} uploads, {d} locked", .{
+            st.expired, st.noncurrent_expired, st.markers_removed, st.uploads_aborted, st.locked,
+        });
+    }
+}
+
+/// Environment defaults for flags not given on the command line.
+fn applyEnv(arena: std.mem.Allocator, cfg: *Config) error{ BadArgs, OutOfMemory }!void {
+    if (cfg.path_prefix == null) {
+        if (envVar(arena, "ZKFSM_PATH_PREFIX") catch return error.OutOfMemory) |p| {
+            if (!s3.router.validBasePath(p)) return error.BadArgs;
+            cfg.path_prefix = p;
+        }
+    }
+    if (cfg.domains.len == 0) {
+        const v = envVar(arena, "ZKFSM_DOMAIN") catch return error.OutOfMemory;
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, v orelse "", ", ");
+        while (it.next()) |d| {
+            if (!validDomain(d)) return error.BadArgs;
+            try list.append(arena, d);
+        }
+        cfg.domains = list.items;
     }
 }
 
@@ -257,6 +465,26 @@ test "arg parsing" {
     try std.testing.expectEqual(@as(usize, 2), (try parseArgs(a, &.{"zkfsm"}, "/a /b", .{})).data.len);
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--protection", "replica:5" }, null, .{}));
     try std.testing.expect((try parseArgs(a, &.{ "zkfsm", "--anonymous", "--data", "d" }, null, .{})).anonymous);
+    try std.testing.expectEqualStrings("/ops/admin", (try parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/admin" }, null, .{})).admin_prefix.?);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/" }, null, .{}));
+    const l = try parseArgs(a, &.{ "zkfsm", "--max-conns", "8", "--idle-timeout", "3", "--workers", "2" }, null, .{});
+    try std.testing.expectEqual(@as(u32, 8), l.limits.max_conns);
+    try std.testing.expectEqual(@as(u32, 3), l.limits.idle_timeout_s);
+    try std.testing.expectEqual(@as(u32, 2), l.limits.workers);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--workers", "0" }, null, .{}));
+
+    const r = try parseArgs(a, &.{ "zkfsm", "--domain", "s3.local", "--domain", "example.com", "--path-prefix", "/s3", "--health-prefix", "/ops/health", "--metrics-path", "/ops/metrics", "--no-minio-compat", "--lifecycle-interval", "60" }, null, .{});
+    try std.testing.expectEqual(@as(usize, 2), r.domains.len);
+    try std.testing.expectEqualStrings("/s3", r.path_prefix.?);
+    try std.testing.expectEqualStrings("/ops/metrics", r.metrics_path);
+    try std.testing.expect(!r.minio_compat);
+    try std.testing.expectEqual(@as(u64, 60), r.lifecycle_interval_s);
+    for ([_][]const u8{ "s3/", "/s3/", "/s3?x", "/a/../b" }) |bad| {
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--path-prefix", bad }, null, .{}));
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--health-prefix", bad }, null, .{}));
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--metrics-path", bad }, null, .{}));
+    }
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--domain", ".bad" }, null, .{}));
 }
 
 test {
@@ -272,4 +500,6 @@ test {
     _ = @import("metrics/root.zig");
     _ = s3;
     _ = iam;
+    _ = admin;
+    _ = tls;
 }

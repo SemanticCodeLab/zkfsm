@@ -180,6 +180,7 @@ fn uploadPart(c: *Ctx) OpError!void {
     var body_buf: [handler.io_buf_len]u8 = undefined;
     var check_buf: [handler.io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    br.limitTo(c.req.head.content_length);
     const len = br.contentLength(c.req.head.content_length);
     const etag = mp.uploadPart(c.svc, c.route.bucket, c.route.key, id, n, br.body(), len) catch |e| {
         if (br.failure) |fc| return handler.fail(c, fc);
@@ -240,6 +241,7 @@ fn readXmlBody(c: *Ctx) OpError![]const u8 {
     var body_buf: [handler.io_buf_len]u8 = undefined;
     var check_buf: [handler.io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    br.limitTo(c.req.head.content_length);
     return br.body().allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
         error.StreamTooLong => error.EntityTooLarge,
         error.ReadFailed => {

@@ -71,13 +71,32 @@ pub const global = struct {
 
 pub const Endpoint = enum { live, ready, metrics };
 
+/// Where the operational endpoints live.
+pub const Paths = struct {
+    /// `{health_prefix}/live` and `{health_prefix}/ready`.
+    health_prefix: []const u8 = "/health",
+    metrics_path: []const u8 = "/metrics",
+    /// Also serve `/minio/health/*` and `/minio/v2/metrics/cluster`.
+    minio_compat: bool = true,
+};
+
 /// Operational paths are served before S3 routing and need no auth.
 pub fn match(target: []const u8) ?Endpoint {
+    return matchPaths(.{}, target);
+}
+
+pub fn matchPaths(p: Paths, target: []const u8) ?Endpoint {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     const eql = std.mem.eql;
-    if (eql(u8, path, "/health/live") or eql(u8, path, "/minio/health/live")) return .live;
-    if (eql(u8, path, "/health/ready") or eql(u8, path, "/minio/health/ready")) return .ready;
-    if (eql(u8, path, "/metrics") or eql(u8, path, "/minio/v2/metrics/cluster")) return .metrics;
+    if (eql(u8, path, p.metrics_path) or (p.minio_compat and eql(u8, path, "/minio/v2/metrics/cluster"))) return .metrics;
+    if (p.minio_compat and std.mem.startsWith(u8, path, "/minio/health/")) {
+        if (eql(u8, path, "/minio/health/live")) return .live;
+        if (eql(u8, path, "/minio/health/ready")) return .ready;
+    }
+    if (!std.mem.startsWith(u8, path, p.health_prefix)) return null;
+    const rest = path[p.health_prefix.len..];
+    if (eql(u8, rest, "/live")) return .live;
+    if (eql(u8, rest, "/ready")) return .ready;
     return null;
 }
 
@@ -92,6 +111,12 @@ test "endpoint matching" {
     try std.testing.expectEqual(Endpoint.metrics, match("/metrics").?);
     try std.testing.expect(match("/healthz") == null);
     try std.testing.expect(match("/bucket/health/live") == null);
+    const p: Paths = .{ .health_prefix = "/ops/h", .metrics_path = "/ops/m", .minio_compat = false };
+    try std.testing.expectEqual(Endpoint.live, matchPaths(p, "/ops/h/live").?);
+    try std.testing.expectEqual(Endpoint.metrics, matchPaths(p, "/ops/m?x").?);
+    try std.testing.expect(matchPaths(p, "/health/live") == null);
+    try std.testing.expect(matchPaths(p, "/minio/health/live") == null);
+    try std.testing.expect(matchPaths(p, "/metrics") == null);
 }
 
 test "render includes counts" {

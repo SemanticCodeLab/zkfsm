@@ -63,6 +63,10 @@ pub const Auth = struct {
     scope: sv.Scope = .{ .date = "", .region = "", .service = "" },
     /// Identity to authorize: the access key, or an STS session's parent.
     principal: []const u8 = "",
+    /// No credentials were presented; only bucket policies can grant access.
+    anonymous: bool = false,
+    /// The key that signed the request (differs from `principal` for STS sessions).
+    access_key: []const u8 = "",
     session_policy: ?[]const u8 = null,
 };
 
@@ -118,7 +122,11 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
             };
         }
     }.get;
-    const sig = try qp(arena, query, "X-Amz-Signature") orelse return deny(.AccessDenied);
+    const sig = try qp(arena, query, "X-Amz-Signature") orelse {
+        if (try qp(arena, query, "X-Amz-Credential") != null or try qp(arena, query, "X-Amz-Algorithm") != null) return deny(.AccessDenied);
+        auth.anonymous = true;
+        return .{ .ok = auth };
+    };
     const alg = try qp(arena, query, "X-Amz-Algorithm") orelse return deny(.AuthorizationHeaderMalformed);
     const cred = try qp(arena, query, "X-Amz-Credential") orelse return deny(.AuthorizationHeaderMalformed);
     const amz_date = try qp(arena, query, "X-Amz-Date") orelse return deny(.AuthorizationHeaderMalformed);
@@ -195,6 +203,7 @@ fn check(
     var dbuf: iam.sts.DecodeBuffer = undefined;
     const ak = p.cred.access_key;
     auth.principal = ak;
+    auth.access_key = ak;
     const secret: []const u8 = if (token) |t| blk: {
         const issuer = src.cfg.sts orelse return deny(.InvalidToken);
         const claims = issuer.verify(ak, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
@@ -207,7 +216,7 @@ fn check(
         break :blk &sts_secret;
     } else src.store.secretFor(ak, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);
     const scope = p.cred.scope;
-    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !std.mem.eql(u8, scope.service, "s3"))
+    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !(std.mem.eql(u8, scope.service, "s3") or std.mem.eql(u8, scope.service, "sts")))
         return deny(.AuthorizationHeaderMalformed);
     var has_host = false;
     var hit = std.mem.splitScalar(u8, p.signed_headers, ';');
@@ -279,14 +288,26 @@ fn canonicalRequest(
 
 /// Parses an HTTP head, tolerating `Content-Encoding: aws-chunked`, which
 /// std.http rejects. The raw head (and so the signed header) is left intact.
+/// An absolute-form target (RFC 9112 3.2.2) is reduced to its path and query.
 pub fn parseHead(arena: std.mem.Allocator, head: []const u8) std.http.Server.Request.Head.ParseError!std.http.Server.Request.Head {
     const Head = std.http.Server.Request.Head;
-    return Head.parse(head) catch |e| {
+    var h = Head.parse(head) catch |e| blk: {
         if (e != error.HttpTransferEncodingUnsupported) return e;
         var a: Writer.Allocating = .init(arena);
         stripChunkedEncoding(&a.writer, head) catch return e;
-        return Head.parse(a.written());
+        break :blk try Head.parse(a.written());
     };
+    h.target = originForm(h.target);
+    return h;
+}
+
+fn originForm(target: []const u8) []const u8 {
+    inline for (.{ "http://", "https://" }) |scheme| if (std.ascii.startsWithIgnoreCase(target, scheme)) {
+        const rest = target[scheme.len..];
+        const i = std.mem.indexOfAny(u8, rest, "/?") orelse return "/";
+        return rest[i..];
+    };
+    return target;
 }
 
 fn stripChunkedEncoding(w: *Writer, head: []const u8) Writer.Error!void {
@@ -319,6 +340,9 @@ test "head with aws-chunked content encoding" {
     try std.testing.expectEqual(std.http.ContentEncoding.identity, h.transfer_compression);
     const g = try parseHead(arena.allocator(), "PUT / HTTP/1.1\r\ncontent-encoding: aws-chunked,gzip\r\n\r\n");
     try std.testing.expectEqual(std.http.ContentEncoding.gzip, g.transfer_compression);
+    const p = try parseHead(arena.allocator(), "GET http://b.s3.local:9000/k?acl HTTP/1.1\r\nHost: b.s3.local:9000\r\n\r\n");
+    try std.testing.expectEqualStrings("/k?acl", p.target);
+    try std.testing.expectEqualStrings("/", originForm("http://host"));
 }
 
 /// Wraps a request body per `Auth`: verifies a declared sha256 at EOF, or
@@ -333,6 +357,9 @@ pub const BodyReader = struct {
     state: enum { header, data, done } = .header,
     /// Set when the body was rejected; the handler reports it as the S3 error.
     failure: ?Code = null,
+    /// Unread bytes of a plain body with a known length. Stopping at zero keeps the
+    /// HTTP body reader from being read past its end, which it does not allow.
+    left: ?u64 = null,
     reader: Reader,
 
     pub fn init(auth: Auth, in: *Reader, buffer: []u8) BodyReader {
@@ -342,6 +369,11 @@ pub const BodyReader = struct {
             .prev = auth.seed,
             .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
         };
+    }
+
+    /// Bounds a plain (sha256) body by its HTTP Content-Length.
+    pub fn limitTo(self: *BodyReader, http_length: ?u64) void {
+        self.left = http_length;
     }
 
     /// The reader to consume; the raw body when nothing needs checking.
@@ -373,23 +405,33 @@ pub const BodyReader = struct {
     }
 
     fn streamPlain(self: *BodyReader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-        const dest = limit.slice(try w.writableSliceGreedy(1));
+        var dest = limit.slice(try w.writableSliceGreedy(1));
+        if (self.left) |l| {
+            if (l == 0) return self.finishPlain(0);
+            if (dest.len > l) dest = dest[0..@intCast(l)];
+        }
         if (dest.len == 0) return 0;
-        // std's content-length reader panics if read again after EndOfStream, and
-        // readSliceShort swallows it; stream once and stop at the first EndOfStream.
-        var fw: Writer = .fixed(dest);
-        const n = self.in.stream(&fw, .limited(dest.len)) catch |e| switch (e) {
-            error.ReadFailed => return error.ReadFailed,
-            error.WriteFailed => unreachable, // limited to dest.len
-            error.EndOfStream => {
-                if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
-                self.state = .done;
-                return error.EndOfStream;
-            },
-        };
+        const n = try self.in.readSliceShort(dest);
         self.hasher.update(dest[0..n]);
         w.advance(n);
+        if (self.left) |*l| {
+            l.* -= n;
+            if (l.* == 0) return self.finishPlain(n);
+        }
+        if (n < dest.len) {
+            // Short read means the body ended; never read it again.
+            if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
+            self.state = .done;
+            if (n == 0) return error.EndOfStream;
+        }
         return n;
+    }
+
+    /// End of a length-bounded body: verify the digest; later calls see end of stream.
+    fn finishPlain(self: *BodyReader, n: usize) Reader.StreamError!usize {
+        if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
+        self.state = .done;
+        return if (n == 0) error.EndOfStream else n;
     }
 
     fn streamChunked(self: *BodyReader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
@@ -523,7 +565,11 @@ test "anonymous and unauthenticated requests" {
     defer arena.deinit();
     const in: Input = .{ .method = "GET", .target = "/b/k", .headers = &.{.{ .name = "host", .value = "h" }} };
     try std.testing.expect((try tverify(arena.allocator(), null, "", in, 0)) == .ok);
-    try expectDenied(.AccessDenied, try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now));
+    // Unsigned requests pass authentication as anonymous; authorization decides.
+    const anon = try tverify(arena.allocator(), ex_ak, ex_secret, in, ex_now);
+    try std.testing.expect(anon == .ok and anon.ok.anonymous and anon.ok.principal.len == 0);
+    const partial: Input = .{ .method = "GET", .target = "/b/k?X-Amz-Credential=x", .headers = in.headers };
+    try expectDenied(.AccessDenied, try tverify(arena.allocator(), ex_ak, ex_secret, partial, ex_now));
 }
 
 test "presigned GET example" {
@@ -683,4 +729,25 @@ test "STS session credentials" {
     var old = try issuer.issue(gpa, .{ .parent = "alice", .duration_s = 900 }, ex_now - 900, prng.random());
     defer old.deinit(gpa);
     try expectDenied(.ExpiredToken, try verify(a, cfg, try signedGet(a, &old.access_key, &old.secret_key, old.session_token), ex_now));
+}
+
+test "length-bounded sha256 body stops at content-length" {
+    const gpa = std.testing.allocator;
+    var auth: Auth = .{ .mode = .sha256 };
+    sv.Sha256.hash("hello", &auth.sha256, .{});
+    // Bytes past the declared length are never read.
+    var src: Reader = .fixed("helloEXTRA");
+    var buf: [64]u8 = undefined;
+    var br: BodyReader = .init(auth, &src, &buf);
+    br.limitTo(5);
+    const got = try br.body().allocRemaining(gpa, .limited(1024));
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("hello", got);
+    try std.testing.expectEqual(@as(usize, 5), src.seek);
+
+    var src2: Reader = .fixed("hellx");
+    var br2: BodyReader = .init(auth, &src2, &buf);
+    br2.limitTo(5);
+    try std.testing.expectError(error.ReadFailed, br2.body().allocRemaining(gpa, .limited(1024)));
+    try std.testing.expectEqual(Code.XAmzContentSHA256Mismatch, br2.failure.?);
 }

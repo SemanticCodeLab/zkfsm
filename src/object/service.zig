@@ -9,6 +9,7 @@ const list_mod = @import("list.zig");
 const versioning = @import("versioning.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
+const index_mod = @import("index.zig");
 
 const Md5 = core.checksum.Md5;
 
@@ -77,6 +78,8 @@ pub const ObjectInfo = struct {
     system: SystemHeaders = .{},
     logical_size: ?u64 = null,
     etag_override: ?core.ETag = null,
+    /// Multipart part sizes (metadata.record.partSize); empty for single-part objects.
+    part_sizes: []const u8 = "",
 };
 
 pub const PutInput = struct {
@@ -147,22 +150,56 @@ pub const ObjectService = struct {
     catalog: metadata.Catalog,
     /// Guards the catalog and record swaps; data streaming runs unlocked.
     mutex: std.Thread.Mutex = .{},
+    /// Names and uploads per bucket; every record write updates it under `mutex`.
+    index: index_mod.Index,
+    /// The on-disk index state is clean (snapshot matches); guarded by `mutex`.
+    index_clean: bool = false,
+    index_gen: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
-        const bytes = store.getRecord(placement.catalog_key, gpa) catch |e| switch (e) {
-            error.NotFound => return .{ .gpa = gpa, .store = store, .catalog = metadata.Catalog.init(gpa) },
-            else => return mapBackend(e),
-        };
-        defer gpa.free(bytes);
-        const cat = metadata.Catalog.decode(gpa, bytes) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Corrupt => error.Corrupt,
-        };
-        return .{ .gpa = gpa, .store = store, .catalog = cat };
+        var cat = metadata.Catalog.init(gpa);
+        if (store.getRecord(placement.catalog_key, gpa)) |bytes| {
+            defer gpa.free(bytes);
+            cat = metadata.Catalog.decode(gpa, bytes) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Corrupt => error.Corrupt,
+            };
+        } else |e| if (e != error.NotFound) return mapBackend(e);
+        var svc: ObjectService = .{ .gpa = gpa, .store = store, .catalog = cat, .index = index_mod.Index.init(gpa) };
+        errdefer svc.deinit();
+        try index_store.open(&svc);
+        return svc;
     }
 
     pub fn deinit(self: *ObjectService) void {
+        self.index.deinit();
         self.catalog.deinit();
+    }
+
+    /// Persists the key index so the next start skips the rebuild. Call on clean shutdown;
+    /// a later write marks the snapshot stale again before touching any record.
+    pub fn flush(self: *ObjectService) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try index_store.flushLocked(self);
+    }
+
+    /// Rebuilds the key index from the records.
+    pub fn rebuildIndex(self: *ObjectService) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try index_store.rebuildLocked(self);
+    }
+
+    /// Caller holds `mutex`; call before changing any record the index covers.
+    pub fn beginIndexChange(self: *ObjectService) Error!void {
+        try index_store.markDirtyLocked(self);
+        if (self.index.stale) try index_store.rebuildLocked(self);
+    }
+
+    fn freshIndex(self: *ObjectService) Error!void {
+        if (!self.index.stale) return;
+        try self.rebuildIndex();
     }
 
     pub fn createBucket(self: *ObjectService, name: []const u8) Error!void {
@@ -183,8 +220,8 @@ pub const ObjectService = struct {
         const b = self.catalog.find(name) orelse return error.NoSuchBucket;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        var it = try self.scanRecords(arena.allocator());
-        if (try it.next(self, b.id) != null) return error.BucketNotEmpty;
+        if (self.index.stale) try index_store.rebuildLocked(self);
+        if (!self.index.isEmpty(b.id)) return error.BucketNotEmpty;
         const saved = b;
         const name_copy = try arena.allocator().dupe(u8, name);
         _ = self.catalog.remove(name);
@@ -193,6 +230,8 @@ pub const ObjectService = struct {
             return e;
         };
         self.store.deleteRecord(placement.bucketConfigKey(saved.id)) catch {};
+        self.index.dropBucket(saved.id);
+        index_store.dropStream(self, saved.id.bytes);
     }
 
     pub fn headBucket(self: *ObjectService, name: []const u8) Error!void {
@@ -288,18 +327,33 @@ pub const ObjectService = struct {
         _ = try versioning.deleteObject(self, bucket, key, .{});
     }
 
-    /// Full scan of the record space; fine for 0.1, indexed later.
+    /// Served from the key index: cost follows the page size, not the bucket size.
     pub fn list(self: *ObjectService, arena: std.mem.Allocator, bucket: []const u8, p: ListParams) Error!ListResult {
         const bid = try self.bucketId(bucket);
-        var entries: std.ArrayList(list_mod.Entry) = .empty;
-        var it = try self.scanRecords(arena);
-        while (try it.next(self, bid)) |rec| {
-            if (!std.mem.startsWith(u8, rec.key, p.prefix)) continue;
-            if (rec.flags.delete_marker) continue;
-            if (!std.mem.eql(u8, &it.lastKey().hex, &placement.recordKey(core.ids.nameId(bid, rec.key)).hex)) continue;
-            try entries.append(arena, .{ .key = rec.key, .size = rec.reportedSize(), .etag = rec.reportedEtag(), .mtime_ns = rec.created_ns });
-        }
-        return list_mod.apply(arena, entries.items, p);
+        try self.freshIndex();
+        return list_mod.apply(arena, try self.index.collectList(arena, bid, p), p);
+    }
+
+    /// Updates the index after `rec` was stored at `pk`. Caller holds `mutex`.
+    pub fn indexStored(self: *ObjectService, pk: backend.PhysicalKey, rec: metadata.ObjectRecord) void {
+        const v = index_mod.Version.of(rec);
+        if (std.mem.eql(u8, &pk.hex, &placement.recordKey(core.ids.nameId(rec.bucket_id, rec.key)).hex))
+            self.index.setCurrent(rec.bucket_id, rec.key, v)
+        else
+            self.index.putNoncurrent(rec.bucket_id, rec.key, v);
+    }
+
+    /// Re-reads one record slot after a failed write and fixes the index from it.
+    /// `version` null is the current slot. Caller holds `mutex`.
+    pub fn indexResync(self: *ObjectService, pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8, version: ?core.VersionId) void {
+        const bytes = self.store.getRecord(pk, self.gpa) catch |e| {
+            if (e != error.NotFound) return self.index.markStale();
+            if (version) |v| self.index.removeNoncurrent(bid, key, v) else self.index.setCurrent(bid, key, null);
+            return;
+        };
+        defer self.gpa.free(bytes);
+        const rec = metadata.record.decode(bytes) catch return self.index.markStale();
+        self.indexStored(pk, rec);
     }
 
     pub fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
@@ -359,6 +413,8 @@ pub const ObjectService = struct {
     }
 };
 
+const index_store = @import("index_store.zig");
+
 /// Header lists are left empty; see `decodeInfo`.
 pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
     return .{
@@ -378,6 +434,7 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .retain_until_ns = r.retain_until_ns,
         .legal_hold = r.flags.legal_hold,
         .tags = r.tags,
+        .part_sizes = r.part_sizes,
     };
 }
 

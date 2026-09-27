@@ -494,10 +494,16 @@ fn listVersions(c: *Ctx) DispatchError!void {
 // ---- small parsers ----
 
 fn readBody(c: *Ctx) DispatchError!?[]const u8 {
+    return readBodyMax(c, max_xml_body);
+}
+
+/// Reads a small request body; null after answering with an error.
+pub fn readBodyMax(c: *Ctx, max: usize) DispatchError!?[]const u8 {
     var buf: [4096]u8 = undefined;
     var check_buf: [4096]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&buf), &check_buf);
-    return br.body().allocRemaining(c.arena, .limited(max_xml_body)) catch |e| switch (e) {
+    br.limitTo(c.req.head.content_length);
+    return br.body().allocRemaining(c.arena, .limited(max)) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.ReadFailed => {
             try handler.fail(c, br.failure orelse return error.ReadFailed);

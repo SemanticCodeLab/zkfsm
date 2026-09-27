@@ -10,6 +10,11 @@ const authz = @import("authz.zig");
 const multipart = @import("multipart.zig");
 const metrics = @import("../metrics/root.zig");
 const versioning = @import("versioning.zig");
+const lifecycle = @import("lifecycle.zig");
+const policy = @import("policy.zig");
+const acl = @import("acl.zig");
+const list_v1 = @import("list_v1.zig");
+const sts = @import("sts.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -35,6 +40,8 @@ pub const Ctx = struct {
     auth: sigv4.Auth,
     request_id: [16]u8,
     ext: versioning.Headers = .{},
+    /// Body read before authentication (STS form posts only).
+    body: ?[]const u8 = null,
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -53,24 +60,40 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         .auth = .{},
         .request_id = std.fmt.bytesToHex(core.ObjectId.random().bytes[0..8].*, .upper),
     };
+    var host: ?[]const u8 = null;
     var hit = req.iterateHeaders();
     while (hit.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "host")) host = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
         try ctx.ext.capture(arena, h);
     }
-    ctx.route = router.parse(arena, ctx.target) catch |e| switch (e) {
+    ctx.route = router.resolve(arena, env.routing, host, ctx.target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
+        // Outside the base path: answer like an unknown bucket, before authentication.
+        error.OutsidePrefix => return fail(&ctx, .NoSuchBucket),
     };
     const now_s = std.time.timestamp();
-    switch (try sigv4.verify(arena, env.auth, try sigv4.Input.fromRequest(arena, req), now_s)) {
+    var in = try sigv4.Input.fromRequest(arena, req);
+    try sts.prepare(&ctx, &in);
+    switch (try sigv4.verify(arena, env.auth, in, now_s)) {
         .ok => |a| ctx.auth = a,
         .denied => |code| return fail(&ctx, code),
     }
-    const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
+    if (try sts.route(&ctx, env, now_s)) return;
+    // STS-scoped signatures are only valid for STS calls.
+    if (std.mem.eql(u8, ctx.auth.scope.service, "sts")) return fail(&ctx, .AccessDenied);
+    for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
+    var ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
+    if (env.auth.iam != null and ctx.route.bucket.len > 0) {
+        ar.bucket_policy = object.policy.get(svc, arena, ctx.route.bucket) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+    }
     if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
-    for (env.extensions) |x| if (try x.route(x.ctx, &ctx)) return;
+    for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
     if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
@@ -86,6 +109,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
         .GET => listBuckets(c),
         else => fail(c, .MethodNotAllowed),
     };
+    if (try lifecycle.route(c) or try policy.route(c) or try acl.route(c)) return;
     if (try versioning.route(c)) return;
     if (r.key.len == 0) return switch (c.method) {
         .PUT => {
@@ -100,7 +124,12 @@ fn dispatch(c: *Ctx) DispatchError!void {
             try c.svc.headBucket(r.bucket);
             try respondEmpty(c, .ok, &.{});
         },
-        .GET => if ((try param(c, "location")) != null) getLocation(c) else listObjects(c),
+        .GET => if ((try param(c, "location")) != null)
+            getLocation(c)
+        else if ((try param(c, "list-type")) == null)
+            list_v1.list(c)
+        else
+            listObjects(c),
         else => fail(c, .MethodNotAllowed),
     };
     return switch (c.method) {
@@ -238,6 +267,7 @@ fn putObject(c: *Ctx) DispatchError!void {
     var body_buf: [io_buf_len]u8 = undefined;
     var check_buf: [io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    br.limitTo(c.req.head.content_length);
     var in: object.PutInput = .{ .content_type = c.content_type, .content_length = br.contentLength(c.req.head.content_length) };
     if (!try versioning.putExtras(c, &in)) return;
     const info = c.svc.put(c.route.bucket, c.route.key, br.body(), in) catch |e| {
@@ -254,7 +284,14 @@ fn putObject(c: *Ctx) DispatchError!void {
 fn getObject(c: *Ctx) DispatchError!void {
     const info = try versioning.lookupForRead(c) orelse return;
     var range: ?core.Range = null;
-    if (c.range) |h| if (core.RangeSpec.parse(h)) |spec| {
+    var parts_count: ?usize = null;
+    if (try param(c, "partNumber")) |pn| {
+        if (c.range != null) return fail(c, .InvalidRequest);
+        const n = std.fmt.parseInt(u16, pn, 10) catch return fail(c, .InvalidArgument);
+        const sel = partRange(info, n) catch return fail(c, if (n == 0) .InvalidArgument else .InvalidPartNumber);
+        range = sel.range;
+        parts_count = sel.count;
+    } else if (c.range) |h| if (core.RangeSpec.parse(h)) |spec| {
         range = spec.resolve(info.size) catch {
             const cr = try std.fmt.allocPrint(c.arena, "bytes */{d}", .{info.size});
             return failWith(c, .InvalidRange, &.{.{ .name = "content-range", .value = cr }});
@@ -275,6 +312,7 @@ fn getObject(c: *Ctx) DispatchError!void {
     if (c.method == .GET) try versioning.applyResponseOverrides(c, &hdrs);
     if (!try versioning.checkRead(c, info, etag, hdrs.items)) return;
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
+    if (parts_count) |n| try hdrs.append(c.arena, .{ .name = "x-amz-mp-parts-count", .value = try std.fmt.allocPrint(c.arena, "{d}", .{n}) });
     if (range) |r| try hdrs.append(c.arena, .{
         .name = "content-range",
         .value = try std.fmt.allocPrint(c.arena, "bytes {d}-{d}/{d}", .{ r.offset, r.last(), info.size }),
@@ -290,6 +328,21 @@ fn getObject(c: *Ctx) DispatchError!void {
     // Headers are committed; a failure now can only abort the connection.
     c.svc.read(info, range, &bw.writer) catch return error.StreamAborted;
     try bw.end();
+}
+
+const PartSel = struct { range: ?core.Range, count: ?usize };
+
+/// Byte range of part `n` (1-based). Single-part objects have only part 1: the whole object.
+fn partRange(info: object.ObjectInfo, n: u16) error{InvalidPartNumber}!PartSel {
+    const count = info.part_sizes.len / 8;
+    // Parts describe the stored blob; transformed objects are served whole.
+    if (count == 0 or info.logical_size != null) return if (n == 1) .{ .range = null, .count = null } else error.InvalidPartNumber;
+    if (n == 0 or n > count) return error.InvalidPartNumber;
+    var offset: u64 = 0;
+    for (0..n - 1) |i| offset += object.partSize(info.part_sizes, i);
+    const len = object.partSize(info.part_sizes, n - 1);
+    if (len == 0) return .{ .range = null, .count = count };
+    return .{ .range = .{ .offset = offset, .length = len }, .count = count };
 }
 
 pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!void {

@@ -71,6 +71,8 @@ pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: serv
         .internal_meta = meta.internal,
         .system = in.system,
     };
+    svc.mutex.lock();
+    defer svc.mutex.unlock();
     try storeUpload(svc, rec);
     return rec.upload_id;
 }
@@ -195,6 +197,8 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     if (hr.count != total) return error.StorageFailed;
     var full: [16]u8 = undefined;
     hr.hasher.final(&full);
+    const sizes = try a.alloc(u8, segs.len * 8);
+    for (segs, 0..) |s, i| std.mem.writeInt(u64, sizes[i * 8 ..][0..8], s.length, .little);
 
     var obj: metadata.ObjectRecord = .{
         .object_id = oid,
@@ -210,6 +214,7 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
         .user_meta = rec.user_meta,
         .internal_meta = rec.internal_meta,
         .system = rec.system,
+        .part_sizes = sizes,
     };
     // Versioning assigns the version id and applies lock defaults.
     const garbage = try versioning.commitPut(svc, bucket, &obj, .{
@@ -226,6 +231,7 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     info.content_type = "";
     info.tags = "";
     info.system = .{};
+    info.part_sizes = "";
     return info;
 }
 
@@ -262,10 +268,14 @@ pub fn listParts(svc: *ObjectService, arena: std.mem.Allocator, bucket: []const 
 /// In-progress uploads of `bucket` whose key starts with `prefix`, sorted by key then start time.
 pub fn listUploads(svc: *ObjectService, arena: std.mem.Allocator, bucket: []const u8, prefix: []const u8) Error![]UploadRecord {
     const bid = try svc.bucketId(bucket);
-    const all = try scanUploads(svc, arena);
+    if (svc.index.stale) try svc.rebuildIndex();
     var out: std.ArrayList(UploadRecord) = .empty;
-    for (all) |r| {
-        if (r.bucket_id.eql(bid) and std.mem.startsWith(u8, r.key, prefix)) try out.append(arena, r);
+    for (try svc.index.uploadsOf(arena, bid, prefix)) |u| {
+        const r = loadUploadLocked(svc, arena, bid, u.upload.key, u.id) catch |e| switch (e) {
+            error.NoSuchUpload => continue,
+            else => return e,
+        };
+        try out.append(arena, r);
     }
     std.mem.sort(UploadRecord, out.items, {}, lessUpload);
     return out.items;
@@ -284,50 +294,20 @@ fn lessUpload(_: void, a: UploadRecord, b: UploadRecord) bool {
 pub fn sweepStale(svc: *ObjectService, now_ns: i128, max_age_ns: i128) Error!usize {
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
-    const all = try scanUploads(svc, arena.allocator());
+    if (svc.index.stale) try svc.rebuildIndex();
     var n: usize = 0;
-    for (all) |r| {
+    for (try svc.index.uploadsOf(arena.allocator(), null, "")) |u| {
         const orphan = blk: {
             svc.mutex.lock();
             defer svc.mutex.unlock();
-            for (svc.catalog.buckets.items) |b| if (b.id.eql(r.bucket_id)) break :blk false;
+            for (svc.catalog.buckets.items) |b| if (b.id.eql(u.upload.bucket)) break :blk false;
             break :blk true;
         };
-        if (!orphan and now_ns - r.created_ns < max_age_ns) continue;
-        dropUpload(svc, r.upload_id);
+        if (!orphan and now_ns - u.upload.created_ns < max_age_ns) continue;
+        dropUpload(svc, u.id);
         n += 1;
     }
     return n;
-}
-
-fn scanUploads(svc: *ObjectService, arena: std.mem.Allocator) Error![]UploadRecord {
-    const Collect = struct {
-        arena: std.mem.Allocator,
-        keys: std.ArrayList(backend.PhysicalKey) = .empty,
-        fn f(ctx: *anyopaque, k: backend.PhysicalKey) backend.Error!void {
-            const c: *@This() = @ptrCast(@alignCast(ctx));
-            try c.keys.append(c.arena, k);
-        }
-    };
-    var c: Collect = .{ .arena = arena };
-    svc.store.list(.record, .{ .ctx = &c, .func = Collect.f }) catch |e| switch (e) {
-        error.NotFound => {},
-        else => return service.mapBackend(e),
-    };
-    var out: std.ArrayList(UploadRecord) = .empty;
-    for (c.keys.items) |k| {
-        const bytes = svc.store.getRecord(k, arena) catch |e| switch (e) {
-            error.NotFound => continue,
-            else => return service.mapBackend(e),
-        };
-        if (!upload.isUpload(bytes)) continue;
-        const r = upload.decode(arena, bytes) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => continue,
-        };
-        try out.append(arena, r);
-    }
-    return out.items;
 }
 
 fn loadUploadLocked(svc: *ObjectService, arena: std.mem.Allocator, bid: core.BucketId, key: []const u8, id: UploadId) Error!UploadRecord {
@@ -358,6 +338,9 @@ fn storeUpload(svc: *ObjectService, rec: UploadRecord) Error!void {
         else => error.OutOfMemory,
     };
     defer svc.gpa.free(bytes);
+    try svc.beginIndexChange();
+    // Indexed first: a failed write may still have landed, and a stale entry is skipped on read.
+    svc.index.putUpload(rec.upload_id, .{ .bucket = rec.bucket_id, .key = rec.key, .created_ns = rec.created_ns });
     svc.store.putRecord(placement.uploadKey(rec.upload_id), bytes) catch |e| return service.mapBackend(e);
 }
 
@@ -368,10 +351,15 @@ fn dropUpload(svc: *ObjectService, id: UploadId) void {
     const rec = blk: {
         svc.mutex.lock();
         defer svc.mutex.unlock();
-        const bytes = svc.store.getRecord(placement.uploadKey(id), arena.allocator()) catch return;
+        const bytes = svc.store.getRecord(placement.uploadKey(id), arena.allocator()) catch |e| {
+            if (e == error.NotFound) svc.index.removeUpload(id);
+            return;
+        };
         if (!upload.isUpload(bytes)) return;
         const r = upload.decode(arena.allocator(), bytes) catch return;
+        svc.beginIndexChange() catch return;
         svc.store.deleteRecord(placement.uploadKey(id)) catch return;
+        svc.index.removeUpload(id);
         break :blk r;
     };
     for (rec.parts) |p| svc.store.delete(placement.dataKey(p.blob)) catch {};
@@ -468,6 +456,8 @@ test "multipart upload, complete, and md5-of-md5s etag" {
     const hd = try fx.svc.head(a, "bkt", "big");
     try testing.expectEqual(@as(u64, min_part_size + 4), hd.size);
     try testing.expectEqual(@as(u32, 2), hd.etag.parts);
+    try testing.expectEqual(@as(usize, 16), hd.part_sizes.len);
+    try testing.expectEqual(@as(u64, 4), metadata.record.partSize(hd.part_sizes, 1));
     try testing.expectEqualStrings("application/x-test", hd.content_type);
     try testing.expectEqualStrings("v", hd.metadata[0].value);
     try testing.expectEqualStrings("inline", hd.system.content_disposition);

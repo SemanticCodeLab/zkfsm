@@ -163,6 +163,78 @@ const entries = [_]struct { Op, []const u8, Target }{
     .{ .list_parts, "s3:ListMultipartUploadParts", .object },
 };
 
+/// Admin API operations and their MinIO-compatible `admin:` actions.
+pub const AdminOp = enum {
+    create_user,
+    delete_user,
+    list_users,
+    get_user,
+    enable_user,
+    disable_user,
+    create_policy,
+    delete_policy,
+    get_policy,
+    list_policies,
+    attach_policy,
+    add_user_to_group,
+    remove_user_from_group,
+    get_group,
+    list_groups,
+    enable_group,
+    disable_group,
+    create_service_account,
+    update_service_account,
+    remove_service_account,
+    list_service_accounts,
+    server_info,
+
+    pub fn action(op: AdminOp) []const u8 {
+        return admin_table[@intFromEnum(op)];
+    }
+};
+
+/// Resource admin actions are evaluated against; MinIO admin statements carry none.
+pub const admin_resource = "arn:aws:s3:::*";
+
+const admin_table = blk: {
+    const n = @typeInfo(AdminOp).@"enum".fields.len;
+    var t: [n][]const u8 = undefined;
+    var seen = [_]bool{false} ** n;
+    for (admin_entries) |e| {
+        const i = @intFromEnum(e[0]);
+        if (seen[i]) @compileError("duplicate admin mapping for " ++ @tagName(e[0]));
+        seen[i] = true;
+        t[i] = e[1];
+    }
+    for (seen, 0..) |s, i| if (!s) @compileError("missing admin mapping for " ++ @typeInfo(AdminOp).@"enum".fields[i].name);
+    break :blk t;
+};
+
+const admin_entries = [_]struct { AdminOp, []const u8 }{
+    .{ .create_user, "admin:CreateUser" },
+    .{ .delete_user, "admin:DeleteUser" },
+    .{ .list_users, "admin:ListUsers" },
+    .{ .get_user, "admin:GetUser" },
+    .{ .enable_user, "admin:EnableUser" },
+    .{ .disable_user, "admin:DisableUser" },
+    .{ .create_policy, "admin:CreatePolicy" },
+    .{ .delete_policy, "admin:DeletePolicy" },
+    .{ .get_policy, "admin:GetPolicy" },
+    .{ .list_policies, "admin:ListUserPolicies" },
+    .{ .attach_policy, "admin:AttachUserOrGroupPolicy" },
+    .{ .add_user_to_group, "admin:AddUserToGroup" },
+    .{ .remove_user_from_group, "admin:RemoveUserFromGroup" },
+    .{ .get_group, "admin:GetGroup" },
+    .{ .list_groups, "admin:ListGroups" },
+    .{ .enable_group, "admin:EnableGroup" },
+    .{ .disable_group, "admin:DisableGroup" },
+    .{ .create_service_account, "admin:CreateServiceAccount" },
+    .{ .update_service_account, "admin:UpdateServiceAccount" },
+    .{ .remove_service_account, "admin:RemoveServiceAccount" },
+    .{ .list_service_accounts, "admin:ListServiceAccounts" },
+    .{ .server_info, "admin:ServerInfo" },
+};
+
 pub const ArnError = error{ArnTooLong};
 
 /// Writes the resource ARN for `op` into `buf`. `key` is ignored for bucket targets.
