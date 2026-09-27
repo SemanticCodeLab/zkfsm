@@ -5,6 +5,7 @@ const handler = @import("handler.zig");
 const sigv4 = @import("sigv4.zig");
 const authz = @import("authz.zig");
 const metrics = @import("../metrics/root.zig");
+const tls = @import("../tls/root.zig");
 
 pub const RunError = error{ListenFailed};
 
@@ -15,6 +16,8 @@ pub const Server = struct {
     extensions: []const @import("extension.zig").Extension = &.{},
     routing: @import("router.zig").Routing = .{},
     ops: metrics.Paths = .{},
+    /// When set, every connection is TLS-terminated before HTTP.
+    tls: ?*tls.Context = null,
 
     pub fn run(self: *Server, addr: std.net.Address) RunError!void {
         var listener = addr.listen(.{ .reuse_address = true }) catch return error.ListenFailed;
@@ -57,7 +60,18 @@ pub const Server = struct {
         var wbuf: [16 * 1024]u8 = undefined;
         var sr = conn.stream.reader(&rbuf);
         var sw = conn.stream.writer(&wbuf);
-        var http = std.http.Server.init(sr.interface(), &sw.interface);
+        var in: *std.Io.Reader = sr.interface();
+        var out: *std.Io.Writer = &sw.interface;
+        const secure: ?*tls.Session = if (self.tls) |ctx| tls.Session.accept(self.gpa, ctx, in, out) catch |e| {
+            std.log.debug("tls handshake failed: {t}", .{e});
+            return;
+        } else null;
+        defer if (secure) |t| t.close();
+        if (secure) |t| {
+            in = &t.reader;
+            out = &t.writer;
+        }
+        var http = std.http.Server.init(in, out);
         while (true) {
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();

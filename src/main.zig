@@ -8,6 +8,7 @@ const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
 const metrics = @import("metrics/root.zig");
 const iam = @import("iam/root.zig");
+const tls = @import("tls/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -29,6 +30,10 @@ const usage =
     \\  --metrics-path   Prometheus metrics path (default: /metrics)
     \\  --no-minio-compat  do not serve /minio/health/* and /minio/v2/metrics/cluster
     \\  --lifecycle-interval  seconds between lifecycle passes, 0 disables (default: 3600)
+    \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
+    \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
+    \\                   SIGHUP reloads the certificate and key
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -47,6 +52,9 @@ const Config = struct {
     metrics_path: []const u8 = "/metrics",
     minio_compat: bool = true,
     lifecycle_interval_s: u64 = 3600,
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    certs_dir: ?[]const u8 = null,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -96,6 +104,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.port = std.fmt.parseInt(u16, args[i][colon + 1 ..], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--protection")) {
             cfg.protection = placement.Profile.parse(args[i]) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--tls-cert")) {
+            cfg.tls_cert = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-key")) {
+            cfg.tls_key = args[i];
+        } else if (std.mem.eql(u8, a, "--certs-dir")) {
+            cfg.certs_dir = args[i];
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--lifecycle-interval")) {
@@ -232,11 +246,26 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
+    var tls_ctx: tls.Context = undefined;
+    const tls_paths = tlsPaths(arena, cfg) catch {
+        std.log.err("--tls-cert and --tls-key must be set together", .{});
+        return 2;
+    };
+    if (tls_paths) |tp| {
+        tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
+            std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
+            return 2;
+        };
+        tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        std.log.info("tls enabled ({s})", .{tp[0]});
+    }
+    defer if (tls_paths != null) tls_ctx.deinit();
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
         .auth = auth,
         .extensions = opts.extensions,
+        .tls = if (tls_paths != null) &tls_ctx else null,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
     };
@@ -246,6 +275,24 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     return 0;
+}
+
+/// Certificate and key paths from flags, else environment; null when TLS is off.
+fn tlsPaths(arena: std.mem.Allocator, cfg: Config) error{ Incomplete, OutOfMemory }!?[2][]const u8 {
+    const env = struct {
+        fn get(a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+            const v = std.process.getEnvVarOwned(a, name) catch return null;
+            return if (v.len == 0) null else v;
+        }
+    };
+    var cert = cfg.tls_cert orelse env.get(arena, "ZKFSM_TLS_CERT");
+    var key = cfg.tls_key orelse env.get(arena, "ZKFSM_TLS_KEY");
+    if (cert == null and key == null) {
+        const dir = cfg.certs_dir orelse env.get(arena, "ZKFSM_CERTS_DIR") orelse return null;
+        cert = try std.fs.path.join(arena, &.{ dir, "public.crt" });
+        key = try std.fs.path.join(arena, &.{ dir, "private.key" });
+    }
+    return .{ cert orelse return error.Incomplete, key orelse return error.Incomplete };
 }
 
 /// Aborts multipart uploads older than a week; runs at start, then hourly.
@@ -374,4 +421,5 @@ test {
     _ = @import("metrics/root.zig");
     _ = s3;
     _ = iam;
+    _ = tls;
 }

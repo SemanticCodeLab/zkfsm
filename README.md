@@ -15,6 +15,7 @@ tests/smoke.sh             # end-to-end curl test against a temp data dir
 tests/durability.sh        # drive loss, bitrot, and heal (replica:2 and EC:4+2)
 tests/s3cli.sh             # SigV4 + IAM with an S3 CLI and the MinIO client (set MC=/path/to/mc)
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
+tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
 ```
 
 ## Run
@@ -36,6 +37,19 @@ path; requests outside it get `404 NoSuchBucket`. `--health-prefix`,
 endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
 3600 s, 0 disables). Containers: `Dockerfile`,
 `deploy/compose/`, and the Helm chart in `helm/zkfsm`.
+
+### TLS
+
+```sh
+zkfsm --data /var/lib/zkfsm --tls-cert chain.pem --tls-key key.pem
+zkfsm --data /var/lib/zkfsm --certs-dir /etc/zkfsm/certs   # public.crt + private.key
+```
+
+Native TLS 1.3 (no TLS 1.2): X25519 and P-256 key exchange, AES-GCM and
+ChaCha20-Poly1305, ECDSA P-256 or RSA 2048-4096 (PSS) certificates. Keys may
+be PKCS#8, SEC1, or PKCS#1 PEM, unencrypted. `ZKFSM_TLS_CERT`/`ZKFSM_TLS_KEY`
+and `ZKFSM_CERTS_DIR` work too; `kill -HUP` reloads the files, keeping the old
+pair if the new one fails to load.
 
 ### Multiple drives
 
