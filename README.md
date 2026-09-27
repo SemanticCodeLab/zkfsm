@@ -14,6 +14,7 @@ scripts/check_layers.sh    # enforces the downward-only import rule
 tests/smoke.sh             # end-to-end curl test against a temp data dir
 tests/durability.sh        # drive loss, bitrot, and heal (replica:2 and EC:4+2)
 tests/s3cli.sh             # SigV4 + IAM with an S3 CLI and the MinIO client (set MC=/path/to/mc)
+tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Compatibility)
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 ```
 
@@ -62,6 +63,32 @@ mc alias set z http://localhost:9000 admin change-me-please
 mc mb z/photos
 mc cp dog.jpg z/photos/
 ```
+
+## Compatibility
+
+`tests/s3/run.sh` drives each client against a single drive and against six
+drives with `EC:4+2`, and prints one line per check plus a
+`conformance: P/T passed (X xfail)` total. rclone and s5cmd are downloaded at
+pinned, checksum-verified versions into `tests/s3/.bin`; boto3 runs from a
+local venv in `tests/s3/.venv`. CI runs the boto3 and S3 CLI suites.
+
+| Client | Checks per layout | Passed (single / EC:4+2) | Known gaps (xfail) |
+| --- | --- | --- | --- |
+| boto3 (pytest) | 145 | 139 / 139 | 6 |
+| S3 CLI (`s3`, `s3api`) | 44 | 44 / 44 | 0 |
+| MinIO client | 23 | 23 / 23 | 0 |
+| rclone v1.75.1 | 21 | 21 / 21 | 0 |
+| s5cmd v2.3.0 | 17 | 17 / 17 | 0 |
+
+Total: 490/502 passed, 12 xfail. The xfails are features not implemented
+yet: virtual-host-style addressing, bucket policy, lifecycle rules,
+`GET ?partNumber`, browser-form POST uploads, and SigV2 signatures.
+
+`SUITES=s3tests tests/s3/run.sh` also runs a subset of
+[ceph/s3-tests](https://github.com/ceph/s3-tests) (MIT, cloned at a pinned
+commit at test time), excluding feature groups zkfsm does not have (ACL-only
+IAM, SSE, website, CORS, lifecycle, notifications, select). Reported
+separately, not gating: 274/435 on a single drive, 271/435 on EC:4+2.
 
 ## Status
 
