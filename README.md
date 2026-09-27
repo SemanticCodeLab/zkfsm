@@ -131,7 +131,7 @@ uploads, and SigV2 signatures.
 [ceph/s3-tests](https://github.com/ceph/s3-tests) (MIT, cloned at a pinned
 commit at test time), excluding feature groups zkfsm does not have (ACL-only
 IAM, SSE, website, CORS, lifecycle, notifications, select). Reported
-separately, not gating: 274/435 on a single drive, 271/435 on EC:4+2.
+separately, not gating: 283/435 on a single drive and 283/435 on EC:4+2.
 
 ## Status
 
