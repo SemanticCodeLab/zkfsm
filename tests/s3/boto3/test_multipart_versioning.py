@@ -150,7 +150,6 @@ def test_transfer_manager(s3, bucket, tmp_path):
     assert out.read_bytes() == data
 
 
-@pytest.mark.xfail(reason="GET/HEAD ?partNumber is not implemented yet", strict=False)
 def test_get_part_number(s3, bucket):
     parts = [os.urandom(5 * MB), b"tail"]
     uid = s3.create_multipart_upload(Bucket=bucket, Key="pn")["UploadId"]

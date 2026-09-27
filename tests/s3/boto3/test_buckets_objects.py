@@ -543,7 +543,6 @@ def test_virtual_host_style(s3, bucket):
     assert c.get_object(Bucket=bucket, Key="v")["Body"].read() == b"vh"
 
 
-@pytest.mark.xfail(reason="bucket policy is not implemented yet", strict=False)
 def test_bucket_policy(s3, bucket):
     import json
     pol = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
@@ -553,7 +552,6 @@ def test_bucket_policy(s3, bucket):
     s3.delete_bucket_policy(Bucket=bucket)
 
 
-@pytest.mark.xfail(reason="lifecycle configuration is not implemented yet", strict=False)
 def test_bucket_lifecycle(s3, bucket):
     s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": [
         {"ID": "r1", "Status": "Enabled", "Filter": {"Prefix": "tmp/"}, "Expiration": {"Days": 1}}]})

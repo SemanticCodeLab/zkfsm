@@ -117,15 +117,15 @@ local venv in `tests/s3/.venv`. CI runs the boto3 and S3 CLI suites.
 
 | Client | Checks per layout | Passed (single / EC:4+2) | Known gaps (xfail) |
 | --- | --- | --- | --- |
-| boto3 (pytest) | 145 | 139 / 139 | 6 |
+| boto3 (pytest) | 145 | 142 / 142 | 3 |
 | S3 CLI (`s3`, `s3api`) | 44 | 44 / 44 | 0 |
 | MinIO client | 23 | 23 / 23 | 0 |
 | rclone v1.75.1 | 21 | 21 / 21 | 0 |
 | s5cmd v2.3.0 | 17 | 17 / 17 | 0 |
 
-Total: 490/502 passed, 12 xfail. The xfails are features not implemented
-yet: virtual-host-style addressing, bucket policy, lifecycle rules,
-`GET ?partNumber`, browser-form POST uploads, and SigV2 signatures.
+Total: 496/502 passed, 6 xfail. The xfails are features not implemented:
+virtual-host-style addressing without a configured domain, browser-form POST
+uploads, and SigV2 signatures.
 
 `SUITES=s3tests tests/s3/run.sh` also runs a subset of
 [ceph/s3-tests](https://github.com/ceph/s3-tests) (MIT, cloned at a pinned
