@@ -8,6 +8,8 @@ const object = @import("object/root.zig");
 const s3 = @import("s3/root.zig");
 const metrics = @import("metrics/root.zig");
 const iam = @import("iam/root.zig");
+const admin = @import("admin/root.zig");
+const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
@@ -30,6 +32,9 @@ const usage =
     \\  --metrics-path   Prometheus metrics path (default: /metrics)
     \\  --no-minio-compat  do not serve /minio/health/* and /minio/v2/metrics/cluster
     \\  --lifecycle-interval  seconds between lifecycle passes, 0 disables (default: 3600)
+    \\  --admin-prefix   admin API path prefix (default: $ZKFSM_ADMIN_PREFIX, else /minio/admin);
+    \\                   /zkfsm/admin is always accepted too. Path-style keys under
+    \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
@@ -57,6 +62,7 @@ const Config = struct {
     metrics_path: []const u8 = "/metrics",
     minio_compat: bool = true,
     lifecycle_interval_s: u64 = 3600,
+    admin_prefix: ?[]const u8 = null,
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
     certs_dir: ?[]const u8 = null,
@@ -123,6 +129,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.port = std.fmt.parseInt(u16, args[i][colon + 1 ..], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--protection")) {
             cfg.protection = placement.Profile.parse(args[i]) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--admin-prefix")) {
+            admin.api.validatePrefix(args[i]) catch return error.BadArgs;
+            cfg.admin_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--tls-cert")) {
             cfg.tls_cert = args[i];
         } else if (std.mem.eql(u8, a, "--tls-key")) {
@@ -271,6 +280,14 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
+    const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
+    admin.api.validatePrefix(admin_prefix) catch {
+        std.log.err("invalid admin prefix {s}: need /seg[/seg...], no trailing slash, '?', '..' or '//'", .{admin_prefix});
+        return 2;
+    };
+    warnShadowedBucket(&svc, arena, admin_prefix);
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -289,7 +306,7 @@ pub fn run(opts: Options) u8 {
         .gpa = gpa,
         .svc = &svc,
         .auth = auth,
-        .extensions = opts.extensions,
+        .extensions = extensions,
         .tls = if (tls_paths != null) &tls_ctx else null,
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
@@ -306,6 +323,16 @@ pub fn run(opts: Options) u8 {
     be.sync() catch |e| std.log.warn("final sync failed: {t}", .{e});
     std.log.info("stopped", .{});
     return 0;
+}
+
+/// The admin prefix takes precedence over path-style S3 keys that share it.
+fn warnShadowedBucket(svc: *object.ObjectService, arena: std.mem.Allocator, prefix: []const u8) void {
+    const buckets = svc.listBuckets(arena) catch return;
+    for ([_][]const u8{ prefix, admin.api.native_prefix }) |p| {
+        const name = admin.api.shadowedBucket(p);
+        for (buckets) |b| if (std.mem.eql(u8, b.name, name))
+            std.log.warn("bucket {s}: path-style keys under {s}/v3/ are served by the admin API", .{ name, p });
+    }
 }
 
 /// Certificate and key paths from flags, else environment; null when TLS is off.
@@ -438,6 +465,8 @@ test "arg parsing" {
     try std.testing.expectEqual(@as(usize, 2), (try parseArgs(a, &.{"zkfsm"}, "/a /b", .{})).data.len);
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--protection", "replica:5" }, null, .{}));
     try std.testing.expect((try parseArgs(a, &.{ "zkfsm", "--anonymous", "--data", "d" }, null, .{})).anonymous);
+    try std.testing.expectEqualStrings("/ops/admin", (try parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/admin" }, null, .{})).admin_prefix.?);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/" }, null, .{}));
     const l = try parseArgs(a, &.{ "zkfsm", "--max-conns", "8", "--idle-timeout", "3", "--workers", "2" }, null, .{});
     try std.testing.expectEqual(@as(u32, 8), l.limits.max_conns);
     try std.testing.expectEqual(@as(u32, 3), l.limits.idle_timeout_s);
@@ -471,5 +500,6 @@ test {
     _ = @import("metrics/root.zig");
     _ = s3;
     _ = iam;
+    _ = admin;
     _ = tls;
 }

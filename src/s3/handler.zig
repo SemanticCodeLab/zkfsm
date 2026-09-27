@@ -14,6 +14,7 @@ const lifecycle = @import("lifecycle.zig");
 const policy = @import("policy.zig");
 const acl = @import("acl.zig");
 const list_v1 = @import("list_v1.zig");
+const sts = @import("sts.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -39,6 +40,8 @@ pub const Ctx = struct {
     auth: sigv4.Auth,
     request_id: [16]u8,
     ext: versioning.Headers = .{},
+    /// Body read before authentication (STS form posts only).
+    body: ?[]const u8 = null,
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -72,10 +75,16 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         error.OutsidePrefix => return fail(&ctx, .NoSuchBucket),
     };
     const now_s = std.time.timestamp();
-    switch (try sigv4.verify(arena, env.auth, try sigv4.Input.fromRequest(arena, req), now_s)) {
+    var in = try sigv4.Input.fromRequest(arena, req);
+    try sts.prepare(&ctx, &in);
+    switch (try sigv4.verify(arena, env.auth, in, now_s)) {
         .ok => |a| ctx.auth = a,
         .denied => |code| return fail(&ctx, code),
     }
+    if (try sts.route(&ctx, env, now_s)) return;
+    // STS-scoped signatures are only valid for STS calls.
+    if (std.mem.eql(u8, ctx.auth.scope.service, "sts")) return fail(&ctx, .AccessDenied);
+    for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
     var ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
     if (env.auth.iam != null and ctx.route.bucket.len > 0) {
         ar.bucket_policy = object.policy.get(svc, arena, ctx.route.bucket) catch |e| switch (e) {
@@ -84,7 +93,7 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         };
     }
     if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
-    for (env.extensions) |x| if (try x.route(x.ctx, &ctx)) return;
+    for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
     if (try multipart.handle(&ctx)) return;
     dispatch(&ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
