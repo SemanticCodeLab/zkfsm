@@ -223,6 +223,7 @@ fn putObject(c: *Ctx) DispatchError!void {
     var body_buf: [io_buf_len]u8 = undefined;
     var check_buf: [io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    br.limitTo(c.req.head.content_length);
     var in: object.PutInput = .{ .content_type = c.content_type, .content_length = br.contentLength(c.req.head.content_length) };
     if (!try versioning.putExtras(c, &in)) return;
     const info = c.svc.put(c.route.bucket, c.route.key, br.body(), in) catch |e| {

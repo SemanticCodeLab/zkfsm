@@ -279,6 +279,9 @@ fn replaceNull(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const
 pub const DeleteOptions = struct {
     version: ?core.VersionId = null,
     bypass_governance: bool = false,
+    /// Only act if the current version was created at this time (lifecycle's
+    /// guard against an object replaced since it was scanned).
+    if_created_ns: ?i128 = null,
 };
 
 pub const DeleteResult = struct {
@@ -304,6 +307,7 @@ fn deleteLocked(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, key: []cons
     const bid = (svc.catalog.find(bucket) orelse return error.NoSuchBucket).id;
     const ck = currentKey(bid, key);
     const cur = try loadAt(svc, a, ck, bid, key);
+    if (opts.if_created_ns) |t| if (cur == null or cur.?.created_ns != t) return error.PreconditionFailed;
     if (opts.version) |v| return deleteVersion(svc, a, bid, key, cur, v, opts.bypass_governance, g);
 
     const cfg = try loadConfigLocked(svc, a, bid);

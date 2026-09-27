@@ -134,13 +134,13 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
             if (!r.enabled or !try matches(a, r.filter, c)) continue;
             const due = if (r.expiration_days) |d| dueAt(c.created_ns, d) <= now else if (r.expiration_date_ns) |d| d <= now else false;
             if (!due) continue;
-            if (try act(svc, bucket, key, null, st)) st.expired += 1;
+            if (try act(svc, bucket, key, null, c.created_ns, st)) st.expired += 1;
             break;
         }
     } else if (older.len == 0) {
         for (rules) |r| {
             if (!r.enabled or !r.expired_object_delete_marker or !try matches(a, r.filter, c)) continue;
-            if (try act(svc, bucket, key, c.versionId(), st)) st.markers_removed += 1;
+            if (try act(svc, bucket, key, c.versionId(), null, st)) st.markers_removed += 1;
             break;
         }
     };
@@ -159,7 +159,7 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
             const days = r.noncurrent_days orelse continue;
             if (!r.enabled or index < (r.newer_noncurrent_versions orelse 0)) continue;
             if (dueAt(successor_ns, days) > now or !try matches(a, r.filter, o.rec)) continue;
-            if (try act(svc, bucket, key, o.rec.versionId(), st)) st.noncurrent_expired += 1;
+            if (try act(svc, bucket, key, o.rec.versionId(), null, st)) st.noncurrent_expired += 1;
             break;
         }
     }
@@ -167,13 +167,13 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
 
 /// Deletes (or, when `version` is null, expires the current version of) `key`.
 /// Returns false when object lock protects it.
-fn act(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, st: *Stats) Error!bool {
-    _ = versioning.deleteObject(svc, bucket, key, .{ .version = version }) catch |e| switch (e) {
+fn act(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, created_ns: ?i128, st: *Stats) Error!bool {
+    _ = versioning.deleteObject(svc, bucket, key, .{ .version = version, .if_created_ns = created_ns }) catch |e| switch (e) {
         error.ObjectLocked => {
             st.locked += 1;
             return false;
         },
-        error.NoSuchKey, error.NoSuchVersion => return false,
+        error.NoSuchKey, error.NoSuchVersion, error.PreconditionFailed => return false,
         else => return e,
     };
     return true;
@@ -302,6 +302,9 @@ test "expiration on an unversioned bucket honors filters" {
     try std.testing.expectEqual(@as(usize, 1), s.expired);
     try std.testing.expectError(error.NoSuchKey, svc.head(a, "lcb", "logs/a"));
     _ = try svc.head(a, "lcb", "logs/b");
+    _ = try svc.head(a, "lcb", "keep/c");
+    const fresh = try svc.head(a, "lcb", "keep/c");
+    try std.testing.expectError(error.PreconditionFailed, versioning.deleteObject(svc, "lcb", "keep/c", .{ .if_created_ns = fresh.created_ns - 1 }));
     _ = try svc.head(a, "lcb", "keep/c");
     try set(svc, "lcb", null);
     try std.testing.expect((try get(svc, a, "lcb")) == null);

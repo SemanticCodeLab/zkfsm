@@ -354,6 +354,9 @@ pub const BodyReader = struct {
     state: enum { header, data, done } = .header,
     /// Set when the body was rejected; the handler reports it as the S3 error.
     failure: ?Code = null,
+    /// Unread bytes of a plain body with a known length. Stopping at zero keeps the
+    /// HTTP body reader from being read past its end, which it does not allow.
+    left: ?u64 = null,
     reader: Reader,
 
     pub fn init(auth: Auth, in: *Reader, buffer: []u8) BodyReader {
@@ -363,6 +366,11 @@ pub const BodyReader = struct {
             .prev = auth.seed,
             .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
         };
+    }
+
+    /// Bounds a plain (sha256) body by its HTTP Content-Length.
+    pub fn limitTo(self: *BodyReader, http_length: ?u64) void {
+        self.left = http_length;
     }
 
     /// The reader to consume; the raw body when nothing needs checking.
@@ -394,11 +402,19 @@ pub const BodyReader = struct {
     }
 
     fn streamPlain(self: *BodyReader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-        const dest = limit.slice(try w.writableSliceGreedy(1));
+        var dest = limit.slice(try w.writableSliceGreedy(1));
+        if (self.left) |l| {
+            if (l == 0) return self.finishPlain(0);
+            if (dest.len > l) dest = dest[0..@intCast(l)];
+        }
         if (dest.len == 0) return 0;
         const n = try self.in.readSliceShort(dest);
         self.hasher.update(dest[0..n]);
         w.advance(n);
+        if (self.left) |*l| {
+            l.* -= n;
+            if (l.* == 0) return self.finishPlain(n);
+        }
         if (n < dest.len) {
             // Short read means the body ended; never read it again.
             if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
@@ -406,6 +422,13 @@ pub const BodyReader = struct {
             if (n == 0) return error.EndOfStream;
         }
         return n;
+    }
+
+    /// End of a length-bounded body: verify the digest; later calls see end of stream.
+    fn finishPlain(self: *BodyReader, n: usize) Reader.StreamError!usize {
+        if (!std.mem.eql(u8, &self.hasher.finalResult(), &self.auth.sha256)) return self.fail(.XAmzContentSHA256Mismatch);
+        self.state = .done;
+        return if (n == 0) error.EndOfStream else n;
     }
 
     fn streamChunked(self: *BodyReader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
@@ -703,4 +726,25 @@ test "STS session credentials" {
     var old = try issuer.issue(gpa, .{ .parent = "alice", .duration_s = 900 }, ex_now - 900, prng.random());
     defer old.deinit(gpa);
     try expectDenied(.ExpiredToken, try verify(a, cfg, try signedGet(a, &old.access_key, &old.secret_key, old.session_token), ex_now));
+}
+
+test "length-bounded sha256 body stops at content-length" {
+    const gpa = std.testing.allocator;
+    var auth: Auth = .{ .mode = .sha256 };
+    sv.Sha256.hash("hello", &auth.sha256, .{});
+    // Bytes past the declared length are never read.
+    var src: Reader = .fixed("helloEXTRA");
+    var buf: [64]u8 = undefined;
+    var br: BodyReader = .init(auth, &src, &buf);
+    br.limitTo(5);
+    const got = try br.body().allocRemaining(gpa, .limited(1024));
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("hello", got);
+    try std.testing.expectEqual(@as(usize, 5), src.seek);
+
+    var src2: Reader = .fixed("hellx");
+    var br2: BodyReader = .init(auth, &src2, &buf);
+    br2.limitTo(5);
+    try std.testing.expectError(error.ReadFailed, br2.body().allocRemaining(gpa, .limited(1024)));
+    try std.testing.expectEqual(Code.XAmzContentSHA256Mismatch, br2.failure.?);
 }

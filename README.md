@@ -28,7 +28,13 @@ Root credentials come from `ZKFSM_ACCESS_KEY`/`ZKFSM_SECRET_KEY` (or
 `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`). Without them the server refuses to
 start unless `--anonymous` is passed. Defaults: data root `$ZKFSM_DATA`, else
 `./data`; listen `0.0.0.0:9000`. Path-style addressing
-(`http://host:9000/bucket/key`). Containers: `Dockerfile`,
+(`http://host:9000/bucket/key`); `--domain s3.example.com` (repeatable, or
+`$ZKFSM_DOMAIN`) adds virtual-host style (`http://bucket.s3.example.com/key`),
+and `--path-prefix /s3` (or `$ZKFSM_PATH_PREFIX`) serves the API under a base
+path; requests outside it get `404 NoSuchBucket`. `--health-prefix`,
+`--metrics-path`, and `--no-minio-compat` move or trim the operational
+endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
+3600 s, 0 disables). Containers: `Dockerfile`,
 `deploy/compose/`, and the Helm chart in `helm/zkfsm`.
 
 ### Multiple drives
@@ -70,7 +76,10 @@ Pre-1.0. Working today and covered by tests:
 - **S3 API**: buckets, objects, ListObjectsV2, ranges, CopyObject,
   DeleteObjects, multipart uploads (incl. UploadPartCopy), versioning with
   delete markers and ListObjectVersions, object lock (governance, compliance,
-  legal hold), object and bucket tagging, conditional requests.
+  legal hold), object and bucket tagging, conditional requests, lifecycle
+  expiration (current, noncurrent, delete markers, incomplete uploads),
+  bucket policies (including anonymous access), GET/HEAD by `partNumber`,
+  canned private ACLs, and ListObjects v1.
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
   evaluation, STS session tokens.
@@ -85,5 +94,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: multi-node clustering, IAM admin HTTP API, SSE, bucket
-notifications, lifecycle rules, virtual-host-style addressing, TLS
-termination (run behind a proxy).
+notifications, lifecycle transitions, non-private ACLs, TLS termination
+(run behind a proxy).
