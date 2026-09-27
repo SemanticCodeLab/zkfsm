@@ -63,6 +63,29 @@ mc mb z/photos
 mc cp dog.jpg z/photos/
 ```
 
+### Users, policies, and temporary credentials
+
+`mc admin` manages users, groups, canned policies, and service accounts
+(`mc admin user add|ls|info|disable`, `mc admin policy create|attach|ls`,
+`mc admin group ...`, `mc admin user svcacct add|ls|rm`). Only root or
+identities whose policies allow the matching `admin:*` action may call it;
+users may manage their own service accounts. State lives in
+`<first drive>/.zkfsm/iam.json`, replaced atomically on every change.
+
+The admin API is served under `--admin-prefix` (or `$ZKFSM_ADMIN_PREFIX`,
+default `/minio/admin` so stock `mc` works) and always under `/zkfsm/admin`.
+A prefix is `/seg[/seg...]` without a trailing slash, `?`, `..` or `//`.
+Requests to `<prefix>/v3/...` and `<prefix>/v4/...` go to the admin API, so in
+the bucket named like the prefix's first segment, path-style keys under the
+rest of the prefix followed by `/v3/` or `/v4/` are unreachable (for the
+default: keys `admin/v3/...` and `admin/v4/...` in bucket `minio`). The server
+logs a warning at startup when such a bucket exists.
+
+STS `AssumeRole` (`POST /`, form body) returns temporary credentials for the
+signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
+narrowed by a session `Policy`; standard `sts assume-role` clients work
+unchanged against the server endpoint.
+
 ## Status
 
 Pre-1.0. Working today and covered by tests:

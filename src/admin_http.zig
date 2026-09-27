@@ -60,7 +60,7 @@ pub const Bridge = struct {
 };
 
 /// Reads exactly the declared body and checks its signed hash; null when an
-/// error response was already sent. Admin clients send plain (not aws-chunked) bodies.
+/// error response was already sent. Admin clients send plain, not chunk-signed, bodies.
 fn readBody(c: *Ctx) ConnError!?[]const u8 {
     if (c.auth.mode != .sha256 and c.auth.mode != .unchecked) {
         try s3.handler.fail(c, .NotImplemented);
