@@ -304,7 +304,7 @@ pub fn respondXmlWith(c: *Ctx, status: std.http.Status, body: []const u8, extra:
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
-    try c.req.respond(body, .{ .status = status, .extra_headers = hdrs.items });
+    try c.req.respond(body, .{ .status = status, .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }
 
 pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) ConnError!void {
@@ -312,7 +312,17 @@ pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) Con
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
-    try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items });
+    try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
+}
+
+/// Close instead of draining an unread body: std asserts if the client hangs up mid-drain
+/// (e.g. after `Expect: 100-continue` is refused), and a failed read leaves the state unknown.
+fn keepAlive(c: *Ctx) bool {
+    const r = &c.req.server.reader;
+    if (r.state == .ready) return true;
+    if (r.state != .received_head) return false;
+    const h = c.req.head;
+    return !h.method.requestHasBody() or (h.transfer_encoding == .none and (h.content_length orelse 0) == 0);
 }
 
 pub fn fail(c: *Ctx, code: Code) ConnError!void {
@@ -330,7 +340,5 @@ pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
-    // After a failed body read the connection state is unknown; close it.
-    const keep = c.req.server.reader.state == .ready or c.req.server.reader.state == .received_head;
-    try c.req.respond(a.written(), .{ .status = code.status(), .extra_headers = hdrs.items, .keep_alive = keep });
+    try c.req.respond(a.written(), .{ .status = code.status(), .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }
