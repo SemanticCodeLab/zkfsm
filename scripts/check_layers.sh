@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../src"
 rank() {
   case "$1" in
     core) echo 0 ;;
-    io | device | metadata) echo 1 ;;
+    io | device | metadata | tls) echo 1 ;;
     backend) echo 2 ;;
     placement) echo 3 ;;
     protection) echo 4 ;;

@@ -49,6 +49,13 @@ pub fn build(b: *std.Build) void {
     const bench = b.addExecutable(.{ .name = "erasure-bench", .root_module = bench_mod });
     b.step("bench", "Erasure codec throughput (ReleaseFast)").dependOn(&b.addRunArtifact(bench).step);
 
+    const s3load = b.addExecutable(.{ .name = "s3load", .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/s3load.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("s3load", "Build the HTTP load generator").dependOn(&b.addInstallArtifact(s3load, .{}).step);
+
     // IAM is not wired into main.zig yet; test it as its own root.
     const iam_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/iam/root.zig"),

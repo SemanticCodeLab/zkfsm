@@ -7,6 +7,8 @@ pub const conditional = @import("conditional.zig");
 pub const blob = @import("blob.zig");
 pub const copy = @import("copy.zig");
 pub const multipart = @import("multipart.zig");
+pub const index = @import("index.zig");
+pub const index_store = @import("index_store.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -39,4 +41,6 @@ test {
     _ = blob;
     _ = copy;
     _ = multipart;
+    _ = index;
+    _ = index_store;
 }

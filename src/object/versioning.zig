@@ -55,6 +55,7 @@ fn loadAt(svc: *Svc, arena: std.mem.Allocator, pk: backend.PhysicalKey, bid: cor
     return rec;
 }
 
+/// Writes a record and mirrors it in the key index. Caller holds the mutex.
 fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
     const bytes = metadata.record.encode(rec, svc.gpa) catch |e| return switch (e) {
         error.KeyTooLong => error.KeyTooLong,
@@ -62,14 +63,26 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
         else => error.OutOfMemory,
     };
     defer svc.gpa.free(bytes);
-    svc.store.putRecord(pk, bytes) catch |e| return service.mapBackend(e);
+    try svc.beginIndexChange();
+    svc.store.putRecord(pk, bytes) catch |e| {
+        svc.indexResync(pk, rec.bucket_id, rec.key, if (isCurrentSlot(pk, rec.bucket_id, rec.key)) null else rec.versionId());
+        return service.mapBackend(e);
+    };
+    svc.indexStored(pk, rec);
 }
 
-fn dropRecord(svc: *Svc, pk: backend.PhysicalKey) Error!void {
+/// Deletes the current record (`version` null) or one noncurrent version record.
+fn dropRecord(svc: *Svc, bid: core.BucketId, key: []const u8, version: ?core.VersionId) Error!void {
+    const pk = if (version) |v| slotKey(bid, key, v) else currentKey(bid, key);
+    try svc.beginIndexChange();
     svc.store.deleteRecord(pk) catch |e| switch (e) {
         error.NotFound => {},
-        else => return service.mapBackend(e),
+        else => {
+            svc.indexResync(pk, bid, key, version);
+            return service.mapBackend(e);
+        },
     };
+    if (version) |v| svc.index.removeNoncurrent(bid, key, v) else svc.index.setCurrent(bid, key, null);
 }
 
 fn retentionOf(r: Record) lock.Retention {
@@ -271,7 +284,7 @@ fn replaceNull(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const
         } else try store(svc, slotKey(bid, key, c.versionId()), c);
     }
     if (old_null) |n| {
-        try dropRecord(svc, nk);
+        try dropRecord(svc, bid, key, null_version_id);
         g.add(n);
     }
 }
@@ -323,7 +336,7 @@ fn deleteLocked(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, key: []cons
         .unset => {
             const c = cur orelse return .{};
             try checkRemovable(c, opts.bypass_governance);
-            try dropRecord(svc, ck);
+            try dropRecord(svc, bid, key, null);
             g.add(c);
             return .{};
         },
@@ -343,37 +356,30 @@ fn deleteVersion(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []con
         const ck = currentKey(bid, key);
         if (try newestNoncurrent(svc, a, bid, key)) |n| {
             try store(svc, ck, n.rec);
-            try dropRecord(svc, n.pk);
-        } else try dropRecord(svc, ck);
+            try dropRecord(svc, bid, key, n.rec.versionId());
+        } else try dropRecord(svc, bid, key, null);
         g.add(c);
         return .{ .version = v, .delete_marker = c.flags.delete_marker };
     };
     const sk = slotKey(bid, key, v);
     const old = try loadAt(svc, a, sk, bid, key) orelse return .{ .version = v };
     try checkRemovable(old, bypass);
-    try dropRecord(svc, sk);
+    try dropRecord(svc, bid, key, v);
     g.add(old);
     return .{ .version = v, .delete_marker = old.flags.delete_marker };
 }
 
 const Located = struct { rec: Record, pk: backend.PhysicalKey };
 
-/// Full scan; versions are not indexed yet.
+/// From the key index; entries whose record has vanished are dropped and skipped.
 fn newestNoncurrent(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const u8) Error!?Located {
-    var best: ?Located = null;
-    var it = try svc.scanRecords(a);
-    while (try it.next(svc, bid)) |rec| {
-        if (!std.mem.eql(u8, rec.key, key)) continue;
-        const pk = it.lastKey();
-        if (isCurrentSlot(pk, bid, key)) continue;
-        if (best == null or newer(rec, best.?.rec)) best = .{ .rec = rec, .pk = pk };
+    if (svc.index.stale) try svc.beginIndexChange();
+    while (svc.index.newestNoncurrent(bid, key)) |v| {
+        const pk = slotKey(bid, key, v.id);
+        if (try loadAt(svc, a, pk, bid, key)) |rec| return .{ .rec = rec, .pk = pk };
+        svc.index.removeNoncurrent(bid, key, v.id);
     }
-    return best;
-}
-
-fn newer(x: Record, y: Record) bool {
-    if (x.created_ns != y.created_ns) return x.created_ns > y.created_ns;
-    return std.mem.order(u8, &x.version.bytes, &y.version.bytes) == .gt;
+    return null;
 }
 
 // ---- reads and per-version updates ----
@@ -483,21 +489,19 @@ pub const VersionListResult = struct {
 
 pub fn listVersions(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, p: VersionListParams) Error!VersionListResult {
     const bid = try svc.bucketId(bucket);
-    var entries: std.ArrayList(VersionEntry) = .empty;
-    var it = try svc.scanRecords(arena);
-    while (try it.next(svc, bid)) |rec| {
-        if (!std.mem.startsWith(u8, rec.key, p.prefix)) continue;
-        try entries.append(arena, .{
-            .key = rec.key,
-            .version = rec.versionId(),
-            .is_latest = isCurrentSlot(it.lastKey(), bid, rec.key),
-            .delete_marker = rec.flags.delete_marker,
-            .size = rec.reportedSize(),
-            .etag = rec.reportedEtag(),
-            .mtime_ns = rec.created_ns,
-        });
-    }
-    return applyVersions(arena, entries.items, p);
+    if (svc.index.stale) try svc.rebuildIndex();
+    const rows = try svc.index.collectVersions(arena, bid, .{ .prefix = p.prefix, .delimiter = p.delimiter, .key_marker = p.key_marker, .max_keys = p.max_keys });
+    const entries = try arena.alloc(VersionEntry, rows.len);
+    for (rows, entries) |r, *e| e.* = .{
+        .key = r.key,
+        .version = r.v.id,
+        .is_latest = r.is_latest,
+        .delete_marker = r.v.delete_marker,
+        .size = r.v.size,
+        .etag = r.v.etag,
+        .mtime_ns = r.v.mtime_ns,
+    };
+    return applyVersions(arena, entries, p);
 }
 
 fn lessVersion(_: void, x: VersionEntry, y: VersionEntry) bool {

@@ -10,6 +10,7 @@ const metrics = @import("metrics/root.zig");
 const iam = @import("iam/root.zig");
 const admin = @import("admin/root.zig");
 const admin_http = @import("admin_http.zig");
+const tls = @import("tls/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -25,6 +26,15 @@ const usage =
     \\  --admin-prefix   admin API path prefix (default: $ZKFSM_ADMIN_PREFIX, else /minio/admin);
     \\                   /zkfsm/admin is always accepted too. Path-style keys under
     \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
+    \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
+    \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
+    \\                   SIGHUP reloads the certificate and key
+    \\  --max-conns      open connections before new ones get 503 (default: 1024)
+    \\  --workers        connections served concurrently (default: 256)
+    \\  --idle-timeout   seconds a connection may idle or a socket op may stall (default: 30)
+    \\  --header-timeout seconds to receive a request head once it starts (default: 10)
+    \\  --shutdown-timeout seconds SIGINT/SIGTERM waits for in-flight requests (default: 30)
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -38,6 +48,10 @@ const Config = struct {
     scan_interval_s: u64 = 600,
     anonymous: bool = false,
     admin_prefix: ?[]const u8 = null,
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    certs_dir: ?[]const u8 = null,
+    limits: s3.server.Limits = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -53,6 +67,19 @@ const ConfigError = error{ BadArgs, HelpRequested, OutOfMemory };
 
 fn isFlag(a: []const u8) bool {
     return std.mem.startsWith(u8, a, "-");
+}
+
+const limit_flags = [_][2][]const u8{
+    .{ "--max-conns", "max_conns" },
+    .{ "--workers", "workers" },
+    .{ "--idle-timeout", "idle_timeout_s" },
+    .{ "--header-timeout", "header_timeout_s" },
+    .{ "--shutdown-timeout", "shutdown_timeout_s" },
+};
+
+fn limitField(flag: []const u8) ?[]const u8 {
+    for (limit_flags) |lf| if (std.mem.eql(u8, flag, lf[0])) return lf[1];
+    return null;
 }
 
 /// Strings in the result point into `args`, `env_data`, or `arena`.
@@ -85,6 +112,18 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         } else if (std.mem.eql(u8, a, "--admin-prefix")) {
             admin.api.validatePrefix(args[i]) catch return error.BadArgs;
             cfg.admin_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-cert")) {
+            cfg.tls_cert = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-key")) {
+            cfg.tls_key = args[i];
+        } else if (std.mem.eql(u8, a, "--certs-dir")) {
+            cfg.certs_dir = args[i];
+        } else if (limitField(a)) |field| {
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return error.BadArgs;
+            if (v == 0) return error.BadArgs;
+            inline for (limit_flags) |lf| if (std.mem.eql(u8, field, lf[1])) {
+                @field(cfg.limits, lf[1]) = v;
+            };
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (opts.extra_flag) |f| {
@@ -202,12 +241,31 @@ pub fn run(opts: Options) u8 {
     warnShadowedBucket(&svc, arena, admin_prefix);
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = extensions };
+    var tls_ctx: tls.Context = undefined;
+    const tls_paths = tlsPaths(arena, cfg) catch {
+        std.log.err("--tls-cert and --tls-key must be set together", .{});
+        return 2;
+    };
+    if (tls_paths) |tp| {
+        tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
+            std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
+            return 2;
+        };
+        tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        std.log.info("tls enabled ({s})", .{tp[0]});
+    }
+    defer if (tls_paths != null) tls_ctx.deinit();
+    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = extensions, .tls = if (tls_paths != null) &tls_ctx else null, .limits = cfg.limits };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
+    active_server = &server;
+    installStopSignals();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
         return 1;
     };
+    svc.flush() catch |e| std.log.warn("key index not saved ({t}); it is rebuilt on next start", .{e});
+    be.sync() catch |e| std.log.warn("final sync failed: {t}", .{e});
+    std.log.info("stopped", .{});
     return 0;
 }
 
@@ -219,6 +277,38 @@ fn warnShadowedBucket(svc: *object.ObjectService, arena: std.mem.Allocator, pref
         for (buckets) |b| if (std.mem.eql(u8, b.name, name))
             std.log.warn("bucket {s}: path-style keys under {s}/v3/ are served by the admin API", .{ name, p });
     }
+}
+
+/// Certificate and key paths from flags, else environment; null when TLS is off.
+fn tlsPaths(arena: std.mem.Allocator, cfg: Config) error{ Incomplete, OutOfMemory }!?[2][]const u8 {
+    const env = struct {
+        fn get(a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+            const v = std.process.getEnvVarOwned(a, name) catch return null;
+            return if (v.len == 0) null else v;
+        }
+    };
+    var cert = cfg.tls_cert orelse env.get(arena, "ZKFSM_TLS_CERT");
+    var key = cfg.tls_key orelse env.get(arena, "ZKFSM_TLS_KEY");
+    if (cert == null and key == null) {
+        const dir = cfg.certs_dir orelse env.get(arena, "ZKFSM_CERTS_DIR") orelse return null;
+        cert = try std.fs.path.join(arena, &.{ dir, "public.crt" });
+        key = try std.fs.path.join(arena, &.{ dir, "private.key" });
+    }
+    return .{ cert orelse return error.Incomplete, key orelse return error.Incomplete };
+}
+
+var active_server: ?*s3.Server = null;
+
+fn onStopSignal(_: i32) callconv(.c) void {
+    const s = active_server orelse return;
+    // A second signal skips the drain.
+    if (!s.requestStop()) std.posix.exit(1);
+}
+
+fn installStopSignals() void {
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStopSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
 /// Aborts multipart uploads older than a week; runs at start, then hourly.
@@ -286,6 +376,11 @@ test "arg parsing" {
     try std.testing.expect((try parseArgs(a, &.{ "zkfsm", "--anonymous", "--data", "d" }, null, .{})).anonymous);
     try std.testing.expectEqualStrings("/ops/admin", (try parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/admin" }, null, .{})).admin_prefix.?);
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--admin-prefix", "/ops/" }, null, .{}));
+    const l = try parseArgs(a, &.{ "zkfsm", "--max-conns", "8", "--idle-timeout", "3", "--workers", "2" }, null, .{});
+    try std.testing.expectEqual(@as(u32, 8), l.limits.max_conns);
+    try std.testing.expectEqual(@as(u32, 3), l.limits.idle_timeout_s);
+    try std.testing.expectEqual(@as(u32, 2), l.limits.workers);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--workers", "0" }, null, .{}));
 }
 
 test {
@@ -302,4 +397,5 @@ test {
     _ = s3;
     _ = iam;
     _ = admin;
+    _ = tls;
 }
