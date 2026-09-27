@@ -14,6 +14,8 @@ pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
     \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
+    \\             [--domain D]... [--path-prefix P] [--health-prefix P] [--metrics-path P] [--no-minio-compat]
+    \\             [--lifecycle-interval S]
     \\  heal             run one scan/heal pass over the drives and exit
     \\  --data           one or more drives; /data{1...4} expands (default: $ZKFSM_DATA, else ./data)
     \\  --listen         listen address (default: 0.0.0.0:9000)
@@ -21,6 +23,13 @@ const usage =
     \\                   default: stored in the drive format, else replica:2 with 2+ drives
     \\  --scan-interval  seconds between background heal passes, 0 disables (default: 600)
     \\  --anonymous      serve without authentication when no credentials are set
+    \\  --domain         virtual-host domain: Host {bucket}.D addresses the bucket; repeatable
+    \\                   (default: $ZKFSM_DOMAIN, comma-separated)
+    \\  --path-prefix    base path of the S3 API, e.g. /s3 (default: $ZKFSM_PATH_PREFIX, else /)
+    \\  --health-prefix  health endpoints at P/live and P/ready (default: /health)
+    \\  --metrics-path   Prometheus metrics path (default: /metrics)
+    \\  --no-minio-compat  do not serve /minio/health/* and /minio/v2/metrics/cluster
+    \\  --lifecycle-interval  seconds between lifecycle passes, 0 disables (default: 3600)
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
@@ -42,6 +51,12 @@ const Config = struct {
     protection: ?placement.Profile = null,
     scan_interval_s: u64 = 600,
     anonymous: bool = false,
+    domains: []const []const u8 = &.{},
+    path_prefix: ?[]const u8 = null,
+    health_prefix: []const u8 = "/health",
+    metrics_path: []const u8 = "/metrics",
+    minio_compat: bool = true,
+    lifecycle_interval_s: u64 = 3600,
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
     certs_dir: ?[]const u8 = null,
@@ -80,6 +95,7 @@ fn limitField(flag: []const u8) ?[]const u8 {
 fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]const u8, opts: Options) ConfigError!Config {
     var cfg: Config = .{ .data = &.{} };
     var specs: std.ArrayList([]const u8) = .empty;
+    var domains: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     if (args.len > 1 and std.mem.eql(u8, args[1], "heal")) {
         cfg.heal_only = true;
@@ -90,6 +106,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.HelpRequested;
         if (std.mem.eql(u8, a, "--anonymous")) {
             cfg.anonymous = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-minio-compat")) {
+            cfg.minio_compat = false;
             continue;
         }
         if (i + 1 >= args.len) return error.BadArgs;
@@ -117,6 +137,16 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             };
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--lifecycle-interval")) {
+            cfg.lifecycle_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--domain")) {
+            try domains.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--path-prefix")) {
+            cfg.path_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--health-prefix")) {
+            cfg.health_prefix = args[i];
+        } else if (std.mem.eql(u8, a, "--metrics-path")) {
+            cfg.metrics_path = args[i];
         } else if (opts.extra_flag) |f| {
             if (!f(opts.extra_ctx, a, args[i])) return error.BadArgs;
         } else return error.BadArgs;
@@ -131,7 +161,17 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         else => error.BadArgs,
     };
     cfg.data = paths.items;
+    cfg.domains = domains.items;
+    for (cfg.domains) |d| if (!validDomain(d)) return error.BadArgs;
+    if (cfg.path_prefix) |p| if (p.len > 0 and !s3.router.validBasePath(p)) return error.BadArgs;
+    if (!s3.router.validBasePath(cfg.health_prefix) or !s3.router.validBasePath(cfg.metrics_path)) return error.BadArgs;
     return cfg;
+}
+
+fn validDomain(d: []const u8) bool {
+    if (d.len == 0 or d[0] == '.' or d[d.len - 1] == '.') return false;
+    for (d) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return false;
+    return true;
 }
 
 pub fn main() u8 {
@@ -146,9 +186,13 @@ pub fn run(opts: Options) u8 {
     const args = std.process.argsAlloc(arena) catch return 1;
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
-    const cfg = parseArgs(arena, args, env_data, opts) catch |e| {
+    var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
         std.debug.print("{s}{s}", .{ usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
+    };
+    applyEnv(arena, &cfg) catch {
+        std.log.err("invalid ZKFSM_PATH_PREFIX or ZKFSM_DOMAIN", .{});
+        return 2;
     };
     const creds = loadCredentials(gpa) catch |e| {
         std.log.err("{s}", .{switch (e) {
@@ -206,6 +250,9 @@ pub fn run(opts: Options) u8 {
     }
     defer if (cfg.scan_interval_s > 0) healer.stop();
     if (std.Thread.spawn(.{}, sweepLoop, .{&svc})) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
+    if (cfg.lifecycle_interval_s > 0) {
+        if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s })) |t| t.detach() else |e| std.log.warn("lifecycle worker not started: {t}", .{e});
+    }
     var auth: s3.sigv4.Config = .{};
     var iam_dir: ?std.fs.Dir = null;
     defer if (iam_dir) |*d| d.close();
@@ -238,7 +285,16 @@ pub fn run(opts: Options) u8 {
         std.log.info("tls enabled ({s})", .{tp[0]});
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    var server: s3.Server = .{ .gpa = gpa, .svc = &svc, .auth = auth, .extensions = opts.extensions, .tls = if (tls_paths != null) &tls_ctx else null, .limits = cfg.limits };
+    var server: s3.Server = .{
+        .gpa = gpa,
+        .svc = &svc,
+        .auth = auth,
+        .extensions = opts.extensions,
+        .tls = if (tls_paths != null) &tls_ctx else null,
+        .limits = cfg.limits,
+        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
+        .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+    };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
     installStopSignals();
@@ -297,6 +353,41 @@ fn sweepLoop(svc: *object.ObjectService) void {
     }
 }
 
+/// Applies bucket lifecycle rules: first pass after one interval, then every interval.
+fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64) void {
+    while (true) {
+        std.Thread.sleep(interval_s * std.time.ns_per_s);
+        const st = object.lifecycle.runOnce(svc, std.time.nanoTimestamp()) catch |e| {
+            std.log.warn("lifecycle pass failed: {t}", .{e});
+            continue;
+        };
+        const n = st.expired + st.noncurrent_expired + st.markers_removed + st.uploads_aborted;
+        if (n > 0 or st.locked > 0) std.log.info("lifecycle: {d} expired, {d} noncurrent, {d} markers, {d} uploads, {d} locked", .{
+            st.expired, st.noncurrent_expired, st.markers_removed, st.uploads_aborted, st.locked,
+        });
+    }
+}
+
+/// Environment defaults for flags not given on the command line.
+fn applyEnv(arena: std.mem.Allocator, cfg: *Config) error{ BadArgs, OutOfMemory }!void {
+    if (cfg.path_prefix == null) {
+        if (envVar(arena, "ZKFSM_PATH_PREFIX") catch return error.OutOfMemory) |p| {
+            if (!s3.router.validBasePath(p)) return error.BadArgs;
+            cfg.path_prefix = p;
+        }
+    }
+    if (cfg.domains.len == 0) {
+        const v = envVar(arena, "ZKFSM_DOMAIN") catch return error.OutOfMemory;
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, v orelse "", ", ");
+        while (it.next()) |d| {
+            if (!validDomain(d)) return error.BadArgs;
+            try list.append(arena, d);
+        }
+        cfg.domains = list.items;
+    }
+}
+
 fn openIamDir(data: []const u8) error{CannotOpen}!std.fs.Dir {
     var root = std.fs.cwd().openDir(data, .{}) catch return error.CannotOpen;
     defer root.close();
@@ -352,6 +443,19 @@ test "arg parsing" {
     try std.testing.expectEqual(@as(u32, 3), l.limits.idle_timeout_s);
     try std.testing.expectEqual(@as(u32, 2), l.limits.workers);
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--workers", "0" }, null, .{}));
+
+    const r = try parseArgs(a, &.{ "zkfsm", "--domain", "s3.local", "--domain", "example.com", "--path-prefix", "/s3", "--health-prefix", "/ops/health", "--metrics-path", "/ops/metrics", "--no-minio-compat", "--lifecycle-interval", "60" }, null, .{});
+    try std.testing.expectEqual(@as(usize, 2), r.domains.len);
+    try std.testing.expectEqualStrings("/s3", r.path_prefix.?);
+    try std.testing.expectEqualStrings("/ops/metrics", r.metrics_path);
+    try std.testing.expect(!r.minio_compat);
+    try std.testing.expectEqual(@as(u64, 60), r.lifecycle_interval_s);
+    for ([_][]const u8{ "s3/", "/s3/", "/s3?x", "/a/../b" }) |bad| {
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--path-prefix", bad }, null, .{}));
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--health-prefix", bad }, null, .{}));
+        try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--metrics-path", bad }, null, .{}));
+    }
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--domain", ".bad" }, null, .{}));
 }
 
 test {

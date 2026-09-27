@@ -40,7 +40,7 @@ fn slotKey(bid: core.BucketId, key: []const u8, v: core.VersionId) backend.Physi
     return placement.versionRecordKey(core.ids.versionNameId(bid, key, v));
 }
 
-fn isCurrentSlot(pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8) bool {
+pub fn isCurrentSlot(pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8) bool {
     return std.mem.eql(u8, &pk.hex, &currentKey(bid, key).hex);
 }
 
@@ -137,7 +137,7 @@ pub fn getConfig(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8) Error!
     return loadConfigLocked(svc, arena, bid);
 }
 
-fn updateConfig(svc: *Svc, bucket: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), *BucketConfig) Error!void) Error!void {
+pub fn updateConfig(svc: *Svc, bucket: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), *BucketConfig) Error!void) Error!void {
     const bid = try svc.bucketId(bucket);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
@@ -292,6 +292,9 @@ fn replaceNull(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const
 pub const DeleteOptions = struct {
     version: ?core.VersionId = null,
     bypass_governance: bool = false,
+    /// Only act if the current version was created at this time (lifecycle's
+    /// guard against an object replaced since it was scanned).
+    if_created_ns: ?i128 = null,
 };
 
 pub const DeleteResult = struct {
@@ -317,6 +320,7 @@ fn deleteLocked(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, key: []cons
     const bid = (svc.catalog.find(bucket) orelse return error.NoSuchBucket).id;
     const ck = currentKey(bid, key);
     const cur = try loadAt(svc, a, ck, bid, key);
+    if (opts.if_created_ns) |t| if (cur == null or cur.?.created_ns != t) return error.PreconditionFailed;
     if (opts.version) |v| return deleteVersion(svc, a, bid, key, cur, v, opts.bypass_governance, g);
 
     const cfg = try loadConfigLocked(svc, a, bid);

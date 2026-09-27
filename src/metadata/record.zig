@@ -6,8 +6,10 @@ const headers = @import("headers.zig");
 
 pub const magic = "ZKOR";
 /// v2 adds flags, retention, and tags; v3 the multipart part count; v4 user and
-/// internal metadata, system headers, and size/ETag overrides. Older records still decode.
-pub const format_version: u16 = 4;
+/// internal metadata, system headers, and size/ETag overrides; v5 multipart part sizes.
+/// Older records still decode.
+pub const format_version: u16 = 5;
+pub const max_parts = 10000;
 pub const max_key_len = 1024;
 
 pub const Error = codec.DecodeError || error{ KeyTooLong, MetadataTooLarge, OutOfMemory };
@@ -50,6 +52,8 @@ pub const ObjectRecord = struct {
     /// Reported size/ETag when they differ from the stored blob's.
     logical_size: ?u64 = null,
     etag_override: ?core.ETag = null,
+    /// Multipart part sizes as little-endian u64s; empty for single-part objects.
+    part_sizes: []const u8 = "",
 
     pub fn reportedSize(r: ObjectRecord) u64 {
         return r.logical_size orelse r.size;
@@ -75,6 +79,7 @@ pub fn encode(r: ObjectRecord, gpa: std.mem.Allocator) Error![]u8 {
         if (l[0].len > 0 and ((headers.take(&c, l[1]) catch return error.MetadataTooLarge).len != l[0].len)) return error.MetadataTooLarge;
     }
     r.system.validate() catch return error.MetadataTooLarge;
+    if (r.part_sizes.len % 8 != 0 or r.part_sizes.len / 8 > max_parts) return error.MetadataTooLarge;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(r, &a.writer) catch return error.OutOfMemory;
@@ -109,12 +114,22 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try codec.putInt(w, u32, r.etag.parts);
     try headers.put(w, r.internal_meta);
     try headers.putSystem(w, r.system);
-    try w.writeByte(@as(u8, @intFromBool(r.logical_size != null)) | @as(u8, @intFromBool(r.etag_override != null)) << 1);
+    try w.writeByte(@as(u8, @intFromBool(r.logical_size != null)) | @as(u8, @intFromBool(r.etag_override != null)) << 1 |
+        @as(u8, @intFromBool(r.part_sizes.len > 0)) << 2);
     if (r.logical_size) |n| try codec.putInt(w, u64, n);
     if (r.etag_override) |e| {
         try w.writeAll(&e.md5);
         try codec.putInt(w, u32, e.parts);
     }
+    if (r.part_sizes.len > 0) {
+        try codec.putInt(w, u16, @intCast(r.part_sizes.len / 8));
+        try w.writeAll(r.part_sizes);
+    }
+}
+
+/// Size of part `i` (0-based) from an encoded part-size list.
+pub fn partSize(part_sizes: []const u8, i: usize) u64 {
+    return std.mem.readInt(u64, part_sizes[i * 8 ..][0..8], .little);
 }
 
 pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
@@ -166,9 +181,15 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         r.internal_meta = try headers.take(&c, .internal);
         r.system = try headers.takeSystem(&c);
         const has = (try c.take(1))[0];
-        if (has & ~@as(u8, 3) != 0) return error.Corrupt;
+        const known: u8 = if (ver >= 5) 7 else 3;
+        if (has & ~known != 0) return error.Corrupt;
         if (has & 1 != 0) r.logical_size = try c.int(u64);
         if (has & 2 != 0) r.etag_override = .{ .md5 = try c.fixed(16), .parts = try c.int(u32) };
+        if (has & 4 != 0) {
+            const n = try c.int(u16);
+            if (n == 0 or n > max_parts) return error.Corrupt;
+            r.part_sizes = try c.take(@as(usize, n) * 8);
+        }
     }
     if (c.pos != bytes.len) return error.Corrupt;
     return r;
@@ -280,6 +301,17 @@ test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" 
     defer gpa.free(again);
     try std.testing.expectEqualSlices(u8, bytes, again);
 
+    var sizes: [16]u8 = undefined;
+    std.mem.writeInt(u64, sizes[0..8], 60, .little);
+    std.mem.writeInt(u64, sizes[8..16], 40, .little);
+    r.part_sizes = &sizes;
+    const withparts = try encode(r, gpa);
+    defer gpa.free(withparts);
+    const dp = try decode(withparts);
+    try std.testing.expectEqual(@as(u64, 40), partSize(dp.part_sizes, 1));
+    for (0..withparts.len) |n| try std.testing.expectError(error.Corrupt, decode(withparts[0..n]));
+    r.part_sizes = "";
+
     // A v3 record is a v4 record without metadata, minus the tail, with version 3.
     r.user_meta = "";
     r.internal_meta = "";
@@ -294,7 +326,7 @@ test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" 
     const o = try decode(v3);
     try std.testing.expectEqual(@as(u64, 100), o.reportedSize());
     try std.testing.expectEqualStrings("", o.user_meta);
-    v3[4] = 5;
+    v3[4] = 6;
     try std.testing.expectError(error.Corrupt, decode(v3));
 
     // A list over the user limit neither encodes nor decodes.

@@ -197,6 +197,8 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     if (hr.count != total) return error.StorageFailed;
     var full: [16]u8 = undefined;
     hr.hasher.final(&full);
+    const sizes = try a.alloc(u8, segs.len * 8);
+    for (segs, 0..) |s, i| std.mem.writeInt(u64, sizes[i * 8 ..][0..8], s.length, .little);
 
     var obj: metadata.ObjectRecord = .{
         .object_id = oid,
@@ -212,6 +214,7 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
         .user_meta = rec.user_meta,
         .internal_meta = rec.internal_meta,
         .system = rec.system,
+        .part_sizes = sizes,
     };
     // Versioning assigns the version id and applies lock defaults.
     const garbage = try versioning.commitPut(svc, bucket, &obj, .{
@@ -228,6 +231,7 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
     info.content_type = "";
     info.tags = "";
     info.system = .{};
+    info.part_sizes = "";
     return info;
 }
 
@@ -452,6 +456,8 @@ test "multipart upload, complete, and md5-of-md5s etag" {
     const hd = try fx.svc.head(a, "bkt", "big");
     try testing.expectEqual(@as(u64, min_part_size + 4), hd.size);
     try testing.expectEqual(@as(u32, 2), hd.etag.parts);
+    try testing.expectEqual(@as(usize, 16), hd.part_sizes.len);
+    try testing.expectEqual(@as(u64, 4), metadata.record.partSize(hd.part_sizes, 1));
     try testing.expectEqualStrings("application/x-test", hd.content_type);
     try testing.expectEqualStrings("v", hd.metadata[0].value);
     try testing.expectEqualStrings("inline", hd.system.content_disposition);
