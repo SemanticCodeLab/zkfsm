@@ -24,6 +24,23 @@ jobs:
       - name: smoke
         run: bash tests/smoke.sh
 
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: boto3 and S3 CLI suites (single drive and EC:4+2)
+        env:
+          SUITES: boto3 s3cli
+          S3CLI_BIN: aws
+        run: bash tests/s3/run.sh
+
   deploy-lint:
     runs-on: ubuntu-latest
     steps:

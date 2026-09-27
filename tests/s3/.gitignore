@@ -1,0 +1,5 @@
+.venv/
+.bin/
+.s3-tests/
+__pycache__/
+.pytest_cache/
