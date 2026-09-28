@@ -1,0 +1,64 @@
+# Four-node zkfsm cluster, four drives per node, EC:4+2 sets spanning the nodes,
+# behind nginx on port 9000. Every node gets the same endpoint list.
+# Usage: ZKFSM_ACCESS_KEY=... ZKFSM_SECRET_KEY=... docker compose -f deploy/compose/docker-compose.cluster.yml up -d
+x-node: &node
+  build:
+    context: ../..
+  image: ghcr.io/semanticcodelab/zkfsm:${ZKFSM_TAG:-latest}
+  command:
+    - --data
+    - http://zkfsm{1...4}:9000/data{1...4}
+    - --listen
+    - 0.0.0.0:9000
+    - --protection
+    - EC:4+2
+  environment:
+    # Root credentials must be identical on every node; they also derive the
+    # node-to-node RPC secret unless ZKFSM_CLUSTER_SECRET is set.
+    ZKFSM_ACCESS_KEY: ${ZKFSM_ACCESS_KEY:?set ZKFSM_ACCESS_KEY}
+    ZKFSM_SECRET_KEY: ${ZKFSM_SECRET_KEY:?set ZKFSM_SECRET_KEY}
+  restart: unless-stopped
+
+services:
+  zkfsm1:
+    <<: *node
+    hostname: zkfsm1
+    volumes: [n1d1:/data1, n1d2:/data2, n1d3:/data3, n1d4:/data4]
+  zkfsm2:
+    <<: *node
+    hostname: zkfsm2
+    volumes: [n2d1:/data1, n2d2:/data2, n2d3:/data3, n2d4:/data4]
+  zkfsm3:
+    <<: *node
+    hostname: zkfsm3
+    volumes: [n3d1:/data1, n3d2:/data2, n3d3:/data3, n3d4:/data4]
+  zkfsm4:
+    <<: *node
+    hostname: zkfsm4
+    volumes: [n4d1:/data1, n4d2:/data2, n4d3:/data3, n4d4:/data4]
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ../lb/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${ZKFSM_PORT:-9000}:9000"
+    depends_on: [zkfsm1, zkfsm2, zkfsm3, zkfsm4]
+    restart: unless-stopped
+
+volumes:
+  n1d1: {}
+  n1d2: {}
+  n1d3: {}
+  n1d4: {}
+  n2d1: {}
+  n2d2: {}
+  n2d3: {}
+  n2d4: {}
+  n3d1: {}
+  n3d2: {}
+  n3d3: {}
+  n3d4: {}
+  n4d1: {}
+  n4d2: {}
+  n4d3: {}
+  n4d4: {}

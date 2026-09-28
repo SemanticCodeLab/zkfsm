@@ -1,2 +1,6 @@
 zkfsm S3 endpoint: http://{{ include "zkfsm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
 Credentials: kubectl get secret {{ include "zkfsm.secretName" . }} -o jsonpath='{.data.accessKey}' | base64 -d
+{{- if gt (int .Values.replicas) 1 }}
+Cluster: {{ .Values.replicas }} pods x {{ .Values.drives.count }} drives. Pods turn ready once they can reach
+write quorum; the Service routes around pods that cannot.
+{{- end }}

@@ -4,7 +4,24 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# replicas > 1 runs a cluster: every pod gets the same endpoint list
+# (http://<pod>.<headless service>:9000/data{1...N}) and erasure sets span pods.
+# Topology is fixed: grow only by appending a pool (cluster.extraPools) and
+# rolling all pods; never change replicas or drives.count of an existing pool.
 replicas: 1
+
+cluster:
+  # Protection for new deployments, e.g. EC:4+2; "" picks one from the drive count.
+  protection: ""
+  # Drives per erasure set; 0 = largest fitting divisor up to 16.
+  setSize: 0
+  clusterDomain: cluster.local
+  # Appended pools, each a list of endpoint patterns served by other StatefulSets,
+  # e.g. [["http://pool2-{0...3}.pool2-headless.ns.svc.cluster.local:9000/data{1...4}"]]
+  extraPools: []
+  # Optional explicit node-to-node secret (Secret key clusterSecret); default is
+  # derived from the root credentials, which must be the same on every pod.
+  useClusterSecret: false
 
 # Drives per pod. Each drive gets its own PVC mounted at /data<N>.
 drives:

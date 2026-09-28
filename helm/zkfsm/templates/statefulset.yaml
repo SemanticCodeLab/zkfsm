@@ -29,8 +29,29 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --data
+            {{- if gt (int .Values.replicas) 1 }}
+            {{- $headless := printf "%s-headless.%s.svc.%s" (include "zkfsm.fullname" .) .Release.Namespace .Values.cluster.clusterDomain }}
+            - http://{{ include "zkfsm.fullname" . }}-{0...{{ sub (int .Values.replicas) 1 }}}.{{ $headless }}:9000/data{1...{{ $drives }}}
+            {{- range .Values.cluster.extraPools }}
+            - --data
+            {{- range . }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            - --node-address
+            - $(POD_NAME).{{ $headless }}:9000
+            {{- with .Values.cluster.protection }}
+            - --protection
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.cluster.setSize }}
+            - --set-size
+            - {{ .Values.cluster.setSize | quote }}
+            {{- end }}
+            {{- else }}
             {{- range $i := until $drives }}
             - /data{{ add $i 1 }}
+            {{- end }}
             {{- end }}
             - --listen
             - 0.0.0.0:9000
@@ -38,6 +59,14 @@ spec:
             - {{ . | quote }}
             {{- end }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            {{- if .Values.cluster.useClusterSecret }}
+            - name: ZKFSM_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef: {name: {{ include "zkfsm.secretName" . }}, key: clusterSecret}
+            {{- end }}
             - name: ZKFSM_ACCESS_KEY
               valueFrom:
                 secretKeyRef: {name: {{ include "zkfsm.secretName" . }}, key: accessKey}

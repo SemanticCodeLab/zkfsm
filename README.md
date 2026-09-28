@@ -84,6 +84,69 @@ mc mb z/photos
 mc cp dog.jpg z/photos/
 ```
 
+### Cluster
+
+Every node starts with the same endpoint list; each `--data` flag is one pool.
+
+```sh
+# on node1..node4 (same command, same root credentials)
+zkfsm --data http://node{1...4}:9000/data{1...4} --protection EC:4+2
+# local test: 4 processes, 4 drives each, one pool
+zkfsm --data http://127.0.0.1:{9001...9004}/srv/d{1...4} --listen 127.0.0.1:9001 --node-address 127.0.0.1:9001
+```
+
+- **Topology** is fixed at startup. The node finds itself from `--listen` (or
+  `--node-address host:port`). A pool is cut into erasure sets (`--set-size`, by
+  default the largest divisor of the pool's drive count up to 16); drives are
+  interleaved across nodes so each set takes as few drives from one node as the
+  layout allows, and each object's k+m shards take at most ceil((k+m)/nodes)
+  drives per node, so a node loss costs no more shards than the parity covers.
+- **Format**: the owner of a pool's first endpoint formats the pool once every
+  drive is reachable. Format files record the deployment id, pool, set, index,
+  set size, profile, a fingerprint of the pool's endpoint list, and all drive
+  ids of the set; a drive from another deployment, a moved drive, or a changed
+  endpoint list or profile is refused. An empty local drive in a known set is
+  formatted as a replacement and healed.
+- **Expansion**: restart every node with a pool appended
+  (`--data <pool1> --data <pool2>`). New objects go to the pool with the most
+  room; reads and deletes find a key in whichever pool holds it. Pool
+  decommission and rebalancing are not part of this edition.
+- **Internal RPC** shares the S3 port (and its TLS) under `/zkfsm/rpc/v1/`.
+  Each request is signed with HMAC-SHA256 over the method, path, sender, time,
+  a nonce, and the body digest; requests outside a 60 s window or with a
+  replayed nonce are refused. The secret is `--cluster-secret`
+  (`$ZKFSM_CLUSTER_SECRET`) or is derived from the root credentials, which must
+  match on every node (checked at startup). Over TLS, peers are verified
+  against `--cluster-ca` files and the node's own certificate chain.
+  Connections are pooled; calls have timeouts; a node that fails a call is
+  marked offline and calls to it fail fast until the 1 s heartbeat sees it back.
+- **Quorum**: erasure writes need k shards (k+1 when k == m) and reads need k;
+  records need a majority, carry a hybrid-clock stamp (newest replica wins),
+  and deletes leave tombstones, so a node that missed changes cannot bring old
+  state back. A set refuses writes once fewer than its set write quorum of
+  drives is reachable; clients get `503 WriteQuorumUnavailable` or
+  `503 ReadQuorumUnavailable`.
+- **Locks**: object writes, deletes, metadata changes, multipart completion,
+  bucket creation/deletion, bucket configuration, and IAM changes take a
+  lock granted by a majority of nodes (30 s leases refreshed every 10 s,
+  unlocks retried, leases of crashed holders expire).
+- **Shared state**: the bucket catalog, bucket configuration (versioning,
+  lock, policy, lifecycle, tags), object records, and the IAM store live in
+  the cluster store's system namespace. Nodes mirror changes through
+  notifications sent when the lock is released, reload the catalog and IAM
+  every `--cluster-refresh` seconds, and rebuild the key index when a peer
+  returns or at startup.
+- **Health**: `/health/ready` is 200 only when the node can reach a lock
+  majority and write quorum for every set, so load balancers route around
+  nodes in a minority. See `deploy/lb/nginx.conf`, `deploy/lb/haproxy.cfg`,
+  `deploy/compose/docker-compose.cluster.yml`, and the Helm chart
+  (`--set replicas=4 --set drives.count=4`).
+- **Healing** runs per set on the lowest-numbered reachable node (and on any
+  node holding a freshly formatted drive): it lists remote drives page by page,
+  rebuilds missing or stale shards and records, spreads tombstones, and purges
+  shards of interrupted writes after 15 minutes. A returning node triggers a
+  pass right away.
+
 ### Users, policies, and temporary credentials
 
 `mc admin` manages users, groups, canned policies, and service accounts
@@ -91,7 +154,8 @@ mc cp dog.jpg z/photos/
 `mc admin group ...`, `mc admin user svcacct add|ls|rm`). Only root or
 identities whose policies allow the matching `admin:*` action may call it;
 users may manage their own service accounts. State lives in
-`<first drive>/.zkfsm/iam.json`, replaced atomically on every change.
+`<first drive>/.zkfsm/iam.json`, replaced atomically on every change (in a
+cluster: a record in the cluster store, locked and propagated to every node).
 
 The admin API is served under `--admin-prefix` (or `$ZKFSM_ADMIN_PREFIX`,
 default `/minio/admin` so stock `mc` works) and always under `/zkfsm/admin`.
@@ -151,12 +215,15 @@ Pre-1.0. Working today and covered by tests:
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and
   a NAS profile.
+- **Cluster**: static multi-node deployments with erasure sets spanning
+  nodes, signed internal RPC, majority locks, node-failure quorum, failover
+  through any node, cross-node healing, and expansion by appending pools.
 - **Operations**: `/health/live`, `/health/ready`, Prometheus `/metrics`
   (MinIO-compatible aliases), Docker image, compose files, Helm chart, CI.
 
 Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
-Not yet: multi-node clustering, IAM admin HTTP API, SSE, bucket
+Not yet: SSE, bucket
 notifications, lifecycle transitions, non-private ACLs, TLS termination
 (run behind a proxy).
