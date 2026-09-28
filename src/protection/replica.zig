@@ -1,5 +1,6 @@
 //! Replica(N): a StorageBackend over a DriveSet. Quorum writes, CRC-verified reads
-//! with replica fallback, inline repair of bad replicas. N=1 is the `single` profile.
+//! with replica fallback, inline repair. N=1 is the `single` profile. Cluster records
+//! carry a clock stamp (newest wins) and deletes leave tombstones.
 const std = @import("std");
 const core = @import("../core/root.zig");
 const iface = @import("../backend/root.zig");
@@ -10,7 +11,9 @@ const Error = iface.Error;
 const PhysicalKey = iface.PhysicalKey;
 const ObjectMeta = iface.ObjectMeta;
 const DriveSet = placement.DriveSet;
-const LocalBackend = iface.local.LocalBackend;
+const Handle = iface.drive.Handle;
+const Pending = iface.drive.Pending;
+const ShardFile = iface.drive.ShardFile;
 const max_drives = placement.max_drives;
 
 /// Per-key outcome of a verify-and-repair pass.
@@ -24,6 +27,9 @@ pub const KeyReport = struct {
 };
 
 const stripe_count = 64;
+
+/// Tombstones younger than this are kept so every drive learns about the delete.
+pub const tombstone_grace_ns: u64 = 15 * std.time.ns_per_min;
 
 pub fn quorum(n: usize) usize {
     return n / 2 + 1;
@@ -70,11 +76,15 @@ pub const ReplicaStore = struct {
         return &self.stripes[std.hash.Wyhash.hash(@intFromEnum(key.space), &key.hex) % stripe_count];
     }
 
+    fn clustered(self: *const ReplicaStore) bool {
+        return self.drives.isCluster();
+    }
+
     /// Shared holds on a list of drives; null slots are offline. Lock order: drives, then stripe.
     pub const Holds = struct {
         set: *DriveSet,
         idx: []const u8,
-        lbs: [max_drives]?*LocalBackend = @splat(null),
+        lbs: [max_drives]?Handle = @splat(null),
 
         pub fn acquire(set: *DriveSet, idx: []const u8) Holds {
             var h: Holds = .{ .set = set, .idx = idx };
@@ -85,18 +95,31 @@ pub const ReplicaStore = struct {
         pub fn release(h: *Holds) void {
             for (h.idx, 0..) |d, j| if (h.lbs[j] != null) h.set.release(d);
         }
+
+        pub fn reachable(h: *const Holds) usize {
+            var n: usize = 0;
+            for (h.lbs[0..h.idx.len]) |l| n += @intFromBool(l != null);
+            return n;
+        }
     };
+
+    /// Error for a quorum miss: a quorum error when unreachable drives caused it.
+    pub fn short(self: *const ReplicaStore, holds: *const Holds, need: usize, worst: Error, comptime q: Error) Error {
+        if (self.drives.isCluster() and holds.reachable() < need) return q;
+        return worst;
+    }
 
     fn put(ctx: *anyopaque, key: PhysicalKey, source: *std.Io.Reader, opts: iface.PutOptions) Error!ObjectMeta {
         const self = cast(ctx);
         if (key.space != .data) return error.InvalidKey;
+        if (!self.drives.writable()) return error.WriteQuorum;
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         const need = quorum(placed.len);
         var holds = Holds.acquire(self.drives, placed);
         defer holds.release();
 
-        var pend: [max_drives]?LocalBackend.PendingWrite = @splat(null);
+        var pend: [max_drives]?Pending = @splat(null);
         defer for (&pend) |*slot| if (slot.*) |*w| w.abort();
         var worst: Error = error.IoFailed;
         var live: usize = 0;
@@ -115,7 +138,7 @@ pub const ReplicaStore = struct {
             pend[j] = w;
             live += 1;
         }
-        if (live < need) return worst;
+        if (live < need) return self.short(&holds, need, worst, error.WriteQuorum);
 
         const buf = try self.gpa.alloc(u8, shard.chunk_size);
         defer self.gpa.free(buf);
@@ -134,7 +157,7 @@ pub const ReplicaStore = struct {
                 };
                 w.writeAll(buf[0..n]) catch |e| dropWriter(slot, &live, &worst, e);
             };
-            if (live < need) return worst;
+            if (live < need) return if (self.clustered()) error.WriteQuorum else worst;
             total += n;
             if (n < want) break;
         }
@@ -155,8 +178,8 @@ pub const ReplicaStore = struct {
             ok += 1;
         };
         if (ok < need) {
-            for (placed, 0..) |_, j| if (committed[j]) holds.lbs[j].?.backend().delete(key) catch {};
-            return worst;
+            for (placed, 0..) |_, j| if (committed[j]) holds.lbs[j].?.store().delete(key) catch {};
+            return if (self.clustered() and worst == error.IoFailed) error.WriteQuorum else worst;
         }
         return .{ .size = total, .mtime_ns = core.time.nowNs() };
     }
@@ -174,7 +197,7 @@ pub const ReplicaStore = struct {
         return w.end;
     }
 
-    fn dropWriter(slot: *?LocalBackend.PendingWrite, live: *usize, worst: *Error, e: Error) void {
+    fn dropWriter(slot: *?Pending, live: *usize, worst: *Error, e: Error) void {
         slot.*.?.abort();
         slot.* = null;
         live.* -= 1;
@@ -195,7 +218,7 @@ pub const ReplicaStore = struct {
     };
 
     /// Streams verified bytes of `range` past `delivered.*` into `sink` (null: verify only).
-    fn readShard(self: *ReplicaStore, lb: *LocalBackend, key: PhysicalKey, range: ?core.Range, sink: ?*std.Io.Writer, delivered: *u64, expect: ?u64) Outcome {
+    fn readShard(self: *ReplicaStore, lb: Handle, key: PhysicalKey, range: ?core.Range, sink: ?*std.Io.Writer, delivered: *u64, expect: ?u64) Outcome {
         var file = lb.openRead(key) catch |e| return if (e == error.NotFound) .missing else .io;
         defer file.close();
         const st = file.stat() catch return .io;
@@ -222,7 +245,7 @@ pub const ReplicaStore = struct {
             if (sink) |s| s.writeAll(data[lo..hi]) catch return .sink_failed;
             delivered.* += hi - lo;
         }
-        return .{ .ok = .{ .size = size, .mtime_ns = st.mtime } };
+        return .{ .ok = .{ .size = size, .mtime_ns = st.mtime_ns } };
     }
 
     fn get(ctx: *anyopaque, key: PhysicalKey, range: ?core.Range, sink: *std.Io.Writer) Error!ObjectMeta {
@@ -235,9 +258,11 @@ pub const ReplicaStore = struct {
         var bad: [max_drives]u8 = undefined;
         var nbad: usize = 0;
         var saw_other = false;
+        var offline = false;
         for (placed) |d| {
             const lb = self.drives.acquire(d) orelse {
                 saw_other = true;
+                offline = true;
                 continue;
             };
             const out = self.readShard(lb, key, range, sink, &delivered, known);
@@ -257,31 +282,35 @@ pub const ReplicaStore = struct {
                     nbad += 1;
                     saw_other = true;
                 },
-                .io => saw_other = true,
+                .io => {
+                    saw_other = true;
+                    offline = true;
+                },
                 .bad_range => return error.IoFailed,
                 .sink_failed => return error.WriteFailed,
             }
             if (delivered > 0 and known == null) known = self.sizeOf(d, key);
         }
+        if (offline and self.clustered()) return error.ReadQuorum;
         return if (saw_other) error.IoFailed else error.NotFound;
     }
 
     fn sizeOf(self: *ReplicaStore, d: u8, key: PhysicalKey) ?u64 {
         const lb = self.drives.acquire(d) orelse return null;
         defer self.drives.release(d);
-        const m = lb.backend().stat(key) catch return null;
+        const m = lb.store().stat(key) catch return null;
         return shard.logicalSize(m.size);
     }
 
     /// Verifies one replica in full.
-    fn check(self: *ReplicaStore, lb: *LocalBackend, key: PhysicalKey) Outcome {
+    fn check(self: *ReplicaStore, lb: Handle, key: PhysicalKey) Outcome {
         if (key.space == .data) {
             var n: u64 = 0;
             return self.readShard(lb, key, null, null, &n, null);
         }
-        const raw = lb.backend().getRecord(key, self.gpa) catch |e| return if (e == error.NotFound) .missing else .io;
+        const raw = lb.store().getRecord(key, self.gpa) catch |e| return if (e == error.NotFound) .missing else .io;
         defer self.gpa.free(raw);
-        return if (shard.unframeRecord(raw) != null) .{ .ok = .{ .size = raw.len, .mtime_ns = 0 } } else .corrupt;
+        return if (shard.unframeAny(raw) != null) .{ .ok = .{ .size = raw.len, .mtime_ns = 0 } } else .corrupt;
     }
 
     /// Rewrites `bad` replicas from `good` after re-verifying it; returns how many were fixed.
@@ -309,22 +338,32 @@ pub const ReplicaStore = struct {
         return fixed;
     }
 
-    fn copy(self: *ReplicaStore, src: *LocalBackend, dst: *LocalBackend, key: PhysicalKey) Error!void {
+    fn copy(self: *ReplicaStore, src: Handle, dst: Handle, key: PhysicalKey) Error!void {
         if (key.space == .data) {
             var file = try src.openRead(key);
             defer file.close();
-            var rbuf: [64 * 1024]u8 = undefined;
-            var fr = file.reader(&rbuf);
-            _ = dst.backend().put(key, &fr.interface, .{}) catch |e| return if (e == error.ReadFailed) error.IoFailed else e;
-            return;
+            const size = (try file.stat()).size;
+            var w = try dst.begin();
+            errdefer w.abort();
+            const buf = try self.gpa.alloc(u8, 256 * 1024);
+            defer self.gpa.free(buf);
+            var off: u64 = 0;
+            while (off < size) {
+                const n = try file.preadAll(buf[0..@intCast(@min(buf.len, size - off))], off);
+                if (n == 0) return error.IoFailed;
+                try w.writeAll(buf[0..n]);
+                off += n;
+            }
+            return w.commit(key);
         }
-        const raw = try src.backend().getRecord(key, self.gpa);
+        const raw = try src.store().getRecord(key, self.gpa);
         defer self.gpa.free(raw);
-        try dst.backend().putRecord(key, raw);
+        try dst.store().putRecord(key, raw);
     }
 
     /// Verifies every placed replica of `key` and rewrites missing or corrupt ones.
     pub fn healKey(self: *ReplicaStore, key: PhysicalKey) KeyReport {
+        if (key.space != .data and self.clustered()) return self.healRecord(key);
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         var holds = Holds.acquire(self.drives, placed);
@@ -334,7 +373,7 @@ pub const ReplicaStore = struct {
         defer m.unlock();
 
         var rep: KeyReport = .{};
-        var good: ?*LocalBackend = null;
+        var good: ?Handle = null;
         var bad: [max_drives]u8 = undefined;
         var nbad: usize = 0;
         var corrupt = false;
@@ -381,12 +420,17 @@ pub const ReplicaStore = struct {
 
     fn stat(ctx: *anyopaque, key: PhysicalKey) Error!ObjectMeta {
         const self = cast(ctx);
+        if (key.space != .data and self.clustered()) {
+            const bytes = try getRecord(ctx, key, self.gpa);
+            defer self.gpa.free(bytes);
+            return .{ .size = bytes.len, .mtime_ns = 0 };
+        }
         var pbuf: [max_drives]u8 = undefined;
         var saw_other = false;
         for (self.drives.placed(key, &pbuf)) |d| {
             const lb = self.drives.acquire(d) orelse continue;
             defer self.drives.release(d);
-            const m = lb.backend().stat(key) catch |e| {
+            const m = lb.store().stat(key) catch |e| {
                 if (e != error.NotFound) saw_other = true;
                 continue;
             };
@@ -403,6 +447,7 @@ pub const ReplicaStore = struct {
     /// Deletes all placed replicas; data or record depending on the key space.
     pub fn delete(ctx: *anyopaque, key: PhysicalKey) Error!void {
         const self = cast(ctx);
+        if (key.space != .data and self.clustered()) return self.tombstone(key);
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         var holds = Holds.acquire(self.drives, placed);
@@ -414,7 +459,7 @@ pub const ReplicaStore = struct {
         var absent: usize = 0;
         var worst: Error = error.IoFailed;
         for (placed, 0..) |_, j| {
-            const b = (holds.lbs[j] orelse continue).backend();
+            const b = (holds.lbs[j] orelse continue).store();
             const r = if (key.space == .data) b.delete(key) else b.deleteRecord(key);
             r catch |e| {
                 if (e == error.NotFound) absent += 1 else worst = worse(worst, e);
@@ -422,15 +467,24 @@ pub const ReplicaStore = struct {
             };
             removed += 1;
         }
-        if (removed + absent < quorum(placed.len)) return worst;
+        if (removed + absent < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
         if (removed == 0) return error.NotFound;
     }
 
     fn putRecord(ctx: *anyopaque, key: PhysicalKey, bytes: []const u8) Error!void {
         const self = cast(ctx);
         if (key.space == .data) return error.InvalidKey;
-        const framed = try shard.frameRecord(self.gpa, bytes);
+        const framed = if (self.clustered())
+            try shard.frameRecord2(self.gpa, bytes, shard.nextStamp(), false)
+        else
+            try shard.frameRecord(self.gpa, bytes);
         defer self.gpa.free(framed);
+        return self.writeFramed(key, framed);
+    }
+
+    /// Writes one framed record to every placed drive; needs a majority.
+    fn writeFramed(self: *ReplicaStore, key: PhysicalKey, framed: []const u8) Error!void {
+        if (!self.drives.writable()) return error.WriteQuorum;
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         var holds = Holds.acquire(self.drives, placed);
@@ -442,18 +496,37 @@ pub const ReplicaStore = struct {
         var worst: Error = error.IoFailed;
         for (placed, 0..) |_, j| {
             const lb = holds.lbs[j] orelse continue;
-            lb.backend().putRecord(key, framed) catch |e| {
+            self.putFramed(lb, key, framed) catch |e| {
                 worst = worse(worst, e);
                 continue;
             };
             ok += 1;
         }
-        if (ok < quorum(placed.len)) return worst;
+        if (ok < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
+    }
+
+    /// Cluster records never move backwards: a drive keeps whichever stamp is newer.
+    fn putFramed(self: *ReplicaStore, lb: Handle, key: PhysicalKey, framed: []const u8) Error!void {
+        if (!self.clustered()) return lb.store().putRecord(key, framed);
+        return switch (lb) {
+            .local => |l| shard.putRecordNewer(l, self.gpa, key, framed),
+            .ext => lb.store().putRecord(key, framed),
+        };
+    }
+
+    /// Cluster delete: a newer tombstone replaces the record on a majority.
+    fn tombstone(self: *ReplicaStore, key: PhysicalKey) Error!void {
+        const cur = try self.getRecord2(key, self.gpa);
+        self.gpa.free(cur);
+        const framed = try shard.frameRecord2(self.gpa, "", shard.nextStamp(), true);
+        defer self.gpa.free(framed);
+        return self.writeFramed(key, framed);
     }
 
     fn getRecord(ctx: *anyopaque, key: PhysicalKey, gpa: std.mem.Allocator) Error![]u8 {
         const self = cast(ctx);
         if (key.space == .data) return error.InvalidKey;
+        if (self.clustered()) return self.getRecord2(key, gpa);
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         var bad: [max_drives]u8 = undefined;
@@ -466,7 +539,7 @@ pub const ReplicaStore = struct {
                     continue;
                 };
                 defer self.drives.release(d);
-                break :blk lb.backend().getRecord(key, self.gpa) catch |e| switch (e) {
+                break :blk lb.store().getRecord(key, self.gpa) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.NotFound => {
                         bad[nbad] = d;
@@ -480,18 +553,154 @@ pub const ReplicaStore = struct {
                 };
             };
             defer self.gpa.free(raw);
-            const payload = shard.unframeRecord(raw) orelse {
+            const payload = (shard.unframeAny(raw) orelse {
                 std.log.warn("drive {s}: corrupt record {s}", .{ self.drives.drives[d].path, &key.hex });
                 bad[nbad] = d;
                 nbad += 1;
                 saw_other = true;
                 continue;
-            };
+            }).payload;
             const out = try gpa.dupe(u8, payload);
             if (nbad > 0) _ = self.repair(key, d, bad[0..nbad]);
             return out;
         }
         return if (saw_other) error.IoFailed else error.NotFound;
+    }
+
+    /// What one drive holds for a record slot.
+    const Replica = union(enum) {
+        offline,
+        missing,
+        corrupt,
+        /// Framed bytes (owned) and their stamp.
+        present: struct { raw: []u8, stamp: u64, tombstone: bool },
+    };
+
+    fn readReplica(self: *ReplicaStore, d: u8, key: PhysicalKey) Error!Replica {
+        const lb = self.drives.acquire(d) orelse return .offline;
+        defer self.drives.release(d);
+        const raw = lb.store().getRecord(key, self.gpa) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotFound => .missing,
+            else => .offline,
+        };
+        const u = shard.unframeAny(raw) orelse {
+            self.gpa.free(raw);
+            std.log.warn("drive {s}: corrupt record {s}", .{ self.drives.drives[d].path, &key.hex });
+            return .corrupt;
+        };
+        shard.observeStamp(u.stamp);
+        return .{ .present = .{ .raw = raw, .stamp = u.stamp, .tombstone = u.tombstone } };
+    }
+
+    /// Reads replicas until enough answered to overlap every write majority; the newest wins.
+    fn getRecord2(self: *ReplicaStore, key: PhysicalKey, gpa: std.mem.Allocator) Error![]u8 {
+        var pbuf: [max_drives]u8 = undefined;
+        const placed = self.drives.placed(key, &pbuf);
+        const need = placed.len - quorum(placed.len) + 1;
+        var reps: [max_drives]Replica = @splat(.offline);
+        defer for (reps[0..placed.len]) |r| if (r == .present) self.gpa.free(r.present.raw);
+        var answered: usize = 0;
+        var best: ?usize = null;
+        for (placed, 0..) |d, j| {
+            if (answered >= need) break;
+            reps[j] = try self.readReplica(d, key);
+            switch (reps[j]) {
+                .missing => answered += 1,
+                .present => |p| {
+                    answered += 1;
+                    if (best == null or p.stamp > reps[best.?].present.stamp) best = j;
+                },
+                else => {},
+            }
+        }
+        if (answered < need) return error.ReadQuorum;
+        const b = best orelse return error.NotFound;
+        const win = reps[b].present;
+        // Bring lagging replicas we read up to the winner.
+        for (placed, 0..) |d, j| {
+            const stale = switch (reps[j]) {
+                .missing, .corrupt => true,
+                .present => |p| p.stamp < win.stamp,
+                .offline => false,
+            };
+            if (!stale or (reps[j] == .missing and win.tombstone)) continue;
+            const lb = self.drives.acquire(d) orelse continue;
+            defer self.drives.release(d);
+            self.putFramed(lb, key, win.raw) catch {};
+        }
+        if (win.tombstone) return error.NotFound;
+        return gpa.dupe(u8, shard.unframeAny(win.raw).?.payload);
+    }
+
+    /// Cluster heal of one record slot: spread the newest replica; purge old tombstones.
+    fn healRecord(self: *ReplicaStore, key: PhysicalKey) KeyReport {
+        var pbuf: [max_drives]u8 = undefined;
+        const placed = self.drives.placed(key, &pbuf);
+        const m = self.stripe(key);
+        m.lock();
+        defer m.unlock();
+        var rep: KeyReport = .{};
+        var reps: [max_drives]Replica = @splat(.offline);
+        defer for (reps[0..placed.len]) |r| if (r == .present) self.gpa.free(r.present.raw);
+        var best: ?usize = null;
+        var corrupt = false;
+        for (placed, 0..) |d, j| {
+            reps[j] = self.readReplica(d, key) catch .offline;
+            switch (reps[j]) {
+                .present => |p| if (best == null or p.stamp > reps[best.?].present.stamp) {
+                    best = j;
+                },
+                .corrupt => corrupt = true,
+                else => {},
+            }
+        }
+        const b = best orelse {
+            rep.lost = corrupt;
+            return rep;
+        };
+        const win = reps[b].present;
+        var all_same = true;
+        for (reps[0..placed.len]) |r| {
+            const same = r == .present and r.present.stamp == win.stamp;
+            all_same = all_same and same;
+        }
+        const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
+        if (win.tombstone and all_same and now -| win.stamp > tombstone_grace_ns) {
+            for (placed) |d| {
+                const lb = self.drives.acquire(d) orelse continue;
+                defer self.drives.release(d);
+                switch (lb) {
+                    .local => |l| shard.deleteRecordIf(l, self.gpa, key, win.stamp) catch {},
+                    .ext => |x| x.vtable.deleteRecordIf(x.ctx, key, win.stamp) catch {},
+                }
+            }
+            return rep;
+        }
+        for (placed, 0..) |d, j| {
+            switch (reps[j]) {
+                .offline => {
+                    rep.unrepaired += 1;
+                    continue;
+                },
+                .present => |p| if (p.stamp == win.stamp) {
+                    rep.healthy += 1;
+                    continue;
+                },
+                else => {},
+            }
+            const lb = self.drives.acquire(d) orelse {
+                rep.unrepaired += 1;
+                continue;
+            };
+            defer self.drives.release(d);
+            self.putFramed(lb, key, win.raw) catch {
+                rep.unrepaired += 1;
+                continue;
+            };
+            rep.repaired += 1;
+        }
+        return rep;
     }
 
     /// Union of keys across online drives, deduplicated.
@@ -517,14 +726,14 @@ pub const ReplicaStore = struct {
         for (0..self.drives.count()) |d| {
             const lb = self.drives.acquire(d) orelse continue;
             defer self.drives.release(d);
-            lb.backend().list(space, .{ .ctx = &st, .func = State.f }) catch |e| {
+            lb.store().list(space, .{ .ctx = &st, .func = State.f }) catch |e| {
                 if (st.user_err) |ue| return ue;
                 if (e == error.OutOfMemory) return e;
                 continue;
             };
             reached += 1;
         }
-        if (reached == 0) return error.IoFailed;
+        if (reached == 0) return if (self.clustered()) error.ReadQuorum else error.IoFailed;
     }
 
     fn sync(ctx: *anyopaque) Error!void {
@@ -532,7 +741,7 @@ pub const ReplicaStore = struct {
         for (0..self.drives.count()) |d| {
             const lb = self.drives.acquire(d) orelse continue;
             defer self.drives.release(d);
-            try lb.backend().sync();
+            lb.store().sync() catch |e| if (!self.clustered() or lb == .local) return e;
         }
     }
 };

@@ -64,8 +64,10 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
     };
     defer svc.gpa.free(bytes);
     try svc.beginIndexChange();
+    const version = if (isCurrentSlot(pk, rec.bucket_id, rec.key)) null else rec.versionId();
+    defer svc.emit(.{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } });
     svc.store.putRecord(pk, bytes) catch |e| {
-        svc.indexResync(pk, rec.bucket_id, rec.key, if (isCurrentSlot(pk, rec.bucket_id, rec.key)) null else rec.versionId());
+        svc.indexResync(pk, rec.bucket_id, rec.key, version);
         return service.mapBackend(e);
     };
     svc.indexStored(pk, rec);
@@ -75,6 +77,7 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
 fn dropRecord(svc: *Svc, bid: core.BucketId, key: []const u8, version: ?core.VersionId) Error!void {
     const pk = if (version) |v| slotKey(bid, key, v) else currentKey(bid, key);
     try svc.beginIndexChange();
+    defer svc.emit(.{ .record = .{ .pk = pk, .bid = bid, .key = key, .version = version } });
     svc.store.deleteRecord(pk) catch |e| switch (e) {
         error.NotFound => {},
         else => {
@@ -141,6 +144,8 @@ pub fn updateConfig(svc: *Svc, bucket: []const u8, ctx: anytype, comptime f: fn 
     const bid = try svc.bucketId(bucket);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
+    const held = try svc.clusterLock("config", bucket, "");
+    defer svc.clusterUnlock(held);
     svc.mutex.lock();
     defer svc.mutex.unlock();
     var cfg = try loadConfigLocked(svc, arena.allocator(), bid);
@@ -231,6 +236,8 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     defer arena.deinit();
     const a = arena.allocator();
     var g: Garbage = .{};
+    const held = try svc.clusterLock("obj", bucket, rec.key);
+    defer svc.clusterUnlock(held);
     svc.mutex.lock();
     defer svc.mutex.unlock();
     const b = svc.catalog.find(bucket) orelse return error.NoSuchBucket;
@@ -307,6 +314,8 @@ pub fn deleteObject(svc: *Svc, bucket: []const u8, key: []const u8, opts: Delete
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     var g: Garbage = .{};
+    const held = try svc.clusterLock("obj", bucket, key);
+    defer svc.clusterUnlock(held);
     const r = blk: {
         svc.mutex.lock();
         defer svc.mutex.unlock();
@@ -419,6 +428,8 @@ fn mutate(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.Version
     const bid = try svc.bucketId(bucket);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
+    const held = try svc.clusterLock("obj", bucket, key);
+    defer svc.clusterUnlock(held);
     svc.mutex.lock();
     defer svc.mutex.unlock();
     const cfg = try loadConfigLocked(svc, arena.allocator(), bid);

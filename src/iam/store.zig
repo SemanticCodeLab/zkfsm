@@ -71,7 +71,15 @@ pub const Persistence = struct {
         load: *const fn (ptr: *anyopaque, gpa: Allocator) PersistError!?[]u8,
         /// Must be atomic: after a crash, load returns either the old or the new bytes.
         save: *const fn (ptr: *anyopaque, bytes: []const u8) PersistError!void,
+        /// Shared stores (a cluster): serialize mutations across processes. A mutation
+        /// takes `lock`, reloads, saves, then `unlock` (which may notify peers).
+        lock: ?*const fn (ptr: *anyopaque) PersistError!void = null,
+        unlock: ?*const fn (ptr: *anyopaque) void = null,
     };
+
+    pub fn shared(p: Persistence) bool {
+        return p.vtable.lock != null;
+    }
 
     pub fn load(p: Persistence, gpa: Allocator) PersistError!?[]u8 {
         return p.vtable.load(p.ptr, gpa);
@@ -284,6 +292,8 @@ pub const Store = struct {
     lock: std.Thread.RwLock = .{},
     state: *State,
     builtins: [canned.len]Policy,
+    /// Digest of the persisted bytes behind `state`; lets `reload` skip unchanged data.
+    digest: [32]u8 = @splat(0),
 
     /// Store must not move after `open` returns (it holds a lock); allocate it in place.
     pub fn open(self: *Store, gpa: Allocator, persist: Persistence, opts: Options) StoreError!void {
@@ -297,7 +307,32 @@ pub const Store = struct {
         const bytes = try persist.load(gpa);
         defer if (bytes) |b| gpa.free(b);
         const st = try State.load(gpa, bytes);
-        self.* = .{ .gpa = gpa, .persist = persist, .opts = opts, .state = st, .builtins = builtins };
+        self.* = .{ .gpa = gpa, .persist = persist, .opts = opts, .state = st, .builtins = builtins, .digest = digestOf(bytes) };
+    }
+
+    fn digestOf(bytes: ?[]const u8) [32]u8 {
+        var d: [32]u8 = @splat(0);
+        if (bytes) |b| std.crypto.hash.sha2.Sha256.hash(b, &d, .{});
+        return d;
+    }
+
+    /// Picks up changes another process saved. Cheap when nothing changed.
+    pub fn reload(self: *Store) StoreError!void {
+        const bytes = try self.persist.load(self.gpa);
+        defer if (bytes) |b| self.gpa.free(b);
+        self.lock.lock();
+        defer self.lock.unlock();
+        try self.swapIn(bytes);
+    }
+
+    /// Caller holds the write lock.
+    fn swapIn(self: *Store, bytes: ?[]const u8) StoreError!void {
+        const d = digestOf(bytes);
+        if (std.mem.eql(u8, &d, &self.digest)) return;
+        const st = try State.load(self.gpa, bytes);
+        self.state.destroy(self.gpa);
+        self.state = st;
+        self.digest = d;
     }
 
     pub fn deinit(self: *Store) void {
@@ -441,7 +476,7 @@ pub const Store = struct {
     pub fn createUser(self: *Store, name: []const u8, secret: []const u8) StoreError!void {
         try validName(name);
         try validSecret(secret);
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         if (self.keyTaken(name)) return error.AlreadyExists;
         var next = self.state.snap;
@@ -451,7 +486,7 @@ pub const Store = struct {
 
     /// Also removes the user's group memberships and service accounts.
     pub fn deleteUser(self: *Store, name: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const a = m.a();
         const i = self.state.users.get(name) orelse return error.NotFound;
@@ -467,7 +502,7 @@ pub const Store = struct {
     }
 
     pub fn setUserEnabled(self: *Store, name: []const u8, enabled: bool) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.users.get(name) orelse return error.NotFound;
         var next = self.state.snap;
@@ -479,7 +514,7 @@ pub const Store = struct {
 
     pub fn setUserSecret(self: *Store, name: []const u8, secret: []const u8) StoreError!void {
         try validSecret(secret);
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.users.get(name) orelse return error.NotFound;
         var next = self.state.snap;
@@ -491,7 +526,7 @@ pub const Store = struct {
 
     pub fn createGroup(self: *Store, name: []const u8) StoreError!void {
         try validName(name);
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         if (self.state.groupIndex(name) != null) return error.AlreadyExists;
         var next = self.state.snap;
@@ -500,7 +535,7 @@ pub const Store = struct {
     }
 
     pub fn deleteGroup(self: *Store, name: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.groupIndex(name) orelse return error.NotFound;
         var next = self.state.snap;
@@ -509,7 +544,7 @@ pub const Store = struct {
     }
 
     pub fn setGroupEnabled(self: *Store, name: []const u8, enabled: bool) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.groupIndex(name) orelse return error.NotFound;
         var next = self.state.snap;
@@ -520,7 +555,7 @@ pub const Store = struct {
     }
 
     pub fn addGroupMember(self: *Store, group: []const u8, user: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.groupIndex(group) orelse return error.NotFound;
         if (self.state.user(user) == null) return error.NotFound;
@@ -533,7 +568,7 @@ pub const Store = struct {
     }
 
     pub fn removeGroupMember(self: *Store, group: []const u8, user: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.groupIndex(group) orelse return error.NotFound;
         if (!containsName(self.state.snap.groups[i].members, user)) return error.NotFound;
@@ -550,7 +585,7 @@ pub const Store = struct {
         if (cannedIndex(name) != null) return error.BuiltinPolicy;
         var check = try parsePolicy(self.gpa, document);
         check.deinit();
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         var next = self.state.snap;
         const doc: PolicyDoc = .{ .name = name, .document = document };
@@ -567,7 +602,7 @@ pub const Store = struct {
 
     pub fn deletePolicy(self: *Store, name: []const u8) StoreError!void {
         if (cannedIndex(name) != null) return error.BuiltinPolicy;
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const s = self.state.snap;
         const idx = for (s.policies, 0..) |p, i| {
@@ -581,7 +616,7 @@ pub const Store = struct {
     }
 
     pub fn attachPolicy(self: *Store, target: AttachTarget, name: []const u8, policy_name: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         if (self.policyByName(policy_name) == null) return error.PolicyNotFound;
         const a = m.a();
@@ -610,7 +645,7 @@ pub const Store = struct {
     }
 
     pub fn detachPolicy(self: *Store, target: AttachTarget, name: []const u8, policy_name: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const a = m.a();
         var next = self.state.snap;
@@ -640,7 +675,7 @@ pub const Store = struct {
             var check = try parsePolicy(self.gpa, doc);
             check.deinit();
         }
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         if (self.keyTaken(sa.access_key)) return error.AlreadyExists;
         if (!self.isRoot(sa.parent) and self.state.user(sa.parent) == null) return error.NotFound;
@@ -650,7 +685,7 @@ pub const Store = struct {
     }
 
     pub fn deleteServiceAccount(self: *Store, access_key: []const u8) StoreError!void {
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.service_accounts.get(access_key) orelse return error.NotFound;
         var next = self.state.snap;
@@ -674,7 +709,7 @@ pub const Store = struct {
             var check = try parsePolicy(self.gpa, doc);
             check.deinit();
         };
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const i = self.state.service_accounts.get(access_key) orelse return error.NotFound;
         var next = self.state.snap;
@@ -693,7 +728,7 @@ pub const Store = struct {
     /// Replaces the full policy list of a user or group in one commit.
     pub fn setPolicies(self: *Store, target: AttachTarget, name: []const u8, names: []const []const u8) StoreError!void {
         if (names.len > limits.max_attached) return error.LimitExceeded;
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const a = m.a();
         var uniq: std.ArrayList([]const u8) = .empty;
@@ -723,7 +758,7 @@ pub const Store = struct {
     pub fn upsertUser(self: *Store, name: []const u8, secret: []const u8, enabled: bool) StoreError!void {
         try validName(name);
         try validSecret(secret);
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         var next = self.state.snap;
         if (self.state.users.get(name)) |i| {
@@ -742,7 +777,7 @@ pub const Store = struct {
     /// deletes the group, which must then be empty. One commit either way.
     pub fn updateGroupMembers(self: *Store, group: []const u8, members: []const []const u8, remove: bool) StoreError!void {
         try validName(group);
-        var m = self.begin();
+        var m = try self.begin();
         defer m.end();
         const a = m.a();
         var next = self.state.snap;
@@ -823,11 +858,22 @@ pub const Store = struct {
         fn end(m: *Mutation) void {
             m.arena.deinit();
             m.store.lock.unlock();
+            if (m.store.persist.vtable.unlock) |f| f(m.store.persist.ptr);
         }
     };
 
-    fn begin(self: *Store) Mutation {
+    /// Shared stores: lock across processes and start from the latest saved state.
+    fn begin(self: *Store) StoreError!Mutation {
+        if (self.persist.vtable.lock) |f| try f(self.persist.ptr);
+        errdefer if (self.persist.vtable.unlock) |f| f(self.persist.ptr);
+        var fresh: ?[]u8 = null;
+        if (self.persist.shared()) fresh = try self.persist.load(self.gpa);
+        defer if (fresh) |b| self.gpa.free(b);
         self.lock.lock();
+        if (self.persist.shared()) self.swapIn(fresh) catch |e| {
+            self.lock.unlock();
+            return e;
+        };
         return .{ .store = self, .arena = .init(self.gpa) };
     }
 
@@ -840,6 +886,7 @@ pub const Store = struct {
         try self.persist.save(bytes);
         self.state.destroy(self.gpa);
         self.state = st;
+        self.digest = digestOf(bytes);
     }
 };
 

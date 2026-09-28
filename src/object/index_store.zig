@@ -65,6 +65,7 @@ fn writeState(svc: *Svc, s: State) Error!void {
 
 /// Loads the snapshot when the state is clean, else rebuilds from the records.
 pub fn open(svc: *Svc) Error!void {
+    if (!svc.persist_index) return rebuildLocked(svc);
     const st = readState(svc);
     if (st) |s| {
         svc.index_gen = s.gen;
@@ -103,7 +104,7 @@ pub fn markDirtyLocked(svc: *Svc) Error!void {
 
 /// Caller holds `svc.mutex`.
 pub fn flushLocked(svc: *Svc) Error!void {
-    if (svc.index_clean) return;
+    if (svc.index_clean or !svc.persist_index) return;
     if (svc.index.stale) try rebuildLocked(svc);
     const gen = svc.index_gen + 1;
     for (svc.catalog.buckets.items) |b| {

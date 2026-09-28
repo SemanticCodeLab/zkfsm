@@ -71,6 +71,7 @@ pub fn create(svc: *ObjectService, bucket: []const u8, key: []const u8, in: serv
         .internal_meta = meta.internal,
         .system = in.system,
     };
+    defer svc.publishPending();
     svc.mutex.lock();
     defer svc.mutex.unlock();
     try storeUpload(svc, rec);
@@ -108,6 +109,8 @@ pub fn uploadPart(
 
     var replaced: ?core.ObjectId = null;
     {
+        const held = try svc.clusterLock("upload", &id.toHex(), "");
+        defer svc.clusterUnlock(held);
         var arena = std.heap.ArenaAllocator.init(svc.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -168,6 +171,8 @@ pub fn uploadPartCopy(
 /// then drops the upload and every part blob. ETag is md5(part md5s) with a part count.
 pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: UploadId, refs: []const PartRef) Error!service.ObjectInfo {
     const bid = try svc.bucketId(bucket);
+    const held = try svc.clusterLock("upload", &id.toHex(), "");
+    defer svc.clusterUnlock(held);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -253,6 +258,8 @@ fn planComplete(rec: UploadRecord, refs: []const PartRef, segs: []blob.Segment) 
 
 pub fn abort(svc: *ObjectService, bucket: []const u8, key: []const u8, id: UploadId) Error!void {
     const bid = try svc.bucketId(bucket);
+    const held = try svc.clusterLock("upload", &id.toHex(), "");
+    defer svc.clusterUnlock(held);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     _ = try loadUploadLocked(svc, arena.allocator(), bid, key, id);
@@ -305,6 +312,7 @@ pub fn sweepStale(svc: *ObjectService, now_ns: i128, max_age_ns: i128) Error!usi
         };
         if (!orphan and now_ns - u.upload.created_ns < max_age_ns) continue;
         dropUpload(svc, u.id);
+        svc.publishPending();
         n += 1;
     }
     return n;
@@ -341,6 +349,7 @@ fn storeUpload(svc: *ObjectService, rec: UploadRecord) Error!void {
     try svc.beginIndexChange();
     // Indexed first: a failed write may still have landed, and a stale entry is skipped on read.
     svc.index.putUpload(rec.upload_id, .{ .bucket = rec.bucket_id, .key = rec.key, .created_ns = rec.created_ns });
+    defer svc.emit(.{ .upload = rec.upload_id });
     svc.store.putRecord(placement.uploadKey(rec.upload_id), bytes) catch |e| return service.mapBackend(e);
 }
 
@@ -360,6 +369,7 @@ fn dropUpload(svc: *ObjectService, id: UploadId) void {
         svc.beginIndexChange() catch return;
         svc.store.deleteRecord(placement.uploadKey(id)) catch return;
         svc.index.removeUpload(id);
+        svc.emit(.{ .upload = id });
         break :blk r;
     };
     for (rec.parts) |p| svc.store.delete(placement.dataKey(p.blob)) catch {};

@@ -26,6 +26,22 @@ pub const Limits = struct {
 
 const Phase = enum(u8) { free, idle, head, busy };
 
+pub const RawError = error{ WriteFailed, ReadFailed, OutOfMemory, HttpExpectationFailed };
+
+/// A reserved path served before S3 parsing and authentication (the route
+/// authenticates itself). It must consume the request body it accepts.
+pub const RawRoute = struct {
+    prefix: []const u8,
+    ctx: *anyopaque,
+    serve: *const fn (ctx: *anyopaque, req: *std.http.Server.Request, arena: std.mem.Allocator) RawError!void,
+};
+
+/// Readiness override (cluster quorum); default is a storage sync probe.
+pub const Ready = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque) bool,
+};
+
 /// One worker's connection, visible to the watchdog.
 const Slot = struct {
     mutex: std.Thread.Mutex = .{},
@@ -93,6 +109,10 @@ pub const Server = struct {
     /// When set, every connection is TLS-terminated before HTTP.
     tls: ?*tls.Context = null,
     limits: Limits = .{},
+    raw_routes: []const RawRoute = &.{},
+    ready: ?Ready = null,
+    /// While false, S3 requests get 503 (raw routes and health still work).
+    open_gate: ?*const std.atomic.Value(bool) = null,
 
     stopping: std.atomic.Value(bool) = .init(false),
     listen_fd: std.atomic.Value(posix.socket_t) = .init(-1),
@@ -213,10 +233,21 @@ pub const Server = struct {
         }
     }
 
+    fn isReady(self: *Server) bool {
+        if (self.open_gate) |g| if (!g.load(.acquire)) return false;
+        if (self.ready) |r| return r.func(r.ctx);
+        return metrics.isReady(self.svc);
+    }
+
+    fn rawRoute(self: *Server, target: []const u8) ?RawRoute {
+        for (self.raw_routes) |r| if (std.mem.startsWith(u8, target, r.prefix)) return r;
+        return null;
+    }
+
     fn serveOps(self: *Server, req: *std.http.Server.Request, ep: metrics.Endpoint) !void {
         switch (ep) {
             .live => try req.respond("OK\n", .{}),
-            .ready => if (metrics.isReady(self.svc) and !self.stopping.load(.monotonic))
+            .ready => if (self.isReady() and !self.stopping.load(.monotonic))
                 try req.respond("OK\n", .{})
             else
                 try req.respond("NOT READY\n", .{ .status = .service_unavailable }),
@@ -269,8 +300,13 @@ pub const Server = struct {
                 .head = sigv4.parseHead(arena.allocator(), head_buffer) catch return,
             };
             const keep_alive = req.head.keep_alive;
-            if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
+            if (self.rawRoute(req.head.target)) |r| {
+                r.serve(r.ctx, &req, arena.allocator()) catch return;
+            } else if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;
+            } else if (self.open_gate != null and !self.open_gate.?.load(.acquire)) {
+                req.respond("server is starting\n", .{ .status = .service_unavailable, .keep_alive = false }) catch {};
+                return;
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;

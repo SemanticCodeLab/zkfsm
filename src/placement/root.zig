@@ -7,6 +7,7 @@ pub const profile = @import("profile.zig");
 pub const rendezvous = @import("rendezvous.zig");
 pub const drives = @import("drives.zig");
 pub const ellipsis = @import("ellipsis.zig");
+pub const layout = @import("layout.zig");
 
 pub const Profile = profile.Profile;
 pub const StorageClassConfig = profile.StorageClassConfig;
@@ -58,4 +59,5 @@ test {
     _ = rendezvous;
     _ = drives;
     _ = ellipsis;
+    _ = layout;
 }

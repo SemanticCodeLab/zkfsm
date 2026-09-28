@@ -320,15 +320,51 @@ fn getObject(c: *Ctx) DispatchError!void {
     const len = if (range) |r| r.length else info.size;
     var out_buf: [io_buf_len]u8 = undefined;
     metrics.global.last_status = if (range != null) 206 else 200;
-    var bw = try c.req.respondStreaming(&out_buf, .{
+    const opts: std.http.Server.Request.RespondStreamingOptions = .{
         .content_length = len,
         .respond_options = .{ .status = if (range != null) .partial_content else .ok, .extra_headers = hdrs.items },
-    });
-    if (bw.isEliding()) return bw.flush();
-    // Headers are committed; a failure now can only abort the connection.
-    c.svc.read(info, range, &bw.writer) catch return error.StreamAborted;
+    };
+    if (c.method != .GET) {
+        var bw = try c.req.respondStreaming(&out_buf, opts);
+        return bw.flush();
+    }
+    // Headers go out with the first body byte, so a read that fails before any data
+    // (e.g. storage quorum lost) still gets a proper error response.
+    var lazy: LazyBody = .{ .req = c.req, .buf = &out_buf, .opts = opts };
+    c.svc.read(info, range, &lazy.writer) catch |e| {
+        if (lazy.bw != null) return error.StreamAborted;
+        return fail(c, errors.fromObject(e));
+    };
+    const bw = lazy.begin() catch return error.WriteFailed;
     try bw.end();
 }
+
+/// A body writer that commits the response head on its first write.
+const LazyBody = struct {
+    req: *Request,
+    buf: []u8,
+    opts: std.http.Server.Request.RespondStreamingOptions,
+    bw: ?std.http.BodyWriter = null,
+    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+    fn begin(self: *LazyBody) std.Io.Writer.Error!*std.http.BodyWriter {
+        if (self.bw == null) self.bw = self.req.respondStreaming(self.buf, self.opts) catch return error.WriteFailed;
+        return &self.bw.?;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *LazyBody = @fieldParentPtr("writer", w);
+        const bw = try self.begin();
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try bw.writer.writeAll(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try bw.writer.writeAll(last);
+        return n + last.len * splat;
+    }
+};
 
 const PartSel = struct { range: ?core.Range, count: ?usize };
 

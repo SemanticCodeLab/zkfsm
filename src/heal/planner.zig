@@ -31,6 +31,8 @@ pub fn plan(gpa: std.mem.Allocator, drives: *const placement.DriveSet, scan: *co
     errdefer p.deinit(gpa);
     for (scan.probes[0..scan.drive_count], 0..) |probe, i| {
         const d: u8 = @intCast(i);
+        // A remote drive's identity is its owner's to repair.
+        if (!drives.isLocal(i)) continue;
         const online = drives.drives[i].online.load(.acquire);
         switch (probe) {
             .unformatted => try p.actions.append(gpa, .{ .reinit_drive = d }),

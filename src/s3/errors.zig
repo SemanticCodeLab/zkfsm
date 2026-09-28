@@ -47,6 +47,8 @@ pub const Code = enum {
     NoSuchBucketPolicy,
     MalformedPolicy,
     InvalidPartNumber,
+    WriteQuorumUnavailable,
+    ReadQuorumUnavailable,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -69,6 +71,7 @@ pub const Code = enum {
             .NoSuchLifecycleConfiguration, .NoSuchBucketPolicy => .not_found,
             .MalformedPolicy => .bad_request,
             .InvalidPartNumber => .range_not_satisfiable,
+            .WriteQuorumUnavailable, .ReadQuorumUnavailable => .service_unavailable,
         };
     }
 
@@ -117,6 +120,8 @@ pub const Code = enum {
             .NoSuchBucketPolicy => "The bucket policy does not exist",
             .MalformedPolicy => "Policies must be valid JSON and the first byte must be '{'",
             .InvalidPartNumber => "The requested partnumber is not satisfiable",
+            .WriteQuorumUnavailable => "Write quorum not available: too many drives or nodes of this erasure set are offline.",
+            .ReadQuorumUnavailable => "Read quorum not available: too many drives or nodes holding this object are offline.",
         };
     }
 };
@@ -145,6 +150,9 @@ pub fn fromObject(e: object.Error) Code {
         error.MetadataTooLarge => .MetadataTooLarge,
         error.BadDigest => .BadDigest,
         error.InvalidMetadata => .InvalidArgument,
+        error.WriteQuorum => .WriteQuorumUnavailable,
+        error.ReadQuorum => .ReadQuorumUnavailable,
+        error.LockTimeout => .ServiceUnavailable,
     };
 }
 

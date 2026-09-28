@@ -15,6 +15,8 @@ pub const Config = struct {
     rate_per_sec: u32 = 2000,
     /// Temp files older than this are leftovers of interrupted writes.
     temp_grace_ns: u64 = std.time.ns_per_hour,
+    /// Collect keys for verification; off, a pass only probes drives and sweeps temps.
+    walk_keys: bool = true,
 };
 
 pub const StaleTemp = struct {
@@ -103,11 +105,39 @@ pub const HealthScanner = struct {
         for (0..res.drive_count) |i| {
             res.probes[i] = self.drives.probe(i);
             if (res.probes[i] != .ok) continue;
-            const lb = self.drives.acquire(i) orelse continue;
+            const h = self.drives.acquire(i) orelse continue;
             defer self.drives.release(i);
-            try self.walk(@intCast(i), lb.root, &res);
+            switch (h) {
+                .local => |lb| try self.walk(@intCast(i), lb.root, &res),
+                .ext => |x| if (self.cfg.walk_keys) try self.scanRemote(@intCast(i), x, &res),
+            }
         }
         return res;
+    }
+
+    /// Remote drives are listed page by page; their temps are the owner's to sweep.
+    fn scanRemote(self: *HealthScanner, drive: u8, x: iface.drive.Ext, res: *ScanResult) Error!void {
+        for ([_]iface.KeySpace{ .data, .record, .system }) |space| {
+            var after: ?[32]u8 = null;
+            while (true) {
+                var page: iface.drive.ScanPage = .{};
+                defer page.deinit(self.gpa);
+                x.vtable.scan(x.ctx, self.gpa, space, after, &page) catch |e| {
+                    if (e == error.OutOfMemory) return error.OutOfMemory;
+                    std.log.warn("heal scan of remote drive {d} stopped: {t}", .{ drive, e });
+                    return;
+                };
+                for (page.keys.items) |k| {
+                    try self.throttle.tick();
+                    res.entries += 1;
+                    const gop = try res.keys.getOrPut(self.gpa, k);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* |= @as(u32, 1) << @intCast(drive);
+                }
+                if (!page.more or page.keys.items.len == 0) break;
+                after = page.keys.items[page.keys.items.len - 1].hex;
+            }
+        }
     }
 
     fn walk(self: *HealthScanner, drive: u8, root: std.fs.Dir, res: *ScanResult) Error!void {
@@ -128,6 +158,7 @@ pub const HealthScanner = struct {
                         const sub: ?struct { Where, iface.KeySpace } =
                             if (std.mem.eql(u8, ent.name, "data")) .{ .fan0, .data } else if (std.mem.eql(u8, ent.name, "record")) .{ .fan0, .record } else if (std.mem.eql(u8, ent.name, "system")) .{ .system, .system } else if (std.mem.eql(u8, ent.name, "tmp")) .{ .tmp, .data } else null;
                         const s = sub orelse continue;
+                        if (!self.cfg.walk_keys and s[0] != .tmp) continue;
                         if (frame.child(ent.name, s[0], s[1])) |c| try stack.append(self.gpa, c);
                     },
                     .fan0, .fan1 => {

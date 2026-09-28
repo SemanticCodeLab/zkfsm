@@ -11,7 +11,9 @@ const replica = @import("replica.zig");
 const Error = iface.Error;
 const PhysicalKey = iface.PhysicalKey;
 const ObjectMeta = iface.ObjectMeta;
-const LocalBackend = iface.local.LocalBackend;
+const Handle = iface.drive.Handle;
+const Pending = iface.drive.Pending;
+const ShardFile = iface.drive.ShardFile;
 const ReplicaStore = replica.ReplicaStore;
 const Holds = ReplicaStore.Holds;
 const KeyReport = replica.KeyReport;
@@ -59,21 +61,24 @@ const Header = struct {
 
 /// Open shard files of one object with their agreed header.
 const Shards = struct {
-    files: [max_n]?std.fs.File = @splat(null),
+    files: [max_n]?ShardFile = @splat(null),
     bad: [max_n]bool = @splat(false),
     missing: usize = 0,
+    /// Drives that could not be asked (offline or unreachable).
+    offline: usize = 0,
+    down: [max_n]bool = @splat(false),
     header: ?Header = null,
     mtime: i128 = 0,
 
     fn close(s: *Shards) void {
-        for (&s.files) |*f| if (f.*) |file| {
+        for (&s.files) |*f| if (f.*) |*file| {
             file.close();
             f.* = null;
         };
     }
 
     fn drop(s: *Shards, i: usize) void {
-        if (s.files[i]) |f| f.close();
+        if (s.files[i]) |*f| f.close();
         s.files[i] = null;
         s.bad[i] = true;
     }
@@ -114,14 +119,21 @@ pub const ErasureStore = struct {
         return @as(usize, self.codec.k) + self.codec.m;
     }
 
-    /// Writes need k+1 shards so at least one parity survives any single later loss.
+    /// Single node: k+1 shards so one parity survives any later loss. Cluster: data
+    /// shards, +1 when data == parity, so two write quorums always overlap.
     fn writeQuorum(self: *const ErasureStore) usize {
+        if (self.drives.isCluster()) return placement.layout.objectWriteQuorum(self.drives.profile);
         return @min(self.width(), @as(usize, self.codec.k) + 1);
+    }
+
+    fn clustered(self: *const ErasureStore) bool {
+        return self.drives.isCluster();
     }
 
     fn put(ctx: *anyopaque, key: PhysicalKey, source: *std.Io.Reader, opts: iface.PutOptions) Error!ObjectMeta {
         const self = cast(ctx);
         if (key.space != .data) return error.InvalidKey;
+        if (!self.drives.writable()) return error.WriteQuorum;
         const n = self.width();
         const k = self.codec.k;
         var pbuf: [max_drives]u8 = undefined;
@@ -129,7 +141,7 @@ pub const ErasureStore = struct {
         var holds = Holds.acquire(self.drives, placed);
         defer holds.release();
 
-        var pend: [max_n]?LocalBackend.PendingWrite = @splat(null);
+        var pend: [max_n]?Pending = @splat(null);
         defer for (&pend) |*slot| if (slot.*) |*w| w.abort();
         var worst: Error = error.IoFailed;
         var live: usize = 0;
@@ -148,7 +160,7 @@ pub const ErasureStore = struct {
             pend[i] = w;
             live += 1;
         }
-        if (live < self.writeQuorum()) return worst;
+        if (live < self.writeQuorum()) return self.meta.short(&holds, self.writeQuorum(), worst, error.WriteQuorum);
 
         const lay0 = Layout.init(0, block_size, k) catch return error.IoFailed;
         const sl = lay0.shardLen();
@@ -175,16 +187,16 @@ pub const ErasureStore = struct {
                 };
                 w.writeAll(slices[i]) catch |e| dropWriter(&pend[i], &live, &worst, e);
             };
-            if (live < self.writeQuorum()) return worst;
+            if (live < self.writeQuorum()) return if (self.clustered()) error.WriteQuorum else worst;
             total += got;
             if (got < want) break;
         }
 
         for (0..n) |i| if (pend[i]) |*w| {
             const h = (Header{ .k = k, .m = self.codec.m, .index = @intCast(i), .block_size = block_size, .size = total }).encode();
-            w.file.pwriteAll(&h, 0) catch dropWriter(&pend[i], &live, &worst, error.IoFailed);
+            w.pwrite(&h, 0) catch dropWriter(&pend[i], &live, &worst, error.IoFailed);
         };
-        if (live < self.writeQuorum()) return worst;
+        if (live < self.writeQuorum()) return if (self.clustered()) error.WriteQuorum else worst;
 
         const mtx = self.meta.stripe(key);
         mtx.lock();
@@ -202,13 +214,13 @@ pub const ErasureStore = struct {
             ok += 1;
         };
         if (ok < self.writeQuorum()) {
-            for (0..n) |i| if (committed[i]) holds.lbs[i].?.backend().delete(key) catch {};
-            return worst;
+            for (0..n) |i| if (committed[i]) holds.lbs[i].?.store().delete(key) catch {};
+            return if (self.clustered() and worst == error.IoFailed) error.WriteQuorum else worst;
         }
         return .{ .size = total, .mtime_ns = core.time.nowNs() };
     }
 
-    fn dropWriter(slot: *?LocalBackend.PendingWrite, live: *usize, worst: *Error, e: Error) void {
+    fn dropWriter(slot: *?Pending, live: *usize, worst: *Error, e: Error) void {
         slot.*.?.abort();
         slot.* = null;
         live.* -= 1;
@@ -223,16 +235,23 @@ pub const ErasureStore = struct {
         for (0..n) |i| {
             const lb = holds.lbs[i] orelse {
                 s.bad[i] = true;
+                s.down[i] = true;
+                s.offline += 1;
                 continue;
             };
             const f = lb.openRead(key) catch |e| {
-                if (e == error.NotFound) s.missing += 1;
+                if (e == error.NotFound) {
+                    s.missing += 1;
+                } else {
+                    s.offline += 1;
+                    s.down[i] = true;
+                }
                 s.bad[i] = true;
                 continue;
             };
             s.files[i] = f;
             var hb: [header_len]u8 = undefined;
-            const got = f.preadAll(&hb, 0) catch 0;
+            const got = s.files[i].?.preadAll(&hb, 0) catch 0;
             headers[i] = Header.decode(hb[0..got]);
             if (headers[i] == null) s.drop(i);
         }
@@ -254,14 +273,14 @@ pub const ErasureStore = struct {
                 s.drop(i);
             } else if (s.mtime == 0) {
                 if (s.files[i].?.stat()) |st| {
-                    s.mtime = st.mtime;
+                    s.mtime = st.mtime_ns;
                 } else |_| {}
             }
         };
         return s;
     }
 
-    fn readBlock(file: std.fs.File, b: u64, out: []u8, scratch: []u8) bool {
+    fn readBlock(file: *ShardFile, b: u64, out: []u8, scratch: []u8) bool {
         const want = 4 + out.len;
         const got = file.preadAll(scratch[0..want], header_len + b * want) catch return false;
         if (got != want) return false;
@@ -278,7 +297,7 @@ pub const ErasureStore = struct {
         var have: usize = 0;
         for (0..n) |i| {
             if (!all and i >= k and have == k) break;
-            const f = s.files[i] orelse continue;
+            const f = if (s.files[i]) |*f| f else continue;
             if (readBlock(f, b, slices[i], scratch)) {
                 present[i] = true;
                 have += 1;
@@ -307,12 +326,15 @@ pub const ErasureStore = struct {
             defer holds.release();
             var s = self.openShards(&holds, key);
             defer s.close();
-            const h = s.header orelse return if (s.missing == self.width()) error.NotFound else error.IoFailed;
+            const h = s.header orelse return self.noHeader(&s);
             const size = h.size;
             const r = range orelse core.Range{ .offset = 0, .length = size };
             if (r.length > 0 and (r.offset >= size or r.length > size - r.offset)) return error.IoFailed;
-            if (r.length > 0) try self.streamRange(&s, h, r, sink);
-            for (s.bad[0..self.width()]) |x| needs_heal = needs_heal or x;
+            if (r.length > 0) self.streamRange(&s, h, r, sink) catch |e| {
+                return if (e == error.IoFailed and self.clustered() and s.offline > 0) error.ReadQuorum else e;
+            };
+            // Shards on unreachable drives are the healer's job once they return.
+            for (s.bad[0..self.width()], s.down[0..self.width()]) |x, u| needs_heal = needs_heal or (x and !u);
             break :blk ObjectMeta{ .size = size, .mtime_ns = s.mtime };
         };
         if (needs_heal) {
@@ -380,14 +402,14 @@ pub const ErasureStore = struct {
         // Pass 1: find shards with bad blocks.
         var b: u64 = 0;
         while (b < lay.blockCount()) : (b += 1) {
-            for (0..n) |i| if (s.files[i]) |f| {
+            for (0..n) |i| if (s.files[i]) |*f| {
                 if (!readBlock(f, b, slices[i], scratch)) {
                     std.log.warn("drive {s}: corrupt shard {d} of {s}", .{ self.drives.drives[placed[i]].path, i, &key.hex });
                     s.drop(i);
                 }
             };
         }
-        var pend: [max_n]?LocalBackend.PendingWrite = @splat(null);
+        var pend: [max_n]?Pending = @splat(null);
         defer for (&pend) |*slot| if (slot.*) |*w| w.abort();
         for (0..n) |i| {
             if (!s.bad[i]) {
@@ -411,6 +433,12 @@ pub const ErasureStore = struct {
             pend[i] = w;
         }
         if (rep.healthy < k) {
+            if (self.dangling(&s)) {
+                std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
+                s.close();
+                for (0..n) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
+                return .{};
+            }
             rep.lost = true;
             return rep;
         }
@@ -448,6 +476,21 @@ pub const ErasureStore = struct {
         return rep;
     }
 
+    /// Why no header could be settled: absent everywhere, unreachable, or damaged.
+    fn noHeader(self: *const ErasureStore, s: *const Shards) Error {
+        if (s.missing == self.width()) return error.NotFound;
+        if (self.clustered() and s.offline > 0) return error.ReadQuorum;
+        return error.IoFailed;
+    }
+
+    /// Fewer than k shards while every drive answered, all older than the grace:
+    /// leftovers of an interrupted write or delete, never readable again.
+    fn dangling(self: *const ErasureStore, s: *const Shards) bool {
+        if (!self.clustered() or s.offline > 0) return false;
+        const now = core.time.nowNs();
+        return s.mtime != 0 and now - s.mtime > replica.tombstone_grace_ns;
+    }
+
     pub fn healKey(self: *ErasureStore, key: PhysicalKey) KeyReport {
         return if (key.space == .data) self.healData(key) else self.meta.healKey(key);
     }
@@ -460,7 +503,7 @@ pub const ErasureStore = struct {
         defer holds.release();
         var s = self.openShards(&holds, key);
         defer s.close();
-        const h = s.header orelse return if (s.missing == self.width()) error.NotFound else error.IoFailed;
+        const h = s.header orelse return self.noHeader(&s);
         return .{ .size = h.size, .mtime_ns = s.mtime };
     }
 

@@ -22,6 +22,16 @@ pub const Healer = struct {
     pass_lock: std.Thread.Mutex = .{},
     stop_ev: std.Thread.ResetEvent = .{},
     thread: ?std.Thread = null,
+    /// Set to run the next pass early (a peer came back, a drive was replaced).
+    wake_flag: std.atomic.Value(bool) = .init(false),
+    /// Cluster sets: whether this node verifies keys now (the set's heal leader, or
+    /// it holds a fresh drive). Null: always.
+    leader: ?Leader = null,
+
+    pub const Leader = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, drives: *placement.DriveSet) bool,
+    };
 
     pub fn init(gpa: std.mem.Allocator, drives: *placement.DriveSet, strategy: protection.Strategy, cfg: Config) Healer {
         return .{ .gpa = gpa, .drives = drives, .strategy = strategy, .cfg = cfg };
@@ -32,7 +42,9 @@ pub const Healer = struct {
         self.pass_lock.lock();
         defer self.pass_lock.unlock();
         var throttle: scanner.Throttle = .{ .per_sec = self.cfg.rate_per_sec, .stop = &self.stop_ev };
-        var sc: scanner.HealthScanner = .{ .gpa = self.gpa, .drives = self.drives, .throttle = &throttle, .cfg = self.cfg };
+        var cfg = self.cfg;
+        if (self.leader) |l| cfg.walk_keys = self.hasFresh() or l.func(l.ctx, self.drives);
+        var sc: scanner.HealthScanner = .{ .gpa = self.gpa, .drives = self.drives, .throttle = &throttle, .cfg = cfg };
         var scan = try sc.scan();
         defer scan.deinit(self.gpa);
         var plan = try planner.plan(self.gpa, self.drives, &scan);
@@ -40,10 +52,20 @@ pub const Healer = struct {
         var report: Report = .{ .entries_scanned = scan.entries };
         var ex: executor.HealExecutor = .{ .drives = self.drives, .strategy = self.strategy, .throttle = &throttle };
         try ex.run(&plan, &report);
-        if (report.fullyRedundant()) {
+        if (report.fullyRedundant() and cfg.walk_keys) {
             for (self.drives.drives) |*d| d.fresh.store(false, .release);
         }
         return report;
+    }
+
+    fn hasFresh(self: *Healer) bool {
+        for (self.drives.drives) |*d| if (d.fresh.load(.acquire)) return true;
+        return false;
+    }
+
+    /// Asks the background loop for a pass as soon as possible.
+    pub fn wake(self: *Healer) void {
+        self.wake_flag.store(true, .release);
     }
 
     /// Starts the background loop; a pass runs at once if a drive is fresh.
@@ -65,9 +87,14 @@ pub const Healer = struct {
                 if (d.fresh.load(.acquire)) break true;
             } else false;
             if (!(first and fresh)) {
-                self.stop_ev.timedWait(interval_ns) catch {};
-                if (self.stop_ev.isSet()) return;
+                // Sleep in short steps so a wake request is served promptly.
+                var waited: u64 = 0;
+                while (waited < interval_ns and !self.wake_flag.load(.acquire)) : (waited += wake_step_ns) {
+                    self.stop_ev.timedWait(@min(wake_step_ns, interval_ns - waited)) catch {};
+                    if (self.stop_ev.isSet()) return;
+                }
             }
+            self.wake_flag.store(false, .release);
             first = false;
             const r = self.runOnce() catch |e| {
                 if (e == error.Stopped) return;
@@ -78,6 +105,8 @@ pub const Healer = struct {
         }
     }
 };
+
+const wake_step_ns = std.time.ns_per_s;
 
 pub fn logReport(r: Report) void {
     std.log.info(

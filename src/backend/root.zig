@@ -8,6 +8,7 @@ pub const s3 = @import("s3.zig");
 pub const azure = @import("azure.zig");
 pub const gcs = @import("gcs.zig");
 pub const nas = @import("nas.zig");
+pub const drive = @import("drive.zig");
 
 pub const Range = core.Range;
 
@@ -22,6 +23,10 @@ pub const Error = error{
     /// The caller's sink writer failed.
     WriteFailed,
     OutOfMemory,
+    /// Too few drives reachable to accept a write.
+    WriteQuorum,
+    /// Too few drives reachable to read the object.
+    ReadQuorum,
 };
 
 /// Streamed blobs live in `data`; small atomic records in `record`/`system`.
@@ -113,6 +118,7 @@ test {
     _ = azure;
     _ = gcs;
     _ = nas;
+    _ = drive;
     _ = @import("s3/sign.zig");
     _ = @import("remote/http.zig");
     _ = @import("remote/xml.zig");

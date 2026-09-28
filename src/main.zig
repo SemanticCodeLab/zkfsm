@@ -11,6 +11,7 @@ const iam = @import("iam/root.zig");
 const admin = @import("admin/root.zig");
 const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
+const cluster = @import("cluster/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -44,6 +45,15 @@ const usage =
     \\  --idle-timeout   seconds a connection may idle or a socket op may stall (default: 30)
     \\  --header-timeout seconds to receive a request head once it starts (default: 10)
     \\  --shutdown-timeout seconds SIGINT/SIGTERM waits for in-flight requests (default: 30)
+    \\cluster (every node gets the same endpoint list; see README "Cluster"):
+    \\  --data URL...    http(s)://host:port/path endpoints with {a...b} patterns; each
+    \\                   --data flag is one pool, pools may only be appended
+    \\  --node-address H:P  this node's host:port in the endpoint list (default: from --listen)
+    \\  --cluster-secret S  node-to-node RPC secret (or $ZKFSM_CLUSTER_SECRET);
+    \\                   default: derived from the root credentials
+    \\  --set-size N     drives per erasure set (default: largest fitting divisor <= 16)
+    \\  --cluster-refresh S  seconds between catalog/IAM reloads from the store (default: 10)
+    \\  --cluster-ca FILE  extra PEM certificates trusted for peer TLS; repeatable
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -67,6 +77,13 @@ const Config = struct {
     tls_key: ?[]const u8 = null,
     certs_dir: ?[]const u8 = null,
     limits: s3.server.Limits = .{},
+    /// Cluster mode: per pool, its endpoint arguments (empty for local drives).
+    pools: []const []const []const u8 = &.{},
+    node_address: ?[]const u8 = null,
+    cluster_secret: ?[]const u8 = null,
+    set_size: ?usize = null,
+    cluster_refresh_s: u64 = 10,
+    cluster_ca: []const []const u8 = &.{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -102,6 +119,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
     var cfg: Config = .{ .data = &.{} };
     var specs: std.ArrayList([]const u8) = .empty;
     var domains: std.ArrayList([]const u8) = .empty;
+    var groups: std.ArrayList([]const []const u8) = .empty;
+    var cas: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     if (args.len > 1 and std.mem.eql(u8, args[1], "heal")) {
         cfg.heal_only = true;
@@ -121,8 +140,20 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         if (i + 1 >= args.len) return error.BadArgs;
         i += 1;
         if (std.mem.eql(u8, a, "--data")) {
+            const first = specs.items.len;
             try specs.append(arena, args[i]);
             while (i + 1 < args.len and !isFlag(args[i + 1])) : (i += 1) try specs.append(arena, args[i + 1]);
+            try groups.append(arena, try arena.dupe([]const u8, specs.items[first..]));
+        } else if (std.mem.eql(u8, a, "--node-address")) {
+            cfg.node_address = args[i];
+        } else if (std.mem.eql(u8, a, "--cluster-secret")) {
+            cfg.cluster_secret = args[i];
+        } else if (std.mem.eql(u8, a, "--cluster-ca")) {
+            try cas.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--set-size")) {
+            cfg.set_size = std.fmt.parseInt(usize, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--cluster-refresh")) {
+            cfg.cluster_refresh_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--listen")) {
             const colon = std.mem.lastIndexOfScalar(u8, args[i], ':') orelse return error.BadArgs;
             cfg.host = args[i][0..colon];
@@ -163,6 +194,16 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
     if (specs.items.len == 0) {
         var it = std.mem.tokenizeScalar(u8, env_data orelse "./data", ' ');
         while (it.next()) |d| try specs.append(arena, d);
+        try groups.append(arena, specs.items);
+    }
+    cfg.cluster_ca = cas.items;
+    var urls: usize = 0;
+    for (specs.items) |sp| urls += @intFromBool(cluster.isUrl(sp));
+    if (urls > 0) {
+        // Cluster endpoints: each --data flag is one pool.
+        if (urls != specs.items.len) return error.BadArgs;
+        cfg.pools = groups.items;
+        return finish(&cfg, domains.items);
     }
     var paths: std.ArrayList([]const u8) = .empty;
     for (specs.items) |sp| placement.ellipsis.expand(arena, sp, &paths) catch |e| return switch (e) {
@@ -170,11 +211,15 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         else => error.BadArgs,
     };
     cfg.data = paths.items;
-    cfg.domains = domains.items;
+    return finish(&cfg, domains.items);
+}
+
+fn finish(cfg: *Config, domains: []const []const u8) ConfigError!Config {
+    cfg.domains = domains;
     for (cfg.domains) |d| if (!validDomain(d)) return error.BadArgs;
     if (cfg.path_prefix) |p| if (p.len > 0 and !s3.router.validBasePath(p)) return error.BadArgs;
     if (!s3.router.validBasePath(cfg.health_prefix) or !s3.router.validBasePath(cfg.metrics_path)) return error.BadArgs;
-    return cfg;
+    return cfg.*;
 }
 
 fn validDomain(d: []const u8) bool {
@@ -223,6 +268,7 @@ pub fn run(opts: Options) u8 {
         std.log.err("invalid listen address {s}", .{cfg.host});
         return 2;
     };
+    if (cfg.pools.len > 0) return runCluster(gpa, arena, cfg, creds, addr, opts);
     var drives = placement.DriveSet.open(gpa, cfg.data, cfg.protection) catch |e| {
         std.log.err("cannot open drives: {t}", .{e});
         return 1;
@@ -258,9 +304,9 @@ pub fn run(opts: Options) u8 {
         };
     }
     defer if (cfg.scan_interval_s > 0) healer.stop();
-    if (std.Thread.spawn(.{}, sweepLoop, .{&svc})) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
+    if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, null) })) |t| t.detach() else |e| std.log.warn("upload sweeper not started: {t}", .{e});
     if (cfg.lifecycle_interval_s > 0) {
-        if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s })) |t| t.detach() else |e| std.log.warn("lifecycle worker not started: {t}", .{e});
+        if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, null) })) |t| t.detach() else |e| std.log.warn("lifecycle worker not started: {t}", .{e});
     }
     var auth: s3.sigv4.Config = .{};
     var iam_dir: ?std.fs.Dir = null;
@@ -325,6 +371,138 @@ pub fn run(opts: Options) u8 {
     return 0;
 }
 
+/// Cluster mode: the RPC route is served before bootstrap so peers can negotiate
+/// the layout; S3 requests wait behind the gate until storage and IAM are up.
+fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options) u8 {
+    if (cfg.heal_only) {
+        std.log.err("heal runs continuously on cluster nodes; the one-shot heal command is for local drives", .{});
+        return 2;
+    }
+    const secret_str = cfg.cluster_secret orelse (envVar(arena, "ZKFSM_CLUSTER_SECRET") catch return 1);
+    const secret = if (secret_str) |sct| cluster.auth.fromString(sct) else if (creds) |c| cluster.auth.fromRoot(c.access_key, c.secret_key) else {
+        std.log.err("an anonymous cluster needs --cluster-secret", .{});
+        return 2;
+    };
+    const tls_paths = tlsPaths(arena, cfg) catch {
+        std.log.err("--tls-cert and --tls-key must be set together", .{});
+        return 2;
+    };
+    var cas: std.ArrayList([]const u8) = .empty;
+    for (cfg.cluster_ca) |c| cas.append(arena, std.fs.cwd().realpathAlloc(arena, c) catch c) catch return 1;
+    if (tls_paths) |tp| cas.append(arena, std.fs.cwd().realpathAlloc(arena, tp[0]) catch tp[0]) catch return 1;
+    const node = cluster.Node.create(gpa, .{
+        .pools = cfg.pools,
+        .node_address = cfg.node_address,
+        .listen_host = cfg.host,
+        .listen_port = cfg.port,
+        .profile = cfg.protection,
+        .set_size = cfg.set_size,
+        .secret = secret,
+        .root_fp = if (creds) |c| cluster.auth.rootFingerprint(secret, c.access_key, c.secret_key) else @splat(0),
+        .ca_files = cas.items,
+        .scan_interval_s = if (cfg.scan_interval_s == 0) 600 else cfg.scan_interval_s,
+        .refresh_s = cfg.cluster_refresh_s,
+    }) catch return 2;
+    defer node.destroy();
+
+    var svc: object.ObjectService = undefined;
+    var svc_ready = false;
+    defer if (svc_ready) svc.deinit();
+    var iam_store: iam.Store = undefined;
+    var iam_ready = false;
+    defer if (iam_ready) iam_store.deinit();
+    var auth: s3.sigv4.Config = .{};
+    if (creds) |c| auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
+    const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
+    admin.api.validatePrefix(admin_prefix) catch {
+        std.log.err("invalid admin prefix {s}", .{admin_prefix});
+        return 2;
+    };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    var tls_ctx: tls.Context = undefined;
+    if (tls_paths) |tp| {
+        tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
+            std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
+            return 2;
+        };
+        tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+    }
+    defer if (tls_paths != null) tls_ctx.deinit();
+    const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    var server: s3.Server = .{
+        .gpa = gpa,
+        .svc = &svc,
+        .auth = auth,
+        .extensions = extensions,
+        .tls = if (tls_paths != null) &tls_ctx else null,
+        .limits = cfg.limits,
+        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
+        .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+        .raw_routes = &routes,
+        .ready = .{ .ctx = node, .func = clusterReady },
+        .open_gate = &node.open,
+    };
+    metrics.global.counters.started_ns = std.time.nanoTimestamp();
+    active_server = &server;
+    installStopSignals();
+    const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
+        std.log.err("cannot start the listener", .{});
+        return 1;
+    };
+    const code: u8 = blk: {
+        node.bootstrap() catch |e| {
+            if (e != error.Stopped) std.log.err("cluster bootstrap failed: {t}", .{e});
+            break :blk if (e == error.Stopped) 0 else 1;
+        };
+        node.initService(&svc) catch |e| {
+            if (e != error.Stopped) std.log.err("cannot open the object service: {t}", .{e});
+            break :blk if (e == error.Stopped) 0 else 1;
+        };
+        svc_ready = true;
+        if (creds) |c| {
+            while (true) {
+                iam_store.open(gpa, node.iamPersistence(), .{ .root_access_key = c.access_key, .root_secret = c.secret_key }) catch |e| {
+                    if (e != error.PersistFailed) {
+                        std.log.err("cannot load IAM store: {t}", .{e});
+                        break :blk 1;
+                    }
+                    if (node.stop_ev.isSet()) break :blk 0;
+                    std.log.info("cluster: waiting for IAM read quorum", .{});
+                    std.Thread.sleep(std.time.ns_per_s);
+                    continue;
+                };
+                iam_ready = true;
+                break;
+            }
+        }
+        node.start(if (iam_ready) &iam_store else null);
+        if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
+        if (cfg.lifecycle_interval_s > 0) {
+            if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
+        }
+        std.log.info("cluster: serving S3 on {f}", .{addr});
+        break :blk 0;
+    };
+    if (code != 0) _ = server.requestStop();
+    serving.join();
+    node.stop();
+    if (svc_ready) node.storage().sync() catch {};
+    std.log.info("stopped", .{});
+    return code;
+}
+
+fn serveThread(server: *s3.Server, addr: std.net.Address, node: *cluster.Node) void {
+    server.run(addr) catch |e| std.log.err("server failed: {t}", .{e});
+    // Unblocks a bootstrap that is still waiting for peers.
+    node.stop_ev.set();
+}
+
+fn clusterReady(ctx: *anyopaque) bool {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    return node.ready();
+}
+
 /// The admin prefix takes precedence over path-style S3 keys that share it.
 fn warnShadowedBucket(svc: *object.ObjectService, arena: std.mem.Allocator, prefix: []const u8) void {
     const buckets = svc.listBuckets(arena) catch return;
@@ -368,9 +546,14 @@ fn installStopSignals() void {
 }
 
 /// Aborts multipart uploads older than a week; runs at start, then hourly.
-fn sweepLoop(svc: *object.ObjectService) void {
+/// In a cluster only the leader node sweeps.
+fn sweepLoop(svc: *object.ObjectService, leader: ?*cluster.Node) void {
     const max_age: i128 = 7 * std.time.ns_per_day;
     while (true) {
+        if (leader) |l| if (!l.isLeader()) {
+            std.Thread.sleep(std.time.ns_per_hour);
+            continue;
+        };
         const n = object.multipart.sweepStale(svc, std.time.nanoTimestamp(), max_age) catch |e| blk: {
             std.log.warn("upload sweep failed: {t}", .{e});
             break :blk 0;
@@ -381,9 +564,10 @@ fn sweepLoop(svc: *object.ObjectService) void {
 }
 
 /// Applies bucket lifecycle rules: first pass after one interval, then every interval.
-fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64) void {
+fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.Node) void {
     while (true) {
         std.Thread.sleep(interval_s * std.time.ns_per_s);
+        if (leader) |l| if (!l.isLeader()) continue;
         const st = object.lifecycle.runOnce(svc, std.time.nanoTimestamp()) catch |e| {
             std.log.warn("lifecycle pass failed: {t}", .{e});
             continue;
@@ -485,6 +669,14 @@ test "arg parsing" {
         try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--metrics-path", bad }, null, .{}));
     }
     try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--domain", ".bad" }, null, .{}));
+
+    // Cluster endpoints: each --data flag is a pool; local paths cannot be mixed in.
+    const k = try parseArgs(a, &.{ "zkfsm", "--data", "http://h{1...4}:9000/d{1...4}", "--data", "http://g1:9000/e{1...8}", "http://g2:9000/e{1...8}", "--node-address", "h1:9000", "--set-size", "8", "--cluster-secret", "s3cr3t" }, null, .{});
+    try std.testing.expectEqual(@as(usize, 2), k.pools.len);
+    try std.testing.expectEqual(@as(usize, 2), k.pools[1].len);
+    try std.testing.expectEqualStrings("h1:9000", k.node_address.?);
+    try std.testing.expectEqual(@as(?usize, 8), k.set_size);
+    try std.testing.expectError(error.BadArgs, parseArgs(a, &.{ "zkfsm", "--data", "http://h:9000/d", "/local" }, null, .{}));
 }
 
 test {
@@ -502,4 +694,5 @@ test {
     _ = iam;
     _ = admin;
     _ = tls;
+    _ = cluster;
 }

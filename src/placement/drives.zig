@@ -4,8 +4,10 @@ const core = @import("../core/root.zig");
 const backend = @import("../backend/root.zig");
 const profile_mod = @import("profile.zig");
 const rendezvous = @import("rendezvous.zig");
+const layout = @import("layout.zig");
 
 const LocalBackend = backend.local.LocalBackend;
+const Handle = backend.drive.Handle;
 const Profile = profile_mod.Profile;
 const DriveId = core.DriveId;
 const SetId = core.SetId;
@@ -77,9 +79,18 @@ pub const Format = struct {
     }
 };
 
+/// Where a drive lives: a local directory or a remote drive behind RPC.
+pub const Kind = union(enum) {
+    local: LocalBackend,
+    remote: backend.drive.Ext,
+};
+
 pub const Drive = struct {
+    /// Local path, or the endpoint URL of a remote drive (for logs).
     path: []const u8,
-    lb: LocalBackend,
+    kind: Kind,
+    /// Owning node; placement spreads shards across distinct nodes.
+    node: u16 = 0,
     /// Shared for I/O, exclusive while the drive is reopened.
     lock: std.Thread.RwLock = .{},
     online: std.atomic.Value(bool) = .init(true),
@@ -90,12 +101,29 @@ pub const Drive = struct {
 /// What a probe of a drive's identity found.
 pub const Probe = enum { ok, unformatted, foreign, inaccessible };
 
+/// Cluster identity of a set; null on single-node drive sets.
+pub const ClusterInfo = struct {
+    /// Format of drive 0; other drives differ only in `index`.
+    format: layout.FormatV2,
+    /// Online drives the set needs before it accepts writes.
+    write_quorum: usize,
+};
+
+/// One drive of a cluster set as the caller found it.
+pub const Member = struct {
+    path: []const u8,
+    node: u16,
+    /// Null for a local drive at `path`.
+    remote: ?backend.drive.Ext = null,
+};
+
 pub const DriveSet = struct {
     gpa: std.mem.Allocator,
     drives: []Drive,
     set: SetId,
     profile: Profile,
     ids: [max_drives]DriveId,
+    cluster: ?ClusterInfo = null,
 
     /// Opens and verifies every drive; formats a brand-new set or empty replacement drives.
     pub fn open(gpa: std.mem.Allocator, paths: []const []const u8, want: ?Profile) OpenError!DriveSet {
@@ -105,7 +133,7 @@ pub const DriveSet = struct {
         var opened: usize = 0;
         errdefer {
             for (drives[0..opened]) |*d| {
-                d.lb.close();
+                d.kind.local.close();
                 gpa.free(d.path);
             }
             gpa.free(drives);
@@ -117,9 +145,9 @@ pub const DriveSet = struct {
                 var l = lb;
                 l.close();
                 return e;
-            }, .lb = lb };
+            }, .kind = .{ .local = lb } };
             opened += 1;
-            formats[i] = try readFormat(&drives[i].lb);
+            formats[i] = try readFormat(&drives[i].kind.local);
         }
 
         var ref: ?Format = null;
@@ -155,27 +183,108 @@ pub const DriveSet = struct {
         return set;
     }
 
+    /// Opens a cluster set. Local drives are verified against `tmpl` (their slot in the
+    /// layout) or formatted when empty; `fresh` marks such drives as needing a heal.
+    pub fn openCluster(gpa: std.mem.Allocator, members: []const Member, tmpl: layout.FormatV2, fresh: bool) OpenError!DriveSet {
+        if (members.len == 0) return error.NoDrives;
+        if (members.len > max_drives or members.len != tmpl.set_size) return error.TooManyDrives;
+        const drives = try gpa.alloc(Drive, members.len);
+        var opened: usize = 0;
+        errdefer {
+            for (drives[0..opened]) |*d| {
+                if (d.kind == .local) d.kind.local.close();
+                gpa.free(d.path);
+            }
+            gpa.free(drives);
+        }
+        var set: DriveSet = .{ .gpa = gpa, .drives = drives, .set = layout.setId(tmpl.deployment, tmpl.pool, tmpl.set), .profile = tmpl.profile, .ids = undefined };
+        set.cluster = .{ .format = tmpl, .write_quorum = layout.setWriteQuorum(members.len, tmpl.profile) };
+        set.cluster.?.format.index = 0;
+        for (members, 0..) |m, i| {
+            set.ids[i] = layout.driveId(tmpl.deployment, tmpl.pool, tmpl.set, @intCast(i));
+            const path = try gpa.dupe(u8, m.path);
+            if (m.remote) |x| {
+                drives[i] = .{ .path = path, .kind = .{ .remote = x }, .node = m.node };
+                opened += 1;
+                continue;
+            }
+            const lb = LocalBackend.open(m.path) catch {
+                gpa.free(path);
+                return error.DriveUnavailable;
+            };
+            drives[i] = .{ .path = path, .kind = .{ .local = lb }, .node = m.node };
+            opened += 1;
+            var buf: [layout.format_max]u8 = undefined;
+            const bytes = drives[i].kind.local.readFormat(&buf) catch |e| switch (e) {
+                error.NotFound => {
+                    set.writeFormat(i) catch return error.DriveUnavailable;
+                    if (fresh) {
+                        drives[i].fresh.store(true, .release);
+                        std.log.warn("drive {s}: empty, formatted as replacement", .{m.path});
+                    }
+                    continue;
+                },
+                else => return error.DriveUnavailable,
+            };
+            const f = layout.FormatV2.parse(bytes) catch return error.CorruptFormat;
+            var want = tmpl;
+            want.index = @intCast(i);
+            if (!std.mem.eql(u8, &f.deployment, &tmpl.deployment)) return error.ForeignDrive;
+            if (!f.sameSlot(want)) return error.DriveMismatch;
+        }
+        if (tmpl.profile.width() > members.len) return error.NotEnoughDrives;
+        return set;
+    }
+
     pub fn deinit(self: *DriveSet) void {
         for (self.drives) |*d| {
-            d.lb.close();
+            if (d.kind == .local) d.kind.local.close();
             self.gpa.free(d.path);
         }
         self.gpa.free(self.drives);
+    }
+
+    pub fn isCluster(self: *const DriveSet) bool {
+        return self.cluster != null;
+    }
+
+    /// Drives usable right now (online and, for remote drives, reachable).
+    pub fn onlineCount(self: *DriveSet) usize {
+        var n: usize = 0;
+        for (self.drives) |*d| {
+            if (!d.online.load(.acquire)) continue;
+            if (d.kind == .remote and !d.kind.remote.vtable.online(d.kind.remote.ctx)) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Cluster sets refuse writes below their set write quorum; local sets always try.
+    pub fn writable(self: *DriveSet) bool {
+        const c = self.cluster orelse return true;
+        return self.onlineCount() >= c.write_quorum;
     }
 
     pub fn count(self: *const DriveSet) usize {
         return self.drives.len;
     }
 
-    /// Takes a shared hold on drive `i`; null when it is offline.
-    pub fn acquire(self: *DriveSet, i: usize) ?*LocalBackend {
+    /// Takes a shared hold on drive `i`; null when it is offline or unreachable.
+    pub fn acquire(self: *DriveSet, i: usize) ?Handle {
         const d = &self.drives[i];
         d.lock.lockShared();
-        if (!d.online.load(.acquire)) {
+        const reachable = switch (d.kind) {
+            .local => true,
+            .remote => |x| x.vtable.online(x.ctx),
+        };
+        if (!d.online.load(.acquire) or !reachable) {
             d.lock.unlockShared();
             return null;
         }
-        return &d.lb;
+        return switch (d.kind) {
+            .local => |*lb| .{ .local = lb },
+            .remote => |x| .{ .ext = x },
+        };
     }
 
     pub fn release(self: *DriveSet, i: usize) void {
@@ -189,12 +298,18 @@ pub const DriveSet = struct {
             for (out[0..n], 0..) |*o, i| o.* = @intCast(i);
             return out[0..n];
         }
+        if (self.cluster != null) {
+            var nodes: [max_drives]u16 = undefined;
+            for (self.drives, 0..) |d, i| nodes[i] = d.node;
+            return layout.spread(self.ids[0..n], nodes[0..n], &key.hex, self.profile.width(), out);
+        }
         const ranked = rendezvous.rank(self.ids[0..n], &key.hex, out);
         return ranked[0..self.profile.width()];
     }
 
     /// Re-reads drive `i`'s identity by path, bypassing the open handle.
     pub fn probe(self: *DriveSet, i: usize) Probe {
+        if (self.cluster) |c| return self.probeCluster(i, c);
         var dir = std.fs.cwd().openDir(self.drives[i].path, .{}) catch |e| return switch (e) {
             error.FileNotFound => .unformatted,
             else => .inaccessible,
@@ -210,15 +325,42 @@ pub const DriveSet = struct {
         return .ok;
     }
 
+    fn probeCluster(self: *DriveSet, i: usize, c: ClusterInfo) Probe {
+        var buf: [layout.format_max]u8 = undefined;
+        const bytes: []const u8 = switch (self.drives[i].kind) {
+            .remote => |x| x.vtable.readFormat(x.ctx, &buf) catch |e| return if (e == error.NotFound) .unformatted else .inaccessible,
+            .local => blk: {
+                var dir = std.fs.cwd().openDir(self.drives[i].path, .{}) catch |e| return switch (e) {
+                    error.FileNotFound => .unformatted,
+                    else => .inaccessible,
+                };
+                defer dir.close();
+                break :blk dir.readFile(LocalBackend.format_file, &buf) catch |e| return switch (e) {
+                    error.FileNotFound => .unformatted,
+                    else => .inaccessible,
+                };
+            },
+        };
+        const f = layout.FormatV2.parse(bytes) catch return .foreign;
+        var want = c.format;
+        want.index = @intCast(i);
+        return if (f.sameSlot(want)) .ok else .foreign;
+    }
+
+    pub fn isLocal(self: *const DriveSet, i: usize) bool {
+        return self.drives[i].kind == .local;
+    }
+
     /// Recreates drive `i` in place and formats it empty; it then needs healing.
     pub fn reinit(self: *DriveSet, i: usize) OpenError!void {
         const d = &self.drives[i];
+        if (d.kind != .local) return error.DriveUnavailable;
         d.lock.lock();
         defer d.lock.unlock();
         d.online.store(false, .release);
         const lb = LocalBackend.open(d.path) catch return error.DriveUnavailable;
-        d.lb.close();
-        d.lb = lb;
+        d.kind.local.close();
+        d.kind.local = lb;
         self.writeFormat(i) catch return error.DriveUnavailable;
         d.fresh.store(true, .release);
         d.online.store(true, .release);
@@ -237,6 +379,13 @@ pub const DriveSet = struct {
     }
 
     fn writeFormat(self: *DriveSet, i: usize) backend.Error!void {
+        if (self.cluster) |c| {
+            var f = c.format;
+            f.index = @intCast(i);
+            var buf: [layout.format_max]u8 = undefined;
+            const bytes = f.encode(&buf) catch return error.IoFailed;
+            return self.drives[i].kind.local.writeFormat(bytes);
+        }
         const f: Format = .{
             .set = self.set,
             .index = @intCast(i),
@@ -246,7 +395,7 @@ pub const DriveSet = struct {
         };
         var buf: [format_max]u8 = undefined;
         const bytes = f.encode(&buf) catch return error.IoFailed;
-        try self.drives[i].lb.writeFormat(bytes);
+        try self.drives[i].kind.local.writeFormat(bytes);
     }
 };
 
@@ -339,4 +488,35 @@ test "drive set formats, reopens, refuses foreign and reordered drives" {
     }
     const mixed = [_][]const u8{ p[0], p[1], p[2], op[0] };
     try std.testing.expectError(error.ForeignDrive, DriveSet.open(gpa, &mixed, null));
+}
+
+test "cluster set: formats by layout slot, refuses moved and foreign drives" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmpPaths(&tmp, &bufs, 4);
+    var members: [4]Member = undefined;
+    for (&members, 0..) |*m, i| m.* = .{ .path = p[i], .node = @intCast(i / 2) };
+    const tmpl: layout.FormatV2 = .{ .deployment = @splat(7), .layout = @splat(8), .pool = 0, .set = 2, .index = 0, .set_size = 4, .profile = .{ .replica = 2 } };
+    {
+        var s = try DriveSet.openCluster(gpa, &members, tmpl, false);
+        defer s.deinit();
+        try std.testing.expect(s.isCluster());
+        try std.testing.expectEqual(Probe.ok, s.probe(3));
+        try std.testing.expect(s.writable());
+        var out: [max_drives]u8 = undefined;
+        const pl = s.placed(.{ .space = .data, .hex = "00112233445566778899aabbccddeeff".* }, &out);
+        // Two nodes, two copies: one per node.
+        try std.testing.expect(s.drives[pl[0]].node != s.drives[pl[1]].node);
+    }
+    const swapped = [_]Member{ members[1], members[0], members[2], members[3] };
+    try std.testing.expectError(error.DriveMismatch, DriveSet.openCluster(gpa, &swapped, tmpl, true));
+    var other = tmpl;
+    other.deployment = @splat(9);
+    try std.testing.expectError(error.ForeignDrive, DriveSet.openCluster(gpa, &members, other, true));
+    try tmp.dir.deleteTree("d1");
+    var s = try DriveSet.openCluster(gpa, &members, tmpl, true);
+    defer s.deinit();
+    try std.testing.expect(s.drives[1].fresh.load(.acquire));
 }

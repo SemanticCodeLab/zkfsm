@@ -46,7 +46,40 @@ pub const Error = error{
     InvalidMetadata,
     /// The body's MD5 differs from the client's Content-MD5.
     BadDigest,
+    /// Too many drives or nodes offline to write.
+    WriteQuorum,
+    /// Too many drives or nodes offline to read.
+    ReadQuorum,
+    /// A cluster namespace lock could not be taken in time.
+    LockTimeout,
 };
+
+/// Cluster coordination hooks; null on a single node, where `mutex` is enough.
+pub const Cluster = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Majority lock on `resource` across nodes; returns an unlock token.
+        lock: *const fn (ctx: *anyopaque, resource: []const u8) Error!u64,
+        unlock: *const fn (ctx: *anyopaque, token: u64) void,
+        /// Delivers changes to every peer; called with no service lock held.
+        publish: *const fn (ctx: *anyopaque, changes: []const Change) void,
+    };
+};
+
+/// A committed change peers must mirror in their caches.
+pub const Change = union(enum) {
+    /// A record slot was written or removed; `version` null is the current slot.
+    record: struct { pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8, version: ?core.VersionId },
+    upload: core.ObjectId,
+    catalog,
+    /// Reload everything (a peer may have missed changes).
+    resync,
+};
+
+/// Held cluster lock on one resource; release with `ObjectService.clusterUnlock`.
+pub const Held = struct { token: ?u64 = null };
 
 pub const Header = metadata.headers.Header;
 pub const SystemHeaders = metadata.headers.System;
@@ -155,8 +188,21 @@ pub const ObjectService = struct {
     /// The on-disk index state is clean (snapshot matches); guarded by `mutex`.
     index_clean: bool = false,
     index_gen: u64 = 0,
+    /// False in cluster mode: the index is always rebuilt from records.
+    persist_index: bool = true,
+    /// Cluster hooks; set right after init, before serving.
+    cluster: ?Cluster = null,
+    /// Changes made under `mutex`, published when the operation's lock is released.
+    pending: std.ArrayList(Change) = .empty,
+    pending_mutex: std.Thread.Mutex = .{},
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
+        return initWith(gpa, store, true);
+    }
+
+    /// `persist_index` false always rebuilds the key index from records (cluster mode,
+    /// where the snapshot state cannot be kept exact across nodes).
+    pub fn initWith(gpa: std.mem.Allocator, store: backend.StorageBackend, persist_index: bool) Error!ObjectService {
         var cat = metadata.Catalog.init(gpa);
         if (store.getRecord(placement.catalog_key, gpa)) |bytes| {
             defer gpa.free(bytes);
@@ -165,7 +211,7 @@ pub const ObjectService = struct {
                 error.Corrupt => error.Corrupt,
             };
         } else |e| if (e != error.NotFound) return mapBackend(e);
-        var svc: ObjectService = .{ .gpa = gpa, .store = store, .catalog = cat, .index = index_mod.Index.init(gpa) };
+        var svc: ObjectService = .{ .gpa = gpa, .store = store, .catalog = cat, .index = index_mod.Index.init(gpa), .persist_index = persist_index };
         errdefer svc.deinit();
         try index_store.open(&svc);
         return svc;
@@ -174,6 +220,110 @@ pub const ObjectService = struct {
     pub fn deinit(self: *ObjectService) void {
         self.index.deinit();
         self.catalog.deinit();
+        for (self.pending.items) |c| self.freeChange(c);
+        self.pending.deinit(self.gpa);
+    }
+
+    // ---- cluster coordination ----
+
+    /// Takes the cluster lock on `kind/a/b`; a no-op without a cluster.
+    pub fn clusterLock(self: *ObjectService, kind: []const u8, a: []const u8, b: []const u8) Error!Held {
+        const c = self.cluster orelse return .{};
+        var buf: [1400]u8 = undefined;
+        const res = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ kind, a, b }) catch return error.KeyTooLong;
+        return .{ .token = try c.vtable.lock(c.ctx, res) };
+    }
+
+    /// Publishes pending changes, then releases the lock. Call with `mutex` released.
+    pub fn clusterUnlock(self: *ObjectService, h: Held) void {
+        self.publishPending();
+        const c = self.cluster orelse return;
+        if (h.token) |t| c.vtable.unlock(c.ctx, t);
+    }
+
+    /// Queues a change for peers. Caller holds `mutex`; the key is copied.
+    pub fn emit(self: *ObjectService, change: Change) void {
+        if (self.cluster == null) return;
+        var c = change;
+        if (c == .record) c.record.key = self.gpa.dupe(u8, change.record.key) catch return;
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        self.pending.append(self.gpa, c) catch self.freeChange(c);
+    }
+
+    fn freeChange(self: *ObjectService, c: Change) void {
+        if (c == .record) self.gpa.free(c.record.key);
+    }
+
+    pub fn publishPending(self: *ObjectService) void {
+        const c = self.cluster orelse return;
+        var changes: std.ArrayList(Change) = blk: {
+            self.pending_mutex.lock();
+            defer self.pending_mutex.unlock();
+            const l = self.pending;
+            self.pending = .empty;
+            break :blk l;
+        };
+        defer {
+            for (changes.items) |ch| self.freeChange(ch);
+            changes.deinit(self.gpa);
+        }
+        if (changes.items.len > 0) c.vtable.publish(c.ctx, changes.items);
+    }
+
+    /// Mirrors a peer's change in this node's caches.
+    pub fn applyChange(self: *ObjectService, change: Change) void {
+        switch (change) {
+            .record => |r| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.indexResync(r.pk, r.bid, r.key, r.version);
+            },
+            .upload => |id| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                const bytes = self.store.getRecord(placement.uploadKey(id), self.gpa) catch |e| {
+                    if (e == error.NotFound) self.index.removeUpload(id) else self.index.markStale();
+                    return;
+                };
+                defer self.gpa.free(bytes);
+                var ua = std.heap.ArenaAllocator.init(self.gpa);
+                defer ua.deinit();
+                const u = metadata.upload.decode(ua.allocator(), bytes) catch return;
+                self.index.putUpload(u.upload_id, .{ .bucket = u.bucket_id, .key = u.key, .created_ns = u.created_ns });
+            },
+            .catalog => self.reloadCatalog() catch |e| std.log.warn("catalog reload failed: {t}", .{e}),
+            .resync => {
+                self.reloadCatalog() catch |e| std.log.warn("catalog reload failed: {t}", .{e});
+                self.rebuildIndex() catch |e| std.log.warn("key index rebuild failed: {t}", .{e});
+            },
+        }
+    }
+
+    /// Re-reads the bucket catalog; buckets that vanished leave the index too.
+    pub fn reloadCatalog(self: *ObjectService) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.reloadCatalogLocked();
+    }
+
+    fn reloadCatalogLocked(self: *ObjectService) Error!void {
+        var cat = metadata.Catalog.init(self.gpa);
+        if (self.store.getRecord(placement.catalog_key, self.gpa)) |bytes| {
+            defer self.gpa.free(bytes);
+            cat = metadata.Catalog.decode(self.gpa, bytes) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Corrupt => error.Corrupt,
+            };
+        } else |e| if (e != error.NotFound) return mapBackend(e);
+        for (self.catalog.buckets.items) |old| {
+            const kept = for (cat.buckets.items) |b| {
+                if (b.id.eql(old.id)) break true;
+            } else false;
+            if (!kept) self.index.dropBucket(old.id);
+        }
+        self.catalog.deinit();
+        self.catalog = cat;
     }
 
     /// Persists the key index so the next start skips the rebuild. Call on clean shutdown;
@@ -204,19 +354,26 @@ pub const ObjectService = struct {
 
     pub fn createBucket(self: *ObjectService, name: []const u8) Error!void {
         if (!validBucketName(name)) return error.InvalidBucketName;
+        const held = try self.clusterLock("catalog", "", "");
+        defer self.clusterUnlock(held);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.cluster != null) try self.reloadCatalogLocked();
         if (self.catalog.find(name) != null) return error.BucketAlreadyExists;
         try self.catalog.add(.{ .name = name, .id = core.BucketId.random(), .created_ns = core.time.nowNs() });
         self.persistCatalog() catch |e| {
             _ = self.catalog.remove(name);
             return e;
         };
+        self.emit(.catalog);
     }
 
     pub fn deleteBucket(self: *ObjectService, name: []const u8) Error!void {
+        const held = try self.clusterLock("catalog", "", "");
+        defer self.clusterUnlock(held);
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.cluster != null) try self.reloadCatalogLocked();
         const b = self.catalog.find(name) orelse return error.NoSuchBucket;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
@@ -232,6 +389,7 @@ pub const ObjectService = struct {
         self.store.deleteRecord(placement.bucketConfigKey(saved.id)) catch {};
         self.index.dropBucket(saved.id);
         index_store.dropStream(self, saved.id.bytes);
+        self.emit(.catalog);
     }
 
     pub fn headBucket(self: *ObjectService, name: []const u8) Error!void {
@@ -359,6 +517,10 @@ pub const ObjectService = struct {
     pub fn bucketId(self: *ObjectService, name: []const u8) Error!core.BucketId {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.catalog.find(name)) |b| return b.id;
+        // A peer may have created it moments ago.
+        if (self.cluster == null) return error.NoSuchBucket;
+        try self.reloadCatalogLocked();
         const b = self.catalog.find(name) orelse return error.NoSuchBucket;
         return b.id;
     }
@@ -453,6 +615,8 @@ pub fn mapBackend(e: backend.Error) Error {
         error.WriteFailed => error.WriteFailed,
         error.OutOfMemory => error.OutOfMemory,
         error.NotFound, error.InvalidKey, error.IoFailed, error.TooLarge => error.StorageFailed,
+        error.WriteQuorum => error.WriteQuorum,
+        error.ReadQuorum => error.ReadQuorum,
     };
 }
 
