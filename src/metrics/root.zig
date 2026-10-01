@@ -2,6 +2,7 @@
 //! the health endpoints. Handlers record; the server serves.
 const std = @import("std");
 const object = @import("../object/root.zig");
+pub const tier = @import("tier.zig");
 
 pub const Status = enum(u3) { s2xx, s3xx, s4xx, s5xx, other };
 

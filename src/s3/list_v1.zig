@@ -48,7 +48,8 @@ pub fn list(c: *Ctx) DispatchError!void {
         try xml.elem(w, "ETag", e.etag.quoted(&eb));
         try xml.elemInt(w, "Size", e.size);
         try w.writeAll("<Owner><ID>" ++ acl.owner_id ++ "</ID><DisplayName>" ++ acl.owner_id ++ "</DisplayName></Owner>");
-        try w.writeAll("<StorageClass>STANDARD</StorageClass></Contents>");
+        try xml.elem(w, "StorageClass", try handler.storageClass(c, e));
+        try w.writeAll("</Contents>");
     }
     for (res.common_prefixes) |cp| {
         try w.writeAll("<CommonPrefixes>");

@@ -6,6 +6,7 @@ const core = @import("../core/root.zig");
 const iam = @import("../iam/root.zig");
 const object = @import("../object/root.zig");
 const sio = @import("sio.zig");
+const tier = @import("tier.zig");
 
 const Allocator = std.mem.Allocator;
 const Op = iam.actions.AdminOp;
@@ -204,6 +205,7 @@ pub fn handle(a: Allocator, env: Env, req: Request) Error!Response {
             return r[2](&c);
         }
     }
+    if (try tier.handle(a, env, req)) |res| return res;
     return fail(a, .not_implemented, "NotImplemented", "A header you provided implies functionality that is not implemented.");
 }
 

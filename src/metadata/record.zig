@@ -6,9 +6,10 @@ const headers = @import("headers.zig");
 
 pub const magic = "ZKOR";
 /// v2 adds flags, retention, and tags; v3 the multipart part count; v4 user and
-/// internal metadata, system headers, and size/ETag overrides; v5 multipart part sizes.
-/// Older records still decode.
-pub const format_version: u16 = 5;
+/// internal metadata, system headers, and size/ETag overrides; v5 multipart part sizes;
+/// v6 the remote tier pointer and restored-copy expiry. Older records still decode.
+pub const format_version: u16 = 6;
+pub const max_tier_name = 64;
 pub const max_parts = 10000;
 pub const max_key_len = 1024;
 
@@ -54,6 +55,12 @@ pub const ObjectRecord = struct {
     etag_override: ?core.ETag = null,
     /// Multipart part sizes as little-endian u64s; empty for single-part objects.
     part_sizes: []const u8 = "",
+    /// Remote tier holding the data blob (empty: data is local); borrowed like `key`.
+    tier: []const u8 = "",
+    /// Name of the blob on the tier.
+    tier_object: [16]u8 = @splat(0),
+    /// A restored local copy of tiered data lives until this time; 0 means none.
+    restore_expiry_ns: i128 = 0,
 
     pub fn reportedSize(r: ObjectRecord) u64 {
         return r.logical_size orelse r.size;
@@ -80,6 +87,7 @@ pub fn encode(r: ObjectRecord, gpa: std.mem.Allocator) Error![]u8 {
     }
     r.system.validate() catch return error.MetadataTooLarge;
     if (r.part_sizes.len % 8 != 0 or r.part_sizes.len / 8 > max_parts) return error.MetadataTooLarge;
+    if (r.tier.len > max_tier_name) return error.MetadataTooLarge;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(r, &a.writer) catch return error.OutOfMemory;
@@ -115,7 +123,8 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try headers.put(w, r.internal_meta);
     try headers.putSystem(w, r.system);
     try w.writeByte(@as(u8, @intFromBool(r.logical_size != null)) | @as(u8, @intFromBool(r.etag_override != null)) << 1 |
-        @as(u8, @intFromBool(r.part_sizes.len > 0)) << 2);
+        @as(u8, @intFromBool(r.part_sizes.len > 0)) << 2 | @as(u8, @intFromBool(r.tier.len > 0)) << 3 |
+        @as(u8, @intFromBool(r.restore_expiry_ns != 0)) << 4);
     if (r.logical_size) |n| try codec.putInt(w, u64, n);
     if (r.etag_override) |e| {
         try w.writeAll(&e.md5);
@@ -125,6 +134,12 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try codec.putInt(w, u16, @intCast(r.part_sizes.len / 8));
         try w.writeAll(r.part_sizes);
     }
+    if (r.tier.len > 0) {
+        try w.writeByte(@intCast(r.tier.len));
+        try w.writeAll(r.tier);
+        try w.writeAll(&r.tier_object);
+    }
+    if (r.restore_expiry_ns != 0) try codec.putInt(w, i128, r.restore_expiry_ns);
 }
 
 /// Size of part `i` (0-based) from an encoded part-size list.
@@ -181,7 +196,7 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         r.internal_meta = try headers.take(&c, .internal);
         r.system = try headers.takeSystem(&c);
         const has = (try c.take(1))[0];
-        const known: u8 = if (ver >= 5) 7 else 3;
+        const known: u8 = if (ver >= 6) 31 else if (ver >= 5) 7 else 3;
         if (has & ~known != 0) return error.Corrupt;
         if (has & 1 != 0) r.logical_size = try c.int(u64);
         if (has & 2 != 0) r.etag_override = .{ .md5 = try c.fixed(16), .parts = try c.int(u32) };
@@ -189,6 +204,16 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
             const n = try c.int(u16);
             if (n == 0 or n > max_parts) return error.Corrupt;
             r.part_sizes = try c.take(@as(usize, n) * 8);
+        }
+        if (has & 8 != 0) {
+            const n = (try c.take(1))[0];
+            if (n == 0 or n > max_tier_name) return error.Corrupt;
+            r.tier = try c.take(n);
+            r.tier_object = try c.fixed(16);
+        }
+        if (has & 16 != 0) {
+            r.restore_expiry_ns = try c.int(i128);
+            if (r.restore_expiry_ns == 0) return error.Corrupt;
         }
     }
     if (c.pos != bytes.len) return error.Corrupt;
@@ -309,6 +334,18 @@ test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" 
     defer gpa.free(withparts);
     const dp = try decode(withparts);
     try std.testing.expectEqual(@as(u64, 40), partSize(dp.part_sizes, 1));
+    r.tier = "WARM";
+    r.tier_object = @splat(9);
+    r.restore_expiry_ns = 77;
+    const tiered = try encode(r, gpa);
+    defer gpa.free(tiered);
+    const dt = try decode(tiered);
+    try std.testing.expectEqualStrings("WARM", dt.tier);
+    try std.testing.expectEqual(@as(u8, 9), dt.tier_object[15]);
+    try std.testing.expectEqual(@as(i128, 77), dt.restore_expiry_ns);
+    for (0..tiered.len) |n| try std.testing.expectError(error.Corrupt, decode(tiered[0..n]));
+    r.tier = "";
+    r.restore_expiry_ns = 0;
     for (0..withparts.len) |n| try std.testing.expectError(error.Corrupt, decode(withparts[0..n]));
     r.part_sizes = "";
 
@@ -326,7 +363,7 @@ test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" 
     const o = try decode(v3);
     try std.testing.expectEqual(@as(u64, 100), o.reportedSize());
     try std.testing.expectEqualStrings("", o.user_meta);
-    v3[4] = 6;
+    v3[4] = 7;
     try std.testing.expectError(error.Corrupt, decode(v3));
 
     // A list over the user limit neither encodes nor decodes.

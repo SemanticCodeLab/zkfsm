@@ -252,9 +252,10 @@ pub const Server = struct {
             else
                 try req.respond("NOT READY\n", .{ .status = .service_unavailable }),
             .metrics => {
-                var buf: [8192]u8 = undefined;
+                var buf: [64 * 1024]u8 = undefined;
                 var w: std.Io.Writer = .fixed(&buf);
                 try metrics.global.counters.render(&w);
+                try metrics.tier.render(self.svc, &w);
                 try req.respond(w.buffered(), .{ .extra_headers = &.{
                     .{ .name = "content-type", .value = "text/plain; version=0.0.4" },
                 } });

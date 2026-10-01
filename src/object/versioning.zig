@@ -9,6 +9,7 @@ const metadata = @import("../metadata/root.zig");
 const service = @import("service.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
+const transition = @import("transition.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -97,19 +98,28 @@ fn checkRemovable(r: Record, bypass: bool) Error!void {
 }
 
 /// Data blobs that became unreachable; deleted by the caller after the lock is released.
+/// Tiered data goes to the cleanup journal instead.
 pub const Garbage = struct {
     ids: [2]?core.ObjectId = .{ null, null },
+    remote: [2]?Remote = .{ null, null },
+
+    const Remote = struct { name: [metadata.record.max_tier_name]u8, len: u8, id: [16]u8 };
 
     fn add(g: *Garbage, r: Record) void {
         if (r.flags.delete_marker) return;
-        for (&g.ids) |*s| if (s.* == null) {
+        for (&g.ids, &g.remote) |*s, *rm| if (s.* == null) {
             s.* = r.object_id;
+            if (r.tier.len > 0) {
+                rm.* = .{ .name = undefined, .len = @intCast(r.tier.len), .id = r.tier_object };
+                @memcpy(rm.*.?.name[0..r.tier.len], r.tier);
+            }
             return;
         };
     }
 
     pub fn collect(g: Garbage, svc: *Svc) void {
         for (g.ids) |id| if (id) |o| svc.store.delete(placement.dataKey(o)) catch {};
+        for (g.remote) |rm| if (rm) |x| transition.enqueueCleanup(svc, x.name[0..x.len], x.id);
     }
 };
 
@@ -423,7 +433,8 @@ pub fn headVersion(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, key:
     return info;
 }
 
-fn mutate(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, ctx: anytype, comptime f: fn (@TypeOf(ctx), BucketConfig, *Record) Error!void) Error!core.VersionId {
+/// Applies `f` to one version's record under the object lock (null: current version).
+pub fn mutate(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, ctx: anytype, comptime f: fn (@TypeOf(ctx), BucketConfig, *Record) Error!void) Error!core.VersionId {
     try service.validKey(key);
     const bid = try svc.bucketId(bucket);
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
@@ -484,6 +495,7 @@ pub const VersionEntry = struct {
     size: u64,
     etag: core.ETag,
     mtime_ns: i128,
+    tiered: bool = false,
 };
 
 pub const VersionListParams = struct {
@@ -515,6 +527,7 @@ pub fn listVersions(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, p: 
         .size = r.v.size,
         .etag = r.v.etag,
         .mtime_ns = r.v.mtime_ns,
+        .tiered = r.v.tiered,
     };
     return applyVersions(arena, entries, p);
 }

@@ -171,6 +171,38 @@ signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
 narrowed by a session `Policy`; standard `sts assume-role` clients work
 unchanged against the server endpoint.
 
+### Tiering
+
+Lifecycle `Transition` and `NoncurrentVersionTransition` rules move object data
+to a remote tier; the local record keeps the metadata, version id, lock state
+and a pointer, and `x-amz-storage-class` reports the tier name. GET and HEAD
+work unchanged (GETs, including ranges, stream from the tier); deleting or
+overwriting a tiered version queues its remote data in a cleanup journal that
+is retried until the tier answers.
+
+```sh
+mc ilm tier add minio myzk WARM --endpoint https://warm:9000 \
+   --access-key AK --secret-key SK --bucket tier --prefix hot1/
+mc ilm rule add myzk/data --transition-days 30 --transition-tier WARM \
+   --noncurrent-transition-days 7 --noncurrent-transition-tier WARM
+mc ilm restore --days 3 myzk/data/report.pdf    # temporary local copy
+mc ilm tier ls|info|verify|edit|rm myzk ...
+```
+
+Tier types: `s3` and `minio` (any S3-compatible endpoint, including another
+zkfsm), `azure` (account name and key), and `gcs` (a credentials file holding an
+HMAC interoperability key pair: `{"access_key": ..., "secret_key": ...}`). Adding
+a tier probes the backend and requires an empty bucket/prefix unless `--force`
+is given. Tier definitions live in cluster-wide system state, sealed with
+XChaCha20-Poly1305 under a key derived from the root credentials (changing the
+root secret makes them unreadable until it is restored); listings redact
+secrets. `POST ?restore` (`RestoreObject`, `Days`) makes a local copy that
+expires after the given days (`x-amz-restore` shows the expiry). While a tier is
+unreachable, reads of its data fail with `503` and transitions wait for the
+next lifecycle pass. Usage per tier is reported by `mc ilm tier info` and as
+`zkfsm_tier_*` series in `/metrics`; restore expiry, the cleanup journal and
+the usage scan run every minute (or every `--lifecycle-interval`, if shorter).
+
 ## Compatibility
 
 `tests/s3/run.sh` drives each client against a single drive and against six
@@ -205,7 +237,8 @@ Pre-1.0. Working today and covered by tests:
   DeleteObjects, multipart uploads (incl. UploadPartCopy), versioning with
   delete markers and ListObjectVersions, object lock (governance, compliance,
   legal hold), object and bucket tagging, conditional requests, lifecycle
-  expiration (current, noncurrent, delete markers, incomplete uploads),
+  expiration (current, noncurrent, delete markers, incomplete uploads) and
+  transition to remote tiers (S3-compatible, Azure, GCS) with RestoreObject,
   bucket policies (including anonymous access), GET/HEAD by `partNumber`,
   canned private ACLs, and ListObjects v1.
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
@@ -225,5 +258,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: SSE, bucket
-notifications, lifecycle transitions, non-private ACLs, TLS termination
+notifications, non-private ACLs, TLS termination
 (run behind a proxy).

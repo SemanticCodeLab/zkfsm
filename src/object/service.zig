@@ -52,6 +52,13 @@ pub const Error = error{
     ReadQuorum,
     /// A cluster namespace lock could not be taken in time.
     LockTimeout,
+    /// The remote tier holding the data could not be reached.
+    TierUnavailable,
+    /// The operation needs tiered data (restore of a local object).
+    InvalidObjectState,
+    RestoreInProgress,
+    /// A lifecycle rule names a tier that is not configured.
+    InvalidStorageClass,
 };
 
 /// Cluster coordination hooks; null on a single node, where `mutex` is enough.
@@ -113,6 +120,16 @@ pub const ObjectInfo = struct {
     etag_override: ?core.ETag = null,
     /// Multipart part sizes (metadata.record.partSize); empty for single-part objects.
     part_sizes: []const u8 = "",
+    /// Remote tier holding the data; empty when local.
+    tier: []const u8 = "",
+    tier_object: [16]u8 = @splat(0),
+    /// Expiry of a restored local copy of tiered data; 0 when none.
+    restore_expiry_ns: i128 = 0,
+
+    /// The bytes must come from the tier (no live restored copy).
+    pub fn remote(i: ObjectInfo, now_ns: i128) bool {
+        return i.tier.len > 0 and i.restore_expiry_ns <= now_ns;
+    }
 };
 
 pub const PutInput = struct {
@@ -195,6 +212,8 @@ pub const ObjectService = struct {
     /// Changes made under `mutex`, published when the operation's lock is released.
     pending: std.ArrayList(Change) = .empty,
     pending_mutex: std.Thread.Mutex = .{},
+    /// Remote tiers; set right after init when tiering is available.
+    tiers: ?*tier_mod.Registry = null,
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -474,8 +493,10 @@ pub const ObjectService = struct {
 
     /// Streams the object's bytes (or `range` of them) into `sink`.
     pub fn read(self: *ObjectService, info: ObjectInfo, range: ?core.Range, sink: *std.Io.Writer) Error!void {
+        if (info.remote(core.time.nowNs())) return tier_mod.readRemote(self, info, range, sink);
         _ = self.store.get(placement.dataKey(info.object_id), range, sink) catch |e| return switch (e) {
-            error.NotFound => error.NoSuchKey,
+            // A restored copy may have just expired.
+            error.NotFound => if (info.tier.len > 0) tier_mod.readRemote(self, info, range, sink) else error.NoSuchKey,
             else => mapBackend(e),
         };
     }
@@ -576,6 +597,7 @@ pub const ObjectService = struct {
 };
 
 const index_store = @import("index_store.zig");
+const tier_mod = @import("tier.zig");
 
 /// Header lists are left empty; see `decodeInfo`.
 pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
@@ -597,6 +619,9 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .legal_hold = r.flags.legal_hold,
         .tags = r.tags,
         .part_sizes = r.part_sizes,
+        .tier = r.tier,
+        .tier_object = r.tier_object,
+        .restore_expiry_ns = r.restore_expiry_ns,
     };
 }
 

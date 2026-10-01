@@ -297,6 +297,10 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     defer svc.deinit();
+    var tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
+    defer tiers.deinit();
+    svc.tiers = &tiers;
+    startTierLoop(&svc, cfg.lifecycle_interval_s, null);
     if (cfg.scan_interval_s > 0) {
         healer.start(cfg.scan_interval_s * std.time.ns_per_s) catch {
             std.log.err("cannot start healer", .{});
@@ -408,6 +412,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var svc: object.ObjectService = undefined;
     var svc_ready = false;
     defer if (svc_ready) svc.deinit();
+    var tiers: object.tier.Registry = undefined;
+    defer if (svc_ready) tiers.deinit();
     var iam_store: iam.Store = undefined;
     var iam_ready = false;
     defer if (iam_ready) iam_store.deinit();
@@ -459,6 +465,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (e != error.Stopped) std.log.err("cannot open the object service: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
         };
+        tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
+        svc.tiers = &tiers;
         svc_ready = true;
         if (creds) |c| {
             while (true) {
@@ -478,6 +486,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         }
         node.start(if (iam_ready) &iam_store else null);
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
+        startTierLoop(&svc, cfg.lifecycle_interval_s, node);
         if (cfg.lifecycle_interval_s > 0) {
             if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         }
@@ -575,6 +584,46 @@ fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.
         const n = st.expired + st.noncurrent_expired + st.markers_removed + st.uploads_aborted;
         if (n > 0 or st.locked > 0) std.log.info("lifecycle: {d} expired, {d} noncurrent, {d} markers, {d} uploads, {d} locked", .{
             st.expired, st.noncurrent_expired, st.markers_removed, st.uploads_aborted, st.locked,
+        });
+        const t = st.transitioned + st.noncurrent_transitioned;
+        if (t > 0 or st.transition_failed > 0) std.log.info("lifecycle: {d} transitioned, {d} noncurrent transitioned, {d} failed", .{
+            st.transitioned, st.noncurrent_transitioned, st.transition_failed,
+        });
+    }
+}
+
+/// Tier config is sealed with a key derived from the root credentials.
+fn tierKey(creds: ?s3.sigv4.Credentials) ?[32]u8 {
+    const c = creds orelse return null;
+    return object.tier.sealKey(c.access_key, c.secret_key);
+}
+
+/// Restore expiry, the remote cleanup journal, and tier usage stats; at most every
+/// minute (sooner with a shorter lifecycle interval). ZKFSM_ILM_DAY_SECONDS shortens
+/// lifecycle and restore days (for tests).
+fn startTierLoop(svc: *object.ObjectService, lifecycle_interval_s: u64, leader: ?*cluster.Node) void {
+    if (std.process.getEnvVarOwned(svc.gpa, "ZKFSM_ILM_DAY_SECONDS")) |v| {
+        defer svc.gpa.free(v);
+        const n = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (n > 0) {
+            object.transition.day_len_ns = @as(i128, n) * std.time.ns_per_s;
+            std.log.warn("lifecycle days last {d}s (ZKFSM_ILM_DAY_SECONDS)", .{n});
+        }
+    } else |_| {}
+    const interval = if (lifecycle_interval_s == 0) 60 else @min(lifecycle_interval_s, 60);
+    if (std.Thread.spawn(.{}, tierLoop, .{ svc, interval, leader })) |t| t.detach() else |e| std.log.warn("tier worker not started: {t}", .{e});
+}
+
+fn tierLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.Node) void {
+    while (true) {
+        std.Thread.sleep(interval_s * std.time.ns_per_s);
+        if (leader) |l| if (!l.isLeader()) continue;
+        const st = object.transition.housekeeping(svc, std.time.nanoTimestamp()) catch |e| {
+            std.log.warn("tier housekeeping failed: {t}", .{e});
+            continue;
+        };
+        if (st.restores_expired > 0 or st.cleaned > 0) std.log.info("tiers: {d} restored copies expired, {d} remote blobs deleted, {d} deletes pending", .{
+            st.restores_expired, st.cleaned, st.cleanup_pending,
         });
     }
 }

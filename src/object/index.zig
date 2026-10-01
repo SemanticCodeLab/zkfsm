@@ -15,9 +15,11 @@ pub const Version = struct {
     etag: core.ETag,
     mtime_ns: i128,
     delete_marker: bool,
+    /// Data lives on a remote tier (listings report its storage class).
+    tiered: bool = false,
 
     pub fn of(r: metadata.ObjectRecord) Version {
-        return .{ .id = r.versionId(), .size = r.reportedSize(), .etag = r.reportedEtag(), .mtime_ns = r.created_ns, .delete_marker = r.flags.delete_marker };
+        return .{ .id = r.versionId(), .size = r.reportedSize(), .etag = r.reportedEtag(), .mtime_ns = r.created_ns, .delete_marker = r.flags.delete_marker, .tiered = r.tier.len > 0 };
     }
 
     fn newer(x: Version, y: Version) bool {
@@ -454,7 +456,7 @@ pub const Index = struct {
         try w.writeAll(&v.etag.md5);
         try codec.putInt(w, u32, v.etag.parts);
         try codec.putInt(w, i128, v.mtime_ns);
-        try w.writeByte(@intFromBool(v.delete_marker));
+        try w.writeByte(@as(u8, @intFromBool(v.delete_marker)) | @as(u8, @intFromBool(v.tiered)) << 1);
     }
 
     fn takeVersion(c: *codec.Cursor) codec.DecodeError!Version {
@@ -463,8 +465,8 @@ pub const Index = struct {
         const etag: core.ETag = .{ .md5 = try c.fixed(16), .parts = try c.int(u32) };
         const mtime = try c.int(i128);
         const dm = (try c.take(1))[0];
-        if (dm > 1) return error.Corrupt;
-        return .{ .id = id, .size = size, .etag = etag, .mtime_ns = mtime, .delete_marker = dm == 1 };
+        if (dm > 3) return error.Corrupt;
+        return .{ .id = id, .size = size, .etag = etag, .mtime_ns = mtime, .delete_marker = dm & 1 != 0, .tiered = dm & 2 != 0 };
     }
 
     /// Loads one bucket's names from `bytes` into an index that holds none for it.
@@ -543,7 +545,7 @@ pub const Index = struct {
 };
 
 fn entry(key: []const u8, v: Version) list.Entry {
-    return .{ .key = key, .size = v.size, .etag = v.etag, .mtime_ns = v.mtime_ns };
+    return .{ .key = key, .size = v.size, .etag = v.etag, .mtime_ns = v.mtime_ns, .tiered = v.tiered };
 }
 
 fn commonPrefix(key: []const u8, prefix: []const u8, delimiter: []const u8) ?[]const u8 {

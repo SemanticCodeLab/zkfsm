@@ -11,6 +11,8 @@ pub const index = @import("index.zig");
 pub const index_store = @import("index_store.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const policy = @import("policy.zig");
+pub const tier = @import("tier.zig");
+pub const transition = @import("transition.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -48,4 +50,6 @@ test {
     _ = index_store;
     _ = lifecycle;
     _ = policy;
+    _ = tier;
+    _ = transition;
 }

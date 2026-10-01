@@ -15,6 +15,7 @@ const policy = @import("policy.zig");
 const acl = @import("acl.zig");
 const list_v1 = @import("list_v1.zig");
 const sts = @import("sts.zig");
+const restore = @import("restore.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -109,7 +110,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
         .GET => listBuckets(c),
         else => fail(c, .MethodNotAllowed),
     };
-    if (try lifecycle.route(c) or try policy.route(c) or try acl.route(c)) return;
+    if (try lifecycle.route(c) or try policy.route(c) or try acl.route(c) or try restore.route(c)) return;
     if (try versioning.route(c)) return;
     if (r.key.len == 0) return switch (c.method) {
         .PUT => {
@@ -231,7 +232,8 @@ fn listObjects(c: *Ctx) DispatchError!void {
         try xml.elem(w, "ETag", e.etag.quoted(&eb));
         try xml.elemInt(w, "Size", e.size);
         if (fetch_owner) try w.writeAll(owner_xml);
-        try w.writeAll("<StorageClass>STANDARD</StorageClass></Contents>");
+        try xml.elem(w, "StorageClass", try storageClass(c, e));
+        try w.writeAll("</Contents>");
     }
     for (res.common_prefixes) |cp| {
         try w.writeAll("<CommonPrefixes>");
@@ -240,6 +242,16 @@ fn listObjects(c: *Ctx) DispatchError!void {
     }
     try w.writeAll("</ListBucketResult>");
     try respondXml(c, .ok, a.written());
+}
+
+/// Tier name for tiered entries (one record read each), else STANDARD.
+pub fn storageClass(c: *Ctx, e: object.list.Entry) error{OutOfMemory}![]const u8 {
+    if (!e.tiered) return "STANDARD";
+    const info = object.versioning.headVersion(c.svc, c.arena, c.route.bucket, e.key, null) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => "STANDARD",
+    };
+    return if (info.tier.len > 0) info.tier else "STANDARD";
 }
 
 pub const owner_xml = "<Owner><ID>zkfsm</ID><DisplayName>zkfsm</DisplayName></Owner>";

@@ -204,6 +204,8 @@ pub fn putResponseHeaders(c: *Ctx, info: object.ObjectInfo, out: *std.ArrayList(
 
 /// Headers describing a version on GET/HEAD.
 pub fn objectHeaders(c: *Ctx, info: object.ObjectInfo, asked_version: bool, out: *std.ArrayList(Header)) error{OutOfMemory}!void {
+    if (info.tier.len > 0) try out.append(c.arena, .{ .name = "x-amz-storage-class", .value = info.tier });
+    if (try object.transition.restoreHeader(c.svc, c.arena, info)) |v| try out.append(c.arena, .{ .name = "x-amz-restore", .value = v });
     if (asked_version or !info.version_id.eql(ov.null_version_id)) try out.append(c.arena, try versionHeader(c, info.version_id));
     if (info.retention_mode != .none) {
         const tb = try c.arena.create([24]u8);
@@ -234,6 +236,11 @@ pub fn applyResponseOverrides(c: *Ctx, out: *std.ArrayList(Header)) error{OutOfM
         }
         try out.append(c.arena, .{ .name = n, .value = v });
     };
+}
+
+fn versionClass(c: *Ctx, e: ov.VersionEntry) []const u8 {
+    const info = ov.headVersion(c.svc, c.arena, c.route.bucket, e.key, e.version) catch return "STANDARD";
+    return if (info.tier.len > 0) info.tier else "STANDARD";
 }
 
 /// Looks up the version to serve; answers delete markers itself (returns null).
@@ -477,7 +484,7 @@ fn listVersions(c: *Ctx) DispatchError!void {
             var eb: [core.ETag.quoted_max]u8 = undefined;
             try xml.elem(w, "ETag", e.etag.quoted(&eb));
             try xml.elemInt(w, "Size", e.size);
-            try xml.elem(w, "StorageClass", "STANDARD");
+            try xml.elem(w, "StorageClass", if (e.tiered) versionClass(c, e) else "STANDARD");
         }
         try w.writeAll("<Owner><ID>zkfsm</ID><DisplayName>zkfsm</DisplayName></Owner>");
         try xml.close(w, tag);
