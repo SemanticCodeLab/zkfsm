@@ -45,6 +45,8 @@ const Chunk = struct { len: usize = 0, items: [chunk_cap]*Name = undefined };
 const Names = struct {
     chunks: std.ArrayList(*Chunk) = .empty,
     count: usize = 0,
+    /// Stored bytes and object versions (delete markers excluded), for quotas.
+    usage: Usage = .{},
 
     const Pos = struct { c: usize, i: usize };
 
@@ -159,6 +161,23 @@ const Names = struct {
 };
 
 pub const Upload = struct { bucket: core.BucketId, key: []const u8, created_ns: i128 };
+
+pub const Usage = struct {
+    bytes: u64 = 0,
+    objects: u64 = 0,
+
+    fn add(u: *Usage, v: Version) void {
+        if (v.delete_marker) return;
+        u.bytes +|= v.size;
+        u.objects +|= 1;
+    }
+
+    fn sub(u: *Usage, v: Version) void {
+        if (v.delete_marker) return;
+        u.bytes -|= v.size;
+        u.objects -|= 1;
+    }
+};
 pub const UploadEntry = struct { id: core.ObjectId, upload: Upload };
 
 /// One row of a version listing; `key` lives in the caller's arena.
@@ -244,10 +263,14 @@ pub const Index = struct {
         if (v == null) {
             const b = self.buckets.get(bid.bytes) orelse return;
             const f = b.find(key) orelse return;
+            if (f[0].current) |old| b.usage.sub(old);
             f[0].current = null;
             return self.prune(bid, key);
         }
         const n = self.nameFor(bid, key) catch return self.markStale();
+        const b = self.buckets.get(bid.bytes).?;
+        if (n.current) |old| b.usage.sub(old);
+        b.usage.add(v.?);
         n.current = v;
     }
 
@@ -256,14 +279,18 @@ pub const Index = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const n = self.nameFor(bid, key) catch return self.markStale();
+        const b = self.buckets.get(bid.bytes).?;
         for (n.noncurrent.items) |*x| if (x.id.eql(v.id)) {
+            b.usage.sub(x.*);
+            b.usage.add(v);
             x.* = v;
             return;
         };
         n.noncurrent.append(self.gpa, v) catch {
             self.prune(bid, key);
-            self.markStale();
+            return self.markStale();
         };
+        b.usage.add(v);
     }
 
     pub fn removeNoncurrent(self: *Index, bid: core.BucketId, key: []const u8, id: core.VersionId) void {
@@ -272,6 +299,7 @@ pub const Index = struct {
         const b = self.buckets.get(bid.bytes) orelse return;
         const f = b.find(key) orelse return;
         for (f[0].noncurrent.items, 0..) |x, i| if (x.id.eql(id)) {
+            b.usage.sub(x);
             _ = f[0].noncurrent.swapRemove(i);
             break;
         };
@@ -293,6 +321,23 @@ pub const Index = struct {
             best = v;
         };
         return best;
+    }
+
+    /// The current version of a name, if any.
+    pub fn current(self: *Index, bid: core.BucketId, key: []const u8) ?Version {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.buckets.get(bid.bytes) orelse return null;
+        const f = b.find(key) orelse return null;
+        return f[0].current;
+    }
+
+    /// Bytes and object versions stored in the bucket.
+    pub fn usage(self: *Index, bid: core.BucketId) Usage {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const b = self.buckets.get(bid.bytes) orelse return .{};
+        return b.usage;
     }
 
     /// True when the bucket holds no version of any name.
@@ -483,6 +528,7 @@ pub const Index = struct {
             const has = (try c.take(1))[0];
             if (has > 1) return error.Corrupt;
             const cur: ?Version = if (has == 1) try takeVersion(&c) else null;
+            if (cur) |v| b.usage.add(v);
             const nn = try c.int(u32);
             if (nn > c.bytes.len) return error.Corrupt;
             if (cur == null and nn == 0) return error.Corrupt;
@@ -497,7 +543,11 @@ pub const Index = struct {
             };
             prev = n.key;
             try n.noncurrent.ensureTotalCapacity(self.gpa, nn);
-            for (0..nn) |_| n.noncurrent.appendAssumeCapacity(try takeVersion(&c));
+            for (0..nn) |_| {
+                const v = try takeVersion(&c);
+                b.usage.add(v);
+                n.noncurrent.appendAssumeCapacity(v);
+            }
         }
         if (c.pos != bytes.len) return error.Corrupt;
     }

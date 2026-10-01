@@ -15,6 +15,7 @@ const policy = @import("policy.zig");
 const acl = @import("acl.zig");
 const list_v1 = @import("list_v1.zig");
 const sts = @import("sts.zig");
+const tenancy = @import("tenancy.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -42,6 +43,9 @@ pub const Ctx = struct {
     ext: versioning.Headers = .{},
     /// Body read before authentication (STS form posts only).
     body: ?[]const u8 = null,
+    env: authz.Env = .{},
+    /// Tenant that buckets created by this caller belong to ("" = global).
+    tenant: []const u8 = "",
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -85,12 +89,19 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     // STS-scoped signatures are only valid for STS calls.
     if (std.mem.eql(u8, ctx.auth.scope.service, "sts")) return fail(&ctx, .AccessDenied);
     for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
+    ctx.env = env;
+    var tbuf: tenancy.NameBuf = undefined;
+    const caller_tenant = tenancy.callerTenant(env.auth, ctx.auth, &tbuf);
+    if (caller_tenant) |t| {
+        if (!tenancy.tenantActive(env.auth, t)) return fail(&ctx, .AccessDenied);
+        ctx.tenant = try arena.dupe(u8, t);
+    }
     var ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
     if (env.auth.iam != null and ctx.route.bucket.len > 0) {
-        ar.bucket_policy = object.policy.get(svc, arena, ctx.route.bucket) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
+        if (object.tenancy.access(svc, arena, ctx.route.bucket)) |acc| {
+            if (!tenancy.mayReach(env.auth, ctx.auth, caller_tenant, acc.tenant)) return fail(&ctx, .AccessDenied);
+            ar.bucket_policy = acc.policy;
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
     }
     if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
     for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
@@ -113,7 +124,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
     if (try versioning.route(c)) return;
     if (r.key.len == 0) return switch (c.method) {
         .PUT => {
-            try c.svc.createBucket(r.bucket);
+            try object.tenancy.createOwned(c.svc, r.bucket, c.tenant);
             try respondEmpty(c, .ok, &.{.{ .name = "location", .value = c.target }});
         },
         .DELETE => {
@@ -151,7 +162,7 @@ pub fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
 }
 
 fn listBuckets(c: *Ctx) DispatchError!void {
-    const buckets = try c.svc.listBuckets(c.arena);
+    const buckets = try tenancy.visibleBuckets(c.svc, c.arena, c.env.auth, c.auth);
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "ListAllMyBucketsResult");

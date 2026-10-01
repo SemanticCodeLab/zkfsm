@@ -6,6 +6,7 @@ const core = @import("../core/root.zig");
 const iam = @import("../iam/root.zig");
 const object = @import("../object/root.zig");
 const sio = @import("sio.zig");
+const identity = @import("identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Op = iam.actions.AdminOp;
@@ -58,6 +59,9 @@ pub const Caller = struct {
     /// Identity to authorize (an STS session's parent).
     principal: []const u8,
     session_policy: ?[]const u8 = null,
+    federated_policies: ?[]const u8 = null,
+    /// Tenant of the caller; tenant identities only get self-service operations.
+    tenant: []const u8 = "",
 };
 
 pub const Request = struct {
@@ -72,6 +76,8 @@ pub const Response = struct {
     status: std.http.Status = .ok,
     body: []const u8 = "",
     content_type: []const u8 = "application/json",
+    /// Tells clients a configuration change took effect without a restart.
+    config_applied: bool = false,
 };
 
 pub const Env = struct {
@@ -79,27 +85,35 @@ pub const Env = struct {
     svc: ?*object.ObjectService = null,
     region: []const u8 = "us-east-1",
     started_s: i64 = 0,
+    /// Identity providers supplied by flags or environment (read-only here).
+    idp_env: iam.idp.EnvConfig = .{},
 };
 
 pub const Error = error{OutOfMemory};
 
-const Ctx = struct {
+pub const Ctx = struct {
     a: Allocator,
     env: Env,
     req: Request,
 
-    fn param(c: *const Ctx, name: []const u8) Error!?[]const u8 {
+    pub fn param(c: *const Ctx, name: []const u8) Error!?[]const u8 {
         return queryParam(c.a, c.req.target.query, name);
     }
 
-    fn can(c: *const Ctx, op: Op) Error!bool {
+    pub fn can(c: *const Ctx, op: Op) Error!bool {
+        return c.canAction(op.action());
+    }
+
+    /// Like `can`, for admin actions without an `AdminOp` entry.
+    pub fn canAction(c: *const Ctx, action: []const u8) Error!bool {
         const store = c.env.store;
         const who = c.req.caller;
         var sp: ?iam.Policy = null;
         if (who.session_policy) |doc| sp = iam.policy.parse(c.a, doc) catch return false;
-        const id: iam.Identity = .{ .access_key = who.principal, .session_policy = if (sp) |*p| p else null };
+        if (who.tenant.len > 0) return false;
+        const id: iam.Identity = .{ .access_key = who.principal, .session_policy = if (sp) |*p| p else null, .federated_policies = who.federated_policies };
         const ctx: iam.Context = .{ .now_s = c.req.now_s };
-        return store.authorize(id, op.action(), iam.actions.admin_resource, &ctx).allowed();
+        return store.authorize(id, action, iam.actions.admin_resource, &ctx).allowed();
     }
 
     /// Plain (non-session, non-service-account) identity acting for itself.
@@ -108,11 +122,11 @@ const Ctx = struct {
         return std.mem.eql(u8, who.principal, user) and std.mem.eql(u8, who.access_key, user);
     }
 
-    fn json(c: *const Ctx, v: anytype) Error!Response {
+    pub fn json(c: *const Ctx, v: anytype) Error!Response {
         return .{ .body = try std.json.Stringify.valueAlloc(c.a, v, .{ .emit_null_optional_fields = false }) };
     }
 
-    fn encrypted(c: *const Ctx, v: anytype) Error!Response {
+    pub fn encrypted(c: *const Ctx, v: anytype) Error!Response {
         const plain = try std.json.Stringify.valueAlloc(c.a, v, .{ .emit_null_optional_fields = false });
         const ct = sio.encrypt(c.a, c.req.caller.secret, plain) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -121,7 +135,7 @@ const Ctx = struct {
         return .{ .body = ct, .content_type = "application/octet-stream" };
     }
 
-    fn decryptBody(c: *const Ctx) Error!?[]u8 {
+    pub fn decryptBody(c: *const Ctx) Error!?[]u8 {
         return sio.decrypt(c.a, c.req.caller.secret, c.req.body) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => null,
@@ -134,11 +148,11 @@ pub fn fail(a: Allocator, status: std.http.Status, code: []const u8, message: []
     return .{ .status = status, .body = body };
 }
 
-fn denied(a: Allocator) Error!Response {
+pub fn denied(a: Allocator) Error!Response {
     return fail(a, .forbidden, "AccessDenied", "Access Denied.");
 }
 
-fn badRequest(a: Allocator, message: []const u8) Error!Response {
+pub fn badRequest(a: Allocator, message: []const u8) Error!Response {
     return fail(a, .bad_request, "XMinioAdminInvalidArgument", message);
 }
 
@@ -204,6 +218,7 @@ pub fn handle(a: Allocator, env: Env, req: Request) Error!Response {
             return r[2](&c);
         }
     }
+    if (try identity.route(&c)) |res| return res;
     return fail(a, .not_implemented, "NotImplemented", "A header you provided implies functionality that is not implemented.");
 }
 
@@ -659,7 +674,7 @@ fn accountInfo(c: *const Ctx) Error!Response {
         const buckets = svc.listBuckets(c.a) catch &.{};
         var sp: ?iam.Policy = null;
         if (c.req.caller.session_policy) |doc| sp = iam.policy.parse(c.a, doc) catch null;
-        const id: iam.Identity = .{ .access_key = who, .session_policy = if (sp) |*p| p else null };
+        const id: iam.Identity = .{ .access_key = who, .session_policy = if (sp) |*p| p else null, .federated_policies = c.req.caller.federated_policies };
         const ctx: iam.Context = .{ .now_s = c.req.now_s };
         for (buckets) |b| {
             const arn = try std.fmt.allocPrint(c.a, "arn:aws:s3:::{s}/*", .{b.name});
@@ -712,12 +727,12 @@ fn parseValue(a: Allocator, doc: []const u8) ?Value {
     return std.json.parseFromSliceLeaky(Value, a, doc, .{}) catch null;
 }
 
-fn parseObject(a: Allocator, doc: []const u8) ?std.json.ObjectMap {
+pub fn parseObject(a: Allocator, doc: []const u8) ?std.json.ObjectMap {
     const v = parseValue(a, doc) orelse return null;
     return if (v == .object) v.object else null;
 }
 
-fn str(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+pub fn str(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = o.get(key) orelse return null;
     return if (v == .string) v.string else null;
 }
@@ -727,7 +742,7 @@ fn nonEmpty(s: ?[]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
-fn strList(a: Allocator, v: ?Value) ?[]const []const u8 {
+pub fn strList(a: Allocator, v: ?Value) ?[]const []const u8 {
     const val = v orelse return null;
     if (val == .null) return &.{};
     if (val != .array) return null;

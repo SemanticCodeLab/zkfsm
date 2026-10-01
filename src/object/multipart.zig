@@ -12,6 +12,7 @@ const lock = @import("lock.zig");
 const blob = @import("blob.zig");
 const copy = @import("copy.zig");
 const versioning = @import("versioning.zig");
+const quota = @import("quota.zig");
 
 const ObjectService = service.ObjectService;
 const Md5 = core.checksum.Md5;
@@ -90,6 +91,7 @@ pub fn uploadPart(
 ) Error!core.ETag {
     if (number == 0 or number > max_part_number) return error.InvalidPartNumber;
     const bid = try svc.bucketId(bucket);
+    if (content_length) |n| try quota.precheck(svc, bucket, null, n);
     {
         var arena = std.heap.ArenaAllocator.init(svc.gpa);
         defer arena.deinit();

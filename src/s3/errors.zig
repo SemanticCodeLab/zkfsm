@@ -49,6 +49,7 @@ pub const Code = enum {
     InvalidPartNumber,
     WriteQuorumUnavailable,
     ReadQuorumUnavailable,
+    QuotaExceeded,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -72,6 +73,7 @@ pub const Code = enum {
             .MalformedPolicy => .bad_request,
             .InvalidPartNumber => .range_not_satisfiable,
             .WriteQuorumUnavailable, .ReadQuorumUnavailable => .service_unavailable,
+            .QuotaExceeded => .bad_request,
         };
     }
 
@@ -122,6 +124,7 @@ pub const Code = enum {
             .InvalidPartNumber => "The requested partnumber is not satisfiable",
             .WriteQuorumUnavailable => "Write quorum not available: too many drives or nodes of this erasure set are offline.",
             .ReadQuorumUnavailable => "Read quorum not available: too many drives or nodes holding this object are offline.",
+            .QuotaExceeded => "Bucket quota exceeded",
         };
     }
 };
@@ -153,6 +156,7 @@ pub fn fromObject(e: object.Error) Code {
         error.WriteQuorum => .WriteQuorumUnavailable,
         error.ReadQuorum => .ReadQuorumUnavailable,
         error.LockTimeout => .ServiceUnavailable,
+        error.QuotaExceeded => .QuotaExceeded,
     };
 }
 

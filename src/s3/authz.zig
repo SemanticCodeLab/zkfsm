@@ -15,7 +15,11 @@ pub const Env = struct {
     peer: ?std.net.Address = null,
     extensions: []const @import("extension.zig").Extension = &.{},
     routing: router.Routing = .{},
+    /// Verified TLS client certificate of the connection (mutual TLS only).
+    client_cert: ?ClientCert = null,
 };
+
+pub const ClientCert = struct { common_name: []const u8, not_after_s: i64 };
 
 /// Action for requests no S3 operation covers; only root (or `*` grants) pass.
 const unmapped_action = "s3:ZkfsmUnmappedRequest";
@@ -108,7 +112,7 @@ pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request,
     const store = env.auth.iam orelse return true;
     var session: ?iam.Policy = null;
     if (auth.session_policy) |doc| session = iam.policy.parse(arena, doc) catch return false;
-    const who: iam.Identity = .{ .access_key = auth.principal, .session_policy = if (session) |*p| p else null };
+    const who: iam.Identity = .{ .access_key = auth.principal, .session_policy = if (session) |*p| p else null, .federated_policies = auth.federated_policies };
     // Stored policies were validated on PUT; one that no longer parses grants nothing.
     var bucket_policy: ?iam.Policy = null;
     if (r.bucket_policy) |doc| bucket_policy = iam.policy.parse(arena, doc) catch |e| switch (e) {

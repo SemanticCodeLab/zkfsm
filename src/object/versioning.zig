@@ -9,6 +9,7 @@ const metadata = @import("../metadata/root.zig");
 const service = @import("service.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
+const quota = @import("quota.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -257,6 +258,8 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     var etag_buf: [core.ETag.quoted_max]u8 = undefined;
     const live_etag: ?[]const u8 = if (cur) |c| (if (c.flags.delete_marker) null else c.reportedEtag().quoted(&etag_buf)) else null;
     conditional.evalWrite(in.conditions, live_etag) catch |e| return e;
+    const freed: u64 = if (cfg.versioning == .unset) if (cur) |c| (if (c.flags.delete_marker) 0 else c.reportedSize()) else 0 else 0;
+    try quota.check(svc, bid, cfg, rec.reportedSize(), freed);
 
     switch (cfg.versioning) {
         .unset => {

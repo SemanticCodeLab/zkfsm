@@ -52,6 +52,8 @@ pub const Error = error{
     ReadQuorum,
     /// A cluster namespace lock could not be taken in time.
     LockTimeout,
+    /// The write would take the bucket past its hard quota.
+    QuotaExceeded,
 };
 
 /// Cluster coordination hooks; null on a single node, where `mutex` is enough.
@@ -409,6 +411,7 @@ pub const ObjectService = struct {
     pub fn put(self: *ObjectService, bucket: []const u8, key: []const u8, source: *std.Io.Reader, in: PutInput) Error!ObjectInfo {
         try validKey(key);
         const bid = try self.bucketId(bucket);
+        if (in.content_length) |n| try @import("quota.zig").precheck(self, bucket, key, n);
         const meta = try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system);
         defer meta.deinit(self.gpa);
         const oid = core.ObjectId.random();
