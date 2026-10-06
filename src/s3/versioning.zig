@@ -56,6 +56,8 @@ pub const Headers = struct {
         inline for (object.SystemHeaders.fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[1])) {
             @field(self.system, f[0]) = try arena.dupe(u8, h.value);
         };
+        // aws-chunked describes the upload framing, not the stored object.
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding")) self.system.content_encoding = try withoutAwsChunked(arena, h.value);
         const prefix = "x-amz-meta-";
         if (h.name.len <= prefix.len or !std.ascii.startsWithIgnoreCase(h.name, prefix)) return;
         const name = try std.ascii.allocLowerString(arena, h.name[prefix.len..]);
@@ -78,6 +80,18 @@ pub const Headers = struct {
         };
     }
 };
+
+pub fn withoutAwsChunked(arena: std.mem.Allocator, v: []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, v, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0 or std.ascii.eqlIgnoreCase(t, "aws-chunked")) continue;
+        if (out.items.len > 0) try out.append(arena, ',');
+        try out.appendSlice(arena, t);
+    }
+    return out.items;
+}
 
 fn has(c: *Ctx, name: []const u8) error{OutOfMemory}!bool {
     return (try handler.param(c, name)) != null;
@@ -219,6 +233,7 @@ pub fn objectHeaders(c: *Ctx, info: object.ObjectInfo, asked_version: bool, out:
         });
     }
     if (info.legal_hold) try out.append(c.arena, .{ .name = "x-amz-object-lock-legal-hold", .value = "ON" });
+    if (object.replica.statusOf(info.internal)) |st| try out.append(c.arena, .{ .name = "x-amz-replication-status", .value = st.text() });
     for (info.metadata) |m| try out.append(c.arena, .{ .name = try std.fmt.allocPrint(c.arena, "x-amz-meta-{s}", .{m.name}), .value = m.value });
     inline for (object.SystemHeaders.fields) |f| {
         const v = @field(info.system, f[0]);

@@ -12,6 +12,7 @@ const admin = @import("admin/root.zig");
 const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
+const replication = @import("replication/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -357,8 +358,12 @@ pub fn run(opts: Options) u8 {
         return 2;
     };
     warnShadowedBucket(&svc, arena, admin_prefix);
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    var repl = replication.Replicator.init(gpa, &svc, .{});
+    defer repl.deinit();
+    startReplication(&repl, &svc, auth.iam);
+    var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -455,8 +460,13 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         std.log.err("invalid admin prefix {s}", .{admin_prefix});
         return 2;
     };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    // Set up once the object service exists; requests wait behind the gate until then.
+    var repl: replication.Replicator = undefined;
+    var repl_ready = false;
+    defer if (repl_ready) repl.deinit();
+    var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
         tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
@@ -519,6 +529,9 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
                 break;
             }
         }
+        repl = replication.Replicator.init(gpa, &svc, .{ .leader = .{ .ctx = node, .func = clusterLeader } });
+        repl_ready = true;
+        startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         node.start(if (iam_ready) &iam_store else null);
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
@@ -540,6 +553,19 @@ fn serveThread(server: *s3.Server, addr: std.net.Address, node: *cluster.Node) v
     server.run(addr) catch |e| std.log.err("server failed: {t}", .{e});
     // Unblocks a bootstrap that is still waiting for peers.
     node.stop_ev.set();
+}
+
+fn clusterLeader(ctx: *anyopaque) bool {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    return node.isLeader();
+}
+
+/// Hooks the replication engine into the object service, metrics, and IAM.
+fn startReplication(repl: *replication.Replicator, svc: *object.ObjectService, iam_store: ?*iam.Store) void {
+    repl.site_ctx = .{ .iam = iam_store };
+    svc.replication = repl.sink();
+    metrics.global.extra[0] = .{ .ctx = &repl.stats, .func = replication.stats.Stats.render };
+    repl.start() catch |e| std.log.warn("replication worker not started: {t}", .{e});
 }
 
 fn clusterReady(ctx: *anyopaque) bool {
@@ -814,4 +840,5 @@ test {
     _ = admin;
     _ = tls;
     _ = cluster;
+    _ = replication;
 }

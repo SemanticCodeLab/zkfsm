@@ -106,10 +106,15 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     }
     if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
     for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
-    if (try multipart.handle(&ctx)) return;
-    dispatch(&ctx) catch |e| switch (e) {
+    try runBuiltin(&ctx);
+}
+
+/// Built-in S3 dispatch; lets an extension wrap the standard handling of a request.
+pub fn runBuiltin(ctx: *Ctx) ConnError!void {
+    if (try multipart.handle(ctx)) return;
+    dispatch(ctx) catch |e| switch (e) {
         error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| return ce,
-        else => |oe| return fail(&ctx, errors.fromObject(oe)),
+        else => |oe| return fail(ctx, errors.fromObject(oe)),
     };
 }
 

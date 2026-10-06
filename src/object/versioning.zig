@@ -11,6 +11,7 @@ const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
 const transition = @import("transition.zig");
 const quota = @import("quota.zig");
+const replica = @import("replica.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -243,6 +244,13 @@ pub fn encodeObjectTags(arena: std.mem.Allocator, tags: []const Tag) Error![]con
 /// Commits `rec` (data blob already written) as the new current version of its name.
 /// Assigns the version id and lock fields; returns blobs that became unreachable.
 pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInput) Error!Garbage {
+    var notify = false;
+    const g = try commitPutLocked(svc, bucket, rec, in, &notify);
+    if (notify) svc.notifyReplication(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .put });
+    return g;
+}
+
+fn commitPutLocked(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInput, notify: *bool) Error!Garbage {
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -254,6 +262,17 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     const b = svc.catalog.find(bucket) orelse return error.NoSuchBucket;
     const bid = b.id;
     const cfg = try loadConfigLocked(svc, a, bid);
+    // The status header lives in `arena`; restore the caller's bytes on return.
+    const caller_internal = rec.internal_meta;
+    defer rec.internal_meta = caller_internal;
+    const origin = replica.origin;
+    if (origin) |o| {
+        if (o.created_ns) |t| rec.created_ns = t;
+        rec.internal_meta = try statusMeta(a, rec.internal_meta, .replica);
+    } else if (cfg.versioning == .enabled) if (svc.replication) |s| if (s.vtable.wants(s.ctx, bid, bucket, rec.key, rec.tags)) {
+        rec.internal_meta = try statusMeta(a, rec.internal_meta, .pending);
+        notify.* = true;
+    };
 
     if (in.retention != null or in.legal_hold) {
         if (!cfg.lock_enabled) return error.InvalidRequest;
@@ -280,7 +299,11 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
             }
         },
         .enabled => {
-            rec.version = core.ids.newVersionId(rec.created_ns);
+            if (origin) |o| if (o.version) |v| {
+                rec.version = v;
+                if (try placeReplica(svc, a, bid, cur, rec.*, &g)) return g;
+            };
+            if (origin == null or origin.?.version == null) rec.version = core.ids.newVersionId(rec.created_ns);
             if (cur) |c| try store(svc, slotKey(bid, c.key, c.versionId()), c);
         },
         .suspended => {
@@ -290,6 +313,36 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     }
     try store(svc, ck, rec.*);
     return g;
+}
+
+fn statusMeta(a: std.mem.Allocator, internal: []const u8, st: replica.Status) Error![]const u8 {
+    return replica.withStatus(a, internal, st) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        error.MetadataTooLarge => error.MetadataTooLarge,
+    };
+}
+
+/// A replica whose version already exists, or that is older than the current version,
+/// lands in its own slot; returns false when it should become the current version.
+fn placeReplica(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, cur: ?Record, rec: Record, g: *Garbage) Error!bool {
+    const v = rec.versionId();
+    if (cur) |c| if (c.versionId().eql(v)) {
+        g.add(c);
+        try store(svc, currentKey(bid, rec.key), rec);
+        return true;
+    };
+    const sk = slotKey(bid, rec.key, v);
+    if (try loadAt(svc, a, sk, bid, rec.key)) |old| {
+        g.add(old);
+        try store(svc, sk, rec);
+        return true;
+    }
+    if (cur) |c| if (c.created_ns > rec.created_ns) {
+        try store(svc, sk, rec);
+        return true;
+    };
+    return false;
 }
 
 /// Suspended-mode write: the existing null version is replaced, a versioned current is demoted.
@@ -327,14 +380,21 @@ pub fn deleteObject(svc: *Svc, bucket: []const u8, key: []const u8, opts: Delete
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     var g: Garbage = .{};
-    const held = try svc.clusterLock("obj", bucket, key);
+    var held = try svc.clusterLock("obj", bucket, key);
     defer svc.clusterUnlock(held);
     const r = blk: {
         svc.mutex.lock();
         defer svc.mutex.unlock();
         break :blk try deleteLocked(svc, arena.allocator(), bucket, key, opts, &g);
     };
+    svc.clusterUnlock(held);
+    held = .{};
     g.collect(svc);
+    if (r.version) |v| {
+        if (opts.version != null) {
+            svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .delete_version });
+        } else if (r.delete_marker) svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .delete_marker });
+    }
     return r;
 }
 
@@ -343,6 +403,7 @@ fn deleteLocked(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, key: []cons
     const ck = currentKey(bid, key);
     const cur = try loadAt(svc, a, ck, bid, key);
     if (opts.if_created_ns) |t| if (cur == null or cur.?.created_ns != t) return error.PreconditionFailed;
+    if (replica.origin) |o| if (o.delete_marker) return replicaMarker(svc, a, bid, key, cur, o, opts.version orelse return error.InvalidRequest);
     if (opts.version) |v| return deleteVersion(svc, a, bid, key, cur, v, opts.bypass_governance, g);
 
     const cfg = try loadConfigLocked(svc, a, bid);
@@ -374,6 +435,58 @@ fn deleteLocked(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, key: []cons
     }
     try store(svc, ck, marker);
     return .{ .version = marker.versionId(), .delete_marker = true };
+}
+
+/// Stores a replicated delete marker under its source version id and time.
+fn replicaMarker(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const u8, cur: ?Record, o: replica.Origin, v: core.VersionId) Error!DeleteResult {
+    const cfg = try loadConfigLocked(svc, a, bid);
+    if (cfg.versioning != .enabled) return error.InvalidRequest;
+    const done: DeleteResult = .{ .version = v, .delete_marker = true };
+    if (cur) |c| if (c.versionId().eql(v)) return done;
+    const sk = slotKey(bid, key, v);
+    if (try loadAt(svc, a, sk, bid, key) != null) return done;
+    const marker: Record = .{
+        .object_id = core.ObjectId.random(),
+        .bucket_id = bid,
+        .version = v,
+        .size = 0,
+        .etag = .{ .md5 = [_]u8{0} ** 16 },
+        .checksum = .{},
+        .created_ns = o.created_ns orelse core.time.nowNs(),
+        .key = key,
+        .flags = .{ .delete_marker = true },
+        .internal_meta = try statusMeta(a, "", .replica),
+    };
+    if (cur) |c| {
+        if (c.created_ns > marker.created_ns) {
+            try store(svc, sk, marker);
+            return done;
+        }
+        try store(svc, slotKey(bid, key, c.versionId()), c);
+    }
+    try store(svc, currentKey(bid, key), marker);
+    return done;
+}
+
+/// Sets the replication status of one version (delete markers included) without
+/// notifying the sink. A missing version is not an error.
+pub fn setReplicationStatus(svc: *Svc, bucket: []const u8, key: []const u8, version: core.VersionId, st: replica.Status) Error!void {
+    const bid = try svc.bucketId(bucket);
+    var arena = std.heap.ArenaAllocator.init(svc.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const held = try svc.clusterLock("obj", bucket, key);
+    defer svc.clusterUnlock(held);
+    svc.mutex.lock();
+    defer svc.mutex.unlock();
+    var l = locate(svc, a, bid, key, version) catch |e| return switch (e) {
+        error.NoSuchKey, error.NoSuchVersion => {},
+        else => e,
+    };
+    const hs = metadata.headers.decode(a, l.rec.internal_meta) catch return error.Corrupt;
+    if (replica.statusOf(hs)) |old| if (old == st or old == .replica) return;
+    l.rec.internal_meta = try statusMeta(a, l.rec.internal_meta, st);
+    try store(svc, l.pk, l.rec);
 }
 
 fn deleteVersion(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []const u8, cur: ?Record, v: core.VersionId, bypass: bool, g: *Garbage) Error!DeleteResult {
@@ -459,33 +572,38 @@ pub fn setObjectTags(svc: *Svc, bucket: []const u8, key: []const u8, version: ?c
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const enc = if (tags) |t| try encodeObjectTags(arena.allocator(), t) else "";
-    return mutate(svc, bucket, key, version, enc, struct {
+    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, enc, struct {
         fn f(e: []const u8, _: BucketConfig, r: *Record) Error!void {
             r.tags = e;
         }
-    }.f);
+    }.f));
+}
+
+fn metadataChanged(svc: *Svc, bucket: []const u8, key: []const u8, v: core.VersionId) core.VersionId {
+    svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .metadata });
+    return v;
 }
 
 pub const RetentionInput = struct { retention: lock.Retention, bypass_governance: bool = false };
 
 pub fn setRetention(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, in: RetentionInput) Error!core.VersionId {
-    return mutate(svc, bucket, key, version, in, struct {
+    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, in, struct {
         fn f(x: RetentionInput, cfg: BucketConfig, r: *Record) Error!void {
             if (!cfg.lock_enabled) return error.InvalidRequest;
             lock.checkChange(retentionOf(r.*), x.retention, x.bypass_governance, core.time.nowNs()) catch return error.ObjectLocked;
             r.retention_mode = x.retention.mode;
             r.retain_until_ns = if (x.retention.mode == .none) 0 else x.retention.until_ns;
         }
-    }.f);
+    }.f));
 }
 
 pub fn setLegalHold(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, on: bool) Error!core.VersionId {
-    return mutate(svc, bucket, key, version, on, struct {
+    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, on, struct {
         fn f(x: bool, cfg: BucketConfig, r: *Record) Error!void {
             if (!cfg.lock_enabled) return error.InvalidRequest;
             r.flags.legal_hold = x;
         }
-    }.f);
+    }.f));
 }
 
 // ---- ListObjectVersions ----

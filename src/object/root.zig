@@ -15,6 +15,7 @@ pub const tier = @import("tier.zig");
 pub const transition = @import("transition.zig");
 pub const quota = @import("quota.zig");
 pub const tenancy = @import("tenancy.zig");
+pub const replica = @import("replica.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -56,4 +57,5 @@ test {
     _ = transition;
     _ = quota;
     _ = tenancy;
+    _ = replica;
 }

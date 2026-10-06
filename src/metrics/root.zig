@@ -61,13 +61,22 @@ pub const Counters = struct {
         const up_ns = std.time.nanoTimestamp() - c.started_ns;
         try w.print("# TYPE zkfsm_uptime_seconds gauge\nzkfsm_uptime_seconds {d}\n", .{@divTrunc(@max(up_ns, 0), std.time.ns_per_s)});
         try w.writeAll("# TYPE zkfsm_build_info gauge\nzkfsm_build_info{version=\"0.1.0\"} 1\n");
+        for (global.extra) |e| if (e) |r| try r.func(r.ctx, w);
     }
+};
+
+/// Extra metric families appended by subsystems that live above this layer.
+pub const Renderer = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void,
 };
 
 pub const global = struct {
     pub var counters: Counters = .{};
     /// Status of the response being written on this thread.
     pub threadlocal var last_status: u10 = 200;
+    /// Set once at startup, before serving.
+    pub var extra: [4]?Renderer = .{ null, null, null, null };
 };
 
 pub const Endpoint = enum { live, ready, metrics };

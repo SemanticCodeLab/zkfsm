@@ -6,6 +6,7 @@ const admin = @import("admin/root.zig");
 const iam = @import("iam/root.zig");
 const object = @import("object/root.zig");
 const metrics = @import("metrics/root.zig");
+const replication = @import("replication/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -15,6 +16,8 @@ pub const Bridge = struct {
     auth: s3.sigv4.Config,
     svc: *object.ObjectService,
     started_s: i64,
+    /// Remote targets and site replication; also sees IAM changes for peers.
+    repl: ?*replication.Replicator = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -43,7 +46,7 @@ pub const Bridge = struct {
             sts_secret = issuer.secretFor(ak);
             break :blk &sts_secret;
         } else store.secretFor(ak, now_s, &sbuf) orelse return denied(c);
-        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s, .idp_env = if (self.auth.federation) |f| f.env else .{} }, .{
+        const req: admin.api.Request = .{
             .method = c.method,
             .target = target,
             .body = body,
@@ -56,7 +59,13 @@ pub const Bridge = struct {
                 .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
-        });
+        };
+        if (self.repl) |r| if (try replication.admin.handle(r, c.arena, store, req)) |res| {
+            try respond(c, res);
+            return true;
+        };
+        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s, .idp_env = if (self.auth.federation) |f| f.env else .{} }, req);
+        if (self.repl) |r| replication.admin.observe(r, c.arena, req, res);
         try respond(c, res);
         return true;
     }
