@@ -10,6 +10,7 @@ const versioning = @import("versioning.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
 const index_mod = @import("index.zig");
+const replica = @import("replica.zig");
 
 const Md5 = core.checksum.Md5;
 
@@ -195,6 +196,8 @@ pub const ObjectService = struct {
     /// Changes made under `mutex`, published when the operation's lock is released.
     pending: std.ArrayList(Change) = .empty,
     pending_mutex: std.Thread.Mutex = .{},
+    /// Replication engine; set right after init, before serving.
+    replication: ?replica.Sink = null,
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -222,6 +225,13 @@ pub const ObjectService = struct {
         self.catalog.deinit();
         for (self.pending.items) |c| self.freeChange(c);
         self.pending.deinit(self.gpa);
+    }
+
+    /// Hands a committed change to the replication engine; replica writes are not re-sent.
+    pub fn notifyReplication(self: *ObjectService, ev: replica.Event) void {
+        if (replica.origin != null) return;
+        const s = self.replication orelse return;
+        s.vtable.notify(s.ctx, ev);
     }
 
     // ---- cluster coordination ----
