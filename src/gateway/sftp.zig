@@ -37,4 +37,5 @@ test {
     _ = @import("ssh_cipher.zig");
     _ = @import("ssh_keys.zig");
     _ = @import("ssh_kex.zig");
+    _ = @import("ssh_transport.zig");
 }
