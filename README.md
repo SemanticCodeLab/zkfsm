@@ -17,6 +17,7 @@ tests/s3cli.sh             # SigV4 + IAM with an S3 CLI and the MinIO client (se
 tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Compatibility)
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
+tests/replication.sh       # bucket and site replication across three deployments (set MC)
 ```
 
 ## Run
@@ -170,6 +171,45 @@ STS `AssumeRole` (`POST /`, form body) returns temporary credentials for the
 signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
 narrowed by a session `Policy`; standard `sts assume-role` clients work
 unchanged against the server endpoint.
+
+### Replication
+
+Bucket replication (both buckets versioned):
+
+```sh
+mc replicate add src/photos --remote-bucket http://KEY:SECRET@dr.example:9000/photos \
+  --replicate "delete,delete-marker,existing-objects,metadata-sync"
+mc replicate status src/photos
+mc replicate resync start src/photos --remote-bucket <arn>
+```
+
+- Rules: ID, Priority, Status, Filter (prefix, tag, And), Destination ARN and
+  StorageClass, DeleteMarkerReplication, DeleteReplication, ExistingObjectReplication,
+  ReplicaModifications. Targets are managed through the admin API
+  (`set-remote-target`, `list-remote-targets`, `remove-remote-target`, encrypted bodies).
+- Every change is queued as a durable record before the client gets its answer and
+  delivered asynchronously with exponential backoff (1 s up to 30 s), so a crash or
+  target outage loses nothing. Version ids and times, user metadata, tags, retention,
+  legal hold, and multipart layout (same ETag) are kept. Objects carry
+  `x-amz-replication-status` PENDING/COMPLETED/FAILED/REPLICA; replicas are never sent
+  back, so two-way (active-active) setups do not loop. Per-target bandwidth limits apply.
+- `/metrics` carries `zkfsm_replication_*` counters per bucket and target.
+- In a cluster every node queues, the leader delivers.
+
+Site replication links deployments for all buckets, bucket configuration, IAM, and
+objects in every direction:
+
+```sh
+mc admin replicate add site1 site2 site3
+mc admin replicate info site1
+mc admin replicate status site1
+mc admin replicate rm site1 site3 --force
+```
+
+Sites share a `site-replicator-0` service account. New buckets are versioned and
+pushed to peers with versioning, object lock, policy, lifecycle, tags, encryption, and
+CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
+out on join. STS session tokens validate across sites only when root credentials match.
 
 ## Compatibility
 
