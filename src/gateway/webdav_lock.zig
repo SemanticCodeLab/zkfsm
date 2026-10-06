@@ -218,7 +218,8 @@ test "lock conflicts, tokens, expiry" {
     try std.testing.expect(t.blocker("/b/dirx", false, &.{}, 102, &buf) == null);
     try std.testing.expectEqualStrings("/b/dir", t.blocker("/b", true, &.{}, 102, &buf).?);
     try std.testing.expect(t.blocker("/b/other/new", false, &.{}, 102, &buf) == null);
-    try std.testing.expectEqual(@as(usize, 1), t.discover("/b/dir/f", 102, &[_]Lock{.{}} ** 1));
+    var found: [2]Lock = undefined;
+    try std.testing.expectEqual(@as(usize, 1), t.discover("/b/dir/f", 102, &found));
     _ = try t.refresh("/b/dir/f", &.{&a.token}, 100, 105);
     try std.testing.expect(t.valid("/b/dir", &a.token, 150));
     try std.testing.expectError(error.NoMatch, t.release("/b/elsewhere", &a.token, 150));

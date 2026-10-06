@@ -381,13 +381,13 @@ pub fn baseName(path: []const u8) []const u8 {
 pub fn guessType(path: []const u8) []const u8 {
     const ext = std.fs.path.extension(path);
     const map = [_][2][]const u8{
-        .{ ".txt", "text/plain" },        .{ ".html", "text/html" },          .{ ".htm", "text/html" },
-        .{ ".css", "text/css" },          .{ ".js", "text/javascript" },      .{ ".json", "application/json" },
-        .{ ".xml", "application/xml" },   .{ ".pdf", "application/pdf" },     .{ ".zip", "application/zip" },
-        .{ ".gz", "application/gzip" },   .{ ".tar", "application/x-tar" },   .{ ".png", "image/png" },
-        .{ ".jpg", "image/jpeg" },        .{ ".jpeg", "image/jpeg" },         .{ ".gif", "image/gif" },
-        .{ ".svg", "image/svg+xml" },     .{ ".webp", "image/webp" },         .{ ".mp4", "video/mp4" },
-        .{ ".mp3", "audio/mpeg" },        .{ ".md", "text/markdown" },        .{ ".csv", "text/csv" },
+        .{ ".txt", "text/plain" },      .{ ".html", "text/html" },        .{ ".htm", "text/html" },
+        .{ ".css", "text/css" },        .{ ".js", "text/javascript" },    .{ ".json", "application/json" },
+        .{ ".xml", "application/xml" }, .{ ".pdf", "application/pdf" },   .{ ".zip", "application/zip" },
+        .{ ".gz", "application/gzip" }, .{ ".tar", "application/x-tar" }, .{ ".png", "image/png" },
+        .{ ".jpg", "image/jpeg" },      .{ ".jpeg", "image/jpeg" },       .{ ".gif", "image/gif" },
+        .{ ".svg", "image/svg+xml" },   .{ ".webp", "image/webp" },       .{ ".mp4", "video/mp4" },
+        .{ ".mp3", "audio/mpeg" },      .{ ".md", "text/markdown" },      .{ ".csv", "text/csv" },
     };
     for (map) |m| if (std.ascii.eqlIgnoreCase(ext, m[0])) return m[1];
     return "application/octet-stream";
