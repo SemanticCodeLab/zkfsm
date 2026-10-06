@@ -210,7 +210,10 @@ pub const Transport = struct {
                 }
                 return t.in[0..p.len];
             }
-            if (t.bytes_since_kex >= t.opts.rekey_bytes and !t.kexinit_sent) try t.serverRekey();
+            if (t.bytes_since_kex >= t.opts.rekey_bytes and !t.kexinit_sent) {
+                try t.serverRekey();
+                continue;
+            }
             if (!try t.waitReadable(@intCast(@as(u64, t.opts.keepalive_s) * 1000))) {
                 if (t.probes >= 3) return error.Timeout;
                 t.probes += 1;
