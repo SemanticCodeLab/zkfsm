@@ -204,6 +204,94 @@ next lifecycle pass. Usage per tier is reported by `mc ilm tier info` and as
 minute; restore expiry and the usage scan run every 10 minutes (both follow
 `--lifecycle-interval` when it is shorter than a minute).
 
+### External identity
+
+Federated STS actions turn an external identity into temporary credentials
+whose rights are a list of canned or stored policies (still narrowed by an
+optional session `Policy`). The session token carries the policy names and the
+tenant, so no per-session server state exists; every node accepts the tokens.
+
+- **OpenID Connect** (`AssumeRoleWithWebIdentity`, `AssumeRoleWithClientGrants`):
+  providers are added with `mc idp openid add ALIAS [NAME] config_url=...
+  client_id=... [claim_name=policy] [claim_prefix=] [scopes=...]
+  [redirect_uri=...] [role_policy=...] [tenant=...|tenant_claim=...]`
+  (`ls`, `info`, `update`, `rm` as usual), or at startup with
+  `--identity-openid "k=v ..."` / `$ZKFSM_IDENTITY_OPENID_<KEY>` (shown as the
+  default provider `_`). The server reads the discovery document, caches the
+  JWKS for an hour, refetches it when a token names an unknown key id (at most
+  every 10 s per provider, and keeps the old keys if the refetch fails), and
+  verifies RS256/384/512 and ES256/384 signatures, `exp`/`nbf` (60 s leeway),
+  `iss` (the discovered issuer) and `aud`/`azp` (the client id). Policies come
+  from the claim (a JSON array or a comma-separated string; names that do not
+  exist are dropped, none left is AccessDenied). A provider with
+  `role_policy` is selected by its role ARN `arn:zkfsm:iam:::role/<name>`
+  (listed by `mc idp openid ls`) and grants exactly that policy list.
+- **LDAP / Active Directory** (`AssumeRoleWithLDAPIdentity`, `LDAPUsername`
+  and `LDAPPassword`): `mc idp ldap add ALIAS server_addr=host:636
+  lookup_bind_dn=... lookup_bind_password=... user_dn_search_base_dn=...
+  user_dn_search_filter=(uid=%s) [group_search_base_dn=...
+  group_search_filter=(&(objectclass=groupOfNames)(member=%d))]
+  [server_starttls=on | server_insecure=on] [tls_skip_verify=on]
+  [tls_ca_file=...] [tenant=...]`. The built-in LDAPv3 client binds as the
+  lookup account, finds exactly one user entry (the username is escaped per
+  RFC 4515), binds as that DN with the password (empty passwords are refused),
+  then collects group DNs. LDAPS is the default; StartTLS and plain TCP are
+  opt-in. Policies are attached to user or group DNs with `mc idp ldap policy
+  attach|detach ALIAS POLICY --user DN | --group DN` and listed with
+  `mc idp ldap policy entities`. A directory that is down gives
+  ServiceUnavailable; wrong credentials and unknown users both give
+  AccessDenied.
+- **Client certificates** (`AssumeRoleWithCertificate`): with
+  `--tls-client-ca FILE` the TLS listener asks clients for a certificate
+  (optional for every other request). A client presenting a certificate that
+  chains to that CA gets credentials whose policy is the one named by the
+  certificate's subject Common Name, for at most an hour and never past the
+  certificate's expiry.
+
+Secrets in IdP settings (`client_secret`, `lookup_bind_password`) are stored
+in the IAM state and shown redacted by `info`. Configuration changes apply
+immediately on every node (they live in the IAM store).
+
+### Bucket quotas
+
+`mc quota set ALIAS/BUCKET --size 10GiB`, `mc quota info`, `mc quota clear`
+(admin `set-bucket-quota` / `get-bucket-quota`, actions `admin:SetBucketQuota`
+and `admin:GetBucketQuota`). A hard quota rejects writes that would take the
+bucket past the limit with `QuotaExceeded` (HTTP 400): PutObject (checked
+before the body is read when its length is known, and again at commit),
+CopyObject, UploadPart, and CompleteMultipartUpload. Usage is the sum of all
+stored versions (delete markers excluded), kept in the key index next to the
+names, so it is exact after every write, delete, and restart, and every
+cluster node sees the same value. An overwrite in an unversioned bucket only
+needs room for the difference. `get-bucket-quota` also reports `usage` and
+`objects`.
+
+### Multi-tenancy
+
+Users already isolate through policies; tenants add a hard boundary on top,
+like separate accounts sharing one server (the equivalent of the
+project-scoped buckets other servers get from Keystone).
+
+- A tenant is a name (`a-z0-9-`). A user belongs to at most one tenant; its
+  service accounts and STS sessions inherit it. Federated sessions get it
+  from the provider (`tenant=` fixed, or `tenant_claim=` for OpenID).
+- A bucket created by a tenant identity is owned by that tenant. Tenant
+  identities see (ListBuckets) and reach only their tenant's buckets, global
+  identities only global buckets, whatever their policies say; a copy source
+  in another tenant is refused as well. Bucket names stay globally unique.
+  Root (and root's service accounts) reach everything. Anonymous requests
+  are governed by bucket policies only, so a tenant can still publish a
+  bucket on purpose.
+- Tenant identities get no admin API rights except self-service (their own
+  service accounts). Disabling a tenant blocks all of its identities at once.
+- Admin routes (root or `admin:TenantAdmin`; sign with SigV4 like any admin
+  call, e.g. `curl --aws-sigv4 aws:amz:us-east-1:s3 --user KEY:SECRET -X PUT`):
+  `PUT /minio/admin/v3/tenant/add?name=T`, `DELETE .../tenant/remove?name=T`
+  (only when it has no users or buckets), `GET .../tenant/list` (users,
+  buckets, and usage per tenant), `PUT .../tenant/set-status?name=T&status=enabled|disabled`,
+  `PUT .../tenant/assign-user?name=T&accessKey=U` (empty `name` makes the
+  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`.
+
 ## Compatibility
 
 `tests/s3/run.sh` drives each client against a single drive and against six
@@ -244,7 +332,8 @@ Pre-1.0. Working today and covered by tests:
   canned private ACLs, and ListObjects v1.
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
-  evaluation, STS session tokens.
+  evaluation, STS session tokens; OpenID Connect, LDAP, and client
+  certificate federation; tenants; hard bucket quotas.
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and

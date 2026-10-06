@@ -13,6 +13,8 @@ pub const lifecycle = @import("lifecycle.zig");
 pub const policy = @import("policy.zig");
 pub const tier = @import("tier.zig");
 pub const transition = @import("transition.zig");
+pub const quota = @import("quota.zig");
+pub const tenancy = @import("tenancy.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -52,4 +54,6 @@ test {
     _ = policy;
     _ = tier;
     _ = transition;
+    _ = quota;
+    _ = tenancy;
 }

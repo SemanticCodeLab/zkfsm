@@ -10,16 +10,20 @@ pub const limits = struct {
     pub const min_duration_s = 900;
     pub const max_duration_s = 43_200;
     pub const max_policy_bytes = 2048;
-    pub const max_parent_bytes = 128;
-    pub const max_payload = 2 + 1 + access_key_len + 1 + max_parent_bytes + 8 + 2 + max_policy_bytes;
+    pub const max_parent_bytes = 512;
+    pub const max_roles_bytes = 1024;
+    pub const max_tenant_bytes = 64;
+    pub const max_payload = 2 + 1 + access_key_len + 2 + max_parent_bytes + 8 + 2 + max_policy_bytes + 2 + max_roles_bytes + 1 + max_tenant_bytes;
     pub const max_token_bytes = b64.Encoder.calcSize(max_payload + Hmac.mac_length);
 };
 
 pub const access_key_len = 20;
 pub const secret_key_len = 40;
-const magic = [2]u8{ 'Z', '1' };
+const magic_v1 = [2]u8{ 'Z', '1' };
+/// v2 adds federated policy names and a tenant, and widens the parent length.
+const magic = [2]u8{ 'Z', '2' };
 
-pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy };
+pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant };
 pub const ValidateError = error{ MalformedToken, BadSignature, Expired, AccessKeyMismatch };
 
 pub const Request = struct {
@@ -28,6 +32,9 @@ pub const Request = struct {
     duration_s: i64 = 3600,
     /// Optional policy JSON; the session gets the intersection with the parent's rights.
     session_policy: ?[]const u8 = null,
+    /// Federated sessions: comma-separated policy names that replace the parent lookup.
+    federated_policies: ?[]const u8 = null,
+    tenant: []const u8 = "",
 };
 
 pub const Credentials = struct {
@@ -47,6 +54,8 @@ pub const Claims = struct {
     parent: []const u8,
     expires_s: i64,
     session_policy: ?[]const u8,
+    federated_policies: ?[]const u8 = null,
+    tenant: []const u8 = "",
 };
 
 pub const DecodeBuffer = [limits.max_payload + Hmac.mac_length]u8;
@@ -65,6 +74,8 @@ pub const Issuer = struct {
             };
             p.deinit();
         }
+        if (req.federated_policies) |r| if (r.len > limits.max_roles_bytes) return error.InvalidRoles;
+        if (req.tenant.len > limits.max_tenant_bytes) return error.InvalidTenant;
         var creds: Credentials = .{
             .access_key = undefined,
             .secret_key = undefined,
@@ -82,11 +93,18 @@ pub const Issuer = struct {
         w.writeAll(&magic) catch unreachable; // sizes bounded above
         w.writeByte(access_key_len) catch unreachable;
         w.writeAll(&creds.access_key) catch unreachable;
-        w.writeByte(@intCast(req.parent.len)) catch unreachable;
+        w.writeInt(u16, @intCast(req.parent.len), .little) catch unreachable;
         w.writeAll(req.parent) catch unreachable;
         w.writeInt(i64, creds.expires_s, .little) catch unreachable;
         w.writeInt(u16, @intCast(pol.len), .little) catch unreachable;
         w.writeAll(pol) catch unreachable;
+        // Length 0xffff marks "not federated" so an empty policy list stays distinct.
+        if (req.federated_policies) |r| {
+            w.writeInt(u16, @intCast(r.len), .little) catch unreachable;
+            w.writeAll(r) catch unreachable;
+        } else w.writeInt(u16, 0xffff, .little) catch unreachable;
+        w.writeByte(@intCast(req.tenant.len)) catch unreachable;
+        w.writeAll(req.tenant) catch unreachable;
         const payload_len = w.end;
         self.mac(raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
         const signed = raw[0 .. payload_len + Hmac.mac_length];
@@ -108,17 +126,33 @@ pub const Issuer = struct {
             return error.BadSignature;
         var r: std.Io.Reader = .fixed(payload);
         const m = r.takeArray(2) catch return error.MalformedToken;
-        if (!std.mem.eql(u8, m, &magic)) return error.MalformedToken;
+        const v2 = std.mem.eql(u8, m, &magic);
+        if (!v2 and !std.mem.eql(u8, m, &magic_v1)) return error.MalformedToken;
         const ak_len = r.takeByte() catch return error.MalformedToken;
         const ak = r.take(ak_len) catch return error.MalformedToken;
-        const parent_len = r.takeByte() catch return error.MalformedToken;
+        const parent_len: usize = if (v2) r.takeInt(u16, .little) catch return error.MalformedToken else r.takeByte() catch return error.MalformedToken;
         const parent = r.take(parent_len) catch return error.MalformedToken;
         const exp = r.takeInt(i64, .little) catch return error.MalformedToken;
         const pol_len = r.takeInt(u16, .little) catch return error.MalformedToken;
         const pol = r.take(pol_len) catch return error.MalformedToken;
+        var roles: ?[]const u8 = null;
+        var tenant: []const u8 = "";
+        if (v2) {
+            const roles_len = r.takeInt(u16, .little) catch return error.MalformedToken;
+            if (roles_len != 0xffff) roles = r.take(roles_len) catch return error.MalformedToken;
+            const tenant_len = r.takeByte() catch return error.MalformedToken;
+            tenant = r.take(tenant_len) catch return error.MalformedToken;
+        }
         if (r.seek != payload.len) return error.MalformedToken;
         if (now_s >= exp) return error.Expired;
-        return .{ .access_key = ak, .parent = parent, .expires_s = exp, .session_policy = if (pol.len == 0) null else pol };
+        return .{
+            .access_key = ak,
+            .parent = parent,
+            .expires_s = exp,
+            .session_policy = if (pol.len == 0) null else pol,
+            .federated_policies = roles,
+            .tenant = tenant,
+        };
     }
 
     /// Validates the token and that it was issued for `access_key`.
@@ -196,9 +230,29 @@ test "issue rejects bad requests" {
     try std.testing.expectError(error.InvalidDuration, test_issuer.issue(a, .{ .parent = "x", .duration_s = 60 }, 0, r));
     try std.testing.expectError(error.InvalidDuration, test_issuer.issue(a, .{ .parent = "x", .duration_s = 100_000 }, 0, r));
     try std.testing.expectError(error.InvalidParent, test_issuer.issue(a, .{ .parent = "" }, 0, r));
+    try std.testing.expectError(error.InvalidTenant, test_issuer.issue(a, .{ .parent = "x", .tenant = "t" ** 65 }, 0, r));
     try std.testing.expectError(error.InvalidSessionPolicy, test_issuer.issue(a, .{ .parent = "x", .session_policy = "{}" }, 0, r));
     const big = try a.alloc(u8, limits.max_policy_bytes + 1);
     defer a.free(big);
     @memset(big, ' ');
     try std.testing.expectError(error.SessionPolicyTooLarge, test_issuer.issue(a, .{ .parent = "x", .session_policy = big }, 0, r));
+}
+
+test "federated session carries policies and tenant" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(4);
+    const dn = "uid=alice,ou=people,dc=example,dc=org" ** 4;
+    var c = try test_issuer.issue(a, .{ .parent = dn, .federated_policies = "readwrite,diag", .tenant = "acme" }, 0, prng.random());
+    defer c.deinit(a);
+    var buf: DecodeBuffer = undefined;
+    const cl = try test_issuer.validate(c.session_token, 0, &buf);
+    try std.testing.expectEqualStrings(dn, cl.parent);
+    try std.testing.expectEqualStrings("readwrite,diag", cl.federated_policies.?);
+    try std.testing.expectEqualStrings("acme", cl.tenant);
+    var e = try test_issuer.issue(a, .{ .parent = "bob", .federated_policies = "" }, 0, prng.random());
+    defer e.deinit(a);
+    try std.testing.expectEqualStrings("", (try test_issuer.validate(e.session_token, 0, &buf)).federated_policies.?);
+    var l = try test_issuer.issue(a, .{ .parent = "bob" }, 0, prng.random());
+    defer l.deinit(a);
+    try std.testing.expect((try test_issuer.validate(l.session_token, 0, &buf)).federated_policies == null);
 }

@@ -283,6 +283,10 @@ pub const Server = struct {
             out = &t.writer;
         }
         var http = std.http.Server.init(in, out);
+        var client_cert: ?authz.ClientCert = null;
+        if (secure) |t| if (t.peerIdentity()) |p| {
+            client_cert = .{ .common_name = p.common_name, .not_after_s = p.not_after_s };
+        };
         const idle_ns = @as(u64, self.limits.idle_timeout_s) * std.time.ns_per_s;
         var served: usize = 0;
         while (true) {
@@ -311,7 +315,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
-                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .routing = self.routing }, &req, arena.allocator());
+                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .routing = self.routing, .client_cert = client_cert }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
                     _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);

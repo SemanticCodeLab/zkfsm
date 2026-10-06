@@ -89,6 +89,10 @@ pub fn route(c: *Ctx) DispatchError!bool {
     if (r.key.len == 0) {
         if (c.method == .PUT and c.ext.bucket_lock and !try has(c, "object-lock") and !try has(c, "tagging") and !try has(c, "versioning")) {
             try ov.createLockedBucket(c.svc, r.bucket);
+            if (c.tenant.len > 0) object.tenancy.setTenant(c.svc, r.bucket, c.tenant) catch |e| {
+                c.svc.deleteBucket(r.bucket) catch {};
+                return e;
+            };
             try handler.respondEmpty(c, .ok, &.{.{ .name = "location", .value = c.target }});
             return true;
         }

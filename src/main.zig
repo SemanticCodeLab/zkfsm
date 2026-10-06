@@ -38,6 +38,7 @@ const usage =
     \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -54,6 +55,11 @@ const usage =
     \\  --set-size N     drives per erasure set (default: largest fitting divisor <= 16)
     \\  --cluster-refresh S  seconds between catalog/IAM reloads from the store (default: 10)
     \\  --cluster-ca FILE  extra PEM certificates trusted for peer TLS; repeatable
+    \\identity providers (also settable at runtime with mc admin idp openid|ldap add):
+    \\  --identity-openid "k=v ..."  default OpenID provider, e.g. config_url=... client_id=...
+    \\                   (or $ZKFSM_IDENTITY_OPENID_<KEY>)
+    \\  --identity-ldap "k=v ..."    LDAP directory, e.g. server_addr=host:636 lookup_bind_dn=...
+    \\                   (or $ZKFSM_IDENTITY_LDAP_<KEY>)
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -84,6 +90,9 @@ const Config = struct {
     set_size: ?usize = null,
     cluster_refresh_s: u64 = 10,
     cluster_ca: []const []const u8 = &.{},
+    identity_openid: ?[]const u8 = null,
+    identity_ldap: ?[]const u8 = null,
+    tls_client_ca: ?[]const u8 = null,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -150,6 +159,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.cluster_secret = args[i];
         } else if (std.mem.eql(u8, a, "--cluster-ca")) {
             try cas.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--identity-openid")) {
+            cfg.identity_openid = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
+            cfg.tls_client_ca = args[i];
+        } else if (std.mem.eql(u8, a, "--identity-ldap")) {
+            cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
             cfg.set_size = std.fmt.parseInt(usize, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--cluster-refresh")) {
@@ -330,6 +345,12 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
+    var federation: iam.federation.Federation = .{ .gpa = gpa, .store = &iam_store };
+    defer federation.deinit();
+    if (creds != null) {
+        federation.env = identityEnv(arena, cfg) catch return 2;
+        auth.federation = &federation;
+    }
     const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
     admin.api.validatePrefix(admin_prefix) catch {
         std.log.err("invalid admin prefix {s}: need /seg[/seg...], no trailing slash, '?', '..' or '//'", .{admin_prefix});
@@ -349,6 +370,10 @@ pub fn run(opts: Options) u8 {
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
         std.log.info("tls enabled ({s})", .{tp[0]});
     }
     defer if (tls_paths != null) tls_ctx.deinit();
@@ -419,6 +444,12 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     defer if (iam_ready) iam_store.deinit();
     var auth: s3.sigv4.Config = .{};
     if (creds) |c| auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
+    var federation: iam.federation.Federation = .{ .gpa = gpa, .store = &iam_store };
+    defer federation.deinit();
+    if (creds != null) {
+        federation.env = identityEnv(arena, cfg) catch return 2;
+        auth.federation = &federation;
+    }
     const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
     admin.api.validatePrefix(admin_prefix) catch {
         std.log.err("invalid admin prefix {s}", .{admin_prefix});
@@ -433,6 +464,10 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
     const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
@@ -669,6 +704,39 @@ fn loadCredentials(gpa: std.mem.Allocator) error{ Incomplete, OutOfMemory }!?s3.
         return .{ .access_key = ak orelse return error.Incomplete, .secret_key = sk orelse return error.Incomplete };
     }
     return null;
+}
+
+/// Identity provider settings from the environment, overridden key by key by the flags.
+fn identityEnv(arena: std.mem.Allocator, cfg: Config) error{ BadArgs, OutOfMemory }!iam.idp.EnvConfig {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    var out: iam.idp.EnvConfig = .{};
+    inline for (.{ .{ iam.idp.Kind.openid, "openid" }, .{ iam.idp.Kind.ldap, "ldap" } }) |k| {
+        var list: std.ArrayList(iam.store.Setting) = .empty;
+        try list.appendSlice(arena, try iam.idp.fromEnv(arena, k[0], &env));
+        if (@field(cfg, "identity_" ++ k[1])) |text| {
+            const flag_settings = iam.idp.parseSettings(arena, k[0], text) catch |e| {
+                std.log.err("--identity-{s}: {t}", .{ k[1], e });
+                return error.BadArgs;
+            };
+            for (flag_settings) |fs| {
+                for (list.items) |*x| {
+                    if (std.mem.eql(u8, x.key, fs.key)) {
+                        x.value = fs.value;
+                        break;
+                    }
+                } else try list.append(arena, fs);
+            }
+        }
+        if (list.items.len > 0) {
+            iam.idp.validate(k[0], list.items) catch |e| {
+                std.log.err("identity {s} settings: {t}", .{ k[1], e });
+                return error.BadArgs;
+            };
+            std.log.info("identity: {s} provider from flags/environment", .{k[1]});
+        }
+        @field(out, k[1]) = list.items;
+    }
+    return out;
 }
 
 fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {

@@ -36,13 +36,14 @@ pub const Bridge = struct {
         const now_s = std.time.timestamp();
         const ak = c.auth.access_key;
         var sbuf: iam.Store.SecretBuf = undefined;
+        var tbuf: s3.tenancy.NameBuf = undefined;
         var sts_secret: [iam.sts.secret_key_len]u8 = undefined;
         const secret: []const u8 = if (!std.mem.eql(u8, ak, c.auth.principal)) blk: {
             const issuer = self.auth.sts orelse return denied(c);
             sts_secret = issuer.secretFor(ak);
             break :blk &sts_secret;
         } else store.secretFor(ak, now_s, &sbuf) orelse return denied(c);
-        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s }, .{
+        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s, .idp_env = if (self.auth.federation) |f| f.env else .{} }, .{
             .method = c.method,
             .target = target,
             .body = body,
@@ -51,6 +52,8 @@ pub const Bridge = struct {
                 .secret = try c.arena.dupe(u8, secret),
                 .principal = c.auth.principal,
                 .session_policy = c.auth.session_policy,
+                .federated_policies = c.auth.federated_policies,
+                .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
         });
@@ -104,8 +107,10 @@ fn denied(c: *Ctx) ConnError!bool {
 
 fn respond(c: *Ctx, res: admin.api.Response) ConnError!void {
     metrics.global.last_status = @intFromEnum(res.status);
-    try c.req.respond(res.body, .{ .status = res.status, .extra_headers = &.{
+    const hs = [_]std.http.Header{
         .{ .name = "content-type", .value = res.content_type },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
-    } });
+        .{ .name = "x-minio-config-applied", .value = "true" },
+    };
+    try c.req.respond(res.body, .{ .status = res.status, .extra_headers = hs[0..if (res.config_applied) 3 else 2] });
 }
