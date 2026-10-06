@@ -36,7 +36,8 @@ printf '[default]\ns3 =\n  addressing_style = path\n' >"$AWS_CONFIG_FILE"
 export MC_CONFIG_DIR="$WORK/mc"
 MC="${MC:-$(command -v mc || true)}"
 if [[ -z "$MC" ]] || ! "$MC" --version 2>/dev/null | grep -q RELEASE; then echo "tiering.sh needs the MinIO client (set MC)"; exit 1; fi
-command -v aws >/dev/null || { echo "tiering.sh needs the aws CLI"; exit 1; }
+S3CLI_BIN="${S3CLI_BIN:-aws}"
+command -v "$S3CLI_BIN" >/dev/null || { echo "tiering.sh needs an S3 CLI (set S3CLI_BIN)"; exit 1; }
 
 pass=0
 fail=0
@@ -45,7 +46,7 @@ check() { # name expected actual
   else fail=$((fail + 1)); echo "FAIL $1: expected [$2] got [$3]"; fi
 }
 ok() { if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
-hot() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "$HOT" "$@"; }
+hot() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$S3CLI_BIN" --endpoint-url "$HOT" "$@"; }
 jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 # head_field KEY FIELD [extra args]: one field of HeadObject ("" when absent).
 head_field() { local k="$1" f="$2"; shift 2; hot s3api head-object --bucket data --key "$k" "$@" 2>/dev/null | jget "d.get('$f','')" || echo ERR; }
@@ -259,7 +260,7 @@ wait_for "cluster tier visible on node 3" 0 ok "$MC" ilm tier verify c3 CWARM
 "$MC" mb c2/cdata >/dev/null
 "$MC" cp "$WORK/big.bin" c2/cdata/obj >/dev/null
 check "cluster rule add (node 2)" 0 "$(ok "$MC" ilm rule add c2/cdata --transition-days 1 --transition-tier CWARM)"
-cclass() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://127.0.0.1:${CPORT[$1]}" s3api head-object --bucket cdata --key obj | jget "d.get('StorageClass','')"; }
+cclass() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$S3CLI_BIN" --endpoint-url "http://127.0.0.1:${CPORT[$1]}" s3api head-object --bucket cdata --key obj | jget "d.get('StorageClass','')"; }
 wait_for "cluster transition" CWARM cclass 3
 check "cluster read-through (node 1)" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat c1/cdata/obj | sha256sum)"
 check "cluster read-through (node 3)" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat c3/cdata/obj | sha256sum)"
