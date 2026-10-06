@@ -90,10 +90,20 @@ pub fn parsePut(arena: std.mem.Allocator, body: []const u8) Error![]PutSegment {
         const parts = try splitPath(path orelse return error.BadManifest);
         seg.container = parts[0];
         seg.object = parts[1];
-        if (seg.etag) |e| if (util.parseMd5Hex(e) == null) return error.BadManifest;
+        if (seg.etag) |e| if (!validEtag(e)) return error.BadManifest;
         if (seg.range) |r| _ = core.RangeSpec.parse(try rangeHeader(arena, r)) catch return error.BadManifest;
     }
     return out;
+}
+
+/// 32 hex digits, optionally quoted, optionally "-<parts>" (multipart uploads).
+pub fn validEtag(e_in: []const u8) bool {
+    const e = std.mem.trim(u8, e_in, "\"");
+    if (e.len < 32 or util.parseMd5Hex(e[0..32]) == null) return false;
+    if (e.len == 32) return true;
+    if (e[32] != '-' or e.len > 32 + 1 + 5) return false;
+    _ = std.fmt.parseInt(u16, e[33..], 10) catch return false;
+    return true;
 }
 
 fn rangeHeader(arena: std.mem.Allocator, r: []const u8) Error![]const u8 {
@@ -229,6 +239,8 @@ test "parse put manifest" {
     try std.testing.expectError(error.BadManifest, parsePut(a, "[{\"path\":\"nocontainer\"}]"));
     try std.testing.expectError(error.BadManifest, parsePut(a, "[{\"path\":\"/c/o\",\"bogus\":1}]"));
     try std.testing.expectError(error.BadManifest, parsePut(a, "[{\"path\":\"/c/o\",\"etag\":\"xyz\"}]"));
+    try std.testing.expect(validEtag("d41d8cd98f00b204e9800998ecf8427e-12"));
+    try std.testing.expect(!validEtag("d41d8cd98f00b204e9800998ecf8427e-x"));
     try std.testing.expectError(error.BadManifest, parsePut(a, "[{\"path\":\"/c/o\",\"range\":\"5-1\"}]"));
     try std.testing.expectError(error.BadManifest, parsePut(a, "[{\"path\":\"/c/o\",\"size_bytes\":-1}]"));
     try std.testing.expectError(error.BadManifest, parsePut(a, "not json"));

@@ -43,7 +43,7 @@ pub const ObjectRow = struct {
 
 pub const Row = union(enum) { object: ObjectRow, subdir: []const u8 };
 
-pub const ContainerRow = struct { name: []const u8, count: u64, bytes: u64, mtime_ns: i128 };
+pub const ContainerRow = struct { name: []const u8, count: u64 = 0, bytes: u64 = 0, mtime_ns: i128 = 0, subdir: bool = false };
 
 pub fn renderContainer(w: *W, f: Format, container: []const u8, rows: []const Row) W.Error!void {
     switch (f) {
@@ -109,6 +109,12 @@ pub fn renderAccount(w: *W, f: Format, account: []const u8, rows: []const Contai
             for (rows, 0..) |r, i| {
                 var lb: [26]u8 = undefined;
                 if (i > 0) try w.writeByte(',');
+                if (r.subdir) {
+                    try w.writeAll("{\"subdir\":");
+                    try util.jsonString(w, r.name);
+                    try w.writeByte('}');
+                    continue;
+                }
                 try w.writeAll("{\"name\":");
                 try util.jsonString(w, r.name);
                 try w.print(",\"count\":{d},\"bytes\":{d},\"last_modified\":\"{s}\"}}", .{ r.count, r.bytes, util.isoListing(&lb, r.mtime_ns) });
@@ -121,6 +127,14 @@ pub fn renderAccount(w: *W, f: Format, account: []const u8, rows: []const Contai
             try w.writeAll("\">");
             for (rows) |r| {
                 var lb: [26]u8 = undefined;
+                if (r.subdir) {
+                    try w.writeAll("<subdir name=\"");
+                    try util.xmlEscape(w, r.name);
+                    try w.writeAll("\"><name>");
+                    try util.xmlEscape(w, r.name);
+                    try w.writeAll("</name></subdir>");
+                    continue;
+                }
                 try w.writeAll("<container><name>");
                 try util.xmlEscape(w, r.name);
                 try w.print("</name><count>{d}</count><bytes>{d}</bytes><last_modified>{s}</last_modified></container>", .{ r.count, r.bytes, util.isoListing(&lb, r.mtime_ns) });

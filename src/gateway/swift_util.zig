@@ -36,8 +36,8 @@ pub fn percentEncode(w: *std.Io.Writer, s: []const u8, keep_slash: bool) std.Io.
 }
 
 /// Value of query parameter `name` (raw, still encoded); "" for a bare flag.
-pub fn queryRaw(query: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
+pub fn queryRaw(qs: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, qs, '&');
     while (it.next()) |kv| {
         const eq = std.mem.indexOfScalar(u8, kv, '=');
         const k = if (eq) |e| kv[0..e] else kv;
