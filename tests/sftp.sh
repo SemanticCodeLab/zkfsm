@@ -104,10 +104,10 @@ printf 'put %s /sftpbkt/dir/rp\nreput %s /sftpbkt/dir/rp\n' "$WORK/part" "$WORK/
 sftpb "$WORK/b5" || true
 check "reput md5" "$BIGMD5" "$(s3 "$EP/sftpbkt/dir/rp" | md5sum | cut -d' ' -f1)"
 
-printf 'ls -l /sftpbkt/dir\nrename /sftpbkt/dir/s.txt /sftpbkt/dir/t.txt\nls /sftpbkt/dir\n' > "$WORK/b6"
+printf 'ls -l /sftpbkt/dir\nrename /sftpbkt/dir/s.txt /sftpbkt/dir/t.txt\nls -1 /sftpbkt/dir\n' > "$WORK/b6"
 sftpb "$WORK/b6" || true
 check "ls -l long name" 1 "$(grep -c '^-rw-r--r-- .* 100000000 .* big$' "$WORK/sftp.out")"
-check "rename visible" 1 "$(grep -c '^t\.txt *$' "$WORK/sftp.out")"
+check "rename visible" 1 "$(grep -v '^sftp>' "$WORK/sftp.out" | grep -c 't\.txt *$')"
 check "renamed via s3" "small file" "$(s3 "$EP/sftpbkt/dir/t.txt")"
 check "old name gone via s3" 404 "$(s3 -o /dev/null -w '%{http_code}' "$EP/sftpbkt/dir/s.txt")"
 
