@@ -598,9 +598,9 @@ fn tierKey(creds: ?s3.sigv4.Credentials) ?[32]u8 {
     return object.tier.sealKey(c.access_key, c.secret_key);
 }
 
-/// Restore expiry, the remote cleanup journal, and tier usage stats; at most every
-/// minute (sooner with a shorter lifecycle interval). ZKFSM_ILM_DAY_SECONDS shortens
-/// lifecycle and restore days (for tests).
+/// The remote cleanup journal every minute (or lifecycle interval, if shorter); restore
+/// expiry and tier usage (a full record scan) every 10 minutes, or as often with a short
+/// lifecycle interval. ZKFSM_ILM_DAY_SECONDS shortens lifecycle/restore days (tests).
 fn startTierLoop(svc: *object.ObjectService, lifecycle_interval_s: u64, leader: ?*cluster.Node) void {
     if (std.process.getEnvVarOwned(svc.gpa, "ZKFSM_ILM_DAY_SECONDS")) |v| {
         defer svc.gpa.free(v);
@@ -615,10 +615,12 @@ fn startTierLoop(svc: *object.ObjectService, lifecycle_interval_s: u64, leader: 
 }
 
 fn tierLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.Node) void {
-    while (true) {
+    const scan_every: u64 = if (interval_s < 60) 1 else 10;
+    var pass: u64 = 0;
+    while (true) : (pass += 1) {
         std.Thread.sleep(interval_s * std.time.ns_per_s);
         if (leader) |l| if (!l.isLeader()) continue;
-        const st = object.transition.housekeeping(svc, std.time.nanoTimestamp()) catch |e| {
+        const st = object.transition.housekeeping(svc, std.time.nanoTimestamp(), pass % scan_every == 0) catch |e| {
             std.log.warn("tier housekeeping failed: {t}", .{e});
             continue;
         };

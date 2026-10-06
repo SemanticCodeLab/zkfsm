@@ -200,8 +200,9 @@ secrets. `POST ?restore` (`RestoreObject`, `Days`) makes a local copy that
 expires after the given days (`x-amz-restore` shows the expiry). While a tier is
 unreachable, reads of its data fail with `503` and transitions wait for the
 next lifecycle pass. Usage per tier is reported by `mc ilm tier info` and as
-`zkfsm_tier_*` series in `/metrics`; restore expiry, the cleanup journal and
-the usage scan run every minute (or every `--lifecycle-interval`, if shorter).
+`zkfsm_tier_*` series in `/metrics`. The cleanup journal is retried every
+minute; restore expiry and the usage scan run every 10 minutes (both follow
+`--lifecycle-interval` when it is shorter than a minute).
 
 ## Compatibility
 

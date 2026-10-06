@@ -249,6 +249,13 @@ const Stats = struct { totalSize: u64, numVersions: u64, numObjects: u64 };
 const Daily = struct { Bins: [24]Stats, UpdatedAt: []const u8 };
 const Info = struct { Name: []const u8, Type: []const u8, Stats: Stats, DailyStats: Daily };
 
+fn daily(a: Allocator, d: object.tier.Daily) Error!Daily {
+    var out: Daily = .{ .Bins = undefined, .UpdatedAt = "0001-01-01T00:00:00Z" };
+    for (d.bins, &out.Bins) |b, *o| o.* = usage(b);
+    if (d.updated_ns > 0) out.UpdatedAt = core.time.iso8601(d.updated_ns, try a.create([24]u8));
+    return out;
+}
+
 fn usage(u: object.tier.Usage) Stats {
     return .{ .totalSize = u.bytes, .numVersions = u.versions, .numObjects = u.objects };
 }
@@ -258,11 +265,9 @@ fn stats(a: Allocator, env: api.Env, req: api.Request) Error!Response {
     const reg = (if (env.svc) |s| s.tiers else null) orelse
         return api.fail(a, .not_implemented, "NotImplemented", "Remote tiers are not available on this server.");
     const view = try reg.statsCopy(a);
-    const tb = try a.create([24]u8);
-    const daily: Daily = .{ .Bins = @splat(.{ .totalSize = 0, .numVersions = 0, .numObjects = 0 }), .UpdatedAt = core.time.iso8601(view.updated_ns, tb) };
     const out = try a.alloc(Info, view.tiers.len + 1);
-    out[0] = .{ .Name = "STANDARD", .Type = "internal", .Stats = usage(view.hot), .DailyStats = daily };
-    for (view.tiers, out[1..]) |t, *o| o.* = .{ .Name = t.name, .Type = t.kind, .Stats = usage(t.usage), .DailyStats = daily };
+    out[0] = .{ .Name = "STANDARD", .Type = "internal", .Stats = usage(view.hot), .DailyStats = try daily(a, .{}) };
+    for (view.tiers, out[1..]) |t, *o| o.* = .{ .Name = t.name, .Type = t.kind, .Stats = usage(t.usage), .DailyStats = try daily(a, t.daily) };
     return .{ .body = try std.json.Stringify.valueAlloc(a, out, .{}) };
 }
 

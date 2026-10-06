@@ -2,7 +2,8 @@
 # ILM tiering end-to-end: a second zkfsm is the remote tier (plus RustFS / MinIO in
 # docker when available). Covers mc ilm tier add/ls/info/verify/edit/rm, transition
 # and noncurrent transition, read-through with ranges, RestoreObject and restore
-# expiry, delete/overwrite cleanup, object lock, tier outages, stats and metrics.
+# expiry, delete/overwrite cleanup, object lock, tier outages, stats and metrics,
+# and a three-node cluster sharing the tier configuration.
 # Lifecycle days are shortened to seconds with ZKFSM_ILM_DAY_SECONDS.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,7 +16,9 @@ WORK="$(mktemp -d)"
 HOT_PID=""
 REM_PID=""
 CONTAINERS=()
+CPIDS=()
 cleanup() {
+  for p in "${CPIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   [[ -n "$HOT_PID" ]] && kill "$HOT_PID" 2>/dev/null || true
   [[ -n "$REM_PID" ]] && kill "$REM_PID" 2>/dev/null || true
   for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
@@ -218,6 +221,7 @@ tinfo() { "$MC" ilm tier info hot --json | jget "[t['Stats']['$1'] for t in d['t
 check "tier info counts WARM versions" 1 "$(( $(tinfo numVersions WARM) >= 4 ))"
 check "tier info counts WARM bytes" 1 "$(( $(tinfo totalSize WARM) >= 3000000 ))"
 check "tier info has STANDARD" 1 "$(( $(tinfo numObjects STANDARD) >= 1 ))"
+check "tier info daily transitions" 1 "$("$MC" ilm tier info hot --json | jget "int(sum(b['numObjects'] for t in d['tiers'] if t['Name']=='WARM' for b in t['DailyStats']['Bins']) >= 4)")"
 check "admin tier-stats has STANDARD" 1 "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$HOT/minio/admin/v3/tier-stats" | jget "int(any(t['Name']=='STANDARD' for t in d))")"
 check "metrics transitions" 1 "$(curl -s "$HOT/metrics" | awk '/^zkfsm_tier_transitions_total /{print ($2>=4)}')"
 check "metrics per-tier bytes" 1 "$(curl -s "$HOT/metrics" | grep -c '^zkfsm_tier_bytes{tier="WARM"')"
@@ -235,6 +239,36 @@ wait_up "$HOT"
 check "other root secret cannot open tiers" 1 "$(ok "$MC" ilm tier verify hot2 WARM)"
 stop_hot
 start_hot
+
+# ---- cluster: tiers are cluster-wide; any node reads through ----
+CPORT=(0 "$(freeport)" "$(freeport)" "$(freeport)")
+CDATA=()
+for i in 1 2 3; do CDATA+=("http://127.0.0.1:${CPORT[$i]}$WORK/c$i/d{1...2}"); done
+for i in 1 2 3; do
+  ZKFSM_ILM_DAY_SECONDS=1 ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "${CDATA[@]}" --listen "127.0.0.1:${CPORT[$i]}" \
+    --node-address "127.0.0.1:${CPORT[$i]}" --protection EC:4+2 --lifecycle-interval 1 >>"$WORK/c$i.log" 2>&1 &
+  CPIDS+=($!)
+done
+cleanup_cluster() { for p in "${CPIDS[@]}"; do kill "$p" 2>/dev/null || true; done; for p in "${CPIDS[@]}"; do wait "$p" 2>/dev/null || true; done; }
+for i in 1 2 3; do
+  for _ in $(seq 600); do [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CPORT[$i]}/health/ready")" == 200 ]] && break; sleep 0.1; done
+done
+for i in 1 2 3; do "$MC" alias set "c$i" "http://127.0.0.1:${CPORT[$i]}" "$AK" "$SK" >/dev/null; done
+"$MC" mb rem/clu >/dev/null
+check "cluster tier add (node 1)" 0 "$(ok "$MC" ilm tier add minio c1 CWARM --endpoint "$REM" --access-key "$RAK" --secret-key "$RSK" --bucket clu --prefix c/)"
+wait_for "cluster tier visible on node 3" 0 ok "$MC" ilm tier verify c3 CWARM
+"$MC" mb c2/cdata >/dev/null
+"$MC" cp "$WORK/big.bin" c2/cdata/obj >/dev/null
+check "cluster rule add (node 2)" 0 "$(ok "$MC" ilm rule add c2/cdata --transition-days 1 --transition-tier CWARM)"
+cclass() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" aws --endpoint-url "http://127.0.0.1:${CPORT[$1]}" s3api head-object --bucket cdata --key obj | jget "d.get('StorageClass','')"; }
+wait_for "cluster transition" CWARM cclass 3
+check "cluster read-through (node 1)" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat c1/cdata/obj | sha256sum)"
+check "cluster read-through (node 3)" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat c3/cdata/obj | sha256sum)"
+check "cluster remote holds data" 1 "$(remote_count clu/c/)"
+"$MC" rm c3/cdata/obj >/dev/null
+wait_for "cluster delete cleans the tier" 0 remote_count clu/c/
+cleanup_cluster
+CPIDS=()
 
 # ---- third-party S3 backends in docker (optional) ----
 docker_tier() { # NAME IMAGE ENV... -- ARGS

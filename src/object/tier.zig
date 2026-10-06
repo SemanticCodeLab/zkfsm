@@ -275,6 +275,40 @@ pub const TierStat = struct {
     name: []const u8,
     kind: []const u8,
     usage: Usage = .{},
+    /// Transitions completed by this node, per UTC hour of the last day.
+    daily: Daily = .{},
+};
+
+/// 24 hourly bins indexed by UTC hour; bins older than a day are cleared on update.
+pub const Daily = struct {
+    bins: [24]Usage = @splat(.{}),
+    updated_ns: i128 = 0,
+
+    fn hour(ns: i128) i128 {
+        return @divFloor(ns, std.time.ns_per_hour);
+    }
+
+    pub fn forwardTo(d: *Daily, now_ns: i128) void {
+        const from = hour(d.updated_ns);
+        const to = hour(now_ns);
+        if (to <= from) return;
+        if (to - from >= 24) {
+            d.bins = @splat(.{});
+        } else {
+            var h = from + 1;
+            while (h <= to) : (h += 1) d.bins[@intCast(@mod(h, 24))] = .{};
+        }
+        d.updated_ns = now_ns;
+    }
+
+    pub fn add(d: *Daily, now_ns: i128, bytes: u64) void {
+        d.forwardTo(now_ns);
+        if (d.updated_ns == 0) d.updated_ns = now_ns;
+        const b = &d.bins[@intCast(@mod(hour(now_ns), 24))];
+        b.objects += 1;
+        b.versions += 1;
+        b.bytes += bytes;
+    }
 };
 
 pub const Registry = struct {
@@ -297,6 +331,8 @@ pub const Registry = struct {
     stats_ns: i128 = 0,
     /// Object ids with a restore in flight.
     restoring: std.AutoHashMapUnmanaged([16]u8, void) = .empty,
+    /// Per-tier transition activity; keys owned by gpa.
+    daily: std.StringHashMapUnmanaged(Daily) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, svc: *Svc, key: ?[32]u8) Registry {
         return .{ .gpa = gpa, .svc = svc, .key = key, .stats_arena = .init(gpa) };
@@ -309,6 +345,24 @@ pub const Registry = struct {
         r.pinned.deinit(r.gpa);
         r.stats_arena.deinit();
         r.restoring.deinit(r.gpa);
+        var it = r.daily.keyIterator();
+        while (it.next()) |k| r.gpa.free(k.*);
+        r.daily.deinit(r.gpa);
+    }
+
+    /// Counts one completed transition of `bytes` into `name`.
+    pub fn recordTransition(r: *Registry, name: []const u8, bytes: u64) void {
+        r.mutex.lock();
+        defer r.mutex.unlock();
+        const gop = r.daily.getOrPut(r.gpa, name) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = r.gpa.dupe(u8, name) catch {
+                _ = r.daily.remove(name);
+                return;
+            };
+            gop.value_ptr.* = .{};
+        }
+        gop.value_ptr.add(core.time.nowNs(), bytes);
     }
 
     /// Returns a referenced tier; pair with `Tier.release`.
@@ -332,6 +386,14 @@ pub const Registry = struct {
             t.release();
             return e;
         };
+    }
+
+    /// Configured plus pinned tiers.
+    pub fn count(r: *Registry) usize {
+        r.mutex.lock();
+        defer r.mutex.unlock();
+        r.refreshLocked(false);
+        return r.tiers.items.len + r.pinned.items.len;
     }
 
     pub fn exists(r: *Registry, name: []const u8) bool {
@@ -542,6 +604,10 @@ pub const Registry = struct {
             for (r.stats) |s| if (std.mem.eql(u8, s.name, c.name)) {
                 o.usage = s.usage;
             };
+            if (r.daily.getPtr(c.name)) |d| {
+                d.forwardTo(core.time.nowNs());
+                o.daily = d.*;
+            }
         }
         return .{ .hot = r.hot, .tiers = out, .updated_ns = r.stats_ns };
     }
@@ -627,6 +693,22 @@ pub const Reader = struct {
         return n;
     }
 };
+
+test "daily bins roll forward by hour" {
+    const h = std.time.ns_per_hour;
+    var d: Daily = .{};
+    d.add(10 * h + 5, 100);
+    d.add(10 * h + 9, 50);
+    try std.testing.expectEqual(@as(u64, 150), d.bins[10].bytes);
+    d.add(12 * h, 7);
+    try std.testing.expectEqual(@as(u64, 2), d.bins[10].objects);
+    try std.testing.expectEqual(@as(u64, 7), d.bins[12].bytes);
+    d.forwardTo(34 * h); // 10:00 the next day clears hour 10 only
+    try std.testing.expectEqual(@as(u64, 0), d.bins[10].bytes);
+    try std.testing.expectEqual(@as(u64, 7), d.bins[12].bytes);
+    d.forwardTo(80 * h);
+    try std.testing.expectEqual(@as(u64, 0), d.bins[12].bytes);
+}
 
 test "seal roundtrip and tamper detection" {
     const gpa = std.testing.allocator;

@@ -115,6 +115,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
     svc.store.delete(placement.dataKey(rec.object_id)) catch {};
     tier.Counters.inc(&reg.counters.transitions, 1);
     tier.Counters.inc(&reg.counters.transitioned_bytes, rec.size);
+    reg.recordTransition(t.cfg.name, rec.size);
     return .done;
 }
 
@@ -201,13 +202,19 @@ pub const HouseStats = struct {
     cleanup_pending: usize = 0,
 };
 
-/// One pass: expires restored copies, retries the cleanup journal, refreshes usage stats.
-pub fn housekeeping(svc: *Svc, now: i128) Error!HouseStats {
+/// One pass: retries the cleanup journal and, with `scan` (and tiers configured),
+/// expires restored copies and refreshes usage stats from a full record scan.
+pub fn housekeeping(svc: *Svc, now: i128, scan: bool) Error!HouseStats {
     const reg = svc.tiers orelse return .{};
     var st: HouseStats = .{};
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    if (!scan or reg.count() == 0) {
+        try processJournal(svc, reg, a, now, &st);
+        reg.counters.cleanup_pending.store(st.cleanup_pending, .monotonic);
+        return st;
+    }
 
     const Bucket = struct { id: core.BucketId, name: []const u8 };
     var buckets: std.ArrayList(Bucket) = .empty;
@@ -484,7 +491,7 @@ test "transition, read-through, restore, outage, and cleanup" {
     });
 
     // The restored copy expires; data is read from the tier again.
-    const hs = try housekeeping(svc, core.time.nowNs() + 10 * day_len_ns);
+    const hs = try housekeeping(svc, core.time.nowNs() + 10 * day_len_ns, true);
     try std.testing.expectEqual(@as(usize, 1), hs.restores_expired);
     try std.testing.expect(!e.localBlob(v.object_id));
     try std.testing.expectEqual(@as(i128, 0), (try svc.head(a, "tbk", "k")).restore_expiry_ns);
@@ -495,14 +502,14 @@ test "transition, read-through, restore, outage, and cleanup" {
     // Overwrite: the remote blob goes through the journal, retried across an outage.
     _ = try e.put("k", "new");
     e.mem.down = true;
-    const p1 = try housekeeping(svc, core.time.nowNs());
+    const p1 = try housekeeping(svc, core.time.nowNs(), true);
     try std.testing.expectEqual(@as(usize, 1), p1.cleanup_pending);
     try std.testing.expectEqual(@as(u32, 1), e.mem.objects.count());
     e.mem.down = false;
-    const p2 = try housekeeping(svc, core.time.nowNs());
+    const p2 = try housekeeping(svc, core.time.nowNs(), true);
     try std.testing.expectEqual(@as(usize, 1), p2.cleaned);
     try std.testing.expectEqual(@as(u32, 0), e.mem.objects.count());
-    try std.testing.expectEqual(@as(usize, 0), (try housekeeping(svc, core.time.nowNs())).cleanup_pending);
+    try std.testing.expectEqual(@as(usize, 0), (try housekeeping(svc, core.time.nowNs(), true)).cleanup_pending);
 }
 
 test "noncurrent transition, copy of tiered data, and version delete cleanup" {
@@ -524,6 +531,6 @@ test "noncurrent transition, copy of tiered data, and version delete cleanup" {
     try std.testing.expectEqualStrings("version one", try e.body("copied", null, null));
 
     _ = try versioning.deleteObject(svc, "tbk", "k", .{ .version = v1.version_id });
-    try std.testing.expectEqual(@as(usize, 1), (try housekeeping(svc, core.time.nowNs())).cleaned);
+    try std.testing.expectEqual(@as(usize, 1), (try housekeeping(svc, core.time.nowNs(), true)).cleaned);
     try std.testing.expectEqual(@as(u32, 0), e.mem.objects.count());
 }
