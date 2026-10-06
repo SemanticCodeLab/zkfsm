@@ -20,7 +20,8 @@ pub const Exchange = struct {
     secure: bool,
 
     pub fn header(x: *const Exchange, name: []const u8) ?[]const u8 {
-        var it = x.req.iterateHeaders();
+        // head_buffer is an arena copy, valid even after the body was read.
+        var it = std.http.HeaderIterator.init(x.req.head_buffer);
         while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         return null;
     }

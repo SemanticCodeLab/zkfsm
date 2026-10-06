@@ -22,6 +22,7 @@ pub const max_tree = fsm.max_rename_objects;
 /// Bound on members listed by one Depth: 1 PROPFIND.
 pub const max_listing = 100_000;
 const list_page = 1000;
+const drain_max = 16 * 1024 * 1024;
 const xml_type = "application/xml; charset=utf-8";
 const allow = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK";
 
@@ -141,8 +142,9 @@ const Req = struct {
 
 fn send(x: *http.Exchange, status: Status, body: []const u8, extra: []const Header) Error!void {
     const unread = x.req.server.reader.state == .received_head and x.hasBody();
-    // A large unread upload is not drained (nor invited); the connection closes.
-    const big = unread and (x.req.head.content_length orelse std.math.maxInt(u64)) > 64 * 1024;
+    // Unread uploads up to drain_max are drained so the client sees the status;
+    // larger ones are not invited (no 100-continue) and the connection closes.
+    const big = unread and (x.req.head.expect != null or (x.req.head.content_length orelse std.math.maxInt(u64)) > drain_max);
     if (big) x.req.head.expect = null;
     return x.req.respond(body, .{ .status = status, .keep_alive = !big, .extra_headers = extra });
 }
@@ -534,8 +536,7 @@ fn copyMove(r: *Req, move: bool) Error!void {
 fn readBody(r: *Req) Error!?[]const u8 {
     return r.x.readSmallBody(xml.max_input) catch |e| switch (e) {
         error.BodyTooLarge => {
-            r.x.req.head.keep_alive = false;
-            try r.x.req.respond("", .{ .status = .payload_too_large, .keep_alive = false });
+            try send(r.x, .payload_too_large, "", &.{});
             return null;
         },
         else => return e,
