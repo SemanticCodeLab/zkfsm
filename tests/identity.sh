@@ -378,5 +378,34 @@ else
 fi
 stop
 
+# ---------------------------------------------------------------- client certificates
+(
+  cd "$WORK"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.crt -days 2 -subj /CN=zk-ca 2>/dev/null
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout bad.key -out bad.crt -days 2 -subj /CN=zk-bad-ca 2>/dev/null
+  mk() { # name cn ca
+    openssl ecparam -name prime256v1 -genkey -noout -out "$1.key" 2>/dev/null
+    openssl req -new -key "$1.key" -subj "/CN=$2" -out "$1.csr" 2>/dev/null
+    openssl x509 -req -in "$1.csr" -CA "$3.crt" -CAkey "$3.key" -CAcreateserial -days 1 -extfile <(echo "$4") -out "$1.crt" 2>/dev/null
+  }
+  mk srv localhost ca "subjectAltName=DNS:localhost,IP:127.0.0.1"
+  mk cli readonly ca "extendedKeyUsage=clientAuth"
+  mk evil readwrite bad "extendedKeyUsage=clientAuth"
+  mk nopol no-such-policy ca "extendedKeyUsage=clientAuth"
+)
+start --tls-cert "$WORK/srv.crt" --tls-key "$WORK/srv.key" --tls-client-ca "$WORK/ca.crt"
+for _ in $(seq 50); do curl -s -o /dev/null --cacert "$WORK/ca.crt" "https://127.0.0.1:$PORT/" && break; sleep 0.1; done
+cstst() { curl -s -X POST --cacert "$WORK/ca.crt" "$@" "https://127.0.0.1:$PORT/?Action=AssumeRoleWithCertificate&Version=2011-06-15"; }
+CX="$(cstst --cert "$WORK/cli.crt" --key "$WORK/cli.key")"
+read -r M_AK M_SK M_TOK <<<"$(echo "$CX" | creds)"
+check "certificate session issued" ASIA "${M_AK:0:4}"
+check "certificate session reads" hello "$(AWS_ACCESS_KEY_ID="$M_AK" AWS_SECRET_ACCESS_KEY="$M_SK" AWS_SESSION_TOKEN="$M_TOK" "$S3CLI_BIN" --endpoint-url "https://127.0.0.1:$PORT" --ca-bundle "$WORK/ca.crt" s3 cp s3://other/seed.txt -)"
+check "certificate session read-only" 1 "$(ok env AWS_ACCESS_KEY_ID="$M_AK" AWS_SECRET_ACCESS_KEY="$M_SK" AWS_SESSION_TOKEN="$M_TOK" "$S3CLI_BIN" --endpoint-url "https://127.0.0.1:$PORT" --ca-bundle "$WORK/ca.crt" s3 cp "$WORK/f.txt" s3://other/m.txt)"
+check "no client certificate" AccessDenied "$(cstst | xmlget Code)"
+check "untrusted client certificate refused" "" "$(cstst --cert "$WORK/evil.crt" --key "$WORK/evil.key" | xmlget AccessKeyId)"
+check "CN without policy" AccessDenied "$(cstst --cert "$WORK/nopol.crt" --key "$WORK/nopol.key" | xmlget Code)"
+check "plain HTTPS without a certificate still works" 200 "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$WORK/ca.crt" "https://127.0.0.1:$PORT/health/live")"
+stop
+
 echo "identity: $pass passed, $fail failed, $skip skipped"
 [[ $fail -eq 0 ]]

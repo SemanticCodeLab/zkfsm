@@ -38,6 +38,7 @@ const usage =
     \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -91,6 +92,7 @@ const Config = struct {
     cluster_ca: []const []const u8 = &.{},
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
+    tls_client_ca: ?[]const u8 = null,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -159,6 +161,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             try cas.append(arena, args[i]);
         } else if (std.mem.eql(u8, a, "--identity-openid")) {
             cfg.identity_openid = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
+            cfg.tls_client_ca = args[i];
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -362,6 +366,10 @@ pub fn run(opts: Options) u8 {
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
         std.log.info("tls enabled ({s})", .{tp[0]});
     }
     defer if (tls_paths != null) tls_ctx.deinit();
@@ -450,6 +458,10 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
     const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
