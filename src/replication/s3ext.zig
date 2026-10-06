@@ -153,7 +153,8 @@ fn configOp(r: *engine.Replicator, c: *Ctx) OpError!void {
         },
         .DELETE => {
             try r.putConfigXml(c.route.bucket, null);
-            try handler.respondEmpty(c, .no_content, &.{});
+            // Clients of the reference server expect 200 here.
+            try handler.respondEmpty(c, .ok, &.{});
         },
         else => try handler.fail(c, .MethodNotAllowed),
     }
