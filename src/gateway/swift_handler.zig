@@ -77,7 +77,7 @@ pub const Ctx = struct {
 
     /// Full response; adds the transaction id, date, and content type.
     pub fn send(c: *Ctx, status: Status, body: []const u8, ctype: ?[]const u8, extra: []const Header) ConnError!void {
-        const hs = try c.baseHeaders(extra, ctype orelse (if (body.len > 0) "text/plain; charset=utf-8" else "text/plain; charset=utf-8"));
+        const hs = try c.baseHeaders(extra, ctype orelse "text/plain; charset=utf-8");
         try c.req.respond(body, .{ .status = status, .extra_headers = hs, .keep_alive = !c.length_missing });
     }
 
@@ -173,7 +173,7 @@ pub fn handle(st: *State, req: *Request, a: std.mem.Allocator, peer: std.net.Add
     if (s1) |i| {
         const r2 = rest[i + 1 ..];
         const s2 = std.mem.indexOfScalar(u8, r2, '/');
-        c.container = if (s2) |j| r2[0..j] else r2;
+        c.container = try util.bucketName(a, if (s2) |j| r2[0..j] else r2);
         if (s2) |j| c.object = r2[j + 1 ..];
     }
     if (c.account.len == 0 or c.account.len > max_account + 5) return c.fail(.bad_request, "Invalid account.");

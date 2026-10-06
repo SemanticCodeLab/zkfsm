@@ -121,13 +121,15 @@ fn readManifest(c: *Ctx, info: object.ObjectInfo) ConnError!?[]slo.Stored {
         try c.failObj(e);
         return null;
     };
-    return slo.parseStored(c.a, out.written()) catch |e| switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
+    const stored = slo.parseStored(c.a, out.written()) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
         else => {
             _ = try corrupt(c);
             return null;
         },
     };
+    for (stored) |*s| s.container = try util.bucketName(c.a, s.container);
+    return stored;
 }
 
 fn splitManifest(v: []const u8) ?struct { []const u8, []const u8 } {
@@ -140,7 +142,7 @@ fn splitManifest(v: []const u8) ?struct { []const u8, []const u8 } {
 /// DLO: every object under container/prefix, in name order (at most `max_dlo_segments`).
 fn resolveDlo(c: *Ctx, info: object.ObjectInfo, want_segs: bool) ConnError!?Resolved {
     const parts = splitManifest(internal(info, dlo_hdr).?) orelse return corrupt(c);
-    const cont = parts[0];
+    const cont = try util.bucketName(c.a, parts[0]);
     const prefix = parts[1];
     if (!c.allowed(.list_objects_v2, cont, "")) {
         try c.denied();
@@ -316,10 +318,16 @@ fn get(c: *Ctx) ConnError!void {
         const segs = if (range) |rg| try sliceSegs(c.a, full.segs, rg) else full.segs;
         const rbuf = try c.a.alloc(u8, io_buf);
         var br = blob.BlobReader.init(c.svc().store, segs, rbuf);
-        _ = br.reader.streamRemaining(&lazy.writer) catch {
-            if (lazy.bw != null) return error.StreamAborted;
-            return c.fail(.conflict, "A segment of this large object could not be read.");
-        };
+        const chunk = try c.a.alloc(u8, io_buf);
+        while (true) {
+            const n = br.reader.readSliceShort(chunk) catch {
+                if (lazy.bw != null) return error.StreamAborted;
+                return c.fail(.conflict, "A segment of this large object could not be read.");
+            };
+            if (n == 0) break;
+            lazy.writer.writeAll(chunk[0..n]) catch return error.WriteFailed;
+            if (n < chunk.len) break;
+        }
     }
     return lazy.finish();
 }
@@ -481,6 +489,7 @@ fn sloPut(c: *Ctx) ConnError!void {
         error.ManifestTooLarge => c.fail(.payload_too_large, "Manifest is too large."),
         error.BadManifest => c.fail(.bad_request, "Manifest must be a list of {\"path\", \"etag\", \"size_bytes\", \"range\"} objects."),
     };
+    for (segs) |*sg| sg.container = try util.bucketName(c.a, sg.container);
     const ci = (try commonInput(c)) orelse return;
     var errs: std.Io.Writer.Allocating = .init(c.a);
     const stored = try c.a.alloc(slo.Stored, segs.len);
@@ -544,7 +553,7 @@ fn parseObjectRef(c: *Ctx, v: []const u8) ?struct { []const u8, []const u8 } {
     const p = if (dec.len > 0 and dec[0] == '/') dec[1..] else dec;
     const i = std.mem.indexOfScalar(u8, p, '/') orelse return null;
     if (i == 0 or i + 1 >= p.len) return null;
-    return .{ p[0..i], p[i + 1 ..] };
+    return .{ util.bucketName(c.a, p[0..i]) catch return null, p[i + 1 ..] };
 }
 
 fn copyVerb(c: *Ctx) ConnError!void {

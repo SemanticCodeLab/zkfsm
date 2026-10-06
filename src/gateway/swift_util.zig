@@ -153,6 +153,15 @@ pub fn timestamp(buf: *[32]u8, ns: i128) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d:0>5}", .{ secs, frac }) catch buf[0..0];
 }
 
+/// Bucket for a Swift container name: `_` becomes `-` so clients' default
+/// `<name>_segments` containers satisfy bucket naming rules.
+pub fn bucketName(a: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '_') == null) return name;
+    const out = try a.dupe(u8, name);
+    std.mem.replaceScalar(u8, out, '_', '-');
+    return out;
+}
+
 pub fn xmlEscape(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     for (s) |c| switch (c) {
         '&' => try w.writeAll("&amp;"),
