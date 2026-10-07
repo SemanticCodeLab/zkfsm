@@ -253,6 +253,8 @@ const Amqp = struct {
             try e.shortstr(self.exchange);
             try e.shortstr(self.exchange_type);
             var bits: u8 = 0;
+            // Brokers refuse to (re)declare reserved amq.* exchanges; only check they exist.
+            if (std.mem.startsWith(u8, self.exchange, "amq.")) bits |= 1;
             if (self.durable) bits |= 2;
             if (self.auto_deleted) bits |= 4;
             if (self.internal) bits |= 8;

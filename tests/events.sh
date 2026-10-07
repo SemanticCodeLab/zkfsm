@@ -16,6 +16,7 @@ H="$ROOT/tests/events_helper.py"
 declare -A PID=()
 CONTAINERS=()
 cleanup() {
+  if [[ "${fail:-0}" -gt 0 ]]; then echo "--- server log tail"; tail -n 40 "$WORK/z.log" 2>/dev/null; fi
   for p in "${PID[@]}"; do kill -9 "$p" 2>/dev/null || true; done
   for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
   rm -rf "$WORK"
@@ -278,8 +279,9 @@ if [[ "$BROKERS" == 1 ]] && command -v docker >/dev/null && docker info >/dev/nu
   eventually "redis access log has every event" 3 sh -c "docker exec $R redis-cli LLEN zkev:acc"
   eventually "postgres namespace keeps live objects" "brokers/obj1.txt" sh -c "docker exec $G psql -U postgres -tAc 'select key from zkevns'"
   eventually "postgres access log has every event" 3 sh -c "docker exec $G psql -U postgres -tAc 'select count(*) from zkevacc'"
-  check "postgres row holds the record" "s3:ObjectCreated:CompleteMultipartUpload" "$(docker exec "$G" psql -U postgres -tAc "select value->>'eventName' from zkevns")"
-  eventually "amqp delivered the events" 3 sh -c "curl -s -u guest:guest 'http://127.0.0.1:$AHP/api/queues/%2f/zkevq' | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"messages\",0))'"
+  check "postgres row holds the record" "s3:ObjectCreated:CompleteMultipartUpload" "$(docker exec "$G" psql -U postgres -tAc "select value->'Records'->0->>'eventName' from zkevns")"
+  # Management stats can omit queue depth; ask the broker directly.
+  eventually "amqp delivered the events" 3 sh -c "docker exec zkev-amqp-$$ rabbitmqctl -q list_queues name messages | awk '\$1==\"zkevq\" {print \$2}'"
   eventually "audit kafka receives entries" 1 sh -c "docker exec $K rpk topic consume zkaudit -n 1 -f '%v\n' 2>/dev/null | grep -c '\"version\":\"1\"'"
 
   echo "== broker outage and recovery"
@@ -289,10 +291,31 @@ if [[ "$BROKERS" == 1 ]] && command -v docker >/dev/null && docker info >/dev/nu
   eventually "redis events queue during the outage" 1 metric 'zkfsm_notify_target_queue_length{target_id="ns",target_name="notify_redis"}'
   run_c redis -p "$RP:6379" redis:7
   eventually "redis catches up after the outage" 1 sh -c "docker exec $R redis-cli HKEYS zkev:ns 2>/dev/null | grep -c obj3"
-  if docker image inspect mysql:8 >/dev/null 2>&1; then
-    echo "(mysql: image present but not wired here)"
+  if docker image inspect mysql:8.4 >/dev/null 2>&1; then
+    echo "== mysql"
+    YP="$(freeport)"
+    run_c mysql --tmpfs /var/lib/mysql -e MYSQL_ROOT_PASSWORD=zkpass -e MYSQL_DATABASE=zkev -p "$YP:3306" mysql:8.4
+    Y="zkev-mysql-$$"
+    myq() { docker exec "$Y" mysql -uroot -pzkpass -N -B zkev -e "$1" 2>/dev/null; }
+    for _ in $(seq 180); do [[ "$(myq 'select 1')" == 1 ]] && break; sleep 1; done
+    DSN="root:zkpass@tcp(127.0.0.1:$YP)/zkev"
+    check "mysql namespace target (caching_sha2, no TLS)" "Successfully applied new settings." "$(set_t notify_mysql:ns dsn_string="$DSN" table=myns format=namespace)"
+    check "mysql access target" "Successfully applied new settings." "$(set_t notify_mysql:acc dsn_string="$DSN" table=myacc format=access)"
+    "$MC" mb z/mysqlb >/dev/null
+    "$MC" event add z/mysqlb arn:minio:sqs::ns:mysql --event put,delete >/dev/null
+    "$MC" event add z/mysqlb arn:minio:sqs::acc:mysql --event put,delete >/dev/null
+    echo 1 | "$MC" pipe z/mysqlb/a.txt >/dev/null
+    echo 2 | "$MC" pipe z/mysqlb/b.txt >/dev/null
+    "$MC" rm z/mysqlb/b.txt >/dev/null
+    eventually "mysql namespace keeps live objects" "mysqlb/a.txt" myq 'select key_name from myns order by key_name'
+    eventually "mysql access log has every event" 3 myq 'select count(*) from myacc'
+    check "mysql row holds the record" "mysqlb" "$(myq "select json_unquote(json_extract(value, '\$.Records[0].s3.bucket.name')) from myns")"
+    check "audit to mysql" "Successfully applied new settings." "$(set_t audit_mysql:a dsn_string="$DSN" table=myaudit)"
+    echo au | "$MC" pipe z/other/audited-my.txt >/dev/null
+    eventually "audit rows in mysql" 1 myq "select count(*) > 0 from myaudit where json_unquote(json_extract(event_data, '\$.api.object')) = 'audited-my.txt'"
+    "$MC" admin config reset z audit_mysql:a >/dev/null
   else
-    echo "skip mysql: no mysql image available locally (verified by the in-process fake server tests)"
+    echo "SKIP mysql: no mysql:8.4 image"
   fi
   else
     echo "SKIP brokers: docker could not start the broker containers (see above)"
@@ -310,7 +333,7 @@ if command -v initdb >/dev/null && command -v postgres >/dev/null && command -v 
     postgres -D "$WORK/pg" -p "$PGP" -k "$WORK" -c listen_addresses=127.0.0.1 >>"$WORK/pg.log" 2>&1 &
     PID[pg]=$!
     for _ in $(seq 100); do PGPASSWORD=zkpass psql -h 127.0.0.1 -p "$PGP" -U postgres -tAc 'select 1' >/dev/null 2>&1 && return 0; sleep 0.2; done
-    echo "postgres did not start"; tail -n 20 "$WORK/pg.log"; exit 1
+    echo "postgres did not start"; tail -n 20 "$WORK/pg.log" "$WORK/initdb.log"; exit 1
   }
   pg_down() { kill -INT "${PID[pg]}" 2>/dev/null || true; wait "${PID[pg]}" 2>/dev/null || true; unset "PID[pg]"; }
   pgq() { PGPASSWORD=zkpass psql -h 127.0.0.1 -p "$PGP" -U postgres -tAc "$1"; }
