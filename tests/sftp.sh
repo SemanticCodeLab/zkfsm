@@ -130,6 +130,21 @@ if "$PY" -c 'import paramiko' 2>/dev/null; then
 else
   echo "skip paramiko checks (set ZKFSM_SFTP_PYTHON to a python with paramiko)"
 fi
+# Bucket quota (needs the MinIO client in $MC): an oversized upload is refused.
+if [[ -n "${MC:-}" ]] && "$MC" --version 2>/dev/null | grep -q RELEASE; then
+  export MC_CONFIG_DIR="$WORK/mc"
+  "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null
+  printf 'mkdir /quotabkt\n' > "$WORK/q1"; sftpb "$WORK/q1" || true
+  check "quota set" 0 "$("$MC" quota set z/quotabkt --size 1MiB >/dev/null 2>&1; echo $?)"
+  head -c 2000000 /dev/urandom > "$WORK/q.big"
+  printf 'put %s /quotabkt/big\n' "$WORK/q.big" > "$WORK/q2"
+  check "quota rejects oversized put" 1 "$(sftpb "$WORK/q2" >/dev/null 2>&1; echo $?)"
+  check "quota object absent" 404 "$(s3 -o /dev/null -w '%{http_code}' "$EP/quotabkt/big")"
+  printf 'put %s /quotabkt/small\n' "$WORK/small" > "$WORK/q3"
+  check "quota allows small put" 0 "$(sftpb "$WORK/q3" >/dev/null 2>&1; echo $?)"
+else
+  echo "skip quota checks (set MC to the MinIO client)"
+fi
 check "server still alive" 0 "$(kill -0 "$PID"; echo $?)"
 
 echo "sftp: $pass passed, $fail failed"

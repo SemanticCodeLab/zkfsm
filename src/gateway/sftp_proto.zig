@@ -96,6 +96,7 @@ pub fn statusOf(e: fs.Error) struct { Status, []const u8 } {
         error.NotDir => .{ .failure, "Not a directory" },
         error.InvalidPath => .{ .failure, "Invalid path" },
         error.TooLarge => .{ .failure, "Too large" },
+        error.QuotaExceeded => .{ .failure, "Quota exceeded" },
         error.OutOfMemory => .{ .failure, "Out of memory" },
         error.Storage, error.ReadFailed, error.WriteFailed => .{ .failure, "Storage error" },
     };
