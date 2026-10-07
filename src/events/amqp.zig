@@ -1,8 +1,8 @@
 //! AMQP 0-9-1 notification target (RabbitMQ and compatible brokers): one
 //! connection, one channel, optional exchange declare and publisher confirms.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{ "url", "exchange", "exchange_type", "routing_key", "mandatory", "durable", "no_wait", "internal", "auto_deleted", "delivery_mode", "publisher_confirms", "queue_dir", "queue_limit", "comment" };
 

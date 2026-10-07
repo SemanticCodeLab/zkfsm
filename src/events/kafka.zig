@@ -2,8 +2,8 @@
 //! (PLAIN, SCRAM-SHA-256/512), Metadata leader lookup, Produce v3 with
 //! record batch v2 and acks=all.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{ "brokers", "topic", "sasl", "sasl_username", "sasl_password", "sasl_mechanism", "tls", "tls_skip_verify", "tls_client_auth", "client_tls_cert", "client_tls_key", "version", "batch_size", "queue_dir", "queue_limit", "comment" };
 

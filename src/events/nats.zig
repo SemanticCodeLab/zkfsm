@@ -1,8 +1,8 @@
 //! NATS notification target: core publish confirmed by PING/PONG, or a
 //! JetStream publish confirmed by the stream's ack on a private inbox.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{
     "address",     "subject",              "username",        "password",

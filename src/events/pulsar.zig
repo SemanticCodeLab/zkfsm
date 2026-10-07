@@ -1,8 +1,8 @@
 //! Apache Pulsar target: a minimal binary-protocol producer (CONNECT, LOOKUP,
 //! PRODUCER, SEND) with hand-written protobuf and CRC32C payload frames.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{ "url", "topic", "token", "tls_skip_verify", "queue_dir", "queue_limit", "comment" };
 

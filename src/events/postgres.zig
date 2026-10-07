@@ -2,8 +2,8 @@
 //! v3 wire protocol directly: TLS via SSLRequest, cleartext/MD5/SCRAM-SHA-256
 //! auth, and the extended query protocol so values travel as parameters.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 const log = std.log.scoped(.events_postgres);
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;

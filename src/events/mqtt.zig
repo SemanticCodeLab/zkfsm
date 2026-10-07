@@ -1,8 +1,8 @@
 //! MQTT notification target (3.1.1 and 5): one clean-session connection kept
 //! open between sends, PUBLISH at QoS 0/1/2 with the matching ack flow.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{
     "broker",    "topic",       "username", "password",         "qos", "keep_alive_interval", "reconnect_interval",

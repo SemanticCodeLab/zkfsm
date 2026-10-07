@@ -3,8 +3,8 @@
 //! caching_sha2 auth (RSA-OAEP full auth without TLS), and COM_QUERY.
 //! Values are sent as hex literals, so no escaping depends on sql_mode.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 const log = std.log.scoped(.events_mysql);
 const Sha1 = std.crypto.hash.Sha1;

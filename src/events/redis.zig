@@ -1,8 +1,8 @@
 //! Redis notification target: a small RESP2 client that writes events as
 //! hash fields (namespace), list entries (access) or channel messages (pubsub).
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{ "address", "key", "format", "password", "user", "tls", "tls_skip_verify", "queue_dir", "queue_limit", "comment" };
 

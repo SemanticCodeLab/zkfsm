@@ -14,15 +14,15 @@ pub const Kind = struct {
     audit: bool = false,
 };
 
-const webhook = @import("targets/webhook.zig");
-const kafka = @import("targets/kafka.zig");
-const nats = @import("targets/nats.zig");
-const mqtt = @import("targets/mqtt.zig");
-const redis = @import("targets/redis.zig");
-const postgres = @import("targets/postgres.zig");
-const mysql = @import("targets/mysql.zig");
-const amqp = @import("targets/amqp.zig");
-const pulsar = @import("targets/pulsar.zig");
+const webhook = @import("webhook.zig");
+const kafka = @import("kafka.zig");
+const nats = @import("nats.zig");
+const mqtt = @import("mqtt.zig");
+const redis = @import("redis.zig");
+const postgres = @import("postgres.zig");
+const mysql = @import("mysql.zig");
+const amqp = @import("amqp.zig");
+const pulsar = @import("pulsar.zig");
 
 pub const all = [_]Kind{
     .{ .subsys = "notify_webhook", .arn_type = "webhook", .env = "WEBHOOK", .keys = &webhook.keys, .create = webhook.create },

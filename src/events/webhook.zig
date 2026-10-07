@@ -1,8 +1,8 @@
 //! Webhook target: POSTs each payload as JSON to an HTTP(S) endpoint.
 //! Also the transport of the audit webhook logger.
 const std = @import("std");
-const target = @import("../target.zig");
-const net = @import("../net.zig");
+const target = @import("target.zig");
+const net = @import("net.zig");
 
 pub const keys = [_][]const u8{ "endpoint", "auth_token", "queue_dir", "queue_limit", "client_cert", "client_key", "tls_skip_verify", "comment" };
 
