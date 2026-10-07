@@ -23,6 +23,8 @@ const postgres = @import("postgres.zig");
 const mysql = @import("mysql.zig");
 const amqp = @import("amqp.zig");
 const pulsar = @import("pulsar.zig");
+const elasticsearch = @import("elasticsearch.zig");
+const nsq = @import("nsq.zig");
 
 pub const all = [_]Kind{
     .{ .subsys = "notify_webhook", .arn_type = "webhook", .env = "WEBHOOK", .keys = &webhook.keys, .create = webhook.create },
@@ -33,6 +35,8 @@ pub const all = [_]Kind{
     .{ .subsys = "notify_postgres", .arn_type = "postgresql", .env = "POSTGRES", .keys = &postgres.keys, .create = postgres.create },
     .{ .subsys = "notify_mysql", .arn_type = "mysql", .env = "MYSQL", .keys = &mysql.keys, .create = mysql.create },
     .{ .subsys = "notify_amqp", .arn_type = "amqp", .env = "AMQP", .keys = &amqp.keys, .create = amqp.create },
+    .{ .subsys = "notify_elasticsearch", .arn_type = "elasticsearch", .env = "ELASTICSEARCH", .keys = &elasticsearch.keys, .create = elasticsearch.create },
+    .{ .subsys = "notify_nsq", .arn_type = "nsq", .env = "NSQ", .keys = &nsq.keys, .create = nsq.create },
     .{ .subsys = "notify_pulsar", .arn_type = "pulsar", .env = "PULSAR", .keys = &pulsar.keys, .create = pulsar.create },
     .{ .subsys = "audit_webhook", .arn_type = "", .env = "WEBHOOK", .keys = &webhook.keys, .create = webhook.create, .audit = true },
     .{ .subsys = "audit_kafka", .arn_type = "", .env = "KAFKA", .keys = &kafka.keys, .create = kafka.create, .audit = true },
@@ -67,4 +71,6 @@ test {
     _ = mysql;
     _ = amqp;
     _ = pulsar;
+    _ = elasticsearch;
+    _ = nsq;
 }

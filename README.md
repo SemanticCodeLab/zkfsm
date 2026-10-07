@@ -332,6 +332,44 @@ pushed to peers with versioning, object lock, policy, lifecycle, tags, encryptio
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
 
+### Bucket notifications and audit logging
+
+Targets are configured at runtime with `mc admin config set` (stored cluster-wide,
+applied without a restart) or from the environment, with `MINIO_NOTIFY_<TYPE>_<KEY>[_<ID>]`
+or `ZKFSM_NOTIFY_...` names (`..._ENABLE[_ID]=on` required, env wins over stored):
+
+```sh
+mc admin config set z notify_webhook:1 endpoint=http://hooks:8080/s3 auth_token=secret
+mc admin config set z notify_kafka:1 brokers=k1:9092,k2:9092 topic=s3 sasl=on \
+  sasl_mechanism=sha512 sasl_username=u sasl_password=p tls=on
+mc event add z/photos arn:minio:sqs::1:webhook --event put,delete --prefix img/ --suffix .jpg
+mc event ls z/photos
+mc watch z/photos --events put
+```
+
+- Targets (`notify_<type>`, ARN `arn:minio:sqs:<region>:<id>:<type>`): webhook, kafka
+  (produce v3, SASL PLAIN/SCRAM-SHA-256/512, TLS), nats (core and JetStream acks), mqtt
+  (3.1.1 and 5, QoS 0-2), redis (namespace hash, access list, pubsub), postgres and
+  mysql (namespace and access tables, parameterized), amqp 0-9-1 (publisher confirms),
+  and pulsar (binary protocol). All protocol clients are part of zkfsm, no libraries.
+- Each target has a crash-safe on-disk queue (`queue_dir`, default
+  `<first drive>/.zkfsm/events/<target>`, or `ZKFSM_EVENTS_DIR`), bounded by
+  `queue_limit` (default 100000), delivered in order with backoff up to 30 s. Delivery is
+  at least once; an entry is removed only after the target acknowledged it.
+- Events: `s3:ObjectCreated:*` (Put, Post, Copy, CompleteMultipartUpload, PutTagging,
+  DeleteTagging, PutRetention, PutLegalHold), `s3:ObjectRemoved:*` (Delete,
+  DeleteMarkerCreated), `s3:ObjectAccessed:*` (Get, Head, GetRetention, GetLegalHold,
+  Attributes), `s3:ObjectRestore:*`, `s3:ObjectTransition:*`, `s3:LifecycleExpiration:*`,
+  `s3:Replication:*`, `s3:BucketCreated`, `s3:BucketRemoved`; records use the MinIO JSON
+  layout. ListenBucketNotification (`mc watch`) streams from the node it is connected to.
+- Audit: one MinIO-layout JSON entry per request (API name, status, timings, identity,
+  tenant, request and response headers with credentials redacted) to `audit_webhook`
+  and `audit_kafka` targets, stderr (`ZKFSM_AUDIT_CONSOLE=on`), or a file
+  (`ZKFSM_AUDIT_FILE=path`).
+- `/metrics` carries `zkfsm_notify_target_*` and `zkfsm_audit_target_*` per target
+  (sent, failed, dropped, queue length, online). In a cluster each node publishes the
+  events of the requests it serves from its own queue.
+
 ### Protocol gateways
 
 FTP/FTPS, SFTP, WebDAV, and OpenStack Swift serve the same namespace as S3, each on
