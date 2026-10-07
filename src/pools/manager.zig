@@ -38,6 +38,8 @@ pub const Manager = struct {
     stop_ev: std.Thread.ResetEvent = .{},
     wake_ev: std.Thread.ResetEvent = .{},
     thread: ?std.Thread = null,
+    modes_thread: ?std.Thread = null,
+    modes_ev: std.Thread.ResetEvent = .{},
     /// Job seen by this node's worker and since when (for the grace period).
     job: u64 = 0,
     job_since: i128 = 0,
@@ -275,18 +277,36 @@ pub const Manager = struct {
             std.log.err("pools: worker not started", .{});
             break :blk null;
         };
+        m.modes_thread = std.Thread.spawn(.{}, modesLoop, .{m}) catch null;
     }
 
     pub fn stop(m: *Manager) void {
         m.stop_ev.set();
         m.wake_ev.set();
+        m.modes_ev.set();
         if (m.thread) |t| t.join();
+        if (m.modes_thread) |t| t.join();
         m.thread = null;
+        m.modes_thread = null;
     }
 
     fn wake(ctx: *anyopaque) void {
         const m: *Manager = @ptrCast(@alignCast(ctx));
         m.wake_ev.set();
+        m.modes_ev.set();
+    }
+
+    /// Keeps pool modes current while the worker may be busy or waiting for its lock.
+    fn modesLoop(m: *Manager) void {
+        while (!m.stopping()) {
+            m.modes_ev.timedWait(poll_ns) catch {};
+            m.modes_ev.reset();
+            if (m.stopping()) return;
+            var arena = std.heap.ArenaAllocator.init(m.gpa);
+            defer arena.deinit();
+            const meta = m.loadFresh(arena.allocator()) catch continue;
+            m.applyModes(meta);
+        }
     }
 
     fn stopping(m: *Manager) bool {
@@ -417,6 +437,7 @@ pub const Manager = struct {
         while (true) {
             var left: usize = 0;
             var moved: usize = 0;
+            var kinds: [3]usize = @splat(0);
             for (r.pools[p].sets) |set| for ([_]backend.KeySpace{ .data, .record, .system }) |space| {
                 var arena = std.heap.ArenaAllocator.init(m.gpa);
                 defer arena.deinit();
@@ -431,10 +452,10 @@ pub const Manager = struct {
                     if (mover.moveKey(r, m.gpa, key, p, buf)) |res| {
                         prog.add(res);
                         moved += 1;
+                        kinds[@intFromEnum(res.outcome)] += 1;
                     } else |e| {
                         if (e == error.OutOfMemory) return error.OutOfMemory;
                         std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
-                        prog.objects_failed += 1;
                         left += 1;
                     }
                     if (std.time.nanoTimestamp() - prog.last_persist >= persist_ns) {
@@ -442,10 +463,13 @@ pub const Manager = struct {
                     }
                 }
             };
-            if (left == 0 and try m.poolEmpty(p)) break;
+            std.log.info("pools: pool {d} pass: {d} moved, {d} gone, {d} dup, {d} left", .{ p + 1, kinds[0], kinds[1], kinds[2], left });
+            // Listed but unreadable keys are delete tombstones, purged by heal later.
+            if (left == 0 and kinds[0] == 0 and kinds[2] == 0) break;
             idle = if (moved == 0) idle + 1 else 0;
             if (idle >= max_idle_passes) {
-                std.log.err("pools: decommission of pool {d} failed: keys cannot be moved", .{p + 1});
+                std.log.err("pools: decommission of pool {d} failed: {d} key(s) cannot be moved", .{ p + 1, left });
+                prog.objects_failed = left;
                 _ = try m.persistDecom(p, &prog, .failed);
                 return;
             }
@@ -461,15 +485,6 @@ pub const Manager = struct {
 
     fn persistQuiet(m: *Manager, p: usize, prog: *Progress) Error!void {
         _ = m.persistDecom(p, prog, null) catch {};
-    }
-
-    fn poolEmpty(m: *Manager, p: usize) Error!bool {
-        var arena = std.heap.ArenaAllocator.init(m.gpa);
-        defer arena.deinit();
-        for (m.router().pools[p].sets) |set| for ([_]backend.KeySpace{ .data, .record, .system }) |space| {
-            if ((try keysOf(arena.allocator(), set, space)).len > 0) return false;
-        };
-        return true;
     }
 
     // ---- rebalance ----

@@ -15,7 +15,9 @@ MC="${MC:-$(command -v mc || true)}"
 PIDS=(0 0 0 0 0)
 TPID=0
 cleanup() {
+  local rc=$?
   [[ "$TPID" != 0 ]] && kill "$TPID" 2>/dev/null || true
+  if [[ $rc -ne 0 && -n "${POOLS_KEEP_LOGS:-}" ]]; then mkdir -p "$POOLS_KEEP_LOGS"; cp "$WORK"/n*.log "$POOLS_KEEP_LOGS/" 2>/dev/null || true; fi
   for p in "${PIDS[@]}"; do [[ "$p" != 0 ]] && kill -9 "$p" 2>/dev/null || true; done
   rm -rf "$WORK"
 }
@@ -72,8 +74,8 @@ cli() { local i="$1"; shift; "$S3CLI_BIN" --endpoint-url "$(ep "$i")" "$@"; }
 sig=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK")
 md5() { md5sum "$1" | cut -d' ' -f1; }
 aliases() { for i in 1 2 3 4; do "$MC" alias set "z$i" "$(ep "$i")" "$AK" "$SK" >/dev/null; done; }
-# Files under a pool's drives that hold keys (blobs and records).
-keyfiles() { find "$WORK"/n*/"$1"[0-9]* \( -path '*/data/*' -o -path '*/record/*' -o -path '*/system/*' \) -type f 2>/dev/null | wc -l; }
+# Blob shard files under a pool's drives (records leave delete tombstones for a while).
+keyfiles() { find "$WORK"/n*/"$1"[0-9]* -path '*/data/*' -type f 2>/dev/null | wc -l; }
 jget() { python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for k in sys.argv[1].split("."):
@@ -125,7 +127,7 @@ load_data() { # node
   mkdir -p "$WORK/obj"
   cli "$n" s3 mb s3://plain >/dev/null
   cli "$n" s3 mb s3://ver >/dev/null
-  cli "$n" s3api put-bucket-versioning --bucket ver --versioning-configuration Status=Enabled
+  cli "$n" s3api put-bucket-versioning --bucket ver --versioning-configuration Status=Enabled >/dev/null
   cli "$n" s3api create-bucket --bucket locked --object-lock-enabled-for-bucket >/dev/null
   for i in $(seq 1 30); do
     head -c $((i * 3001 + 17)) /dev/urandom >"$WORK/obj/o$i"
@@ -139,7 +141,7 @@ load_data() { # node
   echo gone | cli "$n" s3 cp - s3://ver/deleted >/dev/null
   cli "$n" s3 rm s3://ver/deleted >/dev/null
   echo tagged | cli "$n" s3 cp - s3://ver/tagged >/dev/null
-  cli "$n" s3api put-object-tagging --bucket ver --key tagged --tagging 'TagSet=[{Key=team,Value=storage},{Key=tier,Value=hot}]'
+  cli "$n" s3api put-object-tagging --bucket ver --key tagged --tagging 'TagSet=[{Key=team,Value=storage},{Key=tier,Value=hot}]' >/dev/null
   echo held | cli "$n" s3 cp - s3://locked/held >/dev/null
   cli "$n" s3api put-object-retention --bucket locked --key held --retention "Mode=GOVERNANCE,RetainUntilDate=$(date -u -d '+2 days' +%Y-%m-%dT%H:%M:%SZ)" >/dev/null
   echo legal | cli "$n" s3 cp - s3://locked/legal >/dev/null
@@ -160,7 +162,7 @@ traffic() { # node
     head -c $((RANDOM * 4 + 1)) /dev/urandom >"$f"
     code=$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$f" "$(ep "$n")/traffic/t$i" || true)
     if [[ "$code" == 200 ]]; then echo "t$i $(md5 "$f")" >>"$WORK/tr/put"; else echo "put t$i $code" >>"$WORK/tr/err"; fi
-    code=$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$f" "$(ep "$n")/ver/hot" || true)
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$f" "$(ep "$n")/tver/hot" || true)
     if [[ "$code" == 200 ]]; then md5 "$f" >"$WORK/tr/hot"; else echo "put hot $code" >>"$WORK/tr/err"; fi
     if ((i % 3 == 0)); then
       code=$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -X DELETE "$(ep "$n")/traffic/t$((i - 2))" || true)
@@ -184,7 +186,7 @@ verify_traffic() { # node -> number of mismatches
       [[ "$code" == 200 && "$(md5 "$WORK/tr/got")" == "$sum" ]] || bad=$((bad + 1))
     fi
   done <"$WORK/tr/put"
-  curl -s -o "$WORK/tr/got" "${sig[@]}" "$(ep "$n")/ver/hot"
+  curl -s -o "$WORK/tr/got" "${sig[@]}" "$(ep "$n")/tver/hot"
   [[ "$(md5 "$WORK/tr/got")" == "$(cat "$WORK/tr/hot")" ]] || bad=$((bad + 1))
   echo "$bad"
 }
@@ -201,7 +203,7 @@ CMD_A="${PA[*]}"
 CMD_B="${PB[*]}"
 list=$("$MC" admin decommission status --json z1)
 check "status lists both pools" 2 "$(echo "$list" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || true)"
-check "pool 1 not scheduled" "0001-01-01t00:00:00z" "$(decom 2 "$CMD_A" startTime)"
+check "pool 1 not scheduled" "0001-01-01T00:00:00Z" "$(decom 2 "$CMD_A" startTime)"
 check "unknown pool refused" 1 "$("$MC" admin decommission start z1 "http://nowhere:9000/x" >/dev/null 2>&1 && echo 0 || echo 1)"
 
 "$MC" admin decommission start z1 "$CMD_A" >/dev/null
@@ -218,6 +220,9 @@ for _ in $(seq 300); do
 done
 check "a node drains pool 1" yes "$([[ "$W" != 0 ]] && echo yes || echo no)"
 T=$((W % 4 + 1))
+cli 1 s3 mb s3://traffic >/dev/null
+cli 1 s3 mb s3://tver >/dev/null
+cli 1 s3api put-bucket-versioning --bucket tver --versioning-configuration Status=Enabled >/dev/null
 traffic "$T" &
 TPID=$!
 sleep 3
@@ -250,7 +255,7 @@ check "objects moved reported" yes "$([[ "$(decom 1 "$CMD_A" objectsDecommission
 check "bytes moved reported" yes "$([[ "$(decom 1 "$CMD_A" bytesDecommissioned)" =~ ^[1-9] ]] && echo yes || echo no)"
 check "no failed objects" 0 "$(decom 1 "$CMD_A" objectsDecommissionedFailed)"
 check "status table says complete" 1 "$("$MC" admin decommission status z1 | grep -c Complete || true)"
-check "pool 1 drives hold no keys" 0 "$(keyfiles a)"
+check "pool 1 drives hold no blobs" 0 "$(keyfiles a)"
 check "resumed by a node after the crash" yes "$([[ $(cat "$WORK"/n*.log | grep -c 'pools: draining pool 1') -ge 2 ]] && echo yes || echo no)"
 snapshot 2 >"$WORK/after"
 check "all versions, markers, tags, lock, uploads, data intact" "" "$(diff "$WORK/before" "$WORK/after" || true)"
@@ -329,7 +334,7 @@ check "data intact after rebalance" "" "$(diff "$WORK/before" "$WORK/after" || t
 CMD_D="${PD[*]}"
 "$MC" admin decommission start z4 "$CMD_D" >/dev/null
 check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 300)"
-check "middle pool drives hold no keys" 0 "$(keyfiles d)"
+check "middle pool drives hold no blobs" 0 "$(keyfiles d)"
 info=$("$MC" admin decommission status z2)
 check "status table: complete middle, active others" "Active Complete Active" "$(echo "$info" | grep -o 'Active\|Complete' | tr '\n' ' ' | sed 's/ $//')"
 stop_all

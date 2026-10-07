@@ -463,11 +463,15 @@ pub const Node = struct {
         n.retired = retired;
         // New pools take the next unused indexes, in endpoint-list order.
         var next: u32 = @intCast(64 - @clz(present | retired));
+        var fresh = false;
         for (seen, 0..) |s, p| if (!known[p]) {
             for (s) |e| if (e != .none) return false;
             n.orig[p] = next;
             next += 1;
+            fresh = true;
         };
+        // Judged once every pool is formatted (a peer may be formatting right now).
+        if (fresh) return true;
         const missing = ~(present | retired) & ((@as(u64, 1) << @intCast(64 - @clz(present | retired))) -% 1);
         if (missing != 0) {
             std.log.err("cluster: deployment pool {d} is missing from the endpoint list and was not decommissioned", .{@ctz(missing) + 1});

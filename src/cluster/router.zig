@@ -1,6 +1,7 @@
 //! Router: one StorageBackend over every pool and erasure set. A key maps to a set by
 //! hashing it within its pool; new data goes to the pool with the most room, reads and
-//! deletes find a key in whichever pool holds it. System keys always live in pool 0.
+//! deletes find a key in whichever pool holds it. New system keys go to the first
+//! active pool; draining pools take no new keys and are searched last.
 const std = @import("std");
 const iface = @import("../backend/root.zig");
 
@@ -184,9 +185,9 @@ pub const Router = struct {
 
     fn putRecord(ctx: *anyopaque, key: PhysicalKey, bytes: []const u8) Error!void {
         const self = cast(ctx);
+        if (self.pools.len == 1) return at(&self.pools[0], key).putRecord(key, bytes);
         if (self.moving.load(.acquire)) return self.putRecordMoving(key, bytes);
-        if (key.space == .system or self.pools.len == 1) return at(&self.pools[self.systemPoolFor(key)], key).putRecord(key, bytes);
-        // Overwrites stay in the pool that already holds the name.
+        // Overwrites stay in the pool that already holds the name, so one copy exists.
         for (self.pools) |*p| {
             if (p.mode.load(.acquire) == .retired) continue;
             const cur = at(p, key).getRecord(key, self.gpa) catch |e| switch (e) {
@@ -196,11 +197,8 @@ pub const Router = struct {
             self.gpa.free(cur);
             return at(p, key).putRecord(key, bytes);
         }
-        return at(&self.pools[self.pickPool()], key).putRecord(key, bytes);
-    }
-
-    fn systemPoolFor(self: *const Router, key: PhysicalKey) usize {
-        return if (key.space == .system) self.systemPool() else 0;
+        const t = if (key.space == .system) self.systemPool() else self.pickPool();
+        return at(&self.pools[t], key).putRecord(key, bytes);
     }
 
     /// Writes land in an active pool; a copy left in a draining pool is dropped.
@@ -208,7 +206,7 @@ pub const Router = struct {
         const tok = try self.lockKey(key);
         defer self.unlockToken(tok);
         var target: ?usize = null;
-        if (key.space != .system) for (self.pools, 0..) |*p, i| {
+        for (self.pools, 0..) |*p, i| {
             if (p.mode.load(.acquire) != .active) continue;
             const cur = at(p, key).getRecord(key, self.gpa) catch |e| switch (e) {
                 error.NotFound => continue,
@@ -217,7 +215,7 @@ pub const Router = struct {
             self.gpa.free(cur);
             target = i;
             break;
-        };
+        }
         const t = target orelse if (key.space == .system) self.systemPool() else self.pickPool();
         try at(&self.pools[t], key).putRecord(key, bytes);
         for (self.pools, 0..) |*p, i| {
@@ -228,7 +226,7 @@ pub const Router = struct {
 
     fn getRecord(ctx: *anyopaque, key: PhysicalKey, gpa: std.mem.Allocator) Error![]u8 {
         const self = cast(ctx);
-        if (key.space == .system and !self.moving.load(.acquire)) return at(&self.pools[self.systemPool()], key).getRecord(key, gpa);
+        if (self.pools.len == 1) return at(&self.pools[0], key).getRecord(key, gpa);
         var first: Error = error.NotFound;
         var ob: [max_pools]usize = undefined;
         for (self.order(&ob)) |i| {
