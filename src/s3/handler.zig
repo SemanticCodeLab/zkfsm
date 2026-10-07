@@ -17,6 +17,13 @@ const list_v1 = @import("list_v1.zig");
 const sts = @import("sts.zig");
 const restore = @import("restore.zig");
 const tenancy = @import("tenancy.zig");
+const cors = @import("cors.zig");
+const website = @import("website.zig");
+const access = @import("access.zig");
+const extras = @import("bucket_extras.zig");
+const postobject = @import("postobject.zig");
+const attributes = @import("attributes.zig");
+const checksums = @import("checksums.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -55,6 +62,16 @@ pub const Ctx = struct {
     req_headers: []const Header = &.{},
     /// Extra headers of the response written last.
     resp_headers: []const Header = &.{},
+    host: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    acr_method: ?[]const u8 = null,
+    acr_headers: ?[]const u8 = null,
+    /// Added to every response (CORS headers).
+    extra: []const Header = &.{},
+    /// Status for a served object other than 200/206 (website error documents).
+    status_override: ?std.http.Status = null,
+    /// Request headers, copied (valid after the body is read).
+    headers: []const Header = &.{},
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -75,28 +92,37 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         .peer = env.peer,
         .start_ns = std.time.nanoTimestamp(),
     };
-    var host: ?[]const u8 = null;
     var hit = req.iterateHeaders();
     var copied: std.ArrayList(Header) = .empty;
     while (hit.next()) |h| {
         if (env.observers.len > 0 and copied.items.len < max_observed_headers)
             try copied.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
-        if (std.ascii.eqlIgnoreCase(h.name, "host")) host = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "host")) ctx.host = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "origin")) ctx.origin = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "access-control-request-method")) ctx.acr_method = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "access-control-request-headers")) ctx.acr_headers = try arena.dupe(u8, h.value);
         try ctx.ext.capture(arena, h);
     }
     ctx.req_headers = copied.items;
     for (env.observers) |o| o.begin(o.ctx, &ctx);
     defer for (env.observers) |o| o.end(o.ctx, &ctx, metrics.global.last_status);
-    ctx.route = router.resolve(arena, env.routing, host, ctx.target) catch |e| switch (e) {
+    ctx.env = env;
+    ctx.route = router.resolve(arena, env.routing, ctx.host, ctx.target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
         // Outside the base path: answer like an unknown bucket, before authentication.
         error.OutsidePrefix => return fail(&ctx, .NoSuchBucket),
     };
-    const now_s = std.time.timestamp();
+    if (ctx.route.website) return website.serve(&ctx);
+    if (try cors.preflight(&ctx)) return;
+    try cors.prepare(&ctx);
     var in = try sigv4.Input.fromRequest(arena, req);
+    ctx.headers = in.headers;
+    if (try postobject.handle(&ctx)) return;
+    const now_s = std.time.timestamp();
+    if (ctx.route.vhost) in.vhost_bucket = ctx.route.bucket;
     try sts.prepare(&ctx, &in);
     switch (try sigv4.verify(arena, env.auth, in, now_s)) {
         .ok => |a| ctx.auth = a,
@@ -106,23 +132,80 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     // STS-scoped signatures are only valid for STS calls.
     if (std.mem.eql(u8, ctx.auth.scope.service, "sts")) return fail(&ctx, .AccessDenied);
     for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
-    ctx.env = env;
-    var tbuf: tenancy.NameBuf = undefined;
-    const caller_tenant = tenancy.callerTenant(env.auth, ctx.auth, &tbuf);
-    if (caller_tenant) |t| {
-        if (!tenancy.tenantActive(env.auth, t)) return fail(&ctx, .AccessDenied);
-        ctx.tenant = try arena.dupe(u8, t);
-    }
-    var ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
-    if (env.auth.iam != null and ctx.route.bucket.len > 0) {
-        if (object.tenancy.access(svc, arena, ctx.route.bucket)) |acc| {
-            if (!tenancy.mayReach(env.auth, ctx.auth, caller_tenant, acc.tenant)) return fail(&ctx, .AccessDenied);
-            ar.bucket_policy = acc.policy;
-        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
-    }
-    if (!try authz.allowed(arena, env, ctx.auth, ar, now_s)) return fail(&ctx, .AccessDenied);
+    const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
+    if (!try authorize(&ctx, ar, now_s)) return;
     for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
     try runBuiltin(&ctx);
+}
+
+/// Tenant boundary, IAM and bucket policy, then ACLs; false after answering with an error.
+pub fn authorize(c: *Ctx, request: authz.Request, now_s: i64) ConnError!bool {
+    const env = c.env;
+    var ar = request;
+    var tbuf: tenancy.NameBuf = undefined;
+    const caller_tenant = tenancy.callerTenant(env.auth, c.auth, &tbuf);
+    if (caller_tenant) |t| {
+        if (!tenancy.tenantActive(env.auth, t)) return denyWith(c, .AccessDenied);
+        c.tenant = try c.arena.dupe(u8, t);
+    }
+    if (env.auth.iam != null and ar.bucket.len > 0) {
+        if (object.tenancy.access(c.svc, c.arena, ar.bucket)) |acc| {
+            if (!tenancy.mayReach(env.auth, c.auth, caller_tenant, acc.tenant)) return denyWith(c, .AccessDenied);
+            ar.bucket_policy = acc.policy;
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+        access.restrictPolicy(c, &ar) catch |e| {
+            try failDispatch(c, e);
+            return false;
+        };
+    }
+    ar.extra = access.conditionKeys(c, ar) catch |e| {
+        try failDispatch(c, e);
+        return false;
+    };
+    switch (try authz.decide(c.arena, env, c.auth, ar, now_s)) {
+        .allow => return expectedOwnerOk(c),
+        .explicit_deny => return denyWith(c, .AccessDenied),
+        .implicit_deny => {},
+    }
+    const v = access.fallback(c, ar, now_s) catch |e| {
+        try failDispatch(c, e);
+        return false;
+    };
+    return switch (v) {
+        .allow => expectedOwnerOk(c),
+        .deny => |code| denyWith(c, code),
+    };
+}
+
+/// `x-amz-expected-bucket-owner` must name the bucket's owner.
+fn expectedOwnerOk(c: *Ctx) ConnError!bool {
+    if (c.route.bucket.len == 0) return true;
+    for (c.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-amz-expected-bucket-owner")) {
+        const owner = (acl.bucketAcl(c.svc, c.arena, c.route.bucket) catch |e| {
+            try failDispatch(c, e);
+            return false;
+        }).owner;
+        if (!std.mem.eql(u8, std.mem.trim(u8, h.value, " "), owner)) return denyWith(c, .AccessDenied);
+    };
+    return true;
+}
+
+fn denyWith(c: *Ctx, code: Code) ConnError!bool {
+    try fail(c, code);
+    return false;
+}
+
+/// Answers a dispatch-level error (connection errors pass through).
+pub fn failDispatch(c: *Ctx, e: DispatchError) ConnError!void {
+    return switch (e) {
+        error.OutOfMemory, error.WriteFailed, error.ReadFailed, error.HttpExpectationFailed, error.StreamAborted => |ce| ce,
+        else => |oe| fail(c, errors.fromObject(oe)),
+    };
+}
+
+/// Whether an anonymous GET of `key` would be allowed (website endpoint).
+pub fn anonymousMayRead(c: *Ctx, key: []const u8) DispatchError!bool {
+    return access.anonymousMayRead(c, key);
 }
 
 /// Built-in S3 dispatch; lets an extension wrap the standard handling of a request.
@@ -143,14 +226,15 @@ fn dispatch(c: *Ctx) DispatchError!void {
         else => fail(c, .MethodNotAllowed),
     };
     if (try lifecycle.route(c) or try policy.route(c) or try acl.route(c) or try restore.route(c)) return;
+    if (try cors.route(c) or try website.route(c) or try extras.route(c) or try attributes.route(c)) return;
+    if (r.key.len == 0 and c.method == .PUT and !try acl.checkCreateHeaders(c)) return;
     if (try versioning.route(c)) return;
     if (r.key.len == 0) return switch (c.method) {
-        .PUT => {
-            try object.tenancy.createOwned(c.svc, r.bucket, c.tenant);
-            try respondEmpty(c, .ok, &.{.{ .name = "location", .value = c.target }});
-        },
+        .PUT => createBucket(c),
         .DELETE => {
+            const bid = try c.svc.bucketId(r.bucket);
             try c.svc.deleteBucket(r.bucket);
+            object.bucket_meta.dropAll(c.svc, bid);
             try respondEmpty(c, .no_content, &.{});
         },
         .HEAD => {
@@ -165,6 +249,7 @@ fn dispatch(c: *Ctx) DispatchError!void {
             listObjects(c),
         else => fail(c, .MethodNotAllowed),
     };
+    if (c.method == .GET and (try param(c, "torrent")) != null) return fail(c, .NoSuchKey);
     return switch (c.method) {
         .PUT => putObject(c),
         .GET, .HEAD => getObject(c),
@@ -184,26 +269,79 @@ pub fn param(c: *Ctx, name: []const u8) error{OutOfMemory}!?[]const u8 {
 }
 
 fn listBuckets(c: *Ctx) DispatchError!void {
-    const buckets = try tenancy.visibleBuckets(c.svc, c.arena, c.env.auth, c.auth);
+    const all = try tenancy.visibleBuckets(c.svc, c.arena, c.env.auth, c.auth);
+    std.mem.sort(object.BucketInfo, all, {}, struct {
+        fn lt(_: void, x: object.BucketInfo, y: object.BucketInfo) bool {
+            return std.mem.order(u8, x.name, y.name) == .lt;
+        }
+    }.lt);
+    const prefix = (try param(c, "prefix")) orelse "";
+    const after = (try param(c, "continuation-token")) orelse "";
+    var max: usize = std.math.maxInt(usize);
+    if (try param(c, "max-buckets")) |m| {
+        max = std.fmt.parseInt(usize, m, 10) catch return fail(c, .InvalidArgument);
+        if (max == 0 or max > 10000) return fail(c, .InvalidArgument);
+    }
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "ListAllMyBucketsResult");
     try w.writeAll(owner_xml ++ "<Buckets>");
-    for (buckets) |b| {
+    var shown: usize = 0;
+    var next: ?[]const u8 = null;
+    for (all) |b| {
+        if (!std.mem.startsWith(u8, b.name, prefix)) continue;
+        if (after.len > 0 and std.mem.order(u8, b.name, after) != .gt) continue;
+        if (shown == max) break;
         var tb: [24]u8 = undefined;
         try w.writeAll("<Bucket>");
         try xml.elem(w, "Name", b.name);
         try xml.elem(w, "CreationDate", core.time.iso8601(b.created_ns, &tb));
         try w.writeAll("</Bucket>");
+        shown += 1;
+        next = b.name;
     }
-    try w.writeAll("</Buckets></ListAllMyBucketsResult>");
+    try w.writeAll("</Buckets>");
+    if (shown == max and next != null and hasMore(all, prefix, next.?)) try xml.elem(w, "ContinuationToken", next.?);
+    if (prefix.len > 0) try xml.elem(w, "Prefix", prefix);
+    try w.writeAll("</ListAllMyBucketsResult>");
     try respondXml(c, .ok, a.written());
 }
 
+fn hasMore(all: []const object.BucketInfo, prefix: []const u8, last: []const u8) bool {
+    for (all) |b| if (std.mem.startsWith(u8, b.name, prefix) and std.mem.order(u8, b.name, last) == .gt) return true;
+    return false;
+}
+
+/// CreateBucket. Re-creating a bucket the caller already owns succeeds (us-east-1 semantics).
+fn createBucket(c: *Ctx) DispatchError!void {
+    const who = acl.callerOf(c.env.auth, c.auth);
+    var hdrs: [1]Header = .{.{ .name = "location", .value = std.mem.sliceTo(c.target, '?') }};
+    const body = try versioning.readBodyMax(c, 64 * 1024) orelse return;
+    const location: ?[]const u8 = if (versioning.elemText(body, "LocationConstraint")) |l| (if (l.len > 0) l else null) else null;
+    object.tenancy.createOwned(c.svc, c.route.bucket, c.tenant) catch |e| switch (e) {
+        error.BucketAlreadyExists => {
+            const cur = try acl.bucketAcl(c.svc, c.arena, c.route.bucket);
+            const tenant = object.tenancy.tenantOf(c.svc, c.arena, c.route.bucket) catch "";
+            if (!std.mem.eql(u8, cur.owner, who.id) or !std.mem.eql(u8, tenant, c.tenant)) return fail(c, .BucketAlreadyExists);
+            // Only a plain re-create is a no-op; one that would change the ACL conflicts.
+            if (c.ext.acl.present() or cur.grants.len > 1 or cur.isPublic()) return fail(c, .BucketAlreadyExists);
+            return respondEmpty(c, .ok, &hdrs);
+        },
+        else => return e,
+    };
+    try acl.onBucketCreated(c, who);
+    try extras.applyCreateOwnership(c, c.ext.object_ownership);
+    if (location) |l| try object.bucket_meta.set(c.svc, c.route.bucket, .location, l);
+    try respondEmpty(c, .ok, &hdrs);
+}
+
 fn getLocation(c: *Ctx) DispatchError!void {
-    try c.svc.headBucket(c.route.bucket);
-    const body = xml.declaration ++ "<LocationConstraint xmlns=\"" ++ xml.s3_ns ++ "\"></LocationConstraint>";
-    try respondXml(c, .ok, body);
+    const loc = try object.bucket_meta.get(c.svc, c.arena, c.route.bucket, .location) orelse "";
+    var a: std.Io.Writer.Allocating = .init(c.arena);
+    try a.writer.writeAll(xml.declaration ++ "<LocationConstraint xmlns=\"" ++ xml.s3_ns ++ "\">");
+    try xml.escape(&a.writer, loc);
+    try a.writer.writeAll("</LocationConstraint>");
+    try respondXml(c, .ok, a.written());
 }
 
 fn listObjects(c: *Ctx) DispatchError!void {
@@ -247,8 +385,9 @@ fn listObjects(c: *Ctx) DispatchError!void {
         try keyElem(w, url, "Marker", p.start_after);
     }
     try xml.elemInt(w, "MaxKeys", p.max_keys);
-    try xml.elemBool(w, "IsTruncated", res.is_truncated);
-    if (res.is_truncated) if (res.next_marker) |m| {
+    const truncated = res.is_truncated and p.max_keys > 0;
+    try xml.elemBool(w, "IsTruncated", truncated);
+    if (truncated) if (res.next_marker) |m| {
         if (v2) {
             const hex = try c.arena.alloc(u8, m.len * 2);
             for (m, 0..) |byte, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable; // 2 hex chars fit
@@ -308,31 +447,63 @@ test "keyElem url encoding" {
 
 fn putObject(c: *Ctx) DispatchError!void {
     if (c.copy_source) return fail(c, .NotImplemented);
+    if (!try checksums.checkHeaders(c)) return;
     var body_buf: [io_buf_len]u8 = undefined;
     var check_buf: [io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
     br.limitTo(c.req.head.content_length);
     var in: object.PutInput = .{ .content_type = c.content_type, .content_length = br.contentLength(c.req.head.content_length) };
     if (!try versioning.putExtras(c, &in)) return;
-    const info = c.svc.put(c.route.bucket, c.route.key, br.body(), in) catch |e| {
+    var ck_buf: [io_buf_len]u8 = undefined;
+    var ver = checksums.Verifier.init(c.ext.checksum, br.body(), &br, &ck_buf);
+    var source = br.body();
+    var stored_value: []u8 = "";
+    if (ver) |*v| {
+        v.expect_len = in.content_length;
+        source = &v.reader;
+        // Filled in once the body is read (put encodes internal headers after the body).
+        const prefix = try std.fmt.allocPrint(c.arena, "{s}:FULL_OBJECT:", .{v.alg.wireName()});
+        stored_value = try c.arena.alloc(u8, prefix.len + v.alg.base64Len());
+        @memcpy(stored_value[0..prefix.len], prefix);
+        @memset(stored_value[prefix.len..], 'A');
+        var list: std.ArrayList(object.Header) = .empty;
+        try list.appendSlice(c.arena, in.internal);
+        try list.append(c.arena, .{ .name = checksums.stored_header, .value = stored_value });
+        in.internal = list.items;
+        v.slot = stored_value;
+        if (v.finishEmpty()) |code| return fail(c, code);
+    }
+    const info = c.svc.put(c.route.bucket, c.route.key, source, in) catch |e| {
         if (br.failure) |code| return fail(c, code);
+        if (ver) |v| if (v.failure) |code| return fail(c, code);
         return e;
     };
     var eb: [core.ETag.quoted_max]u8 = undefined;
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.append(c.arena, .{ .name = "etag", .value = info.etag.quoted(&eb) });
+    if (ver) |*v| {
+        try hdrs.append(c.arena, .{ .name = v.alg.headerName(), .value = try c.arena.dupe(u8, v.text()) });
+        try hdrs.append(c.arena, .{ .name = "x-amz-checksum-type", .value = "FULL_OBJECT" });
+    }
     try versioning.putResponseHeaders(c, info, &hdrs);
     try respondEmpty(c, .ok, hdrs.items);
+}
+
+/// GET/HEAD of `c.route.key` (website endpoint documents included).
+pub fn serveObject(c: *Ctx) DispatchError!void {
+    return getObject(c);
 }
 
 fn getObject(c: *Ctx) DispatchError!void {
     const info = try versioning.lookupForRead(c) orelse return;
     var range: ?core.Range = null;
     var parts_count: ?usize = null;
+    var part_n: ?u16 = null;
     if (try param(c, "partNumber")) |pn| {
         if (c.range != null) return fail(c, .InvalidRequest);
         const n = std.fmt.parseInt(u16, pn, 10) catch return fail(c, .InvalidArgument);
-        const sel = partRange(info, n) catch return fail(c, if (n == 0) .InvalidArgument else .InvalidPartNumber);
+        part_n = n;
+        const sel = partRange(info, n) catch return fail(c, if (n == 0) .InvalidArgument else .InvalidPart);
         range = sel.range;
         parts_count = sel.count;
     } else if (c.range) |h| if (core.RangeSpec.parse(h)) |spec| {
@@ -355,7 +526,10 @@ fn getObject(c: *Ctx) DispatchError!void {
     try versioning.objectHeaders(c, info, (try param(c, "versionId")) != null, &hdrs);
     if (c.method == .GET) try versioning.applyResponseOverrides(c, &hdrs);
     if (!try versioning.checkRead(c, info, etag, hdrs.items)) return;
+    if (c.ext.checksum.mode_enabled and (range == null or parts_count != null))
+        try checksums.responseHeaders(c, info, if (parts_count != null) part_n else null, &hdrs);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
+    try hdrs.appendSlice(c.arena, c.extra);
     if (parts_count) |n| try hdrs.append(c.arena, .{ .name = "x-amz-mp-parts-count", .value = try std.fmt.allocPrint(c.arena, "{d}", .{n}) });
     if (range) |r| try hdrs.append(c.arena, .{
         .name = "content-range",
@@ -364,10 +538,11 @@ fn getObject(c: *Ctx) DispatchError!void {
     c.resp_headers = hdrs.items;
     const len = if (range) |r| r.length else info.size;
     var out_buf: [io_buf_len]u8 = undefined;
-    metrics.global.last_status = if (range != null) 206 else 200;
+    const st: std.http.Status = c.status_override orelse if (range != null) .partial_content else .ok;
+    metrics.global.last_status = @intFromEnum(st);
     const opts: std.http.Server.Request.RespondStreamingOptions = .{
         .content_length = len,
-        .respond_options = .{ .status = if (range != null) .partial_content else .ok, .extra_headers = hdrs.items },
+        .respond_options = .{ .status = st, .extra_headers = hdrs.items },
     };
     if (c.method != .GET) {
         var bw = try c.req.respondStreaming(&out_buf, opts);
@@ -431,11 +606,16 @@ pub fn respondXml(c: *Ctx, status: std.http.Status, body: []const u8) ConnError!
 }
 
 pub fn respondXmlWith(c: *Ctx, status: std.http.Status, body: []const u8, extra: []const Header) ConnError!void {
+    return respondBody(c, status, body, "application/xml", extra);
+}
+
+pub fn respondBody(c: *Ctx, status: std.http.Status, body: []const u8, content_type: []const u8, extra: []const Header) ConnError!void {
     metrics.global.last_status = @intFromEnum(status);
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
+    try hdrs.appendSlice(c.arena, c.extra);
     try hdrs.appendSlice(c.arena, &.{
-        .{ .name = "content-type", .value = "application/xml" },
+        .{ .name = "content-type", .value = content_type },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
     c.resp_headers = hdrs.items;
@@ -446,6 +626,7 @@ pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) Con
     metrics.global.last_status = @intFromEnum(status);
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
+    try hdrs.appendSlice(c.arena, c.extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     c.resp_headers = hdrs.items;
     try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
@@ -467,15 +648,20 @@ pub fn fail(c: *Ctx, code: Code) ConnError!void {
 
 pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
     metrics.global.last_status = @intFromEnum(code.status());
+    // Refusing before reading the body: no `100 Continue` (the connection then closes).
+    if (c.req.server.reader.state == .received_head) c.req.head.expect = null;
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const resource = std.mem.sliceTo(c.target, '?');
     errors.writeBody(&a.writer, code, resource, &c.request_id) catch return error.OutOfMemory;
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
+    try hdrs.appendSlice(c.arena, c.extra);
     try hdrs.appendSlice(c.arena, &.{
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
     c.resp_headers = hdrs.items;
-    try c.req.respond(a.written(), .{ .status = code.status(), .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
+    // HEAD responses carry no body.
+    const body = if (c.method == .HEAD) "" else a.written();
+    try c.req.respond(body, .{ .status = code.status(), .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }

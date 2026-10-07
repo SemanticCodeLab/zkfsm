@@ -5,6 +5,7 @@ const core = @import("../core/root.zig");
 const router = @import("router.zig");
 const errors = @import("errors.zig");
 const iam = @import("../iam/root.zig");
+const sigv2 = @import("sigv2.zig");
 
 const sv = core.sigv4;
 const Code = errors.Code;
@@ -37,6 +38,8 @@ pub const Input = struct {
     method: []const u8,
     target: []const u8,
     headers: []const Header,
+    /// Bucket taken from a virtual-host Host header (SigV2 signs it into the resource).
+    vhost_bucket: ?[]const u8 = null,
 
     pub fn header(in: Input, name: []const u8) ?[]const u8 {
         for (in.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -51,7 +54,9 @@ pub const Input = struct {
     }
 };
 
-pub const PayloadMode = enum { unchecked, sha256, chunked_signed, chunked_unsigned };
+pub const PayloadMode = enum { unchecked, sha256, chunked_signed, chunked_signed_trailer, chunked_unsigned };
+
+const streaming_signed_trailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
 
 /// Verified request state needed to check the body as it streams.
 pub const Auth = struct {
@@ -89,6 +94,8 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
     if (payload) |p| {
         if (std.mem.eql(u8, p, sv.streaming_payload)) {
             auth.mode = .chunked_signed;
+        } else if (std.mem.eql(u8, p, streaming_signed_trailer)) {
+            auth.mode = .chunked_signed_trailer;
         } else if (std.mem.eql(u8, p, sv.streaming_unsigned_trailer)) {
             auth.mode = .chunked_unsigned;
         } else if (std.mem.startsWith(u8, p, "STREAMING-")) {
@@ -101,7 +108,7 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
             auth.mode = .sha256;
         }
     }
-    if (auth.mode == .chunked_signed or auth.mode == .chunked_unsigned) {
+    if (auth.mode == .chunked_signed or auth.mode == .chunked_signed_trailer or auth.mode == .chunked_unsigned) {
         if (in.header("x-amz-decoded-content-length")) |d|
             auth.decoded_length = std.fmt.parseInt(u64, d, 10) catch return deny(.InvalidArgument);
     }
@@ -109,6 +116,11 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
     const store = cfg.iam orelse return .{ .ok = auth };
     const src: Source = .{ .cfg = cfg, .store = store, .now_s = now_s };
     const query = if (std.mem.indexOfScalar(u8, in.target, '?')) |i| in.target[i + 1 ..] else "";
+    switch (try sigv2.parse(arena, in.method, in.target, in.headers)) {
+        .none => {},
+        .malformed => return deny(.InvalidArgument),
+        .parsed => |p| return checkV2(arena, src, in, p, &auth),
+    }
     if (in.header("authorization")) |h| {
         const p = parseAuthorization(h) orelse return deny(.AuthorizationHeaderMalformed);
         const amz_date = in.header("x-amz-date") orelse return deny(.AccessDenied);
@@ -140,7 +152,7 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
     const signed = try qp(arena, query, "X-Amz-SignedHeaders") orelse return deny(.AuthorizationHeaderMalformed);
     if (!std.mem.eql(u8, alg, sv.algorithm)) return deny(.AuthorizationHeaderMalformed);
     const expires = std.fmt.parseInt(i64, exp_s, 10) catch return deny(.AuthorizationHeaderMalformed);
-    if (expires < 1 or expires > max_presign_expires_s) return deny(.AuthorizationHeaderMalformed);
+    if (expires < 1 or expires > max_presign_expires_s) return deny(.AccessDenied);
     const t = sv.parseAmzDate(amz_date) catch return deny(.AuthorizationHeaderMalformed);
     if (now_s + max_skew_s < t or now_s > t + expires) return deny(.AccessDenied);
     const p: Parsed = .{
@@ -151,6 +163,64 @@ pub fn verify(arena: std.mem.Allocator, cfg: Config, in: Input, now_s: i64) erro
     const ph = try qp(arena, query, "X-Amz-Content-Sha256") orelse sv.unsigned_payload;
     const token = try qp(arena, query, "X-Amz-Security-Token");
     return check(arena, src, token, in, p, amz_date, ph, true, &auth);
+}
+
+/// Legacy SigV2 (header or presigned query); the payload is never checked.
+fn checkV2(arena: std.mem.Allocator, src: Source, in: Input, p: sigv2.Parsed, auth: *Auth) error{OutOfMemory}!Outcome {
+    switch (sigv2.checkTime(in.headers, p.expires_s, src.now_s)) {
+        .ok => {},
+        .expired, .missing_date => return deny(.AccessDenied),
+        .skewed => return deny(.RequestTimeTooSkewed),
+    }
+    if (p.expires_s) |e| if (e - src.now_s > max_presign_expires_s) return deny(.AccessDenied);
+    var sbuf: iam.Store.SecretBuf = undefined;
+    var sts_secret: [iam.sts.secret_key_len]u8 = undefined;
+    var dbuf: iam.sts.DecodeBuffer = undefined;
+    auth.principal = p.access_key;
+    auth.access_key = p.access_key;
+    const token = in.header("x-amz-security-token") orelse blk: {
+        const q = if (std.mem.indexOfScalar(u8, in.target, '?')) |i| in.target[i + 1 ..] else "";
+        break :blk router.queryParam(arena, q, "x-amz-security-token") catch null;
+    };
+    const secret: []const u8 = if (token) |t| blk: {
+        const issuer = src.cfg.sts orelse return deny(.InvalidToken);
+        const claims = issuer.verify(p.access_key, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
+            error.Expired => .ExpiredToken,
+            else => .InvalidToken,
+        });
+        auth.principal = try arena.dupe(u8, claims.parent);
+        auth.session_policy = if (claims.session_policy) |sp| try arena.dupe(u8, sp) else null;
+        auth.federated_policies = if (claims.federated_policies) |fp| try arena.dupe(u8, fp) else null;
+        auth.tenant = try arena.dupe(u8, claims.tenant);
+        sts_secret = issuer.secretFor(p.access_key);
+        break :blk &sts_secret;
+    } else src.store.secretFor(p.access_key, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);
+    const expires_raw: ?[]const u8 = if (p.presigned) blk: {
+        const q = if (std.mem.indexOfScalar(u8, in.target, '?')) |i| in.target[i + 1 ..] else "";
+        break :blk rawQueryValue(q, "Expires");
+    } else null;
+    const sts = try sigv2.stringToSign(arena, in.method, in.target, in.headers, expires_raw, in.vhost_bucket);
+    if (!sigv2.verifySignature(sigv2.sign(secret, sts), p.signature)) {
+        // Some clients sign a bucket-level path-style resource as `/bucket/`.
+        const q = std.mem.indexOfScalar(u8, in.target, '?') orelse in.target.len;
+        const path = in.target[0..q];
+        if (in.vhost_bucket != null or path.len < 2 or std.mem.indexOfScalarPos(u8, path, 1, '/') != null) return deny(.SignatureDoesNotMatch);
+        const alt = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, in.target[q..] });
+        const sts2 = try sigv2.stringToSign(arena, in.method, alt, in.headers, expires_raw, null);
+        if (!sigv2.verifySignature(sigv2.sign(secret, sts2), p.signature)) return deny(.SignatureDoesNotMatch);
+    }
+    // Chunked bodies are not signed per chunk under V2; their framing is still decoded.
+    if (auth.mode == .chunked_signed or auth.mode == .chunked_signed_trailer) auth.mode = .chunked_unsigned;
+    return .{ .ok = auth.* };
+}
+
+fn rawQueryValue(q: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, q, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 const Credential = struct { access_key: []const u8, scope: sv.Scope };
@@ -339,12 +409,21 @@ fn repeatedQueryName(target: []const u8) bool {
 pub fn parseHead(arena: std.mem.Allocator, head: []const u8) std.http.Server.Request.Head.ParseError!std.http.Server.Request.Head {
     const Head = std.http.Server.Request.Head;
     var h = Head.parse(head) catch |e| blk: {
-        if (e != error.HttpTransferEncodingUnsupported) return e;
+        if (e != error.HttpTransferEncodingUnsupported and e != error.HttpHeadersInvalid) return e;
         var a: Writer.Allocating = .init(arena);
         stripChunkedEncoding(&a.writer, head) catch return e;
-        break :blk try Head.parse(a.written());
+        break :blk Head.parse(a.written()) catch {
+            // Content-Encoding is object metadata here, never decoded: parse without it.
+            var b: Writer.Allocating = .init(arena);
+            stripContentEncoding(&b.writer, head) catch return e;
+            break :blk try Head.parse(b.written());
+        };
     };
     h.target = originForm(h.target);
+    // Only `100-continue` means anything; other Expect values are ignored.
+    if (h.expect) |x| if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, x, " "), "100-continue")) {
+        h.expect = null;
+    };
     return h;
 }
 
@@ -355,6 +434,16 @@ fn originForm(target: []const u8) []const u8 {
         return rest[i..];
     };
     return target;
+}
+
+fn stripContentEncoding(w: *Writer, head: []const u8) Writer.Error!void {
+    const name = "content-encoding:";
+    var lines = std.mem.splitScalar(u8, head, '\n');
+    while (lines.next()) |l| {
+        if (lines.peek() == null) return w.writeAll(l);
+        if (l.len >= name.len and std.ascii.eqlIgnoreCase(l[0..name.len], name)) continue;
+        try w.print("{s}\n", .{l});
+    }
 }
 
 fn stripChunkedEncoding(w: *Writer, head: []const u8) Writer.Error!void {
@@ -390,6 +479,10 @@ test "head with aws-chunked content encoding" {
     const p = try parseHead(arena.allocator(), "GET http://b.s3.local:9000/k?acl HTTP/1.1\r\nHost: b.s3.local:9000\r\n\r\n");
     try std.testing.expectEqualStrings("/k?acl", p.target);
     try std.testing.expectEqualStrings("/", originForm("http://host"));
+    const d = try parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Encoding: deflate, gzip\r\nExpect: 200\r\nContent-Length: 1\r\n\r\n");
+    try std.testing.expectEqual(@as(?u64, 1), d.content_length);
+    try std.testing.expect(d.expect == null);
+    try std.testing.expectError(error.InvalidContentLength, parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
 }
 
 /// Wraps a request body per `Auth`: verifies a declared sha256 at EOF, or
@@ -407,7 +500,17 @@ pub const BodyReader = struct {
     /// Unread bytes of a plain body with a known length. Stopping at zero keeps the
     /// HTTP body reader from being read past its end, which it does not allow.
     left: ?u64 = null,
+    /// Checksum trailer (`x-amz-checksum-*: value`) of a chunked body, once read.
+    trailer_name: [32]u8 = undefined,
+    trailer_name_len: u8 = 0,
+    trailer_value: [96]u8 = undefined,
+    trailer_value_len: u8 = 0,
     reader: Reader,
+
+    pub fn trailer(self: *const BodyReader) ?struct { name: []const u8, value: []const u8 } {
+        if (self.trailer_name_len == 0) return null;
+        return .{ .name = self.trailer_name[0..self.trailer_name_len], .value = self.trailer_value[0..self.trailer_value_len] };
+    }
 
     pub fn init(auth: Auth, in: *Reader, buffer: []u8) BodyReader {
         return .{
@@ -431,7 +534,7 @@ pub const BodyReader = struct {
     /// Decoded payload length for chunked bodies, else the HTTP length.
     pub fn contentLength(self: *const BodyReader, http_length: ?u64) ?u64 {
         return switch (self.auth.mode) {
-            .chunked_signed, .chunked_unsigned => self.auth.decoded_length,
+            .chunked_signed, .chunked_signed_trailer, .chunked_unsigned => self.auth.decoded_length,
             else => http_length,
         };
     }
@@ -521,7 +624,7 @@ pub const BodyReader = struct {
         const l = try self.line();
         const semi = std.mem.indexOfScalar(u8, l, ';');
         const size = std.fmt.parseInt(u64, l[0 .. semi orelse l.len], 16) catch return self.fail(.InvalidArgument);
-        if (self.auth.mode == .chunked_signed) {
+        if (self.auth.mode == .chunked_signed or self.auth.mode == .chunked_signed_trailer) {
             const ext = if (semi) |i| l[i + 1 ..] else return self.fail(.InvalidArgument);
             const prefix = "chunk-signature=";
             if (!std.mem.startsWith(u8, ext, prefix) or ext.len != prefix.len + 64) return self.fail(.InvalidArgument);
@@ -532,10 +635,14 @@ pub const BodyReader = struct {
         self.state = .data;
         if (size > 0) return;
         if (!self.chunkSignatureOk()) return self.fail(.SignatureDoesNotMatch);
-        // Trailer section (checksum trailers are not verified yet), then the blank line.
+        // Trailer section, then the blank line. Signed trailers end with their signature.
+        var trailer_hash: sv.Sha256 = .init(.{});
+        var signed_trailer = false;
         var i: usize = 0;
         while (i < max_trailer_lines) : (i += 1) {
-            if ((try self.line()).len == 0) {
+            const tl = try self.line();
+            if (tl.len == 0) {
+                if (self.auth.mode == .chunked_signed_trailer and !signed_trailer and self.trailer_name_len > 0) return self.fail(.SignatureDoesNotMatch);
                 // Drain to the HTTP end of body so the connection stays reusable.
                 const extra = self.in.discardRemaining() catch return self.fail(.IncompleteBody);
                 if (extra != 0) return self.fail(.InvalidArgument);
@@ -543,12 +650,43 @@ pub const BodyReader = struct {
                 return;
             }
             if (self.auth.mode == .chunked_signed) return self.fail(.InvalidArgument);
+            const colon = std.mem.indexOfScalar(u8, tl, ':') orelse return self.fail(.InvalidArgument);
+            const name = std.mem.trim(u8, tl[0..colon], " ");
+            const value = std.mem.trim(u8, tl[colon + 1 ..], " ");
+            if (std.ascii.eqlIgnoreCase(name, "x-amz-trailer-signature")) {
+                if (self.auth.mode != .chunked_signed_trailer) return self.fail(.InvalidArgument);
+                if (!self.trailerSignatureOk(&trailer_hash, value)) return self.fail(.SignatureDoesNotMatch);
+                signed_trailer = true;
+                continue;
+            }
+            trailer_hash.update(tl[0..colon]);
+            trailer_hash.update(":");
+            trailer_hash.update(value);
+            trailer_hash.update("\n");
+            if (name.len <= self.trailer_name.len and value.len <= self.trailer_value.len) {
+                for (name, 0..) |ch, k| self.trailer_name[k] = std.ascii.toLower(ch);
+                self.trailer_name_len = @intCast(name.len);
+                @memcpy(self.trailer_value[0..value.len], value);
+                self.trailer_value_len = @intCast(value.len);
+            }
         }
         return self.fail(.InvalidArgument);
     }
 
+    fn trailerSignatureOk(self: *BodyReader, h: *sv.Sha256, got: []const u8) bool {
+        const key = self.auth.key orelse return true;
+        if (got.len != 64) return false;
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        var buf: [1024]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        w.print("AWS4-HMAC-SHA256-TRAILER\n{s}\n{f}\n{s}\n{s}", .{ self.auth.amz_date, self.auth.scope, &self.prev, &std.fmt.bytesToHex(digest, .lower) }) catch return false;
+        const sig = sv.sign(key, w.buffered());
+        return std.crypto.timing_safe.eql(sv.Hex, sig, got[0..64].*);
+    }
+
     fn chunkSignatureOk(self: *BodyReader) bool {
-        if (self.auth.mode != .chunked_signed) return true;
+        if (self.auth.mode != .chunked_signed and self.auth.mode != .chunked_signed_trailer) return true;
         const key = self.auth.key orelse return true;
         const digest = self.hasher.finalResult();
         var buf: [1024]u8 = undefined;

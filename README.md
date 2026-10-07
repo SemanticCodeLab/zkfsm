@@ -33,7 +33,9 @@ start unless `--anonymous` is passed. Defaults: data root `$ZKFSM_DATA`, else
 `./data`; listen `0.0.0.0:9000`. Path-style addressing
 (`http://host:9000/bucket/key`); `--domain s3.example.com` (repeatable, or
 `$ZKFSM_DOMAIN`) adds virtual-host style (`http://bucket.s3.example.com/key`),
-and `--path-prefix /s3` (or `$ZKFSM_PATH_PREFIX`) serves the API under a base
+`--website-domain web.example.com` (repeatable, or `$ZKFSM_WEBSITE_DOMAIN`)
+serves each bucket's static website at `http://bucket.web.example.com/`, and
+`--path-prefix /s3` (or `$ZKFSM_PATH_PREFIX`) serves the API under a base
 path; requests outside it get `404 NoSuchBucket`. `--health-prefix`,
 `--metrics-path`, and `--no-minio-compat` move or trim the operational
 endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
@@ -171,6 +173,40 @@ STS `AssumeRole` (`POST /`, form body) returns temporary credentials for the
 signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
 narrowed by a session `Policy`; standard `sts assume-role` clients work
 unchanged against the server endpoint.
+
+### ACLs, CORS, websites, and form uploads
+
+IAM and bucket policies decide first; when they do not allow a request, bucket
+and object ACLs may still grant it. Canned ACLs (`private`, `public-read`,
+`public-read-write`, `authenticated-read`, `bucket-owner-read`,
+`bucket-owner-full-control`, `log-delivery-write`), `x-amz-grant-*` headers,
+and `AccessControlPolicy` bodies are stored and evaluated; grantees are the
+root (canonical ID `zkfsm`), IAM users and service accounts (by name), and the
+`AllUsers`/`AuthenticatedUsers`/`LogDelivery` groups. Identities without IAM
+grants own the buckets and objects they create. An explicit policy deny always
+wins, and the root is never restricted. Ownership controls
+(`BucketOwnerEnforced` disables ACLs), public access blocks, and
+`x-amz-expected-bucket-owner` apply as in S3.
+
+Bucket CORS rules answer unauthenticated `OPTIONS` preflights and add
+`Access-Control-*` headers to every response for a matching `Origin`. A
+bucket with a website configuration (index and error documents, redirect-all,
+routing rules) is served anonymously on the `--website-domain` endpoint;
+objects must be publicly readable by policy or ACL. Browser-form `POST`
+uploads check the form's POST policy (SigV4 or SigV2 signature, expiration,
+`eq`/`starts-with`/`content-length-range` conditions) and honor
+`success_action_status` and `success_action_redirect`. Legacy SigV2 header and
+presigned (`AWSAccessKeyId`/`Expires`/`Signature`) requests are accepted.
+
+Additional checksums (`x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`,
+`-sha1`, `-sha256`), in headers or aws-chunked trailers (signed or unsigned),
+are verified before the object commits, stored, and returned with
+`x-amz-checksum-mode: ENABLED`; multipart uploads keep per-part checksums and
+produce composite or full-object values. `GetObjectAttributes`, conditional
+writes (`If-None-Match`/`If-Match` on PutObject and CompleteMultipartUpload),
+bucket logging configuration (stored; logs are not delivered), and the
+accelerate and request-payment stubs are available; `x-amz-request-payer` is
+accepted and ignored.
 
 ### Tiering
 
@@ -457,21 +493,23 @@ local venv in `tests/s3/.venv`. CI runs the boto3 and S3 CLI suites.
 
 | Client | Checks per layout | Passed (single / EC:4+2) | Known gaps (xfail) |
 | --- | --- | --- | --- |
-| boto3 (pytest) | 145 | 142 / 142 | 3 |
+| boto3 (pytest) | 160 | 160 / 160 | 0 |
 | S3 CLI (`s3`, `s3api`) | 44 | 44 / 44 | 0 |
 | MinIO client | 23 | 23 / 23 | 0 |
 | rclone v1.75.1 | 21 | 21 / 21 | 0 |
 | s5cmd v2.3.0 | 17 | 17 / 17 | 0 |
 
-Total: 496/502 passed, 6 xfail. The xfails are features not implemented:
-virtual-host-style addressing without a configured domain, browser-form POST
-uploads, and SigV2 signatures.
+Total: 532/532 passed. Virtual-host style is tested with `--domain localhost`.
 
-`SUITES=s3tests tests/s3/run.sh` also runs a subset of
+`SUITES=s3tests tests/s3/run.sh` also runs
 [ceph/s3-tests](https://github.com/ceph/s3-tests) (MIT, cloned at a pinned
-commit at test time), excluding feature groups zkfsm does not have (ACL-only
-IAM, SSE, website, CORS, lifecycle, notifications, select). Reported
-separately, not gating: 283/435 on a single drive and 283/435 on EC:4+2.
+commit at test time). With `MC` set, a second IAM user plays the "alt" account.
+Excluded: vendor and IAM-service extensions, time-scaled lifecycle runs, bucket
+logging delivery, and the SSE/KMS/Select/notification groups (covered by their
+own suites). Reported separately, not gating: 503/524 on a single drive and
+501/524 on EC:4+2. The remaining failures are tests whose premise does not
+apply: RGW tenant syntax, root bypassing bucket-policy denies, and
+`fails_on_rgw` header tests that edit headers before signing.
 
 ## Status
 
@@ -484,8 +522,10 @@ Pre-1.0. Working today and covered by tests:
   expiration (current, noncurrent, delete markers, incomplete uploads) and
   transition to remote tiers (S3-compatible, Azure, GCS) with RestoreObject,
   bucket policies (including anonymous access), GET/HEAD by `partNumber`,
-  canned private ACLs, and ListObjects v1.
-- **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
+  canned and grant ACLs, ownership controls, public access blocks, CORS,
+  static websites, browser-form POST uploads, additional checksums,
+  GetObjectAttributes, conditional writes, and ListObjects v1.
+- **Security**: SigV4 and SigV2 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
   evaluation, STS session tokens; OpenID Connect, LDAP, and client
   certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
@@ -505,5 +545,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: bucket
-notifications, non-private ACLs, TLS termination
+notifications, bucket access log delivery, TLS termination
 (run behind a proxy).

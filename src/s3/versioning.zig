@@ -26,12 +26,17 @@ pub const Headers = struct {
     content_md5: ?[]const u8 = null,
     bypass_governance: bool = false,
     bucket_lock: bool = false,
+    acl: @import("acl.zig").RequestAcl = .{},
+    object_ownership: ?[]const u8 = null,
+    checksum: @import("checksums.zig").RequestChecksums = .{},
     /// x-amz-meta-* with the prefix stripped and names lowercased; repeats joined by ",".
     meta: std.ArrayList(object.Header) = .empty,
     system: object.SystemHeaders = .{},
 
     pub fn capture(self: *Headers, arena: std.mem.Allocator, h: Header) error{OutOfMemory}!void {
         try self.captureMeta(arena, h);
+        try self.acl.capture(arena, h);
+        try self.checksum.capture(arena, h);
         const fields = .{
             .{ "if-match", "if_match" },
             .{ "if-none-match", "if_none_match" },
@@ -42,6 +47,7 @@ pub const Headers = struct {
             .{ "x-amz-object-lock-retain-until-date", "lock_until" },
             .{ "x-amz-object-lock-legal-hold", "legal_hold" },
             .{ "content-md5", "content_md5" },
+            .{ "x-amz-object-ownership", "object_ownership" },
         };
         inline for (fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[0])) {
             @field(self, f[1]) = try arena.dupe(u8, h.value);
@@ -87,7 +93,7 @@ pub fn withoutAwsChunked(arena: std.mem.Allocator, v: []const u8) error{OutOfMem
     while (it.next()) |tok| {
         const t = std.mem.trim(u8, tok, " ");
         if (t.len == 0 or std.ascii.eqlIgnoreCase(t, "aws-chunked")) continue;
-        if (out.items.len > 0) try out.append(arena, ',');
+        if (out.items.len > 0) try out.appendSlice(arena, ", ");
         try out.appendSlice(arena, t);
     }
     return out.items;
@@ -213,6 +219,14 @@ pub fn putExtras(c: *Ctx, in: *object.PutInput) DispatchError!bool {
         }
         in.content_md5 = md5;
     }
+    const acl = @import("acl.zig");
+    if (!try acl.checkWriteHeaders(c)) return false;
+    if (try acl.newObjectHeader(c, acl.callerOf(c.env.auth, c.auth))) |hdr| {
+        var list: std.ArrayList(object.Header) = .empty;
+        try list.appendSlice(c.arena, in.internal);
+        try list.append(c.arena, hdr);
+        in.internal = list.items;
+    }
     return true;
 }
 
@@ -265,7 +279,11 @@ fn versionClass(c: *Ctx, e: ov.VersionEntry) []const u8 {
 /// Looks up the version to serve; answers delete markers itself (returns null).
 pub fn lookupForRead(c: *Ctx) DispatchError!?object.ObjectInfo {
     const v = try versionParam(c);
-    const info = try ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, v);
+    const info = ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, v) catch |e| {
+        if (e != error.NoSuchKey) return e;
+        try handler.failWith(c, .NoSuchKey, &.{.{ .name = "x-amz-delete-marker", .value = "false" }});
+        return null;
+    };
     if (!info.delete_marker) return info;
     const hdrs = [_]Header{ .{ .name = "x-amz-delete-marker", .value = "true" }, try versionHeader(c, info.version_id) };
     try handler.failWith(c, if (v != null) .MethodNotAllowed else .NoSuchKey, &hdrs);
@@ -347,8 +365,12 @@ fn putLockConfig(c: *Ctx) DispatchError!void {
     var d: ov.LockDefault = .{};
     if (elemText(body, "DefaultRetention")) |dr| {
         d.mode = parseMode(elemText(dr, "Mode") orelse "") orelse return handler.fail(c, .MalformedXML);
-        if (elemText(dr, "Days")) |s| d.days = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .MalformedXML);
-        if (elemText(dr, "Years")) |s| d.years = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .MalformedXML);
+        const days = elemText(dr, "Days");
+        const years = elemText(dr, "Years");
+        if (days != null and years != null) return handler.fail(c, .MalformedXML);
+        if (days) |s| d.days = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .InvalidRetentionPeriod);
+        if (years) |s| d.years = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .InvalidRetentionPeriod);
+        if (d.days == 0 and d.years == 0) return handler.fail(c, .InvalidRetentionPeriod);
     }
     try ov.setLockConfig(c.svc, c.route.bucket, d);
     try handler.respondEmpty(c, .ok, &.{});
@@ -357,6 +379,7 @@ fn putLockConfig(c: *Ctx) DispatchError!void {
 // ---- object retention, legal hold, tagging ----
 
 fn getRetention(c: *Ctx) DispatchError!void {
+    if (!(try ov.getConfig(c.svc, c.arena, c.route.bucket)).lock_enabled) return handler.fail(c, .InvalidRequest);
     const info = try ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, try versionParam(c));
     if (info.delete_marker) return handler.fail(c, .MethodNotAllowed);
     if (info.retention_mode == .none) return handler.fail(c, .NoSuchObjectLockConfiguration);
@@ -425,7 +448,14 @@ fn objectTagging(c: *Ctx) DispatchError!void {
     }
 }
 
-fn writeTagging(c: *Ctx, tags: []const object.Tag, version: ?core.VersionId) DispatchError!void {
+fn writeTagging(c: *Ctx, unsorted: []const object.Tag, version: ?core.VersionId) DispatchError!void {
+    // Tag sets are unordered; answer in key order.
+    const tags = try c.arena.dupe(object.Tag, unsorted);
+    std.mem.sort(object.Tag, tags, {}, struct {
+        fn lt(_: void, x: object.Tag, y: object.Tag) bool {
+            return std.mem.order(u8, x.key, y.key) == .lt;
+        }
+    }.lt);
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "Tagging");

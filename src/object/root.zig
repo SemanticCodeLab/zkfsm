@@ -17,6 +17,8 @@ pub const quota = @import("quota.zig");
 pub const tenancy = @import("tenancy.zig");
 pub const replica = @import("replica.zig");
 pub const events = @import("events.zig");
+pub const bucket_meta = @import("bucket_meta.zig");
+pub const objmeta = @import("objmeta.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -60,4 +62,6 @@ test {
     _ = quota;
     _ = tenancy;
     _ = replica;
+    _ = bucket_meta;
+    _ = objmeta;
 }

@@ -8,6 +8,10 @@ pub const Target = struct {
     bucket: []const u8,
     key: []const u8,
     query: []const u8,
+    /// The bucket came from the Host header.
+    vhost: bool = false,
+    /// The Host is a static-website endpoint of the bucket.
+    website: bool = false,
 };
 
 /// Deployment addressing: base path and virtual-host domains.
@@ -16,6 +20,8 @@ pub const Routing = struct {
     path_prefix: []const u8 = "",
     /// Hosts `{bucket}.{domain}` address `bucket`.
     domains: []const []const u8 = &.{},
+    /// Hosts `{bucket}.{domain}` serve `bucket` as a static website.
+    website_domains: []const []const u8 = &.{},
 };
 
 pub const ResolveError = Error || error{OutsidePrefix};
@@ -24,13 +30,16 @@ pub const ResolveError = Error || error{OutsidePrefix};
 pub fn resolve(arena: std.mem.Allocator, cfg: Routing, host: ?[]const u8, target: []const u8) ResolveError!Target {
     var rest = stripPrefix(cfg.path_prefix, target) orelse return error.OutsidePrefix;
     if (rest.len == 0 or rest[0] == '?') rest = try std.fmt.allocPrint(arena, "/{s}", .{rest});
-    const bucket = if (host) |h| vhostBucket(cfg.domains, h) else null;
+    const site = if (host) |h| vhostBucket(cfg.website_domains, h) else null;
+    const bucket = site orelse if (host) |h| vhostBucket(cfg.domains, h) else null;
     const b = bucket orelse return parse(arena, rest);
     var t = try parse(arena, rest);
     // The whole path is the key; the bucket came from the host.
     const q = std.mem.indexOfScalar(u8, rest, '?') orelse rest.len;
     t.key = try percentDecode(arena, rest[1..q], false);
     t.bucket = b;
+    t.vhost = true;
+    t.website = site != null;
     return t;
 }
 
@@ -151,6 +160,10 @@ test "base path, virtual hosts, and path validation" {
     try std.testing.expectEqualStrings("", root.key);
     try std.testing.expectEqualStrings("", (try resolve(a, .{ .domains = &.{"example.com"} }, "example.com", "/")).bucket);
     try std.testing.expect(vhostBucket(&.{"example.com"}, "[::1]:9000") == null);
+    const web = try resolve(a, .{ .domains = &.{"example.com"}, .website_domains = &.{"web.example.com"} }, "site.web.example.com", "/docs/");
+    try std.testing.expect(web.website and web.vhost);
+    try std.testing.expectEqualStrings("site", web.bucket);
+    try std.testing.expect(!(try resolve(a, .{ .domains = &.{"example.com"} }, "b.example.com", "/k")).website);
     try std.testing.expect(validBasePath("/s3"));
     try std.testing.expect(validBasePath("/api/s3"));
     for ([_][]const u8{ "", "/", "s3", "/s3/", "/a?b", "/a/../b", "/a//b", "/a%2f" }) |bad| try std.testing.expect(!validBasePath(bad));

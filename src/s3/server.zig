@@ -303,7 +303,12 @@ pub const Server = struct {
             var req: std.http.Server.Request = .{
                 .server = &http,
                 .head_buffer = head_buffer,
-                .head = sigv4.parseHead(arena.allocator(), head_buffer) catch return,
+                .head = sigv4.parseHead(arena.allocator(), head_buffer) catch {
+                    // Unparseable head (e.g. a negative Content-Length): answer, then close.
+                    _ = out.writeAll(bad_request) catch {};
+                    _ = out.flush() catch {};
+                    return;
+                },
             };
             const keep_alive = req.head.keep_alive;
             if (self.rawRoute(req.head.target)) |r| {
@@ -328,6 +333,9 @@ pub const Server = struct {
         }
     }
 };
+
+const bad_request = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/xml\r\ncontent-length: 118\r\nconnection: close\r\n\r\n" ++
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BadRequest</Code><Message>Malformed request head</Message></Error>";
 
 /// True when the request body was consumed exactly, so the next request can follow.
 /// A reader that stopped at the declared length never saw EndOfStream; mark it ready.

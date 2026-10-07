@@ -35,6 +35,21 @@ pub fn resolveSource(svc: *ObjectService, arena: std.mem.Allocator, src: Source)
     return info;
 }
 
+/// Internal headers that describe the version rather than the blob (ACL, owner) start with this.
+pub const version_scoped_prefix = @import("../metadata/root.zig").headers.internal_prefix ++ "obj-";
+
+/// Blob-scoped source headers, then the destination's own.
+fn copiedInternal(a: std.mem.Allocator, src: []const service.Header, dst: []const service.Header) Error![]const service.Header {
+    var out: std.ArrayList(service.Header) = .empty;
+    outer: for (src) |h| {
+        if (std.mem.startsWith(u8, h.name, version_scoped_prefix)) continue;
+        for (dst) |d| if (std.mem.eql(u8, d.name, h.name)) continue :outer;
+        try out.append(a, h);
+    }
+    try out.appendSlice(a, dst);
+    return out.items;
+}
+
 /// Copies `src` to `dst_bucket/dst_key`. Copying an object onto itself is allowed.
 pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_key: []const u8, in: CopyInput) Error!service.ObjectInfo {
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
@@ -48,7 +63,7 @@ pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_
     defer src_rd.deinit();
     var put_in = in.put;
     put_in.content_length = info.blob_size;
-    put_in.internal = info.internal;
+    put_in.internal = try copiedInternal(arena.allocator(), info.internal, in.put.internal);
     put_in.logical_size = info.logical_size;
     put_in.etag_override = info.etag_override;
     if (!in.replace_metadata) {

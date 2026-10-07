@@ -32,6 +32,8 @@ const usage =
     \\  --anonymous      serve without authentication when no credentials are set
     \\  --domain         virtual-host domain: Host {bucket}.D addresses the bucket; repeatable
     \\                   (default: $ZKFSM_DOMAIN, comma-separated)
+    \\  --website-domain static-website endpoint: Host {bucket}.D serves the bucket's website
+    \\                   configuration; repeatable (default: $ZKFSM_WEBSITE_DOMAIN)
     \\  --path-prefix    base path of the S3 API, e.g. /s3 (default: $ZKFSM_PATH_PREFIX, else /)
     \\  --health-prefix  health endpoints at P/live and P/ready (default: /health)
     \\  --metrics-path   Prometheus metrics path (default: /metrics)
@@ -81,6 +83,7 @@ const Config = struct {
     scan_interval_s: u64 = 600,
     anonymous: bool = false,
     domains: []const []const u8 = &.{},
+    website_domains: []const []const u8 = &.{},
     path_prefix: ?[]const u8 = null,
     health_prefix: []const u8 = "/health",
     metrics_path: []const u8 = "/metrics",
@@ -138,6 +141,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
     var cfg: Config = .{ .data = &.{} };
     var specs: std.ArrayList([]const u8) = .empty;
     var domains: std.ArrayList([]const u8) = .empty;
+    var website_domains: std.ArrayList([]const u8) = .empty;
     var groups: std.ArrayList([]const []const u8) = .empty;
     var cas: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
@@ -206,6 +210,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.lifecycle_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--domain")) {
             try domains.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--website-domain")) {
+            if (!validDomain(args[i])) return error.BadArgs;
+            try website_domains.append(arena, args[i]);
         } else if (std.mem.eql(u8, a, "--path-prefix")) {
             cfg.path_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--health-prefix")) {
@@ -226,6 +233,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
         try groups.append(arena, specs.items);
     }
     cfg.cluster_ca = cas.items;
+    cfg.website_domains = website_domains.items;
     var urls: usize = 0;
     for (specs.items) |sp| urls += @intFromBool(cluster.isUrl(sp));
     if (urls > 0) {
@@ -426,7 +434,7 @@ pub fn run(opts: Options) u8 {
         .observers = &observers,
         .tls = if (tls_paths != null) &tls_ctx else null,
         .limits = cfg.limits,
-        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
+        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
     };
     var gateways = gateway.Running.start(.{
@@ -545,7 +553,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .observers = &observers,
         .tls = if (tls_paths != null) &tls_ctx else null,
         .limits = cfg.limits,
-        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
+        .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
         .raw_routes = &routes,
         .ready = .{ .ctx = node, .func = clusterReady },
@@ -840,6 +848,16 @@ fn applyEnv(arena: std.mem.Allocator, cfg: *Config) error{ BadArgs, OutOfMemory 
             try list.append(arena, d);
         }
         cfg.domains = list.items;
+    }
+    if (cfg.website_domains.len == 0) {
+        const v = envVar(arena, "ZKFSM_WEBSITE_DOMAIN") catch return error.OutOfMemory;
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, v orelse "", ", ");
+        while (it.next()) |d| {
+            if (!validDomain(d)) return error.BadArgs;
+            try list.append(arena, d);
+        }
+        cfg.website_domains = list.items;
     }
 }
 

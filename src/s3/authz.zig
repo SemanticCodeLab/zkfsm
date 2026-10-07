@@ -64,6 +64,12 @@ pub fn classify(m: Method, bucket: []const u8, key: []const u8, query: []const u
         if (has(q, "notification")) return pick(m, .get_bucket_notification, .put_bucket_notification, null);
         if (has(q, "events")) return if (m == .GET) .listen_bucket_notification else null;
         if (has(q, "replication")) return pick(m, .get_bucket_replication, .put_bucket_replication, .delete_bucket_replication);
+        if (has(q, "website")) return pick(m, .get_bucket_website, .put_bucket_website, .delete_bucket_website);
+        if (has(q, "ownershipControls")) return pick(m, .get_bucket_ownership_controls, .put_bucket_ownership_controls, .delete_bucket_ownership_controls);
+        if (has(q, "publicAccessBlock")) return pick(m, .get_bucket_public_access_block, .put_bucket_public_access_block, .delete_bucket_public_access_block);
+        if (has(q, "logging")) return pick(m, .get_bucket_logging, .put_bucket_logging, null);
+        if (has(q, "accelerate")) return pick(m, .get_bucket_accelerate, null, null);
+        if (has(q, "requestPayment")) return pick(m, .get_bucket_request_payment, null, null);
         return switch (m) {
             .GET => if (has(q, "list-type")) .list_objects_v2 else .list_objects,
             .HEAD => .head_bucket,
@@ -106,14 +112,21 @@ pub const Request = struct {
     copy_source: bool = false,
     /// Policy JSON of the target bucket: explicit denies win, then any allow (identity or bucket).
     bucket_policy: ?[]const u8 = null,
+    /// Request-specific condition keys (headers, tags) beyond the common ones.
+    extra: []const iam.context.Entry = &.{},
 };
 
 /// True when the verified caller may perform the request. Anonymous mode allows all.
 /// Unsigned requests on an authenticated server are allowed only by a bucket policy.
 pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request, now_s: i64) error{OutOfMemory}!bool {
-    const store = env.auth.iam orelse return true;
+    return (try decide(arena, env, auth, r, now_s)).allowed();
+}
+
+/// Like `allowed`, but tells explicit denies (final) from implicit ones (ACLs may still grant).
+pub fn decide(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request, now_s: i64) error{OutOfMemory}!iam.Decision {
+    const store = env.auth.iam orelse return .allow;
     var session: ?iam.Policy = null;
-    if (auth.session_policy) |doc| session = iam.policy.parse(arena, doc) catch return false;
+    if (auth.session_policy) |doc| session = iam.policy.parse(arena, doc) catch return .explicit_deny;
     const who: iam.Identity = .{ .access_key = auth.principal, .session_policy = if (session) |*p| p else null, .federated_policies = auth.federated_policies };
     // Stored policies were validated on PUT; one that no longer parses grants nothing.
     var bucket_policy: ?iam.Policy = null;
@@ -126,7 +139,7 @@ pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request,
     const op = classify(r.method, r.bucket, r.key, r.query, r.copy_source);
     const action = if (op) |o| iam.actions.mapping(o).action else unmapped_action;
     const arn = if (op) |o|
-        iam.actions.resourceArn(&arn_buf, o, r.bucket, r.key) catch return false
+        iam.actions.resourceArn(&arn_buf, o, r.bucket, r.key) catch return .explicit_deny
     else
         "arn:aws:s3:::*";
     const ctx: iam.Context = .{
@@ -136,9 +149,9 @@ pub fn allowed(arena: std.mem.Allocator, env: Env, auth: sigv4.Auth, r: Request,
     };
     if (auth.anonymous) {
         const nobody: iam.Principal = .{};
-        return iam.authorize(&nobody, action, arn, &ctx).allowed();
+        return iam.authorize(&nobody, action, arn, &ctx);
     }
-    return store.authorize(who, action, arn, &ctx).allowed();
+    return store.authorize(who, action, arn, &ctx);
 }
 
 fn one(arena: std.mem.Allocator, v: []const u8) error{OutOfMemory}![]const []const u8 {
@@ -169,6 +182,7 @@ fn entries(arena: std.mem.Allocator, env: Env, r: Request, now_s: i64) error{Out
         } orelse continue;
         try list.append(arena, .{ .key = try std.fmt.allocPrint(arena, "s3:{s}", .{name}), .values = try one(arena, v) });
     }
+    try list.appendSlice(arena, r.extra);
     return list.items;
 }
 
