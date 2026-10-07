@@ -140,6 +140,8 @@ pub const FormatV2 = struct {
     index: u32,
     set_size: u32,
     profile: Profile,
+    /// Bit i: pool i of this deployment was decommissioned and may leave the endpoint list.
+    retired: u64 = 0,
 
     pub const magic = "zkfsm-format 2";
 
@@ -159,6 +161,7 @@ pub const FormatV2 = struct {
             w.print("{s}{s}", .{ if (i == 0) "" else ",", &id }) catch return error.NoSpaceLeft;
         }
         w.writeAll("\n") catch return error.NoSpaceLeft;
+        if (f.retired != 0) w.print("retired {x}\n", .{f.retired}) catch return error.NoSpaceLeft;
         return w.buffered();
     }
 
@@ -183,6 +186,10 @@ pub const FormatV2 = struct {
             if (n >= f.set_size or !id.eql(driveId(f.deployment, f.pool, f.set, n))) return error.CorruptFormat;
         }
         if (n != f.set_size) return error.CorruptFormat;
+        f.retired = 0;
+        if (lines.next()) |l| if (std.mem.startsWith(u8, l, "retired ")) {
+            f.retired = std.fmt.parseInt(u64, l["retired ".len..], 16) catch return error.CorruptFormat;
+        };
         return f;
     }
 
@@ -313,6 +320,10 @@ test "format v2 roundtrip and slot check" {
     const g = try FormatV2.parse(try f.encode(&buf));
     try std.testing.expect(g.sameSlot(f));
     try std.testing.expect(g.drive().eql(f.drive()));
+    try std.testing.expectEqual(@as(u64, 0), g.retired);
+    var r = f;
+    r.retired = 0b101;
+    try std.testing.expectEqual(@as(u64, 0b101), (try FormatV2.parse(try r.encode(&buf))).retired);
     var h = f;
     h.index = 4;
     try std.testing.expect(!h.sameSlot(f));
