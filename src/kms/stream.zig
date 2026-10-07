@@ -1,11 +1,6 @@
-//! DARE-style chunked AES-256-GCM object stream.
-//!
-//! Layout: stream header `"ZKS1" || base_nonce[12]`, then packages of
-//! `hdr[8] || ciphertext || tag[16]` where hdr = version, flags (bit0 final),
-//! 2 zero bytes, payload length u32 LE. Payloads are 64 KiB except the final
-//! one. Nonce = base_nonce with the package sequence number XORed into its
-//! last 4 bytes; AAD = stream header || hdr || caller AAD. The authenticated
-//! final flag detects truncation; sequence nonces detect reordering.
+//! DARE-style AES-256-GCM object stream: header `"ZKS1" || nonce[12]`, then 64 KiB
+//! packages `hdr[8] || ct || tag[16]` with a sequence-XORed nonce and an
+//! authenticated final flag, so truncation and reordering are detected.
 const std = @import("std");
 
 const Aes = std.crypto.aead.aes_gcm.Aes256Gcm;

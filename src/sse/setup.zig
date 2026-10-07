@@ -1,10 +1,6 @@
-//! Chooses and opens the KMS backend from --kms-* flags and environment.
-//!   static:  --kms-secret-key / ZKFSM_KMS_SECRET_KEY / MINIO_KMS_SECRET_KEY = <name>:<base64 key>
-//!   local:   --kms-dir / ZKFSM_KMS_DIR (default ./.zkfsm-kms), development only
-//!   vault:   VAULT_ADDR, VAULT_TOKEN or VAULT_ROLE_ID+VAULT_SECRET_ID, VAULT_NAMESPACE,
-//!            ZKFSM_KMS_VAULT_ENGINE=transit|kv2 (default transit)
-//!   kms-api: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION,
-//!            ZKFSM_KMS_API_ENDPOINT (optional override)
+//! Chooses and opens the KMS backend (static, local, vault, kms-api) from
+//! --kms-* flags and the environment; see `usage` and README "Server-side
+//! encryption and KMS" for the variables each backend reads.
 const std = @import("std");
 const kms = @import("../kms/root.zig");
 

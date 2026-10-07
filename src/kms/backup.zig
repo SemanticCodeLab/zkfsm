@@ -1,8 +1,6 @@
-//! KMS backup/restore. A versioned manifest lists key metadata and carries a
-//! self-digest; for locally-wrapped backends (local, KV2) an optional bundle
-//! holds the key records sealed under a caller-provided 32-byte backup key.
-//! External backends (Transit, KMS-API) keep material server-side, so restore
-//! only verifies that every listed key is reachable.
+//! KMS backup/restore: a self-digested manifest of key metadata, plus for local
+//! and KV2 keys an optional bundle sealed under a 32-byte backup key. External
+//! backends keep material server-side; restore checks every key is reachable.
 const std = @import("std");
 const types = @import("types.zig");
 const keyring = @import("keyring.zig");
