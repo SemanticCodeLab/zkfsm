@@ -91,7 +91,7 @@ check "s3 sees implicit upload" "$MD5" "$(s3 "$EP/cbkt/imp.bin" | md5sum | cut -
 "${C[@]}" "$FTP/" -Q "MKD /qbkt" -o /dev/null
 s3 -X PUT -d '{"quota":200000,"quotatype":"hard"}' "$EP/minio/admin/v3/set-bucket-quota?bucket=qbkt" -o /dev/null
 check "quota upload under limit" 0 "$(head -c 100000 obj.bin | "${C[@]}" -T - "$FTP/qbkt/small.bin"; echo $?)"
-check "quota upload over limit rejected" 70"$("${C[@]}" -T obj.bin "$FTP/qbkt/big.bin"; echo $?)"
+check "quota upload over limit rejected" 70 "$("${C[@]}" -T obj.bin "$FTP/qbkt/big.bin"; echo $?)"
 check "quota reply is 552" 1 "$("${C[@]}" -v -T obj.bin "$FTP/qbkt/big2.bin" 2>&1 | grep -c '^< 552 Quota exceeded')"
 
 # ---- raw protocol checks ----
