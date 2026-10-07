@@ -18,7 +18,8 @@ pub const Table = struct {
     mutex: std.Thread.Mutex = .{},
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
 
-    const Entry = struct { uid: u64, expires_ms: i64 };
+    /// `since_ms`: when `uid` was first granted the lease (observability).
+    pub const Entry = struct { uid: u64, expires_ms: i64, since_ms: i64 = 0 };
 
     pub fn deinit(t: *Table) void {
         var it = t.entries.keyIterator();
@@ -32,12 +33,12 @@ pub const Table = struct {
         defer t.mutex.unlock();
         if (t.entries.getPtr(resource)) |e| {
             if (e.uid != uid and e.expires_ms > now_ms) return false;
-            e.* = .{ .uid = uid, .expires_ms = now_ms + lease_ms };
+            e.* = .{ .uid = uid, .expires_ms = now_ms + lease_ms, .since_ms = if (e.uid == uid) e.since_ms else now_ms };
             return true;
         }
         const k = try t.gpa.dupe(u8, resource);
         errdefer t.gpa.free(k);
-        try t.entries.put(t.gpa, k, .{ .uid = uid, .expires_ms = now_ms + lease_ms });
+        try t.entries.put(t.gpa, k, .{ .uid = uid, .expires_ms = now_ms + lease_ms, .since_ms = now_ms });
         if (t.entries.count() % 1024 == 0) t.expire(now_ms);
         return true;
     }

@@ -7,6 +7,7 @@ const protection = @import("../protection/root.zig");
 pub const scanner = @import("scanner.zig");
 pub const planner = @import("planner.zig");
 pub const executor = @import("executor.zig");
+pub const stats = @import("stats.zig");
 
 pub const Config = scanner.Config;
 pub const Report = executor.Report;
@@ -27,6 +28,8 @@ pub const Healer = struct {
     /// Cluster sets: whether this node verifies keys now (the set's heal leader, or
     /// it holds a fresh drive). Null: always.
     leader: ?Leader = null,
+    /// Pass counters for admin observability.
+    stats: stats.Stats = .{},
 
     pub const Leader = struct {
         ctx: *anyopaque,
@@ -41,6 +44,8 @@ pub const Healer = struct {
     pub fn runOnce(self: *Healer) Error!Report {
         self.pass_lock.lock();
         defer self.pass_lock.unlock();
+        self.stats.begin();
+        errdefer self.stats.abort();
         var throttle: scanner.Throttle = .{ .per_sec = self.cfg.rate_per_sec, .stop = &self.stop_ev };
         var cfg = self.cfg;
         if (self.leader) |l| cfg.walk_keys = self.hasFresh() or l.func(l.ctx, self.drives);
@@ -55,6 +60,7 @@ pub const Healer = struct {
         if (report.fullyRedundant() and cfg.walk_keys) {
             for (self.drives.drives) |*d| d.fresh.store(false, .release);
         }
+        self.stats.end(report.entries_scanned, report.keys_checked, report.replicas_repaired, report.replicas_unrepaired);
         return report;
     }
 
@@ -188,4 +194,5 @@ test {
     _ = scanner;
     _ = planner;
     _ = executor;
+    _ = stats;
 }

@@ -12,7 +12,9 @@ const admin = @import("admin/root.zig");
 const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
+const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
+const ops = @import("ops/root.zig");
 const pools = @import("pools/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
@@ -92,6 +94,7 @@ const Config = struct {
     set_size: ?usize = null,
     cluster_refresh_s: u64 = 10,
     cluster_ca: []const []const u8 = &.{},
+    gateways: gateway.Config = .{},
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
@@ -204,6 +207,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.health_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--metrics-path")) {
             cfg.metrics_path = args[i];
+        } else if (try gateway.parseFlag(&cfg.gateways, a, args[i])) {
+            continue;
         } else if (opts.extra_flag) |f| {
             if (!f(opts.extra_ctx, a, args[i])) return error.BadArgs;
         } else return error.BadArgs;
@@ -258,7 +263,7 @@ pub fn run(opts: Options) u8 {
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
-        std.debug.print("{s}{s}", .{ usage, opts.extra_usage });
+        std.debug.print("{s}{s}{s}", .{ usage, gateway.usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     applyEnv(arena, &cfg) catch {
@@ -363,7 +368,8 @@ pub fn run(opts: Options) u8 {
     defer repl.deinit();
     startReplication(&repl, &svc, auth.iam);
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .endpoint = std.fmt.allocPrint(arena, "{s}:{d}", .{ cfg.host, cfg.port }) catch return 1, .local = .{ .drives = &drives, .strategy = strategy, .healer = &healer } };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .ops = &ops_ctx };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -393,8 +399,19 @@ pub fn run(opts: Options) u8 {
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
     };
+    var gateways = gateway.Running.start(.{
+        .gpa = gpa,
+        .access = .{ .svc = &svc, .iam = auth.iam },
+        .tls = if (tls_paths != null) &tls_ctx else null,
+        .state_dir = if (creds != null) std.fs.path.join(arena, &.{ cfg.data[0], ".zkfsm" }) catch return 1 else null,
+    }, cfg.gateways) catch |e| {
+        std.log.err("cannot start protocol gateways: {t}", .{e});
+        return 1;
+    };
+    defer gateways.stop();
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
+    ops_ctx.server = &server;
     installStopSignals();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
@@ -402,6 +419,7 @@ pub fn run(opts: Options) u8 {
     };
     svc.flush() catch |e| std.log.warn("key index not saved ({t}); it is rebuilt on next start", .{e});
     be.sync() catch |e| std.log.warn("final sync failed: {t}", .{e});
+    ops_ctx.finish();
     std.log.info("stopped", .{});
     return 0;
 }
@@ -468,7 +486,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var repl_ready = false;
     defer if (repl_ready) repl.deinit();
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .pools = &pool_mgr };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .node = node };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .ops = &ops_ctx, .pools = &pool_mgr };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -483,7 +502,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    const routes = [_]s3.server.RawRoute{ ops_ctx.route(), cluster.server.route(node) };
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -499,7 +518,9 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
+    ops_ctx.server = &server;
     installStopSignals();
+    var gateways: gateway.Running = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
         std.log.err("cannot start the listener", .{});
         return 1;
@@ -538,6 +559,14 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         repl_ready = true;
         startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         node.start(if (iam_ready) &iam_store else null);
+        gateways = gateway.Running.start(.{
+            .gpa = gpa,
+            .access = .{ .svc = &svc, .iam = if (iam_ready) &iam_store else null },
+            .tls = if (tls_paths != null) &tls_ctx else null,
+        }, cfg.gateways) catch |e| {
+            std.log.err("cannot start protocol gateways: {t}", .{e});
+            break :blk 1;
+        };
         pool_mgr.start();
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
@@ -549,10 +578,12 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    gateways.stop();
     pool_mgr.stop();
     if (svc_ready) svc.collectDeferred(true);
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
+    if (code == 0) ops_ctx.finish();
     std.log.info("stopped", .{});
     return code;
 }
@@ -848,6 +879,8 @@ test {
     _ = admin;
     _ = tls;
     _ = cluster;
+    _ = gateway;
     _ = replication;
+    _ = ops;
     _ = pools;
 }
