@@ -309,7 +309,7 @@ check "appended pool starts empty" 0 "$(keyfiles e)"
 check "rebalance status before any run" 1 "$("$MC" admin rebalance status z1 >/dev/null 2>&1 && echo 0 || echo 1)"
 id=$("$MC" admin rebalance start --json z1 | jget id)
 check "rebalance started with an id" yes "$([[ ${#id} -ge 32 ]] && echo yes || echo no)"
-sleep 4
+sleep 12
 "$MC" admin rebalance stop z2 >/dev/null
 st=$("$MC" admin rebalance status --json z3)
 check "stopped rebalance reports Stopped" yes "$(echo "$st" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("yes" if any(p["status"]=="Stopped" for p in d["pools"]) else "no")')"
@@ -340,7 +340,7 @@ check "middle pool drives hold no blobs" 0 "$(keyfiles d)"
 info=$("$MC" admin decommission status z2)
 check "status table: complete middle, active others" "Active Complete Active" "$(echo "$info" | grep -o 'Active\|Complete' | tr '\n' ' ' | sed 's/ $//')"
 # ---- admin views see the pool states ----
-check "admin info: pool states" "active decommissioned active" "$(curl -s "${sig[@]}" "$(ep 1)/minio/admin/v3/info" | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["poolsStatus"]))' 2>/dev/null || true)"
+check "admin info: pool states" "active decommissioned active" "$(curl -s "${sig[@]}" "$(ep 1)/minio/admin/v3/info" | python3 -c 'import json,sys;print(" ".join(p["status"] for p in json.load(sys.stdin)["poolsStatus"]))' 2>/dev/null || true)"
 check "mc admin info: four servers" 4 "$("$MC" admin info --json z2 | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["info"]["servers"]))' 2>/dev/null || true)"
 check "mc admin info: 48 drives" 48 "$("$MC" admin info --json z3 | python3 -c 'import json,sys;print(sum(len(s.get("drives",[])) for s in json.load(sys.stdin)["info"]["servers"]))' 2>/dev/null || true)"
 check "mc admin heal status" 0 "$("$MC" admin heal --json z1 >/dev/null 2>&1; echo $?)"

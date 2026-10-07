@@ -598,7 +598,9 @@ pub const Manager = struct {
             if (!s.source or s.done) continue;
             const p = s.p;
             var enough = false;
-            for (r.pools[p].sets) |set| {
+            // Estimates drift from what the drives hold: re-measure, then pass again.
+            var pass: usize = 0;
+            while (!enough and pass < 4) : (pass += 1) for (r.pools[p].sets) |set| {
                 if (enough) break;
                 var arena = std.heap.ArenaAllocator.init(m.gpa);
                 defer arena.deinit();
@@ -633,10 +635,14 @@ pub const Manager = struct {
                             x.objects = 0;
                             x.bytes = 0;
                         }
+                        m.node.refreshSpace();
                         last_persist = std.time.nanoTimestamp();
                     }
                 }
-            }
+            } else {
+                m.node.refreshSpace();
+                if (ratio(m.usage(p)) <= goal) enough = true;
+            };
             s.done = true;
             if (try m.persistRebal(id, srcs.items, null, goal) == .stop) return;
             for (srcs.items) |*x| {
