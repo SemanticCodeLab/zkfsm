@@ -103,6 +103,23 @@ for i in 1 2 3 4; do for o in $OBJS; do
 done; done
 check "every object reads back through every node" 0 "$bad"
 
+# ---- overwrite and delete during a slow cross-node GET: the read ends on its bytes ----
+head -c 48000000 /dev/urandom >"$WORK/big1"
+head -c 1000 /dev/urandom >"$WORK/big2"
+check "put a large object" 200 "$(cput 1 big "$WORK/big1")"
+curl -s -o "$WORK/bigread" -w '%{http_code}' --limit-rate 3M "${sig[@]}" "$(ep 3)/clu/big" >"$WORK/bigcode" &
+gp=$!
+sleep 2
+check "overwrite during the read" 200 "$(cput 2 big "$WORK/big2")"
+# Past the deferred-deletion grace: only the read leases keep the old shards readable.
+sleep 12
+check "delete during the read" 204 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -X DELETE "$(ep 4)/clu/big")"
+wait "$gp" || true
+check "slow cross-node GET completes" 200 "$(cat "$WORK/bigcode")"
+check "with the bytes it started on" "$(md5 "$WORK/big1")" "$(md5 "$WORK/bigread")"
+check "overwritten object is gone" 404 "$(cget 1 big "$WORK/got")"
+rm -f "$WORK/big1" "$WORK/big2" "$WORK/bigread"
+
 # ---- IAM: a user added on node 1 authenticates on node 2 ----
 if [[ -n "$MC" ]]; then
   "$MC" admin user add z1 alice alice-secret-123 >/dev/null

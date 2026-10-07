@@ -16,6 +16,7 @@ const wire = @import("wire.zig");
 const locks = @import("locks.zig");
 const router_mod = @import("router.zig");
 const remote_drive = @import("remote_drive.zig");
+const handles = @import("handles.zig");
 
 const layout = placement.layout;
 const FormatV2 = layout.FormatV2;
@@ -90,6 +91,8 @@ pub const Node = struct {
     topo_fp: [16]u8,
     table: locks.Table,
     locks: locks.Manager = undefined,
+    /// Blobs peers are reading by lease.
+    leases: handles.Table,
     profile: Profile = .single,
     deployment: [16]u8 = @splat(0),
     local_eps: [][]?LocalEp,
@@ -131,6 +134,7 @@ pub const Node = struct {
             .root_fp = cfg.root_fp,
             .topo_fp = undefined,
             .table = .{ .gpa = gpa },
+            .leases = .{ .gpa = gpa },
             .local_eps = &.{},
             .remotes = &.{},
         };
@@ -189,6 +193,7 @@ pub const Node = struct {
         for (n.pools) |*p| for (p.sets) |*s| s.drives.deinit();
         n.locks.deinit();
         n.table.deinit();
+        n.leases.deinit();
         n.guard.deinit();
         n.rpc.deinit();
         n.threads.deinit(n.gpa);
@@ -677,7 +682,7 @@ pub const Node = struct {
         n.iam_store.store(iam_store, .release);
         n.locks.start();
         for (n.pools) |*p| for (p.sets) |*s| {
-            s.healer.start(time_ns(@max(n.cfg.scan_interval_s, 1))) catch std.log.err("cluster: healer not started", .{});
+            s.healer.start(time_ns(n.cfg.scan_interval_s)) catch std.log.err("cluster: healer not started", .{});
         };
         n.spawn(refreshLoop);
         n.spawn(spaceLoop);
@@ -806,6 +811,8 @@ pub const Node = struct {
                 // A peer still bootstrapping cannot serve drive I/O yet.
                 if (n.hello(node)) |h| n.rpc.setOnline(node, h.drives) else |_| n.rpc.setOnline(node, false);
             }
+            _ = n.leases.sweep(std.time.milliTimestamp());
+            if (n.svc.load(.acquire)) |svc| svc.collectDeferred(false);
             n.stop_ev.timedWait(heartbeat_ns) catch {};
         }
     }

@@ -120,7 +120,7 @@ pub const Garbage = struct {
     }
 
     pub fn collect(g: Garbage, svc: *Svc) void {
-        for (g.ids) |id| if (id) |o| svc.store.delete(placement.dataKey(o)) catch {};
+        for (g.ids) |id| if (id) |o| svc.dropBlob(o);
         for (g.remote) |rm| if (rm) |x| transition.enqueueCleanup(svc, x.name[0..x.len], x.id);
     }
 };

@@ -435,7 +435,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .secret = secret,
         .root_fp = if (creds) |c| cluster.auth.rootFingerprint(secret, c.access_key, c.secret_key) else @splat(0),
         .ca_files = cas.items,
-        .scan_interval_s = if (cfg.scan_interval_s == 0) 600 else cfg.scan_interval_s,
+        .scan_interval_s = cfg.scan_interval_s,
         .refresh_s = cfg.cluster_refresh_s,
     }) catch return 2;
     defer node.destroy();
@@ -550,6 +550,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     if (code != 0) _ = server.requestStop();
     serving.join();
     pool_mgr.stop();
+    if (svc_ready) svc.collectDeferred(true);
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
     std.log.info("stopped", .{});

@@ -1,6 +1,7 @@
 //! Minimal keep-alive HTTP load generator for anonymous zkfsm endpoints.
-//! usage: s3load put|get HOST PORT BUCKET CONC N SIZE
+//! usage: s3load put|get HOST PORT[,PORT...] BUCKET CONC N SIZE
 //!        s3load list HOST PORT BUCKET REPS QUERY
+//! With several ports, connection i goes to port i mod count.
 const std = @import("std");
 const posix = std.posix;
 
@@ -89,6 +90,8 @@ const Job = struct {
     first: usize,
     count: usize,
     body: []const u8,
+    /// Per-request latency in ns, one slot per request of this job.
+    lat: []u64,
     errors: usize = 0,
 
     fn run(j: *Job) void {
@@ -103,6 +106,8 @@ const Job = struct {
                 .get => std.fmt.bufPrint(&req, "GET /{s}/k{d:0>8} HTTP/1.1\r\nHost: x\r\n\r\n", .{ j.bucket, i }),
             } catch unreachable;
             // A server that closes after a response costs a reconnect, not an error.
+            var t = std.time.Timer.start() catch unreachable;
+            defer j.lat[i - j.first] = t.read();
             const st = j.once(&c, head) catch retry: {
                 posix.close(c.fd);
                 c = Conn.open(j.addr) catch return j.fail(i);
@@ -129,7 +134,10 @@ pub fn main() !void {
     const arena = arena_state.allocator();
     const args = try std.process.argsAlloc(arena);
     if (args.len < 7) return error.Usage;
-    const addr = try std.net.Address.parseIp(args[2], try std.fmt.parseInt(u16, args[3], 10));
+    var ports: std.ArrayList(u16) = .empty;
+    var pit = std.mem.splitScalar(u8, args[3], ',');
+    while (pit.next()) |p| try ports.append(arena, try std.fmt.parseInt(u16, p, 10));
+    const addr = try std.net.Address.parseIp(args[2], ports.items[0]);
     const bucket = args[4];
     var out_buf: [256]u8 = undefined;
     var out = std.fs.File.stdout().writer(&out_buf);
@@ -157,12 +165,16 @@ pub fn main() !void {
     const size = if (args.len > 7) try std.fmt.parseInt(usize, args[7], 10) else 0;
     const body = try arena.alloc(u8, size);
     @memset(body, 'x');
+    const lat = try arena.alloc(u64, n);
+    @memset(lat, 0);
     const jobs = try arena.alloc(Job, conc);
     const threads = try arena.alloc(std.Thread, conc);
     var t = try std.time.Timer.start();
     for (jobs, threads, 0..) |*j, *th, i| {
         const lo = n * i / conc;
-        j.* = .{ .addr = addr, .bucket = bucket, .mode = if (std.mem.eql(u8, args[1], "put")) .put else .get, .first = lo, .count = n * (i + 1) / conc - lo, .body = body };
+        const cnt = n * (i + 1) / conc - lo;
+        const a = try std.net.Address.parseIp(args[2], ports.items[i % ports.items.len]);
+        j.* = .{ .addr = a, .bucket = bucket, .mode = if (std.mem.eql(u8, args[1], "put")) .put else .get, .first = lo, .count = cnt, .body = body, .lat = lat[lo..][0..cnt] };
         th.* = try std.Thread.spawn(.{}, Job.run, .{j});
     }
     var errs: usize = 0;
@@ -171,7 +183,10 @@ pub fn main() !void {
         errs += j.errors;
     }
     const secs = @as(f64, @floatFromInt(t.read())) / std.time.ns_per_s;
-    try w.print("ops_s={d:.0} errors={d}\n", .{ @as(f64, @floatFromInt(n)) / secs, errs });
+    std.mem.sort(u64, lat, {}, std.sort.asc(u64));
+    const p50 = if (n > 0) ms(lat[n / 2]) else 0;
+    const p99 = if (n > 0) ms(lat[(n * 99) / 100]) else 0;
+    try w.print("ops_s={d:.0} p50_ms={d:.2} p99_ms={d:.2} errors={d}\n", .{ @as(f64, @floatFromInt(n)) / secs, p50, p99, errs });
     try w.flush();
 }
 
