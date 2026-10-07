@@ -171,6 +171,17 @@ pub const Manager = struct {
         m.wake_ev.set();
     }
 
+    /// Pool state for admin views: "active", "draining", or "decommissioned".
+    pub fn poolState(ctx: ?*anyopaque, p: usize) []const u8 {
+        const m: *Manager = @ptrCast(@alignCast(ctx.?));
+        if (p >= m.router().pools.len) return "active";
+        return switch (m.router().mode(p)) {
+            .active => "active",
+            .draining => "draining",
+            .retired => "decommissioned",
+        };
+    }
+
     // ---- space ----
 
     pub const Usage = struct { total: u64, free: u64 };

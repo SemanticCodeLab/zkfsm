@@ -339,6 +339,13 @@ check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 300
 check "middle pool drives hold no blobs" 0 "$(keyfiles d)"
 info=$("$MC" admin decommission status z2)
 check "status table: complete middle, active others" "Active Complete Active" "$(echo "$info" | grep -o 'Active\|Complete' | tr '\n' ' ' | sed 's/ $//')"
+# ---- admin views see the pool states ----
+check "admin info: pool states" "active decommissioned active" "$(curl -s "${sig[@]}" "$(ep 1)/minio/admin/v3/info" | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["poolsStatus"]))' 2>/dev/null || true)"
+check "mc admin info: four servers" 4 "$("$MC" admin info --json z2 | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["info"]["servers"]))' 2>/dev/null || true)"
+check "mc admin info: 48 drives" 48 "$("$MC" admin info --json z3 | python3 -c 'import json,sys;print(sum(len(s.get("drives",[])) for s in json.load(sys.stdin)["info"]["servers"]))' 2>/dev/null || true)"
+check "mc admin heal status" 0 "$("$MC" admin heal --json z1 >/dev/null 2>&1; echo $?)"
+check "mc admin heal of a bucket" 0 "$("$MC" admin heal -r --json z1/plain >/dev/null 2>&1; echo $?)"
+check "mc admin scanner status" 0 "$(timeout 60 "$MC" admin scanner status --json -n 1 z1 >/dev/null 2>&1; echo $?)"
 stop_all
 POOLS=(--data "${PC[@]}" --data "${PE[@]}")
 start_all
