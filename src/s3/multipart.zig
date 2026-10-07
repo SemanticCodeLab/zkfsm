@@ -324,6 +324,11 @@ fn parseCompleteBody(arena: std.mem.Allocator, body: []const u8) (xml_read.Error
         var md5: [16]u8 = undefined;
         if (hex.len != 32) return error.InvalidPart;
         _ = std.fmt.hexToBytes(&md5, hex) catch return error.InvalidPart;
+        // A part listed twice in a row (it was re-uploaded): the later entry names it.
+        if (refs.items.len > 0 and refs.items[refs.items.len - 1].number == num) {
+            refs.items[refs.items.len - 1].md5 = md5;
+            continue;
+        }
         try refs.append(arena, .{ .number = num, .md5 = md5 });
     }
     return refs.items;
@@ -335,7 +340,15 @@ fn refChecksums(arena: std.mem.Allocator, body: []const u8, n: usize) OpError![]
     @memset(out, null);
     var sc: xml_read.Scanner = .{ .s = body };
     var i: usize = 0;
-    while (try sc.next("Part")) |part| : (i += 1) {
+    var prev: ?[]const u8 = null;
+    while (try sc.next("Part")) |part| {
+        var ns: xml_read.Scanner = .{ .s = part };
+        const num = std.mem.trim(u8, (try ns.next("PartNumber")) orelse "", " \t\r\n");
+        // Mirrors parseCompleteBody: a repeated part number replaces the previous entry.
+        if (prev) |p| {
+            if (!std.mem.eql(u8, p, num)) i += 1;
+        }
+        prev = num;
         if (i >= n) break;
         inline for (.{ "ChecksumCRC32", "ChecksumCRC32C", "ChecksumCRC64NVME", "ChecksumSHA1", "ChecksumSHA256" }) |name| {
             var ps: xml_read.Scanner = .{ .s = part };

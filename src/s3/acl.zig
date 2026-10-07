@@ -199,7 +199,10 @@ pub fn writeXml(w: *std.Io.Writer, a: Acl) std.Io.Writer.Error!void {
     try xml.elem(w, "ID", a.owner);
     try xml.elem(w, "DisplayName", a.owner);
     try w.writeAll("</Owner><AccessControlList>");
-    for (a.grants) |g| {
+    // Groups and other grantees first, the owner's own grants last.
+    for ([_]u2{ 0, 1, 2 }) |pass| for (a.grants) |g| {
+        const rank: u2 = if (g.kind != .id) 0 else if (!std.mem.eql(u8, g.value, a.owner)) 1 else 2;
+        if (rank != pass) continue;
         try w.writeAll("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"");
         switch (g.kind) {
             .id => {
@@ -219,7 +222,7 @@ pub fn writeXml(w: *std.Io.Writer, a: Acl) std.Io.Writer.Error!void {
         try w.writeAll("</Grantee>");
         try xml.elem(w, "Permission", @tagName(g.perm));
         try w.writeAll("</Grant>");
-    }
+    };
     try w.writeAll("</AccessControlList>");
     try xml.close(w, "AccessControlPolicy");
 }
