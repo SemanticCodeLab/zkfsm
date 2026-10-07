@@ -454,21 +454,23 @@ local venv in `tests/s3/.venv`. CI runs the boto3 and S3 CLI suites.
 
 | Client | Checks per layout | Passed (single / EC:4+2) | Known gaps (xfail) |
 | --- | --- | --- | --- |
-| boto3 (pytest) | 145 | 142 / 142 | 3 |
+| boto3 (pytest) | 160 | 160 / 160 | 0 |
 | S3 CLI (`s3`, `s3api`) | 44 | 44 / 44 | 0 |
 | MinIO client | 23 | 23 / 23 | 0 |
 | rclone v1.75.1 | 21 | 21 / 21 | 0 |
 | s5cmd v2.3.0 | 17 | 17 / 17 | 0 |
 
-Total: 496/502 passed, 6 xfail. The xfails are features not implemented:
-virtual-host-style addressing without a configured domain, browser-form POST
-uploads, and SigV2 signatures.
+Total: 532/532 passed. Virtual-host style is tested with `--domain localhost`.
 
-`SUITES=s3tests tests/s3/run.sh` also runs a subset of
+`SUITES=s3tests tests/s3/run.sh` also runs
 [ceph/s3-tests](https://github.com/ceph/s3-tests) (MIT, cloned at a pinned
-commit at test time), excluding feature groups zkfsm does not have (ACL-only
-IAM, SSE, website, CORS, lifecycle, notifications, select). Reported
-separately, not gating: 283/435 on a single drive and 283/435 on EC:4+2.
+commit at test time). With `MC` set, a second IAM user plays the "alt" account.
+Excluded: vendor and IAM-service extensions, time-scaled lifecycle runs, bucket
+logging delivery, and the SSE/KMS/Select/notification groups (covered by their
+own suites). Reported separately, not gating: 503/524 on a single drive and
+501/524 on EC:4+2. The remaining failures are tests whose premise does not
+apply: RGW tenant syntax, root bypassing bucket-policy denies, and
+`fails_on_rgw` header tests that edit headers before signing.
 
 ## Status
 
@@ -481,8 +483,10 @@ Pre-1.0. Working today and covered by tests:
   expiration (current, noncurrent, delete markers, incomplete uploads) and
   transition to remote tiers (S3-compatible, Azure, GCS) with RestoreObject,
   bucket policies (including anonymous access), GET/HEAD by `partNumber`,
-  canned private ACLs, and ListObjects v1.
-- **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
+  canned and grant ACLs, ownership controls, public access blocks, CORS,
+  static websites, browser-form POST uploads, additional checksums,
+  GetObjectAttributes, conditional writes, and ListObjects v1.
+- **Security**: SigV4 and SigV2 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
   evaluation, STS session tokens; OpenID Connect, LDAP, and client
   certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
@@ -502,5 +506,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: bucket
-notifications, non-private ACLs, TLS termination
+notifications, bucket access log delivery, TLS termination
 (run behind a proxy).
