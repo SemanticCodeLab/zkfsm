@@ -91,6 +91,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
         if (br.err) |be| if (be == error.NotFound) return .skipped; // replaced meanwhile
         log.warn("transition of {s}/{s} to {s} failed: {t}", .{ bucket, rec.key, tier_name, e });
         tier.Counters.inc(&reg.counters.transition_failures, 1);
+        svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .transition_failed, .size = rec.size });
         return .failed;
     };
     const Ctx = struct { oid: core.ObjectId, tier: []const u8, id: [16]u8 };
@@ -108,6 +109,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
             else => blk: {
                 tier.Counters.inc(&reg.counters.transition_failures, 1);
                 log.warn("transition of {s}/{s}: commit failed: {t}", .{ bucket, rec.key, e });
+                svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .transition_failed, .size = rec.size });
                 break :blk .failed;
             },
         };
@@ -116,6 +118,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
     tier.Counters.inc(&reg.counters.transitions, 1);
     tier.Counters.inc(&reg.counters.transitioned_bytes, rec.size);
     reg.recordTransition(t.cfg.name, rec.size);
+    svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .transitioned, .size = rec.size });
     return .done;
 }
 
@@ -169,6 +172,7 @@ pub fn restore(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.Ve
     try setExpiry(svc, bucket, info, expiry, null);
     keep = true;
     tier.Counters.inc(&reg.counters.restores, 1);
+    svc.emitEvent(.{ .bucket = bucket, .key = key, .version = info.version_id, .kind = .restore_completed, .size = info.size, .content_type = info.content_type });
     return .accepted;
 }
 

@@ -18,6 +18,7 @@ pub const sts = @import("sts.zig");
 pub const restore = @import("restore.zig");
 pub const tenancy = @import("tenancy.zig");
 pub const Extension = extension.Extension;
+pub const Observer = extension.Observer;
 
 pub const Server = server.Server;
 

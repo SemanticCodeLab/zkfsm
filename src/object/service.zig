@@ -6,6 +6,7 @@ const placement = @import("../placement/root.zig");
 const metadata = @import("../metadata/root.zig");
 const io = @import("../io/root.zig");
 const list_mod = @import("list.zig");
+const events_mod = @import("events.zig");
 const versioning = @import("versioning.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
@@ -219,6 +220,8 @@ pub const ObjectService = struct {
     tiers: ?*tier_mod.Registry = null,
     /// Replication engine; set right after init, before serving.
     replication: ?replica.Sink = null,
+    /// Bucket notifications; set right after init, before serving.
+    events: ?events_mod.Sink = null,
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -246,6 +249,12 @@ pub const ObjectService = struct {
         self.catalog.deinit();
         for (self.pending.items) |c| self.freeChange(c);
         self.pending.deinit(self.gpa);
+    }
+
+    /// Hands a committed change to the notification subsystem.
+    pub fn emitEvent(self: *ObjectService, ch: events_mod.Change) void {
+        const s = self.events orelse return;
+        s.notify(s.ctx, ch);
     }
 
     /// Hands a committed change to the replication engine; replica writes are not re-sent.

@@ -104,6 +104,7 @@ pub const Server = struct {
     svc: *object.ObjectService,
     auth: sigv4.Config,
     extensions: []const @import("extension.zig").Extension = &.{},
+    observers: []const @import("extension.zig").Observer = &.{},
     routing: @import("router.zig").Routing = .{},
     ops: metrics.Paths = .{},
     /// When set, every connection is TLS-terminated before HTTP.
@@ -315,7 +316,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
-                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .routing = self.routing, .client_cert = client_cert }, &req, arena.allocator());
+                const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .observers = self.observers, .routing = self.routing, .client_cert = client_cert }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
                     _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);

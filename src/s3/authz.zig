@@ -14,6 +14,7 @@ pub const Env = struct {
     auth: sigv4.Config = .{},
     peer: ?std.net.Address = null,
     extensions: []const @import("extension.zig").Extension = &.{},
+    observers: []const @import("extension.zig").Observer = &.{},
     routing: router.Routing = .{},
     /// Verified TLS client certificate of the connection (mutual TLS only).
     client_cert: ?ClientCert = null,

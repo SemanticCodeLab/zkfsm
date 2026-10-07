@@ -6,6 +6,7 @@ const core = @import("../core/root.zig");
 const metadata = @import("../metadata/root.zig");
 const service = @import("service.zig");
 const versioning = @import("versioning.zig");
+const events = @import("events.zig");
 const multipart = @import("multipart.zig");
 const transition = @import("transition.zig");
 
@@ -209,6 +210,8 @@ fn count(o: transition.Outcome, done: *usize, st: *Stats) void {
 /// Deletes (or, when `version` is null, expires the current version of) `key`.
 /// Returns false when object lock protects it.
 fn act(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, created_ns: ?i128, st: *Stats) Error!bool {
+    events.cause = .lifecycle;
+    defer events.cause = .request;
     _ = versioning.deleteObject(svc, bucket, key, .{ .version = version, .if_created_ns = created_ns }) catch |e| switch (e) {
         error.ObjectLocked => {
             st.locked += 1;

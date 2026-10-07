@@ -16,6 +16,7 @@ pub const transition = @import("transition.zig");
 pub const quota = @import("quota.zig");
 pub const tenancy = @import("tenancy.zig");
 pub const replica = @import("replica.zig");
+pub const events = @import("events.zig");
 
 pub const ObjectService = service.ObjectService;
 pub const Error = service.Error;
@@ -41,6 +42,7 @@ pub fn decodeTags(arena: @import("std").mem.Allocator, bytes: []const u8) Error!
 }
 
 test {
+    _ = events;
     _ = service;
     _ = list;
     _ = versioning;

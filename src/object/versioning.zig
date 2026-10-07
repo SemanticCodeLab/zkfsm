@@ -12,6 +12,7 @@ const conditional = @import("conditional.zig");
 const transition = @import("transition.zig");
 const quota = @import("quota.zig");
 const replica = @import("replica.zig");
+const events = @import("events.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -247,6 +248,8 @@ pub fn commitPut(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutInp
     var notify = false;
     const g = try commitPutLocked(svc, bucket, rec, in, &notify);
     if (notify) svc.notifyReplication(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .put });
+    var eb: [core.ETag.quoted_max]u8 = undefined;
+    svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .created, .size = rec.logical_size orelse rec.size, .etag = events.etagText(rec.reportedEtag(), &eb), .content_type = rec.content_type });
     return g;
 }
 
@@ -395,6 +398,7 @@ pub fn deleteObject(svc: *Svc, bucket: []const u8, key: []const u8, opts: Delete
             svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .delete_version });
         } else if (r.delete_marker) svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .delete_marker });
     }
+    svc.emitEvent(.{ .bucket = bucket, .key = key, .version = r.version, .kind = if (r.delete_marker and opts.version == null) .delete_marker else .deleted });
     return r;
 }
 
@@ -572,22 +576,23 @@ pub fn setObjectTags(svc: *Svc, bucket: []const u8, key: []const u8, version: ?c
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const enc = if (tags) |t| try encodeObjectTags(arena.allocator(), t) else "";
-    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, enc, struct {
+    return metadataChanged(svc, bucket, key, if (tags == null) .tags_deleted else .tags_put, try mutate(svc, bucket, key, version, enc, struct {
         fn f(e: []const u8, _: BucketConfig, r: *Record) Error!void {
             r.tags = e;
         }
     }.f));
 }
 
-fn metadataChanged(svc: *Svc, bucket: []const u8, key: []const u8, v: core.VersionId) core.VersionId {
+fn metadataChanged(svc: *Svc, bucket: []const u8, key: []const u8, kind: events.Kind, v: core.VersionId) core.VersionId {
     svc.notifyReplication(.{ .bucket = bucket, .key = key, .version = v, .kind = .metadata });
+    svc.emitEvent(.{ .bucket = bucket, .key = key, .version = v, .kind = kind });
     return v;
 }
 
 pub const RetentionInput = struct { retention: lock.Retention, bypass_governance: bool = false };
 
 pub fn setRetention(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, in: RetentionInput) Error!core.VersionId {
-    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, in, struct {
+    return metadataChanged(svc, bucket, key, .retention_put, try mutate(svc, bucket, key, version, in, struct {
         fn f(x: RetentionInput, cfg: BucketConfig, r: *Record) Error!void {
             if (!cfg.lock_enabled) return error.InvalidRequest;
             lock.checkChange(retentionOf(r.*), x.retention, x.bypass_governance, core.time.nowNs()) catch return error.ObjectLocked;
@@ -598,7 +603,7 @@ pub fn setRetention(svc: *Svc, bucket: []const u8, key: []const u8, version: ?co
 }
 
 pub fn setLegalHold(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, on: bool) Error!core.VersionId {
-    return metadataChanged(svc, bucket, key, try mutate(svc, bucket, key, version, on, struct {
+    return metadataChanged(svc, bucket, key, .legal_hold_put, try mutate(svc, bucket, key, version, on, struct {
         fn f(x: bool, cfg: BucketConfig, r: *Record) Error!void {
             if (!cfg.lock_enabled) return error.InvalidRequest;
             r.flags.legal_hold = x;

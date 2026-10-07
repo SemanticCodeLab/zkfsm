@@ -10,3 +10,11 @@ pub const Extension = struct {
     /// Run after authentication but before S3 authorization; the extension authorizes itself.
     before_authz: bool = false,
 };
+
+/// Sees every S3 request: `begin` once the request is parsed, `end` after the
+/// response (or connection error) with the final status. Must not respond.
+pub const Observer = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, c: *handler.Ctx) void,
+    end: *const fn (ctx: *anyopaque, c: *handler.Ctx, status: u16) void,
+};

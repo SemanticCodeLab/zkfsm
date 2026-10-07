@@ -26,6 +26,7 @@ const Code = errors.Code;
 pub const ConnError = error{ WriteFailed, ReadFailed, HttpExpectationFailed, OutOfMemory, StreamAborted };
 
 pub const io_buf_len = 64 * 1024;
+const max_observed_headers = 64;
 const max_list_keys = 1000;
 
 /// Request fields copied out of the head before the body reader invalidates it.
@@ -47,6 +48,13 @@ pub const Ctx = struct {
     env: authz.Env = .{},
     /// Tenant that buckets created by this caller belong to ("" = global).
     tenant: []const u8 = "",
+    /// Connection peer and observer-visible state (events, audit).
+    peer: ?std.net.Address = null,
+    start_ns: i128 = 0,
+    /// Request headers, copied before the body is read.
+    req_headers: []const Header = &.{},
+    /// Extra headers of the response written last.
+    resp_headers: []const Header = &.{},
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -64,15 +72,23 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         .copy_source = false,
         .auth = .{},
         .request_id = std.fmt.bytesToHex(core.ObjectId.random().bytes[0..8].*, .upper),
+        .peer = env.peer,
+        .start_ns = std.time.nanoTimestamp(),
     };
     var host: ?[]const u8 = null;
     var hit = req.iterateHeaders();
+    var copied: std.ArrayList(Header) = .empty;
     while (hit.next()) |h| {
+        if (env.observers.len > 0 and copied.items.len < max_observed_headers)
+            try copied.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
         if (std.ascii.eqlIgnoreCase(h.name, "host")) host = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "range")) ctx.range = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) ctx.copy_source = true;
         try ctx.ext.capture(arena, h);
     }
+    ctx.req_headers = copied.items;
+    for (env.observers) |o| o.begin(o.ctx, &ctx);
+    defer for (env.observers) |o| o.end(o.ctx, &ctx, metrics.global.last_status);
     ctx.route = router.resolve(arena, env.routing, host, ctx.target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUri => return fail(&ctx, .InvalidURI),
@@ -345,6 +361,7 @@ fn getObject(c: *Ctx) DispatchError!void {
         .name = "content-range",
         .value = try std.fmt.allocPrint(c.arena, "bytes {d}-{d}/{d}", .{ r.offset, r.last(), info.size }),
     });
+    c.resp_headers = hdrs.items;
     const len = if (range) |r| r.length else info.size;
     var out_buf: [io_buf_len]u8 = undefined;
     metrics.global.last_status = if (range != null) 206 else 200;
@@ -421,6 +438,7 @@ pub fn respondXmlWith(c: *Ctx, status: std.http.Status, body: []const u8, extra:
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
+    c.resp_headers = hdrs.items;
     try c.req.respond(body, .{ .status = status, .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }
 
@@ -429,6 +447,7 @@ pub fn respondEmpty(c: *Ctx, status: std.http.Status, extra: []const Header) Con
     var hdrs: std.ArrayList(Header) = .empty;
     try hdrs.appendSlice(c.arena, extra);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
+    c.resp_headers = hdrs.items;
     try c.req.respond("", .{ .status = status, .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }
 
@@ -457,5 +476,6 @@ pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
         .{ .name = "content-type", .value = "application/xml" },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
     });
+    c.resp_headers = hdrs.items;
     try c.req.respond(a.written(), .{ .status = code.status(), .extra_headers = hdrs.items, .keep_alive = keepAlive(c) });
 }
