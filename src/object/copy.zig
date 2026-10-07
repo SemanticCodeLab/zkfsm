@@ -1,7 +1,7 @@
 //! Server-side copy: streams an existing object into a new object.
 const std = @import("std");
 const service = @import("service.zig");
-const blob = @import("blob.zig");
+const tier = @import("tier.zig");
 const versioning = @import("versioning.zig");
 const core = @import("../core/root.zig");
 const conditional = @import("conditional.zig");
@@ -42,9 +42,10 @@ pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_
     const info = try resolveSource(svc, arena.allocator(), src);
     var eb: [core.ETag.quoted_max]u8 = undefined;
     if (conditional.evalRead(in.source_conditions, info.etag.quoted(&eb), info.created_ns) != .proceed) return error.PreconditionFailed;
-    const segs = [_]blob.Segment{.{ .blob = info.object_id, .offset = 0, .length = info.blob_size }};
     var buf: [64 * 1024]u8 = undefined;
-    var br = blob.BlobReader.init(svc.store, &segs, &buf);
+    var src_rd: tier.Source = undefined;
+    try src_rd.init(svc, info, 0, info.blob_size, &buf);
+    defer src_rd.deinit();
     var put_in = in.put;
     put_in.content_length = info.blob_size;
     put_in.internal = info.internal;
@@ -56,12 +57,9 @@ pub fn copyObject(svc: *ObjectService, src: Source, dst_bucket: []const u8, dst_
         put_in.system = info.system;
     }
     if (!in.replace_tags) put_in.tags = info.tags;
-    return svc.put(dst_bucket, dst_key, &br.reader, put_in) catch |e| switch (e) {
-        // The source vanished mid-copy (overwritten or deleted).
-        error.ReadFailed => if (br.err) |be| switch (be) {
-            error.NotFound => error.NoSuchKey,
-            else => service.mapBackend(be),
-        } else error.ReadFailed,
+    return svc.put(dst_bucket, dst_key, src_rd.reader(), put_in) catch |e| switch (e) {
+        // The source vanished mid-copy (overwritten or deleted), or its tier failed.
+        error.ReadFailed => src_rd.failure() orelse error.ReadFailed,
         else => e,
     };
 }

@@ -10,8 +10,10 @@ const io = @import("../io/root.zig");
 const service = @import("service.zig");
 const lock = @import("lock.zig");
 const blob = @import("blob.zig");
+const tier = @import("tier.zig");
 const copy = @import("copy.zig");
 const versioning = @import("versioning.zig");
+const quota = @import("quota.zig");
 
 const ObjectService = service.ObjectService;
 const Md5 = core.checksum.Md5;
@@ -90,6 +92,7 @@ pub fn uploadPart(
 ) Error!core.ETag {
     if (number == 0 or number > max_part_number) return error.InvalidPartNumber;
     const bid = try svc.bucketId(bucket);
+    if (content_length) |n| try quota.precheck(svc, bucket, null, n);
     {
         var arena = std.heap.ArenaAllocator.init(svc.gpa);
         defer arena.deinit();
@@ -154,15 +157,19 @@ pub fn uploadPartCopy(
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
     const info = try copy.resolveSource(svc, arena.allocator(), src);
-    var seg: blob.Segment = .{ .blob = info.object_id, .offset = 0, .length = info.size };
+    var off: u64 = 0;
+    var len: u64 = info.size;
     if (range) |r| {
         if (r.last < r.first or r.last >= info.size) return error.InvalidRange;
-        seg = .{ .blob = info.object_id, .offset = r.first, .length = r.last - r.first + 1 };
+        off = r.first;
+        len = r.last - r.first + 1;
     }
     var buf: [64 * 1024]u8 = undefined;
-    var br = blob.BlobReader.init(svc.store, (&seg)[0..1], &buf);
-    return uploadPart(svc, bucket, key, id, number, &br.reader, seg.length) catch |e| switch (e) {
-        error.ReadFailed => if (br.err) |be| (if (be == error.NotFound) error.NoSuchKey else service.mapBackend(be)) else error.ReadFailed,
+    var src_rd: tier.Source = undefined;
+    try src_rd.init(svc, info, off, len, &buf);
+    defer src_rd.deinit();
+    return uploadPart(svc, bucket, key, id, number, src_rd.reader(), len) catch |e| switch (e) {
+        error.ReadFailed => src_rd.failure() orelse error.ReadFailed,
         else => e,
     };
 }

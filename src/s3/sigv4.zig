@@ -19,6 +19,8 @@ pub const Config = struct {
     iam: ?*iam.Store = null,
     /// Validates STS session tokens and derives their secrets.
     sts: ?iam.sts.Issuer = null,
+    /// External identity providers for the federated STS actions.
+    federation: ?*iam.federation.Federation = null,
 };
 
 /// STS issuer key derived from the root secret, so tokens survive restarts.
@@ -68,6 +70,10 @@ pub const Auth = struct {
     /// The key that signed the request (differs from `principal` for STS sessions).
     access_key: []const u8 = "",
     session_policy: ?[]const u8 = null,
+    /// Federated STS session: its policy names (see iam.Identity).
+    federated_policies: ?[]const u8 = null,
+    /// Tenant carried by a federated session token.
+    tenant: []const u8 = "",
 };
 
 pub const Outcome = union(enum) { ok: Auth, denied: Code };
@@ -212,6 +218,8 @@ fn check(
         });
         auth.principal = try arena.dupe(u8, claims.parent);
         auth.session_policy = if (claims.session_policy) |sp| try arena.dupe(u8, sp) else null;
+        auth.federated_policies = if (claims.federated_policies) |fp| try arena.dupe(u8, fp) else null;
+        auth.tenant = try arena.dupe(u8, claims.tenant);
         sts_secret = issuer.secretFor(ak);
         break :blk &sts_secret;
     } else src.store.secretFor(ak, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);

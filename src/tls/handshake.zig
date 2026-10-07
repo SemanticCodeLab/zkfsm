@@ -314,9 +314,51 @@ pub fn finished(b: *Builder, verify_data: []const u8) Builder.Error!void {
     try b.end(u24, m);
 }
 
+/// CertificateRequest with an empty context and our verifiable schemes (RFC 8446 4.3.2).
+pub fn certificateRequest(b: *Builder, schemes: []const tls.SignatureScheme) Builder.Error!void {
+    try b.int(u8, @intFromEnum(tls.HandshakeType.certificate_request));
+    const m = try b.begin(u24);
+    try b.int(u8, 0);
+    const e = try b.begin(u16);
+    try b.int(u16, ext.signature_algorithms);
+    const x = try b.begin(u16);
+    const l = try b.begin(u16);
+    for (schemes) |sc| try b.int(u16, @intFromEnum(sc));
+    try b.end(u16, l);
+    try b.end(u16, x);
+    try b.end(u16, e);
+    try b.end(u24, m);
+}
+
+pub const max_peer_chain = 8;
+pub const CertificateError = ParseError || error{BadCertificate};
+
+/// Splits a client Certificate body into DER entries; empty means no certificate.
+pub fn parseCertificate(body: []const u8, out: *[max_peer_chain][]const u8) CertificateError![]const []const u8 {
+    var c: Cursor = .{ .b = body };
+    if ((try c.vec(u8)).len != 0) return error.IllegalParameter;
+    const list = try c.vec(u24);
+    if (c.left() != 0) return error.DecodeError;
+    var l: Cursor = .{ .b = list };
+    var n: usize = 0;
+    while (l.left() > 0) : (n += 1) {
+        const cert = try l.vec(u24);
+        _ = try l.vec(u16);
+        if (cert.len == 0) return error.DecodeError;
+        if (n == max_peer_chain) return error.BadCertificate;
+        out[n] = cert;
+    }
+    return out[0..n];
+}
+
 /// Content covered by the server CertificateVerify signature (RFC 8446 4.4.3).
 pub fn verifyContent(out: []u8, transcript_hash: []const u8) []const u8 {
-    const ctx = "TLS 1.3, server CertificateVerify";
+    return verifyContentFor(out, "TLS 1.3, server CertificateVerify", transcript_hash);
+}
+
+pub const client_verify_context = "TLS 1.3, client CertificateVerify";
+
+pub fn verifyContentFor(out: []u8, comptime ctx: []const u8, transcript_hash: []const u8) []const u8 {
     @memset(out[0..64], 0x20);
     @memcpy(out[64..][0..ctx.len], ctx);
     out[64 + ctx.len] = 0;
@@ -335,4 +377,29 @@ test "client hello rejects duplicates, bad lengths, and pre-1.3" {
     try std.testing.expectError(error.ProtocolVersion, ClientHello.parse(&old));
     const long = [_]u8{ 0x03, 0x03 } ++ [_]u8{0} ** 32 ++ [_]u8{ 0, 0, 2, 0x13, 0x01, 1, 0, 0, 7, 0, 43, 0, 9, 2, 3, 4 };
     try std.testing.expectError(error.DecodeError, ClientHello.parse(&long));
+}
+
+test "certificate request encoding" {
+    var buf: [64]u8 = undefined;
+    var b: Builder = .{ .buf = &buf };
+    try certificateRequest(&b, &.{ .ecdsa_secp256r1_sha256, .ed25519 });
+    try std.testing.expectEqualSlices(u8, &.{ 13, 0, 0, 13, 0, 0, 10, 0, 13, 0, 6, 0, 4, 4, 3, 8, 7 }, b.written());
+}
+
+test "client certificate message bounds" {
+    var out: [max_peer_chain][]const u8 = undefined;
+    try std.testing.expectEqual(0, (try parseCertificate(&.{ 0, 0, 0, 0 }, &out)).len);
+    const one = [_]u8{ 0, 0, 0, 7, 0, 0, 2, 0xaa, 0xbb, 0, 0 };
+    const got = try parseCertificate(&one, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, got[0]);
+    // Non-empty request context, overlong entry, trailing bytes, empty entry.
+    try std.testing.expectError(error.IllegalParameter, parseCertificate(&.{ 1, 9, 0, 0, 0 }, &out));
+    try std.testing.expectError(error.DecodeError, parseCertificate(&.{ 0, 0, 0, 7, 0, 0, 9, 0xaa, 0xbb, 0, 0 }, &out));
+    try std.testing.expectError(error.DecodeError, parseCertificate(&.{ 0, 0, 0, 0, 1 }, &out));
+    try std.testing.expectError(error.DecodeError, parseCertificate(&.{ 0, 0, 0, 5, 0, 0, 0, 0, 0 }, &out));
+    try std.testing.expectError(error.DecodeError, parseCertificate(&.{ 0, 0xff, 0xff, 0xff }, &out));
+    var nine: [4 + 9 * 6]u8 = undefined;
+    nine[0..4].* = .{ 0, 0, 0, 9 * 6 };
+    for (0..9) |i| nine[4 + i * 6 ..][0..6].* = .{ 0, 0, 1, 0x30, 0, 0 };
+    try std.testing.expectError(error.BadCertificate, parseCertificate(&nine, &out));
 }

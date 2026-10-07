@@ -1,5 +1,5 @@
-//! Get/Put/DeleteBucketLifecycleConfiguration. Expiration actions only; transition
-//! actions parse but are rejected with NotImplemented.
+//! Get/Put/DeleteBucketLifecycleConfiguration: expiration, abort, and transition
+//! actions (StorageClass names a configured remote tier).
 const std = @import("std");
 const core = @import("../core/root.zig");
 const object = @import("../object/root.zig");
@@ -82,7 +82,6 @@ fn int(comptime T: type, s: []const u8, name: []const u8) ParseError!?T {
 }
 
 fn parseRule(arena: std.mem.Allocator, body: []const u8) ParseError!Rule {
-    if (try child(body, "Transition") != null or try child(body, "NoncurrentVersionTransition") != null) return error.NotImplemented;
     var r: Rule = .{};
     r.id = try text(arena, body, "ID") orelse "";
     const status = try text(arena, body, "Status") orelse return error.MalformedXML;
@@ -104,8 +103,32 @@ fn parseRule(arena: std.mem.Allocator, body: []const u8) ParseError!Rule {
     if (try child(body, "AbortIncompleteMultipartUpload")) |e| {
         r.abort_upload_days = try int(u32, e, "DaysAfterInitiation") orelse return error.MalformedXML;
     }
+    if (try single(body, "Transition")) |e| {
+        r.transition_days = try int(u32, e, "Days");
+        if (try text(arena, e, "Date")) |d| r.transition_date_ns = core.time.parseIso8601(d) catch return error.InvalidArgument;
+        r.transition_tier = try storageClass(arena, e);
+    }
+    if (try single(body, "NoncurrentVersionTransition")) |e| {
+        r.noncurrent_transition_days = try int(u32, e, "NoncurrentDays") orelse return error.MalformedXML;
+        r.noncurrent_transition_newer = try int(u32, e, "NewerNoncurrentVersions");
+        r.noncurrent_transition_tier = try storageClass(arena, e);
+    }
     object.lifecycle.validate(&.{r}) catch return error.InvalidArgument;
     return r;
+}
+
+/// One transition per kind and rule; more than one is not supported.
+fn single(body: []const u8, name: []const u8) ParseError!?[]const u8 {
+    var sc: xml_read.Scanner = .{ .s = body };
+    const first = try sc.next(name) orelse return null;
+    if (try sc.next(name) != null) return error.NotImplemented;
+    return first;
+}
+
+fn storageClass(arena: std.mem.Allocator, e: []const u8) ParseError![]const u8 {
+    const sc = try text(arena, e, "StorageClass") orelse return error.MalformedXML;
+    if (sc.len == 0 or sc.len > 64) return error.InvalidArgument;
+    return sc;
 }
 
 fn boolean(s: []const u8) ParseError!bool {
@@ -170,6 +193,23 @@ pub fn write(w: *std.Io.Writer, rules: []const Rule) std.Io.Writer.Error!void {
             try xml.elemInt(w, "DaysAfterInitiation", d);
             try w.writeAll("</AbortIncompleteMultipartUpload>");
         }
+        if (r.transition_tier.len > 0) {
+            try w.writeAll("<Transition>");
+            if (r.transition_days) |d| try xml.elemInt(w, "Days", d);
+            if (r.transition_date_ns) |d| {
+                var tb: [24]u8 = undefined;
+                try xml.elem(w, "Date", core.time.iso8601(d, &tb));
+            }
+            try xml.elem(w, "StorageClass", r.transition_tier);
+            try w.writeAll("</Transition>");
+        }
+        if (r.noncurrent_transition_days) |d| {
+            try w.writeAll("<NoncurrentVersionTransition>");
+            try xml.elemInt(w, "NoncurrentDays", d);
+            if (r.noncurrent_transition_newer) |n| try xml.elemInt(w, "NewerNoncurrentVersions", n);
+            try xml.elem(w, "StorageClass", r.noncurrent_transition_tier);
+            try w.writeAll("</NoncurrentVersionTransition>");
+        }
         try w.writeAll("</Rule>");
     }
     try xml.close(w, "LifecycleConfiguration");
@@ -230,8 +270,19 @@ test "lifecycle xml parse and write" {
     try std.testing.expectEqual(rules[1].expiration_date_ns, again[1].expiration_date_ns);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<Filter><And><Prefix>logs/</Prefix>") != null);
 
-    const tr = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>";
-    try std.testing.expectError(error.NotImplemented, parse(a, tr));
+    const tr = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>WARM</StorageClass></Transition>" ++
+        "<NoncurrentVersionTransition><NoncurrentDays>2</NoncurrentDays><StorageClass>COLD</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>";
+    const tr_rules = try parse(a, tr);
+    try std.testing.expectEqualStrings("WARM", tr_rules[0].transition_tier);
+    try std.testing.expectEqual(@as(?u32, 0), tr_rules[0].transition_days);
+    try std.testing.expectEqual(@as(?u32, 2), tr_rules[0].noncurrent_transition_days);
+    var tw: std.Io.Writer.Allocating = .init(a);
+    try write(&tw.writer, tr_rules);
+    try std.testing.expectEqualStrings("COLD", (try parse(a, tw.written()))[0].noncurrent_transition_tier);
+    const two = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>A</StorageClass></Transition>" ++
+        "<Transition><Days>2</Days><StorageClass>B</StorageClass></Transition></Rule></LifecycleConfiguration>";
+    try std.testing.expectError(error.NotImplemented, parse(a, two));
+    try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days></Transition></Rule></LifecycleConfiguration>"));
     try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration></LifecycleConfiguration>"));
     try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration><Rule><Status>On</Status></Rule></LifecycleConfiguration>"));
     try std.testing.expectError(error.InvalidArgument, parse(a, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>"));

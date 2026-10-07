@@ -10,6 +10,7 @@ const versioning = @import("versioning.zig");
 const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
 const index_mod = @import("index.zig");
+const replica = @import("replica.zig");
 
 const Md5 = core.checksum.Md5;
 
@@ -52,6 +53,15 @@ pub const Error = error{
     ReadQuorum,
     /// A cluster namespace lock could not be taken in time.
     LockTimeout,
+    /// The remote tier holding the data could not be reached.
+    TierUnavailable,
+    /// The operation needs tiered data (restore of a local object).
+    InvalidObjectState,
+    RestoreInProgress,
+    /// A lifecycle rule names a tier that is not configured.
+    InvalidStorageClass,
+    /// The write would take the bucket past its hard quota.
+    QuotaExceeded,
 };
 
 /// Cluster coordination hooks; null on a single node, where `mutex` is enough.
@@ -113,6 +123,16 @@ pub const ObjectInfo = struct {
     etag_override: ?core.ETag = null,
     /// Multipart part sizes (metadata.record.partSize); empty for single-part objects.
     part_sizes: []const u8 = "",
+    /// Remote tier holding the data; empty when local.
+    tier: []const u8 = "",
+    tier_object: [16]u8 = @splat(0),
+    /// Expiry of a restored local copy of tiered data; 0 when none.
+    restore_expiry_ns: i128 = 0,
+
+    /// The bytes must come from the tier (no live restored copy).
+    pub fn remote(i: ObjectInfo, now_ns: i128) bool {
+        return i.tier.len > 0 and i.restore_expiry_ns <= now_ns;
+    }
 };
 
 pub const PutInput = struct {
@@ -195,6 +215,10 @@ pub const ObjectService = struct {
     /// Changes made under `mutex`, published when the operation's lock is released.
     pending: std.ArrayList(Change) = .empty,
     pending_mutex: std.Thread.Mutex = .{},
+    /// Remote tiers; set right after init when tiering is available.
+    tiers: ?*tier_mod.Registry = null,
+    /// Replication engine; set right after init, before serving.
+    replication: ?replica.Sink = null,
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -222,6 +246,13 @@ pub const ObjectService = struct {
         self.catalog.deinit();
         for (self.pending.items) |c| self.freeChange(c);
         self.pending.deinit(self.gpa);
+    }
+
+    /// Hands a committed change to the replication engine; replica writes are not re-sent.
+    pub fn notifyReplication(self: *ObjectService, ev: replica.Event) void {
+        if (replica.origin != null) return;
+        const s = self.replication orelse return;
+        s.vtable.notify(s.ctx, ev);
     }
 
     // ---- cluster coordination ----
@@ -409,6 +440,7 @@ pub const ObjectService = struct {
     pub fn put(self: *ObjectService, bucket: []const u8, key: []const u8, source: *std.Io.Reader, in: PutInput) Error!ObjectInfo {
         try validKey(key);
         const bid = try self.bucketId(bucket);
+        if (in.content_length) |n| try @import("quota.zig").precheck(self, bucket, key, n);
         const meta = try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system);
         defer meta.deinit(self.gpa);
         const oid = core.ObjectId.random();
@@ -474,8 +506,10 @@ pub const ObjectService = struct {
 
     /// Streams the object's bytes (or `range` of them) into `sink`.
     pub fn read(self: *ObjectService, info: ObjectInfo, range: ?core.Range, sink: *std.Io.Writer) Error!void {
+        if (info.remote(core.time.nowNs())) return tier_mod.readRemote(self, info, range, sink);
         _ = self.store.get(placement.dataKey(info.object_id), range, sink) catch |e| return switch (e) {
-            error.NotFound => error.NoSuchKey,
+            // A restored copy may have just expired.
+            error.NotFound => if (info.tier.len > 0) tier_mod.readRemote(self, info, range, sink) else error.NoSuchKey,
             else => mapBackend(e),
         };
     }
@@ -576,6 +610,7 @@ pub const ObjectService = struct {
 };
 
 const index_store = @import("index_store.zig");
+const tier_mod = @import("tier.zig");
 
 /// Header lists are left empty; see `decodeInfo`.
 pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
@@ -597,6 +632,9 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .legal_hold = r.flags.legal_hold,
         .tags = r.tags,
         .part_sizes = r.part_sizes,
+        .tier = r.tier,
+        .tier_object = r.tier_object,
+        .restore_expiry_ns = r.restore_expiry_ns,
     };
 }
 

@@ -187,6 +187,8 @@ pub const AdminOp = enum {
     remove_service_account,
     list_service_accounts,
     server_info,
+    set_tier,
+    list_tier,
 
     pub fn action(op: AdminOp) []const u8 {
         return admin_table[@intFromEnum(op)];
@@ -233,6 +235,8 @@ const admin_entries = [_]struct { AdminOp, []const u8 }{
     .{ .remove_service_account, "admin:RemoveServiceAccount" },
     .{ .list_service_accounts, "admin:ListServiceAccounts" },
     .{ .server_info, "admin:ServerInfo" },
+    .{ .set_tier, "admin:SetTier" },
+    .{ .list_tier, "admin:ListTier" },
 };
 
 pub const ArnError = error{ArnTooLong};

@@ -7,6 +7,11 @@ pub const eval = @import("eval.zig");
 pub const actions = @import("actions.zig");
 pub const sts = @import("sts.zig");
 pub const store = @import("store.zig");
+pub const jwt = @import("jwt.zig");
+pub const ldap = @import("ldap.zig");
+pub const idp = @import("idp.zig");
+pub const federation = @import("federation.zig");
+pub const tenants = @import("tenants.zig");
 
 pub const Policy = policy.Policy;
 pub const Context = context.Context;
@@ -56,4 +61,9 @@ test {
     _ = actions;
     _ = sts;
     _ = store;
+    _ = jwt;
+    _ = ldap;
+    _ = idp;
+    _ = federation;
+    _ = tenants;
 }

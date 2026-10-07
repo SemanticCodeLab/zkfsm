@@ -6,6 +6,7 @@ pub const tags = @import("tags.zig");
 pub const upload = @import("upload.zig");
 pub const headers = @import("headers.zig");
 pub const lifecycle = @import("lifecycle.zig");
+pub const tier_config = @import("tier_config.zig");
 pub const ObjectRecord = record.ObjectRecord;
 pub const Catalog = catalog.Catalog;
 pub const Bucket = catalog.Bucket;
@@ -20,4 +21,5 @@ test {
     _ = upload;
     _ = headers;
     _ = lifecycle;
+    _ = tier_config;
 }

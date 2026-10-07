@@ -23,6 +23,8 @@ pub const Error = error{
     IsDir,
     NotDir,
     TooLarge,
+    /// The bucket's hard quota would be exceeded.
+    QuotaExceeded,
     Storage,
     OutOfMemory,
     /// The caller's source or sink failed.
@@ -119,6 +121,7 @@ fn mapErr(e: object.Error) Error {
         error.WriteFailed => error.WriteFailed,
         error.MetadataTooLarge => error.TooLarge,
         error.ObjectLocked, error.MethodNotAllowed => error.Denied,
+        error.QuotaExceeded => error.QuotaExceeded,
         else => error.Storage,
     };
 }
@@ -206,7 +209,7 @@ pub const Fs = struct {
             .root => return error.Exists,
             .bucket => {
                 try f.check(.create_bucket, l.bucket, "");
-                return f.svc().createBucket(l.bucket) catch |e| mapErr(e);
+                return f.access.createBucket(&f.who, l.bucket) catch |e| mapErr(e);
             },
             else => {},
         }
@@ -291,7 +294,7 @@ pub const Fs = struct {
         var out: std.ArrayList(Entry) = .empty;
         if (l.bucket.len == 0) {
             try f.check(.list_buckets, "", "");
-            const bs = f.svc().listBuckets(arena) catch |e| return mapErr(e);
+            const bs = f.access.visibleBuckets(arena, &f.who) catch |e| return mapErr(e);
             for (bs) |b| try out.append(arena, .{ .name = b.name, .kind = .bucket, .mtime_ns = b.created_ns });
             return .{ .entries = out.items, .next = null };
         }

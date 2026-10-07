@@ -15,6 +15,8 @@ pub const policy = @import("policy.zig");
 pub const acl = @import("acl.zig");
 pub const list_v1 = @import("list_v1.zig");
 pub const sts = @import("sts.zig");
+pub const restore = @import("restore.zig");
+pub const tenancy = @import("tenancy.zig");
 pub const Extension = extension.Extension;
 
 pub const Server = server.Server;
@@ -36,4 +38,6 @@ test {
     _ = acl;
     _ = list_v1;
     _ = sts;
+    _ = restore;
+    _ = tenancy;
 }
