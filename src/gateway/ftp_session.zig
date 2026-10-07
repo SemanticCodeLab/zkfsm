@@ -119,6 +119,7 @@ pub const Session = struct {
             error.IsDir => s.reply(550, "Is a directory."),
             error.NotDir => s.reply(550, "Not a directory."),
             error.TooLarge => s.reply(552, "Too large."),
+            error.QuotaExceeded => s.reply(552, "Quota exceeded."),
             error.ReadFailed, error.WriteFailed => s.reply(426, "Connection closed; transfer aborted."),
             error.Storage, error.OutOfMemory => s.reply(451, "Local error in processing."),
         }
