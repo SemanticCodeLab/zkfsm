@@ -46,6 +46,7 @@ pub const Entry = struct {
     kind: Kind,
     size: u64 = 0,
     mtime_ns: i128 = 0,
+    etag: ?core.ETag = null,
 };
 
 /// A path split into bucket and key; key ends without `/` (dir keys are prefixes).
@@ -309,7 +310,7 @@ pub const Fs = struct {
         }
         for (r.contents) |c| {
             if (c.key.len == prefix.len) continue; // this directory's own marker
-            try out.append(arena, .{ .name = c.key[prefix.len..], .kind = .file, .size = c.size, .mtime_ns = c.mtime_ns });
+            try out.append(arena, .{ .name = c.key[prefix.len..], .kind = .file, .size = c.size, .mtime_ns = c.mtime_ns, .etag = c.etag });
         }
         return .{ .entries = out.items, .next = if (r.is_truncated) r.next_marker else null };
     }
