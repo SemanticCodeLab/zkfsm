@@ -51,7 +51,7 @@ read -r -a PA <<<"$(pool a)"
 read -r -a PB <<<"$(pool b)"
 POOLS=()
 RATE=64
-DRATE=2
+DRATE=1
 
 start() { # node
   local i="$1"
@@ -240,6 +240,7 @@ check "progress persisted before the crash" yes "$([[ "$(decom "$T" "$CMD_A" obj
 W=0
 for i in 1 2 3 4; do [[ $(grep -c "pools: draining pool 1" "$WORK/n$i.log") -gt 0 ]] && W=$i; done
 [[ "$W" == "$T" || "$W" == 0 ]] && W=$((T % 4 + 1))
+check "still draining when the node is killed" false "$(decom "$T" "$CMD_A" complete)"
 kill9 "$W"
 sleep 2
 start "$W"
