@@ -13,7 +13,7 @@ PIDS=()
 cleanup() {
   for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  rm -rf "$WORK"
+  if [[ -n "${KEEP:-}" ]]; then echo "logs kept in $WORK"; else rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
 
@@ -41,7 +41,11 @@ for p in "${PORT[@]}"; do
   done
 done
 ALL=$(IFS=,; echo "${PORT[*]}")
-mk() { curl -sf -X PUT "http://127.0.0.1:${PORT[0]}/$1" >/dev/null; }
+mk() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:${PORT[0]}/$1")
+  [[ "$code" == 200 ]] || echo "create bucket $1: HTTP $code"
+}
 
 echo "== cluster 4 nodes x 4 drives, EC:4+2, ${SIZE} B objects, $OPS ops per run, all endpoints"
 for c in $CONCS; do
@@ -50,3 +54,8 @@ for c in $CONCS; do
   printf "PUT c=%-3s %s\n" "$c" "$("$LOAD" put 127.0.0.1 "$ALL" "bkt$c" "$c" "$OPS" "$SIZE")"
   printf "GET c=%-3s %s\n" "$c" "$("$LOAD" get 127.0.0.1 "$ALL" "bkt$c" "$c" "$OPS")"
 done
+pat='error|panic|exception|fault'
+if grep -qEh "$pat" "$WORK"/n*.log; then
+  echo "== node log problems"
+  grep -Eh "$pat" "$WORK"/n*.log | sort | uniq -c | sort -rn | head -30
+fi

@@ -329,9 +329,13 @@ pub const Node = struct {
 
     /// Asks a peer who it is; once our drives are open the call also tells the peer
     /// to count us online at once rather than at its next heartbeat.
-    fn hello(n: *Node, node: u16) error{ Unreachable, CredentialMismatch }!Hello {
+    fn hello(n: *Node, node: u16) error{ Unreachable, Busy, CredentialMismatch }!Hello {
         const q = if (n.drives_open.load(.acquire)) "drives=1" else "";
-        var c = n.rpc.call(node, "hello", q, .{ .bytes = "" }, .{ .probe = true, .timeout_ms = 2000 }) catch return error.Unreachable;
+        var c = n.rpc.call(node, "hello", q, .{ .bytes = "" }, .{ .probe = true, .timeout_ms = 2000 }) catch |e| {
+            if (e == error.Busy) return error.Busy;
+            std.log.debug("hello to {s}: {t}", .{ n.topo.nodes[node].name, e });
+            return error.Unreachable;
+        };
         defer c.deinit();
         if (c.status == 401) {
             std.log.err("cluster: node {s} rejected our requests: cluster secret or root credentials differ", .{n.topo.nodes[node].name});
@@ -1004,7 +1008,11 @@ pub const Node = struct {
                 const node: u16 = @intCast(i);
                 if (node == nn.topo.local) return;
                 // A peer still bootstrapping cannot serve drive I/O yet.
-                const h = nn.hello(node) catch return nn.rpc.setOnline(node, false);
+                const h = nn.hello(node) catch |e| {
+                    // Every connection busy means the peer is up and working.
+                    if (e != error.Busy) nn.rpc.setOnline(node, false);
+                    return;
+                };
                 nn.rpc.setOnline(node, h.drives);
                 if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, std.time.milliTimestamp())) nn.sync_ev.set();
             }

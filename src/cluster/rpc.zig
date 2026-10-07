@@ -39,7 +39,7 @@ const io_buf = 64 * 1024;
 const max_head = 16 * 1024;
 const connect_timeout_ms = 3000;
 /// Probes (heartbeats, bootstrap) may open this many connections past the cap.
-const probe_extra = 4;
+const probe_extra = 16;
 
 const Conn = struct {
     stream: std.net.Stream,
@@ -177,6 +177,8 @@ pub const Rpc = struct {
         const cap = if (probe) self.peer_cap + probe_extra else self.peer_cap;
         var timer = std.time.Timer.start() catch unreachable;
         while (p.conns >= cap) {
+            // Probes measure liveness: never queue them behind busy connections.
+            if (probe) return error.Busy;
             const spent = timer.read();
             const limit = slot_wait_ms * std.time.ns_per_ms;
             if (spent >= limit) return error.Busy;
