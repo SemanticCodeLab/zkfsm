@@ -17,6 +17,10 @@ pub const list_v1 = @import("list_v1.zig");
 pub const sts = @import("sts.zig");
 pub const restore = @import("restore.zig");
 pub const tenancy = @import("tenancy.zig");
+pub const postform = @import("postform.zig");
+pub const sigv2 = @import("sigv2.zig");
+pub const cors_config = @import("cors_config.zig");
+pub const website_config = @import("website_config.zig");
 pub const Extension = extension.Extension;
 
 pub const Server = server.Server;
@@ -40,4 +44,8 @@ test {
     _ = sts;
     _ = restore;
     _ = tenancy;
+    _ = postform;
+    _ = sigv2;
+    _ = cors_config;
+    _ = website_config;
 }

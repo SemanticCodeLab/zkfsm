@@ -148,6 +148,7 @@ pub const PutInput = struct {
     /// Content-MD5 the stored body must match.
     content_md5: ?[16]u8 = null,
     /// User metadata (names without `x-amz-meta-`) and reserved `x-zkfsm-internal-*` headers.
+    /// `put` encodes them after the body is read, so values may be completed by the source reader.
     metadata: []const Header = &.{},
     internal: []const Header = &.{},
     system: SystemHeaders = .{},
@@ -441,8 +442,8 @@ pub const ObjectService = struct {
         try validKey(key);
         const bid = try self.bucketId(bucket);
         if (in.content_length) |n| try @import("quota.zig").precheck(self, bucket, key, n);
-        const meta = try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system);
-        defer meta.deinit(self.gpa);
+        // Validated now, encoded after the body: header values may be filled while it streams.
+        (try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system)).deinit(self.gpa);
         const oid = core.ObjectId.random();
         const data_key = placement.dataKey(oid);
 
@@ -463,6 +464,8 @@ pub const ObjectService = struct {
             if (fin.logical_size) |v| logical_size = v;
             if (fin.etag_override) |v| etag_override = v;
         }
+        const meta = try EncodedMeta.init(self.gpa, in.metadata, in.internal, in.system);
+        defer meta.deinit(self.gpa);
         var rec: metadata.ObjectRecord = .{
             .object_id = oid,
             .bucket_id = bid,

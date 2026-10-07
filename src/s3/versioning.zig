@@ -26,12 +26,17 @@ pub const Headers = struct {
     content_md5: ?[]const u8 = null,
     bypass_governance: bool = false,
     bucket_lock: bool = false,
+    acl: @import("acl.zig").RequestAcl = .{},
+    object_ownership: ?[]const u8 = null,
+    checksum: @import("checksums.zig").RequestChecksums = .{},
     /// x-amz-meta-* with the prefix stripped and names lowercased; repeats joined by ",".
     meta: std.ArrayList(object.Header) = .empty,
     system: object.SystemHeaders = .{},
 
     pub fn capture(self: *Headers, arena: std.mem.Allocator, h: Header) error{OutOfMemory}!void {
         try self.captureMeta(arena, h);
+        try self.acl.capture(arena, h);
+        try self.checksum.capture(arena, h);
         const fields = .{
             .{ "if-match", "if_match" },
             .{ "if-none-match", "if_none_match" },
@@ -42,6 +47,7 @@ pub const Headers = struct {
             .{ "x-amz-object-lock-retain-until-date", "lock_until" },
             .{ "x-amz-object-lock-legal-hold", "legal_hold" },
             .{ "content-md5", "content_md5" },
+            .{ "x-amz-object-ownership", "object_ownership" },
         };
         inline for (fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[0])) {
             @field(self, f[1]) = try arena.dupe(u8, h.value);
@@ -213,6 +219,14 @@ pub fn putExtras(c: *Ctx, in: *object.PutInput) DispatchError!bool {
         }
         in.content_md5 = md5;
     }
+    const acl = @import("acl.zig");
+    if (!try acl.checkWriteHeaders(c)) return false;
+    if (try acl.newObjectHeader(c, acl.callerOf(c.env.auth, c.auth))) |hdr| {
+        var list: std.ArrayList(object.Header) = .empty;
+        try list.appendSlice(c.arena, in.internal);
+        try list.append(c.arena, hdr);
+        in.internal = list.items;
+    }
     return true;
 }
 
@@ -265,7 +279,11 @@ fn versionClass(c: *Ctx, e: ov.VersionEntry) []const u8 {
 /// Looks up the version to serve; answers delete markers itself (returns null).
 pub fn lookupForRead(c: *Ctx) DispatchError!?object.ObjectInfo {
     const v = try versionParam(c);
-    const info = try ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, v);
+    const info = ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, v) catch |e| {
+        if (e != error.NoSuchKey) return e;
+        try handler.failWith(c, .NoSuchKey, &.{.{ .name = "x-amz-delete-marker", .value = "false" }});
+        return null;
+    };
     if (!info.delete_marker) return info;
     const hdrs = [_]Header{ .{ .name = "x-amz-delete-marker", .value = "true" }, try versionHeader(c, info.version_id) };
     try handler.failWith(c, if (v != null) .MethodNotAllowed else .NoSuchKey, &hdrs);

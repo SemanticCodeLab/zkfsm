@@ -62,6 +62,12 @@ pub fn classify(m: Method, bucket: []const u8, key: []const u8, query: []const u
         if (has(q, "encryption")) return pick(m, .get_bucket_encryption, .put_bucket_encryption, .delete_bucket_encryption);
         if (has(q, "notification")) return pick(m, .get_bucket_notification, .put_bucket_notification, null);
         if (has(q, "replication")) return pick(m, .get_bucket_replication, .put_bucket_replication, .delete_bucket_replication);
+        if (has(q, "website")) return pick(m, .get_bucket_website, .put_bucket_website, .delete_bucket_website);
+        if (has(q, "ownershipControls")) return pick(m, .get_bucket_ownership_controls, .put_bucket_ownership_controls, .delete_bucket_ownership_controls);
+        if (has(q, "publicAccessBlock")) return pick(m, .get_bucket_public_access_block, .put_bucket_public_access_block, .delete_bucket_public_access_block);
+        if (has(q, "logging")) return pick(m, .get_bucket_logging, .put_bucket_logging, null);
+        if (has(q, "accelerate")) return pick(m, .get_bucket_accelerate, null, null);
+        if (has(q, "requestPayment")) return pick(m, .get_bucket_request_payment, null, null);
         return switch (m) {
             .GET => if (has(q, "list-type")) .list_objects_v2 else .list_objects,
             .HEAD => .head_bucket,
