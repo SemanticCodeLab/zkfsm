@@ -64,6 +64,19 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(iam_tests).step);
 
+    // S3 Select over Parquet/CSV/JSON fixtures whose expected output came from DuckDB.
+    const select_fx = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/select_fixtures_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "select", .module = b.createModule(.{
+            .root_source_file = b.path("src/select/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(select_fx).step);
+
     // Live remote-backend tests; they skip unless ZKFSM_S3_* / ZKFSM_AZURE_* / ZKFSM_GCS_* are set.
     const live = b.addTest(.{ .root_module = mod, .filters = &.{"remote live"} });
     const live_run = b.addRunArtifact(live);

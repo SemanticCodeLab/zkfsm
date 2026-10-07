@@ -12,7 +12,9 @@ const admin = @import("admin/root.zig");
 const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
+const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
+const sse = @import("sse/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -94,9 +96,11 @@ const Config = struct {
     set_size: ?usize = null,
     cluster_refresh_s: u64 = 10,
     cluster_ca: []const []const u8 = &.{},
+    gateways: gateway.Config = .{},
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
+    kms: sse.setup.Flags = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -210,6 +214,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.health_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--metrics-path")) {
             cfg.metrics_path = args[i];
+        } else if (sse.setup.Flags.isFlag(a)) {
+            if (!cfg.kms.set(a, args[i])) return error.BadArgs;
+        } else if (try gateway.parseFlag(&cfg.gateways, a, args[i])) {
+            continue;
         } else if (opts.extra_flag) |f| {
             if (!f(opts.extra_ctx, a, args[i])) return error.BadArgs;
         } else return error.BadArgs;
@@ -265,7 +273,7 @@ pub fn run(opts: Options) u8 {
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
-        std.debug.print("{s}{s}", .{ usage, opts.extra_usage });
+        std.debug.print("{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     applyEnv(arena, &cfg) catch {
@@ -292,7 +300,19 @@ pub fn run(opts: Options) u8 {
         std.log.err("invalid listen address {s}", .{cfg.host});
         return 2;
     };
-    if (cfg.pools.len > 0) return runCluster(gpa, arena, cfg, creds, addr, opts);
+    var kms_holder: sse.setup.Holder = .{};
+    if (!cfg.heal_only) {
+        if (!cfg.kms.applyEnv(arena)) {
+            std.log.err("invalid ZKFSM_KMS_BACKEND or ZKFSM_KMS_DEFAULT_KEY", .{});
+            return 2;
+        }
+        kms_holder.init(gpa, cfg.kms) catch |e| {
+            std.log.err("kms backend {s} failed to start: {t}", .{ cfg.kms.backend.text(), e });
+            return 2;
+        };
+        if (kms_holder.handle != null) std.log.info("kms backend {s}, default key {s}", .{ cfg.kms.backend.text(), kms_holder.default_key });
+    }
+    if (cfg.pools.len > 0) return runCluster(gpa, arena, cfg, creds, addr, opts, &kms_holder);
     var drives = placement.DriveSet.open(gpa, cfg.data, cfg.protection) catch |e| {
         std.log.err("cannot open drives: {t}", .{e});
         return 1;
@@ -371,7 +391,11 @@ pub fn run(opts: Options) u8 {
     startReplication(&repl, &svc, auth.iam);
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
+    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -400,6 +424,16 @@ pub fn run(opts: Options) u8 {
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
     };
+    var gateways = gateway.Running.start(.{
+        .gpa = gpa,
+        .access = .{ .svc = &svc, .iam = auth.iam },
+        .tls = if (tls_paths != null) &tls_ctx else null,
+        .state_dir = if (creds != null) std.fs.path.join(arena, &.{ cfg.data[0], ".zkfsm" }) catch return 1 else null,
+    }, cfg.gateways) catch |e| {
+        std.log.err("cannot start protocol gateways: {t}", .{e});
+        return 1;
+    };
+    defer gateways.stop();
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
     installStopSignals();
@@ -415,7 +449,7 @@ pub fn run(opts: Options) u8 {
 
 /// Cluster mode: the RPC route is served before bootstrap so peers can negotiate
 /// the layout; S3 requests wait behind the gate until storage and IAM are up.
-fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options) u8 {
+fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *const sse.setup.Holder) u8 {
     if (cfg.heal_only) {
         std.log.err("heal runs continuously on cluster nodes; the one-shot heal command is for local drives", .{});
         return 2;
@@ -474,7 +508,11 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     defer if (repl_ready) repl.deinit();
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
+    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
         tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
@@ -505,6 +543,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
     installStopSignals();
+    var gateways: gateway.Running = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
         std.log.err("cannot start the listener", .{});
         return 1;
@@ -541,6 +580,14 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         repl_ready = true;
         startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         node.start(if (iam_ready) &iam_store else null);
+        gateways = gateway.Running.start(.{
+            .gpa = gpa,
+            .access = .{ .svc = &svc, .iam = if (iam_ready) &iam_store else null },
+            .tls = if (tls_paths != null) &tls_ctx else null,
+        }, cfg.gateways) catch |e| {
+            std.log.err("cannot start protocol gateways: {t}", .{e});
+            break :blk 1;
+        };
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
         if (cfg.lifecycle_interval_s > 0) {
@@ -551,6 +598,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    gateways.stop();
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
     std.log.info("stopped", .{});
@@ -858,5 +906,9 @@ test {
     _ = admin;
     _ = tls;
     _ = cluster;
+    _ = gateway;
     _ = replication;
+    _ = sse;
+    _ = @import("kms/root.zig");
+    _ = @import("select/root.zig");
 }
