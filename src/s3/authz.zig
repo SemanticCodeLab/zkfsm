@@ -46,7 +46,7 @@ fn pick(m: Method, get: ?Op, put: ?Op, del: ?Op) ?Op {
 /// The S3 operation a request performs, or null when none applies.
 pub fn classify(m: Method, bucket: []const u8, key: []const u8, query: []const u8, copy_source: bool) ?Op {
     const q = query;
-    if (bucket.len == 0) return if (m == .GET) .list_buckets else null;
+    if (bucket.len == 0) return if (m != .GET) null else if (has(q, "events")) .listen_notification else .list_buckets;
     if (key.len == 0) {
         if (has(q, "delete")) return if (m == .POST) .delete_objects else null;
         if (has(q, "uploads")) return if (m == .GET) .list_multipart_uploads else null;
@@ -62,6 +62,7 @@ pub fn classify(m: Method, bucket: []const u8, key: []const u8, query: []const u
         if (has(q, "lifecycle")) return pick(m, .get_bucket_lifecycle, .put_bucket_lifecycle, .delete_bucket_lifecycle);
         if (has(q, "encryption")) return pick(m, .get_bucket_encryption, .put_bucket_encryption, .delete_bucket_encryption);
         if (has(q, "notification")) return pick(m, .get_bucket_notification, .put_bucket_notification, null);
+        if (has(q, "events")) return if (m == .GET) .listen_bucket_notification else null;
         if (has(q, "replication")) return pick(m, .get_bucket_replication, .put_bucket_replication, .delete_bucket_replication);
         return switch (m) {
             .GET => if (has(q, "list-type")) .list_objects_v2 else .list_objects,

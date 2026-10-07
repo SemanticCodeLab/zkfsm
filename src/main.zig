@@ -13,6 +13,7 @@ const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
 const replication = @import("replication/root.zig");
+const events = @import("events/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -61,6 +62,10 @@ const usage =
     \\                   (or $ZKFSM_IDENTITY_OPENID_<KEY>)
     \\  --identity-ldap "k=v ..."    LDAP directory, e.g. server_addr=host:636 lookup_bind_dn=...
     \\                   (or $ZKFSM_IDENTITY_LDAP_<KEY>)
+    \\events: targets from mc admin config set notify_<type>[:id] ..., or MINIO_NOTIFY_<TYPE>_<KEY>[_ID]
+    \\             / ZKFSM_NOTIFY_... env (ENABLE=on); audit via audit_webhook / audit_kafka, or
+    \\             ZKFSM_AUDIT_CONSOLE=on and ZKFSM_AUDIT_FILE=path; region from ZKFSM_REGION / MINIO_REGION;
+    \\             queues under ZKFSM_EVENTS_DIR (default: <first drive>/.zkfsm/events)
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -362,8 +367,15 @@ pub fn run(opts: Options) u8 {
     defer repl.deinit();
     startReplication(&repl, &svc, auth.iam);
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
+    const ev_opts = eventOptions(arena, cfg, cfg.data[0], addr) catch return 2;
+    var notif = events.Notifier.init(gpa, &svc, ev_opts);
+    defer notif.deinit();
+    startEvents(&notif, &svc, false);
+    var ev_ext: events.s3ext.Ext = .{ .n = &notif };
+    svc.events = ev_ext.sink();
+    const observers = [_]s3.Observer{ev_ext.observer()};
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), ev_ext.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -387,6 +399,7 @@ pub fn run(opts: Options) u8 {
         .svc = &svc,
         .auth = auth,
         .extensions = extensions,
+        .observers = &observers,
         .tls = if (tls_paths != null) &tls_ctx else null,
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
@@ -465,8 +478,13 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var repl_ready = false;
     defer if (repl_ready) repl.deinit();
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
+    var notif: events.Notifier = undefined;
+    var notif_ready = false;
+    defer if (notif_ready) notif.deinit();
+    var ev_ext: events.s3ext.Ext = .{ .n = &notif };
+    const observers = [_]s3.Observer{ev_ext.observer()};
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), ev_ext.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
         tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
@@ -486,6 +504,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .svc = &svc,
         .auth = auth,
         .extensions = extensions,
+        .observers = &observers,
         .tls = if (tls_paths != null) &tls_ctx else null,
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
@@ -532,6 +551,11 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         repl = replication.Replicator.init(gpa, &svc, .{ .leader = .{ .ctx = node, .func = clusterLeader } });
         repl_ready = true;
         startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
+        const ev_opts = eventOptions(arena, cfg, node.localPath() orelse ".", addr) catch break :blk 2;
+        notif = events.Notifier.init(gpa, &svc, ev_opts);
+        notif_ready = true;
+        startEvents(&notif, &svc, true);
+        svc.events = ev_ext.sink();
         node.start(if (iam_ready) &iam_store else null);
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
@@ -566,6 +590,51 @@ fn startReplication(repl: *replication.Replicator, svc: *object.ObjectService, i
     svc.replication = repl.sink();
     metrics.global.extra[0] = .{ .ctx = &repl.stats, .func = replication.stats.Stats.render };
     repl.start() catch |e| std.log.warn("replication worker not started: {t}", .{e});
+}
+
+/// Event options from the environment; queues default under `<drive>/.zkfsm/events`.
+fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: std.net.Address) error{ BadArgs, OutOfMemory }!events.notifier.Options {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    const region = env.get("ZKFSM_REGION") orelse env.get("MINIO_REGION") orelse env.get("MINIO_SITE_REGION") orelse "";
+    const root = env.get("ZKFSM_EVENTS_DIR") orelse try std.fs.path.join(arena, &.{ drive, ".zkfsm", "events" });
+    const host = cfg.node_address orelse try std.fmt.allocPrint(arena, "{f}", .{addr});
+    const scheme = if ((tlsPaths(arena, cfg) catch null) != null) "https" else "http";
+    const targets = try events.settings.fromEnv(arena, &env);
+    for (targets) |t| {
+        const k = events.kinds.bySubsys(t.subsys).?;
+        const c = k.create(arena, t.settings()) catch {
+            std.log.err("{s}:{s} from the environment: invalid settings", .{ t.subsys, t.id });
+            return error.BadArgs;
+        };
+        c.deinit();
+    }
+    return .{
+        .region = region,
+        .queue_root = root,
+        .endpoint = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, host }),
+        .env_targets = targets,
+    };
+}
+
+/// Loads targets, opens the audit console/file loggers, and hooks up metrics.
+fn startEvents(n: *events.Notifier, svc: *object.ObjectService, cluster_mode: bool) void {
+    _ = svc;
+    const a = n.gpa;
+    if (envVar(a, "ZKFSM_AUDIT_CONSOLE") catch null) |v| {
+        n.audit_console = std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+    }
+    if (envVar(a, "ZKFSM_AUDIT_FILE") catch null) |p| {
+        if (std.fs.cwd().createFile(p, .{ .truncate = false })) |f| {
+            f.seekFromEnd(0) catch {};
+            n.audit_file = f;
+        } else |e| std.log.err("audit file {s}: {t}", .{ p, e });
+    }
+    n.reload() catch |e| {
+        std.log.warn("events: stored target configuration not loaded ({t}); using the environment only", .{e});
+        n.apply("") catch {};
+    };
+    metrics.global.extra[1] = .{ .ctx = n, .func = events.Notifier.render };
+    n.startWatcher(if (cluster_mode) 10 else 60) catch |e| std.log.warn("events: config watcher not started: {t}", .{e});
 }
 
 fn clusterReady(ctx: *anyopaque) bool {
@@ -841,4 +910,5 @@ test {
     _ = tls;
     _ = cluster;
     _ = replication;
+    _ = events;
 }

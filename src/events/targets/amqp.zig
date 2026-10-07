@@ -159,14 +159,6 @@ const Amqp = struct {
         self.conn = null;
     }
 
-    fn io(e: anytype) Fail {
-        return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Rejected => error.Rejected,
-            else => error.Unreachable,
-        };
-    }
-
     fn sendMethod(self: *Amqp, ch: u16) Fail!void {
         const c = self.conn orelse return error.Unreachable;
         writeFrame(c.writer(), frame_method, ch, self.enc.list.items) catch return error.Unreachable;
@@ -205,7 +197,7 @@ const Amqp = struct {
         if (self.conn != null) return;
         const u = self.url;
         const tls: ?net.TlsOptions = if (u.tls) .{} else null;
-        self.conn = net.dial(self.gpa, u.host, u.port, .{ .tls = tls }) catch |e| return io(e);
+        self.conn = net.dial(self.gpa, u.host, u.port, .{ .tls = tls }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.Unreachable;
         errdefer self.drop();
         const c = self.conn.?;
         c.writer().writeAll("AMQP\x00\x00\x09\x01") catch return error.Unreachable;

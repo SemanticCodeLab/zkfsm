@@ -537,6 +537,12 @@ pub const Node = struct {
         n.router = .{ .gpa = n.gpa, .pools = n.router_pools };
     }
 
+    /// Path of this node's first local drive, if it has one.
+    pub fn localPath(n: *Node) ?[]const u8 {
+        for (n.local_eps) |pool| for (pool) |ep| if (ep) |e| return e.path;
+        return null;
+    }
+
     pub fn storage(n: *Node) backend.StorageBackend {
         return n.router.backend();
     }

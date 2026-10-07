@@ -145,13 +145,8 @@ pub fn entryKey(a: Allocator, ev: Event) error{OutOfMemory}![]const u8 {
 pub fn renderPayload(a: Allocator, ev: Event, record: []const u8) error{OutOfMemory}![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
-    var s: Stringify = .{ .writer = w };
-    s.beginObject() catch return error.OutOfMemory;
-    field(&s, "EventName", ev.name.text()) catch return error.OutOfMemory;
-    field(&s, "Key", try entryKey(a, ev)) catch return error.OutOfMemory;
-    s.objectField("Records") catch return error.OutOfMemory;
+    w.print("{{\"EventName\":{f},\"Key\":{f},\"Records\":[", .{ std.json.fmt(ev.name.text(), .{}), std.json.fmt(try entryKey(a, ev), .{}) }) catch return error.OutOfMemory;
     // The record is already JSON; splice it in.
-    w.writeAll("[") catch return error.OutOfMemory;
     w.writeAll(record) catch return error.OutOfMemory;
     w.writeAll("]}") catch return error.OutOfMemory;
     return out.written();

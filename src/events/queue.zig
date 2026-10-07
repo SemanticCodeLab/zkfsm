@@ -1,5 +1,6 @@
 //! Per-target persistent event queue: one file per entry, written to a temp name,
 //! synced, then renamed, so a crash never leaves a partial entry. Bounded by count.
+//! Without a directory the queue lives in memory (audit loggers without queue_dir).
 const std = @import("std");
 const target = @import("target.zig");
 
@@ -19,8 +20,10 @@ pub const Item = struct {
 
 pub const Queue = struct {
     gpa: Allocator,
-    dir: std.fs.Dir,
+    dir: ?std.fs.Dir,
     limit: u32,
+    /// In-memory mode: encoded entries, parallel to `seqs`.
+    mem: std.ArrayList([]u8) = .empty,
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     /// Sequence numbers on disk, oldest first.
@@ -34,11 +37,11 @@ pub const Queue = struct {
         const q = gpa.create(Queue) catch return error.OutOfMemory;
         q.* = .{ .gpa = gpa, .dir = dir, .limit = @max(1, limit) };
         errdefer q.close();
-        var it = q.dir.iterate();
+        var it = dir.iterate();
         while (it.next() catch return error.StorageFailed) |e| {
             if (e.kind != .file) continue;
             if (std.mem.startsWith(u8, e.name, ".tmp-")) {
-                q.dir.deleteFile(e.name) catch {};
+                dir.deleteFile(e.name) catch {};
                 continue;
             }
             if (e.name.len != name_len or !std.mem.endsWith(u8, e.name, ext)) continue;
@@ -50,9 +53,17 @@ pub const Queue = struct {
         return q;
     }
 
+    pub fn openMemory(gpa: Allocator, limit: u32) error{OutOfMemory}!*Queue {
+        const q = try gpa.create(Queue);
+        q.* = .{ .gpa = gpa, .dir = null, .limit = @max(1, limit) };
+        return q;
+    }
+
     pub fn close(q: *Queue) void {
         q.seqs.deinit(q.gpa);
-        q.dir.close();
+        for (q.mem.items) |m| q.gpa.free(m);
+        q.mem.deinit(q.gpa);
+        if (q.dir) |*d| d.close();
         q.gpa.destroy(q);
     }
 
@@ -72,18 +83,32 @@ pub const Queue = struct {
         defer q.mutex.unlock();
         if (q.seqs.items.len >= q.limit) return error.QueueFull;
         const seq = q.next_seq;
+        const dir = q.dir orelse {
+            const copy = try q.gpa.dupe(u8, bytes);
+            q.mem.append(q.gpa, copy) catch {
+                q.gpa.free(copy);
+                return error.OutOfMemory;
+            };
+            q.seqs.append(q.gpa, seq) catch {
+                q.gpa.free(q.mem.pop().?);
+                return error.OutOfMemory;
+            };
+            q.next_seq = seq + 1;
+            q.cond.signal();
+            return;
+        };
         var nb: [name_len]u8 = undefined;
         var tb: [name_len + 5]u8 = undefined;
         const name = fileName(seq, &nb);
         const tmp = std.fmt.bufPrint(&tb, ".tmp-{s}", .{name}) catch unreachable; // sized for it
         {
-            var f = q.dir.createFile(tmp, .{ .exclusive = false }) catch return error.StorageFailed;
+            var f = dir.createFile(tmp, .{ .exclusive = false }) catch return error.StorageFailed;
             defer f.close();
             f.writeAll(bytes) catch return error.StorageFailed;
             f.sync() catch return error.StorageFailed;
         }
-        q.dir.rename(tmp, name) catch return error.StorageFailed;
-        syncDir(q.dir);
+        dir.rename(tmp, name) catch return error.StorageFailed;
+        syncDir(dir);
         try q.seqs.append(q.gpa, seq);
         q.next_seq = seq + 1;
         q.cond.signal();
@@ -99,18 +124,28 @@ pub const Queue = struct {
             const seq = q.seqs.items[0];
             var nb: [name_len]u8 = undefined;
             const name = fileName(seq, &nb);
-            const bytes = q.dir.readFileAlloc(a, name, max_entry_len) catch |e| {
+            const dir = q.dir orelse {
+                const msg = decode(a, try a.dupe(u8, q.mem.items[0])) catch |e| {
+                    if (e == error.OutOfMemory) return error.OutOfMemory;
+                    corrupt.* += 1;
+                    _ = q.seqs.orderedRemove(0);
+                    q.gpa.free(q.mem.orderedRemove(0));
+                    continue;
+                };
+                return .{ .seq = seq, .msg = msg };
+            };
+            const bytes = dir.readFileAlloc(a, name, max_entry_len) catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
                 corrupt.* += 1;
                 _ = q.seqs.orderedRemove(0);
-                q.dir.deleteFile(name) catch {};
+                dir.deleteFile(name) catch {};
                 continue;
             };
             const msg = decode(a, bytes) catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
                 corrupt.* += 1;
                 _ = q.seqs.orderedRemove(0);
-                q.dir.deleteFile(name) catch {};
+                dir.deleteFile(name) catch {};
                 continue;
             };
             return .{ .seq = seq, .msg = msg };
@@ -124,10 +159,11 @@ pub const Queue = struct {
         defer q.mutex.unlock();
         for (q.seqs.items, 0..) |s, i| if (s == seq) {
             _ = q.seqs.orderedRemove(i);
+            if (q.dir == null) q.gpa.free(q.mem.orderedRemove(i));
             break;
         };
         var nb: [name_len]u8 = undefined;
-        q.dir.deleteFile(fileName(seq, &nb)) catch {};
+        if (q.dir) |d| d.deleteFile(fileName(seq, &nb)) catch {};
     }
 
     /// Wakes a waiting `peek`; used at shutdown.
@@ -197,4 +233,18 @@ test "entries survive reopen, stay ordered, and the queue is bounded" {
     try std.testing.expect((try q.peek(arena.allocator(), 1000, &corrupt)) == null);
     try q.put(&.{ .body = "{}" });
     try std.testing.expectEqual(@as(u64, 3), (try q.peek(arena.allocator(), 0, &corrupt)).?.seq);
+}
+
+test "memory queue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corrupt: u64 = 0;
+    const q = try Queue.openMemory(std.testing.allocator, 1);
+    defer q.close();
+    try q.put(&.{ .body = "{\"a\":1}" });
+    try std.testing.expectError(error.QueueFull, q.put(&.{ .body = "x" }));
+    const it = (try q.peek(arena.allocator(), 0, &corrupt)).?;
+    try std.testing.expectEqualStrings("{\"a\":1}", it.msg.body);
+    q.remove(it.seq);
+    try std.testing.expectEqual(@as(usize, 0), q.len());
 }

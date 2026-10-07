@@ -338,6 +338,7 @@ fn markCompleted(r: *engine.Replicator, a: Allocator, e: Entry, v: core.VersionI
         }
     }
     ov.setReplicationStatus(r.svc, e.bucket, e.key, v, .completed) catch {};
+    r.svc.emitEvent(.{ .bucket = e.bucket, .key = e.key, .version = v, .kind = .replication_completed });
 }
 
 /// Marks a version FAILED after its first failed delivery.
@@ -345,4 +346,5 @@ pub fn markFailed(r: *engine.Replicator, e: Entry) void {
     if (e.op != .put and e.op != .existing) return;
     const v = ov.parseVersionId(e.version) catch return;
     ov.setReplicationStatus(r.svc, e.bucket, e.key, v, .failed) catch {};
+    r.svc.emitEvent(.{ .bucket = e.bucket, .key = e.key, .version = v, .kind = .replication_failed });
 }
