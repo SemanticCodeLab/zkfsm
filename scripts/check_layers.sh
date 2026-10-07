@@ -15,6 +15,7 @@ rank() {
     metrics | iam) echo 6 ;;
     s3 | admin) echo 7 ;;
     cluster | replication) echo 8 ;;
+    ops) echo 9 ;;
     *) echo -1 ;;
   esac
 }

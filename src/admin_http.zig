@@ -7,6 +7,7 @@ const iam = @import("iam/root.zig");
 const object = @import("object/root.zig");
 const metrics = @import("metrics/root.zig");
 const replication = @import("replication/root.zig");
+const ops = @import("ops/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -18,6 +19,8 @@ pub const Bridge = struct {
     started_s: i64,
     /// Remote targets and site replication; also sees IAM changes for peers.
     repl: ?*replication.Replicator = null,
+    /// Server info, heal, service, scanner, and lock views; served first.
+    ops: ?*ops.Ops = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -59,6 +62,14 @@ pub const Bridge = struct {
                 .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
+        };
+        if (self.ops) |o| switch (try o.handle(c, store, req)) {
+            .none => {},
+            .res => |res| {
+                try respond(c, res);
+                return true;
+            },
+            .sent => return true,
         };
         if (self.repl) |r| if (try replication.admin.handle(r, c.arena, store, req)) |res| {
             try respond(c, res);
