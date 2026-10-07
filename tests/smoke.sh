@@ -364,7 +364,7 @@ GLC=$(curl -s "$EP/aclb?lifecycle")
 check "get lifecycle rules" 2 "$(grep -o '<Rule>' <<<"$GLC" | wc -l)"
 check "get lifecycle and filter" 1 "$(grep -c '<Filter><And><Prefix>tmp/</Prefix><Tag><Key>t</Key><Value>1</Value></Tag></And></Filter>' <<<"$GLC")"
 check "get lifecycle noncurrent" 1 "$(grep -c '<NoncurrentDays>30</NoncurrentDays><NewerNoncurrentVersions>2</NewerNoncurrentVersions>' <<<"$GLC")"
-check "lifecycle transition" 501 "$(status -X PUT --data-binary '<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>COLD</StorageClass></Transition></Rule></LifecycleConfiguration>' "$EP/aclb?lifecycle")"
+check "lifecycle transition to unknown tier" 400 "$(status -X PUT --data-binary '<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>COLD</StorageClass></Transition></Rule></LifecycleConfiguration>' "$EP/aclb?lifecycle")"
 check "lifecycle bad days" 400 "$(status -X PUT --data-binary '<LifecycleConfiguration><Rule><Status>Enabled</Status><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>' "$EP/aclb?lifecycle")"
 check "lifecycle malformed" 1 "$(curl -s -X PUT --data-binary 'junk' "$EP/aclb?lifecycle" | grep -c '<Code>MalformedXML</Code>')"
 check "lifecycle kept after bad put" 2 "$(curl -s "$EP/aclb?lifecycle" | grep -o '<Rule>' | wc -l)"

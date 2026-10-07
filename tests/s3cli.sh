@@ -158,7 +158,7 @@ check "cli get lifecycle ids" "logs mpu dm" "$(s3cli s3api get-bucket-lifecycle-
 check "cli get lifecycle filter" 10 "$(s3cli s3api get-bucket-lifecycle-configuration --bucket pubb --query 'Rules[0].Filter.And.ObjectSizeGreaterThan' --output text)"
 check "cli get lifecycle newer noncurrent" 3 "$(s3cli s3api get-bucket-lifecycle-configuration --bucket pubb --query 'Rules[0].NoncurrentVersionExpiration.NewerNoncurrentVersions' --output text)"
 TRJ='{"Rules":[{"ID":"t","Filter":{"Prefix":""},"Status":"Enabled","Transitions":[{"Days":30,"StorageClass":"STANDARD_IA"}]}]}'
-check "cli lifecycle transition rejected" 1 "$(s3cli s3api put-bucket-lifecycle-configuration --bucket pubb --lifecycle-configuration "$TRJ" 2>&1 | grep -c NotImplemented)"
+check "cli lifecycle transition to unknown tier rejected" 1 "$(s3cli s3api put-bucket-lifecycle-configuration --bucket pubb --lifecycle-configuration "$TRJ" 2>&1 | grep -c InvalidStorageClass)"
 check "cli delete lifecycle" 0 "$(s3cli s3api delete-bucket-lifecycle --bucket pubb >/dev/null; echo $?)"
 check "cli lifecycle gone" 1 "$(s3cli s3api get-bucket-lifecycle-configuration --bucket pubb 2>&1 | grep -c NoSuchLifecycleConfiguration)"
 

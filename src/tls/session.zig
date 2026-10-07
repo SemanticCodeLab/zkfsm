@@ -1,11 +1,12 @@
 //! Server side of one TLS 1.3 connection: handshake, then std.Io.Reader/Writer
-//! over protected records. No PSK, no 0-RTT, no client certificates.
+//! over protected records. No PSK, no 0-RTT; optional client certificates.
 const std = @import("std");
 const tls = std.crypto.tls;
 const hs = @import("handshake.zig");
 const sched = @import("schedule.zig");
 const config = @import("config.zig");
 const keys = @import("keys.zig");
+const peer_cert = @import("peer.zig");
 
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -26,6 +27,9 @@ pub const Error = error{
     DecryptError,
     NoApplicationProtocol,
     MissingExtension,
+    BadCertificate,
+    CertificateExpired,
+    UnknownCa,
     InternalError,
     OutOfMemory,
 };
@@ -48,6 +52,9 @@ const Keys = union(enum) {
     chacha: Pair(sched.Chacha),
 };
 
+/// Verified client certificate subject; `common_name` lives inside the Session.
+pub const PeerIdentity = struct { common_name: []const u8, not_before_s: i64, not_after_s: i64 };
+
 const suite_fields = .{ .{ sched.Aes128, "aes128" }, .{ sched.Aes256, "aes256" }, .{ sched.Chacha, "chacha" } };
 
 pub const Session = struct {
@@ -67,6 +74,10 @@ pub const Session = struct {
     sni_buf: [255]u8 = undefined,
     sni_len: u8 = 0,
     alpn: bool = false,
+    peer_cn_buf: [peer_cert.max_common_name]u8 = undefined,
+    peer_cn_len: u8 = 0,
+    peer_not_before: i64 = 0,
+    peer_not_after: i64 = 0,
     pend: []u8 = &.{},
     // Handshake reassembly, only allocated during the handshake.
     hs_buf: []u8 = &.{},
@@ -93,7 +104,7 @@ pub const Session = struct {
         s.writer.buffer = &s.wbuf;
         const creds = ctx.acquire();
         defer creds.release();
-        s.handshake(creds) catch |e| {
+        s.handshake(creds, ctx.client_cas) catch |e| {
             s.sendAlertFor(e);
             s.destroy();
             return e;
@@ -104,6 +115,12 @@ pub const Session = struct {
     /// Server name the client asked for, if any.
     pub fn serverName(s: *const Session) ?[]const u8 {
         return if (s.sni_len > 0) s.sni_buf[0..s.sni_len] else null;
+    }
+
+    /// Verified client certificate identity, if the client presented one with a usable CN.
+    pub fn peerIdentity(s: *const Session) ?PeerIdentity {
+        if (s.peer_cn_len == 0) return null;
+        return .{ .common_name = s.peer_cn_buf[0..s.peer_cn_len], .not_before_s = s.peer_not_before, .not_after_s = s.peer_not_after };
     }
 
     pub fn negotiatedHttp11(s: *const Session) bool {
@@ -143,7 +160,7 @@ pub const Session = struct {
 
     // ---- handshake ----
 
-    fn handshake(s: *Session, creds: *config.Credentials) Error!void {
+    fn handshake(s: *Session, creds: *config.Credentials, cas: []const []const u8) Error!void {
         s.hs_buf = try s.gpa.alloc(u8, max_handshake_msg + 4);
         defer s.freeHandshake();
         const flight = try s.gpa.alloc(u8, max_flight);
@@ -155,7 +172,7 @@ pub const Session = struct {
         if (msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch = try parseHello(msg);
         inline for (suite_fields) |sf| {
-            if (ch.offersSuite(sf[0].suite_id)) return s.run(sf[0], sf[1], creds, msg, ch, flight);
+            if (ch.offersSuite(sf[0].suite_id)) return s.run(sf[0], sf[1], creds, cas, msg, ch, flight);
         }
         return error.HandshakeFailure;
     }
@@ -174,7 +191,7 @@ pub const Session = struct {
         return .{ .scheme = scheme, .alpn = alpn };
     }
 
-    fn run(s: *Session, comptime S: type, comptime field: []const u8, creds: *config.Credentials, msg1: []const u8, ch1: hs.ClientHello, flight: []u8) Error!void {
+    fn run(s: *Session, comptime S: type, comptime field: []const u8, creds: *config.Credentials, cas: []const []const u8, msg1: []const u8, ch1: hs.ClientHello, flight: []u8) Error!void {
         var ch = ch1;
         var neg = try negotiate(ch, creds);
         const groups = ch.groups orelse return error.MissingExtension;
@@ -277,6 +294,7 @@ pub const Session = struct {
         var b: hs.Builder = .{ .buf = flight };
         var mark = b.len;
         hs.encryptedExtensions(&b, if (neg.alpn) alpn_http11 else null, ch.sni != null) catch return error.InternalError;
+        if (cas.len > 0) hs.certificateRequest(&b, &peer_cert.schemes) catch return error.InternalError;
         hs.certificate(&b, creds.chain) catch return error.InternalError;
         transcript.update(b.buf[mark..b.len]);
         {
@@ -303,7 +321,9 @@ pub const Session = struct {
         pair.write.wipe();
         pair.write = S.Traffic.init(s_ap);
 
-        var expected = S.finishedData(c_hs, &th);
+        // Client auth messages extend the transcript for Finished only (RFC 8446 7.1).
+        if (cas.len > 0) try s.clientAuth(S, &transcript, cas);
+        var expected = S.finishedData(c_hs, &peek(S, transcript));
         defer std.crypto.secureZero(u8, &expected);
         const fin = try s.readHandshake();
         if (fin[0] != @intFromEnum(tls.HandshakeType.finished)) return error.UnexpectedMessage;
@@ -313,6 +333,36 @@ pub const Session = struct {
         pair.read.wipe();
         pair.read = S.Traffic.init(c_ap);
         s.early_skip = 0;
+    }
+
+    fn clientAuth(s: *Session, comptime S: type, transcript: *S.Hash, cas: []const []const u8) Error!void {
+        const m = try s.readHandshake();
+        if (m[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        // Later reads compact hs_buf, so keep our own copy of the chain.
+        const msg = try s.gpa.dupe(u8, m);
+        defer s.gpa.free(msg);
+        transcript.update(msg);
+        var list: [hs.max_peer_chain][]const u8 = undefined;
+        const chain = try hs.parseCertificate(msg[4..], &list);
+        if (chain.len == 0) return;
+        const leaf = try peer_cert.verifyChain(chain, cas, std.time.timestamp());
+
+        const cv = try s.readHandshake();
+        if (cv[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
+        var c: hs.Cursor = .{ .b = cv[4..] };
+        const scheme = try c.int(u16);
+        const sig = try c.vec(u16);
+        if (c.left() != 0) return error.DecodeError;
+        var content_buf: [200]u8 = undefined;
+        const content = hs.verifyContentFor(&content_buf, hs.client_verify_context, &peek(S, transcript.*));
+        try peer_cert.verifySignature(leaf, scheme, sig, content);
+        transcript.update(cv);
+        if (peer_cert.commonName(leaf)) |cn| {
+            @memcpy(s.peer_cn_buf[0..cn.len], cn);
+            s.peer_cn_len = @intCast(cn.len);
+            s.peer_not_before = @intCast(leaf.validity.not_before);
+            s.peer_not_after = @intCast(leaf.validity.not_after);
+        }
     }
 
     fn peek(comptime S: type, t: S.Hash) [S.hash_len]u8 {
@@ -467,6 +517,9 @@ pub const Session = struct {
             error.DecryptError => .decrypt_error,
             error.NoApplicationProtocol => .no_application_protocol,
             error.MissingExtension => .missing_extension,
+            error.BadCertificate => .bad_certificate,
+            error.CertificateExpired => .certificate_expired,
+            error.UnknownCa => .unknown_ca,
             error.InternalError, error.OutOfMemory => .internal_error,
         };
         s.sendAlert(desc);

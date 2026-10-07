@@ -51,10 +51,7 @@ pub const PrivateKey = struct {
         switch (k.kind) {
             .ecdsa_p256 => |kp| {
                 const sig = kp.sign(msg, null) catch return error.SignFailed;
-                var buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-                const d = sig.toDer(&buf);
-                @memcpy(out[0..d.len], d);
-                return out[0..d.len];
+                return ecdsaDer(sig.r, sig.s, out);
             },
             .rsa => |r| {
                 const o: *[rsa.max_bytes]u8 = out[0..rsa.max_bytes];
@@ -66,6 +63,26 @@ pub const PrivateKey = struct {
                 } catch error.SignFailed;
             },
         }
+    }
+
+    /// SEQUENCE { INTEGER r, INTEGER s } with minimal integers; peers reject
+    /// leading zero bytes, which std's toDer keeps.
+    fn ecdsaDer(r: [32]u8, s: [32]u8, out: *[max_signature_len]u8) []const u8 {
+        var n: usize = 2;
+        inline for (.{ r, s }) |v| {
+            var i: usize = 0;
+            while (i < v.len - 1 and v[i] == 0) i += 1;
+            const pad: usize = @intFromBool(v[i] & 0x80 != 0);
+            const len = v.len - i + pad;
+            out[n] = 0x02;
+            out[n + 1] = @intCast(len);
+            out[n + 2] = 0;
+            @memcpy(out[n + 2 + pad ..][0 .. v.len - i], v[i..]);
+            n += 2 + len;
+        }
+        out[0] = 0x30;
+        out[1] = @intCast(n - 2);
+        return out[0..n];
     }
 
     /// True when `spki_key` (the certificate's subjectPublicKey bits) belongs to this key.
@@ -174,4 +191,21 @@ test "garbage keys are rejected" {
     try std.testing.expectError(error.NoKey, parsePem(a, "nothing here"));
     try std.testing.expectError(error.BadKey, parsePem(a, "-----BEGIN PRIVATE KEY-----\nMAMCAQA=\n-----END PRIVATE KEY-----\n"));
     try std.testing.expectError(error.EncryptedKey, parsePem(a, "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAA==\n-----END ENCRYPTED PRIVATE KEY-----\n"));
+}
+
+test "ecdsa DER integers are minimal" {
+    var out: [max_signature_len]u8 = undefined;
+    var r = [_]u8{0} ** 32;
+    r[1] = 0x7f; // one leading zero byte to trim
+    r[31] = 1;
+    var s = [_]u8{0xff} ** 32; // high bit needs a 0x00 pad
+    const d = PrivateKey.ecdsaDer(r, s, &out);
+    try std.testing.expectEqual(@as(u8, 0x30), d[0]);
+    try std.testing.expectEqual(@as(usize, d.len - 2), d[1]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 31, 0x7f }, d[2..5]);
+    const so = 2 + 2 + 31;
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 33, 0x00, 0xff }, d[so .. so + 4]);
+    s = [_]u8{0} ** 32;
+    const z = PrivateKey.ecdsaDer(r, s, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 1, 0x00 }, z[z.len - 3 ..]);
 }

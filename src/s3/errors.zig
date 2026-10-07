@@ -49,6 +49,10 @@ pub const Code = enum {
     InvalidPartNumber,
     WriteQuorumUnavailable,
     ReadQuorumUnavailable,
+    InvalidObjectState,
+    RestoreAlreadyInProgress,
+    InvalidStorageClass,
+    QuotaExceeded,
 
     pub fn status(c: Code) std.http.Status {
         return switch (c) {
@@ -72,6 +76,10 @@ pub const Code = enum {
             .MalformedPolicy => .bad_request,
             .InvalidPartNumber => .range_not_satisfiable,
             .WriteQuorumUnavailable, .ReadQuorumUnavailable => .service_unavailable,
+            .InvalidObjectState => .forbidden,
+            .RestoreAlreadyInProgress => .conflict,
+            .InvalidStorageClass => .bad_request,
+            .QuotaExceeded => .bad_request,
         };
     }
 
@@ -122,6 +130,10 @@ pub const Code = enum {
             .InvalidPartNumber => "The requested partnumber is not satisfiable",
             .WriteQuorumUnavailable => "Write quorum not available: too many drives or nodes of this erasure set are offline.",
             .ReadQuorumUnavailable => "Read quorum not available: too many drives or nodes holding this object are offline.",
+            .InvalidObjectState => "The operation is not valid for the current state of the object.",
+            .RestoreAlreadyInProgress => "Object restore is already in progress",
+            .InvalidStorageClass => "The storage class you specified is not valid",
+            .QuotaExceeded => "Bucket quota exceeded",
         };
     }
 };
@@ -152,7 +164,11 @@ pub fn fromObject(e: object.Error) Code {
         error.InvalidMetadata => .InvalidArgument,
         error.WriteQuorum => .WriteQuorumUnavailable,
         error.ReadQuorum => .ReadQuorumUnavailable,
-        error.LockTimeout => .ServiceUnavailable,
+        error.LockTimeout, error.TierUnavailable => .ServiceUnavailable,
+        error.InvalidObjectState => .InvalidObjectState,
+        error.RestoreInProgress => .RestoreAlreadyInProgress,
+        error.InvalidStorageClass => .InvalidStorageClass,
+        error.QuotaExceeded => .QuotaExceeded,
     };
 }
 

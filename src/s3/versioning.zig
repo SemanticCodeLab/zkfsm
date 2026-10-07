@@ -56,6 +56,8 @@ pub const Headers = struct {
         inline for (object.SystemHeaders.fields) |f| if (std.ascii.eqlIgnoreCase(h.name, f[1])) {
             @field(self.system, f[0]) = try arena.dupe(u8, h.value);
         };
+        // aws-chunked describes the upload framing, not the stored object.
+        if (std.ascii.eqlIgnoreCase(h.name, "content-encoding")) self.system.content_encoding = try withoutAwsChunked(arena, h.value);
         const prefix = "x-amz-meta-";
         if (h.name.len <= prefix.len or !std.ascii.startsWithIgnoreCase(h.name, prefix)) return;
         const name = try std.ascii.allocLowerString(arena, h.name[prefix.len..]);
@@ -79,6 +81,18 @@ pub const Headers = struct {
     }
 };
 
+pub fn withoutAwsChunked(arena: std.mem.Allocator, v: []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, v, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0 or std.ascii.eqlIgnoreCase(t, "aws-chunked")) continue;
+        if (out.items.len > 0) try out.append(arena, ',');
+        try out.appendSlice(arena, t);
+    }
+    return out.items;
+}
+
 fn has(c: *Ctx, name: []const u8) error{OutOfMemory}!bool {
     return (try handler.param(c, name)) != null;
 }
@@ -89,6 +103,10 @@ pub fn route(c: *Ctx) DispatchError!bool {
     if (r.key.len == 0) {
         if (c.method == .PUT and c.ext.bucket_lock and !try has(c, "object-lock") and !try has(c, "tagging") and !try has(c, "versioning")) {
             try ov.createLockedBucket(c.svc, r.bucket);
+            if (c.tenant.len > 0) object.tenancy.setTenant(c.svc, r.bucket, c.tenant) catch |e| {
+                c.svc.deleteBucket(r.bucket) catch {};
+                return e;
+            };
             try handler.respondEmpty(c, .ok, &.{.{ .name = "location", .value = c.target }});
             return true;
         }
@@ -204,6 +222,8 @@ pub fn putResponseHeaders(c: *Ctx, info: object.ObjectInfo, out: *std.ArrayList(
 
 /// Headers describing a version on GET/HEAD.
 pub fn objectHeaders(c: *Ctx, info: object.ObjectInfo, asked_version: bool, out: *std.ArrayList(Header)) error{OutOfMemory}!void {
+    if (info.tier.len > 0) try out.append(c.arena, .{ .name = "x-amz-storage-class", .value = info.tier });
+    if (try object.transition.restoreHeader(c.svc, c.arena, info)) |v| try out.append(c.arena, .{ .name = "x-amz-restore", .value = v });
     if (asked_version or !info.version_id.eql(ov.null_version_id)) try out.append(c.arena, try versionHeader(c, info.version_id));
     if (info.retention_mode != .none) {
         const tb = try c.arena.create([24]u8);
@@ -213,6 +233,7 @@ pub fn objectHeaders(c: *Ctx, info: object.ObjectInfo, asked_version: bool, out:
         });
     }
     if (info.legal_hold) try out.append(c.arena, .{ .name = "x-amz-object-lock-legal-hold", .value = "ON" });
+    if (object.replica.statusOf(info.internal)) |st| try out.append(c.arena, .{ .name = "x-amz-replication-status", .value = st.text() });
     for (info.metadata) |m| try out.append(c.arena, .{ .name = try std.fmt.allocPrint(c.arena, "x-amz-meta-{s}", .{m.name}), .value = m.value });
     inline for (object.SystemHeaders.fields) |f| {
         const v = @field(info.system, f[0]);
@@ -234,6 +255,11 @@ pub fn applyResponseOverrides(c: *Ctx, out: *std.ArrayList(Header)) error{OutOfM
         }
         try out.append(c.arena, .{ .name = n, .value = v });
     };
+}
+
+fn versionClass(c: *Ctx, e: ov.VersionEntry) []const u8 {
+    const info = ov.headVersion(c.svc, c.arena, c.route.bucket, e.key, e.version) catch return "STANDARD";
+    return if (info.tier.len > 0) info.tier else "STANDARD";
 }
 
 /// Looks up the version to serve; answers delete markers itself (returns null).
@@ -477,7 +503,7 @@ fn listVersions(c: *Ctx) DispatchError!void {
             var eb: [core.ETag.quoted_max]u8 = undefined;
             try xml.elem(w, "ETag", e.etag.quoted(&eb));
             try xml.elemInt(w, "Size", e.size);
-            try xml.elem(w, "StorageClass", "STANDARD");
+            try xml.elem(w, "StorageClass", if (e.tiered) versionClass(c, e) else "STANDARD");
         }
         try w.writeAll("<Owner><ID>zkfsm</ID><DisplayName>zkfsm</DisplayName></Owner>");
         try xml.close(w, tag);

@@ -26,6 +26,8 @@ pub const User = struct {
     secret: []const u8,
     enabled: bool = true,
     policies: []const []const u8 = &.{},
+    /// Owning tenant; null for global users.
+    tenant: ?[]const u8 = null,
 };
 
 pub const Group = struct {
@@ -50,12 +52,36 @@ pub const ServiceAccount = struct {
 
 pub const PolicyDoc = struct { name: []const u8, document: []const u8 };
 
+/// External identity provider settings as key/value pairs (see idp.zig).
+pub const IdpConfig = struct {
+    kind: []const u8,
+    name: []const u8,
+    settings: []const Setting = &.{},
+};
+pub const Setting = struct { key: []const u8, value: []const u8 };
+
+/// Policies attached to an LDAP user or group DN.
+pub const LdapMapping = struct {
+    dn: []const u8,
+    group: bool = false,
+    policies: []const []const u8 = &.{},
+};
+
+/// An isolation boundary for users and buckets (see tenant.zig).
+pub const Tenant = struct {
+    name: []const u8,
+    enabled: bool = true,
+};
+
 pub const Snapshot = struct {
     format: u32 = format_version,
     users: []const User = &.{},
     groups: []const Group = &.{},
     service_accounts: []const ServiceAccount = &.{},
     policies: []const PolicyDoc = &.{},
+    idp: []const IdpConfig = &.{},
+    ldap_mappings: []const LdapMapping = &.{},
+    tenants: []const Tenant = &.{},
 };
 
 // ---------------------------------------------------------------- persistence
@@ -213,6 +239,9 @@ pub const Identity = struct {
     access_key: []const u8,
     /// STS session policy (already parsed by the caller from the token claims).
     session_policy: ?*const Policy = null,
+    /// Federated session: comma-separated policy names; `access_key` is then the
+    /// external identity's name and is not looked up.
+    federated_policies: ?[]const u8 = null,
 };
 
 /// Loaded snapshot plus lookup indexes; everything lives in `arena`.
@@ -390,7 +419,10 @@ pub const Store = struct {
         var username: []const u8 = who.access_key;
         var root = false;
 
-        if (self.isRoot(who.access_key)) {
+        if (who.federated_policies) |names| {
+            var it = std.mem.tokenizeScalar(u8, names, ',');
+            while (it.next()) |n| if (self.policyByName(n)) |p| ids.append(a, p) catch return .implicit_deny;
+        } else if (self.isRoot(who.access_key)) {
             root = true;
         } else if (st.user(who.access_key)) |u| {
             if (!u.enabled) return .implicit_deny;
@@ -610,6 +642,7 @@ pub const Store = struct {
         } else return error.PolicyNotFound;
         for (s.users) |u| if (containsName(u.policies, name)) return error.PolicyInUse;
         for (s.groups) |g| if (containsName(g.policies, name)) return error.PolicyInUse;
+        for (s.ldap_mappings) |l| if (containsName(l.policies, name)) return error.PolicyInUse;
         var next = s;
         next.policies = try removeAt(m.a(), PolicyDoc, s.policies, idx);
         try self.commit(next);
@@ -809,6 +842,36 @@ pub const Store = struct {
         };
         next.groups = out;
         try self.commit(next);
+    }
+
+    /// Applies `f` to a copy of the latest snapshot and commits it. `f` allocates
+    /// from the given arena; lets feature modules add mutations without new store code.
+    pub fn mutate(self: *Store, ctx: anytype, comptime f: fn (@TypeOf(ctx), Allocator, *Snapshot) StoreError!void) StoreError!void {
+        var m = try self.begin();
+        defer m.end();
+        var next = self.state.snap;
+        try f(ctx, m.a(), &next);
+        try self.commit(next);
+    }
+
+    /// True when `name` is a canned or stored policy.
+    pub fn policyExists(self: *Store, name: []const u8) bool {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        return self.policyByName(name) != null;
+    }
+
+    /// Tenant of a user, or of a service account's parent; null for global identities.
+    pub fn tenantOf(self: *Store, access_key: []const u8, out: *[limits.max_name]u8) ?[]const u8 {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const st = self.state;
+        const name = if (st.serviceAccount(access_key)) |sa| sa.parent else access_key;
+        const u = st.user(name) orelse return null;
+        const t = u.tenant orelse return null;
+        if (t.len > out.len) return null;
+        @memcpy(out[0..t.len], t);
+        return out[0..t.len];
     }
 
     /// Read-locked access to the current snapshot; call `release` when done.
