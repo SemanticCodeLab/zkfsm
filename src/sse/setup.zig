@@ -97,6 +97,8 @@ pub const Holder = struct {
     api_creds: kms.kms_api.EnvCredentials = undefined,
     api: kms.kms_api.KmsApi = undefined,
     handle: ?kms.Kms = null,
+    /// Key records of locally wrapped backends (local, KV2), for backups.
+    key_store: ?kms.keyring.KeyStore = null,
     default_key: []const u8 = "",
 
     /// `self` must not move after init.
@@ -113,6 +115,7 @@ pub const Holder = struct {
             .local => {
                 self.local.init(f.dir) catch return error.BackendFailed;
                 self.handle = self.local.kms();
+                self.key_store = self.local.files.keyStore();
             },
             .vault => {
                 const addr = env(gpa, "VAULT_ADDR") orelse return error.MissingConfig;
@@ -125,6 +128,7 @@ pub const Holder = struct {
                 if (std.mem.eql(u8, engine, "kv2")) {
                     self.kv2.init(&self.vault_client);
                     self.handle = self.kv2.kms();
+                    self.key_store = self.kv2.store.keyStore();
                 } else if (std.mem.eql(u8, engine, "transit")) {
                     self.transit = .{ .client = &self.vault_client };
                     self.handle = self.transit.kms();

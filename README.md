@@ -355,6 +355,10 @@ key id (default `zkfsm-sse-s3`, created at startup when the backend allows it;
 the static key's name for `static`). Keys are managed with
 `mc admin kms key create|list|status` and `/minio/kms/v1/{status,version,apis,
 key/create,key/rotate,key/list,key/status}`, gated by `kms:*` policy actions.
+`POST /minio/kms/v1/backup` returns a digest-checked manifest of all keys; with
+`x-zkfsm-kms-backup-key: <64 hex>` it also carries the key records (local and
+KV2 backends) sealed under that key. `POST /minio/kms/v1/restore[?dry-run=true]`
+takes the same document back and never overwrites existing keys.
 
 Storage: the blob is DARE ciphertext (64 KiB AES-256-GCM packages bound to the
 object path and part number); the sealed data key lives in internal record

@@ -381,7 +381,7 @@ pub fn run(opts: Options) u8 {
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
     const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
@@ -488,7 +488,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
     const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;

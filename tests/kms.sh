@@ -103,6 +103,27 @@ start local2.log "$WORK/d-local" --kms-backend local --kms-dir "$WORK/kms"
 s3api get-object --bucket kms-local --key k1 "$WORK/r.out" >/dev/null && cmp -s "$WORK/obj.bin" "$WORK/r.out" || fail "read after restart"
 "$MC" admin kms key list z | grep -q allowed-key || fail "keys lost on restart"
 ok "local: keys and objects survive restart"
+BKEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+kmsapi -f -X POST -H "x-zkfsm-kms-backup-key: $BKEY" "$EP/minio/kms/v1/backup" >"$WORK/backup.json" || fail "kms backup"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); m=json.loads(d["manifest"]); assert d["bundle"] and {"tenant-a","allowed-key"} <= {k["id"] for k in m["keys"]}' "$WORK/backup.json" \
+  || fail "backup document: $(head -c 300 "$WORK/backup.json")"
+kmsapi -f -X POST "$EP/minio/kms/v1/backup" | grep -q '"bundle":null' || fail "metadata-only backup"
+stop
+# Restore into an empty key directory, then read the old objects.
+start local3.log "$WORK/d-local" --kms-backend local --kms-dir "$WORK/kms-restored"
+s3api get-object --bucket kms-local --key k1 "$WORK/r.out" >/dev/null 2>&1 && fail "read before restore"
+code=$(kmsapi -o /dev/null -w '%{http_code}' -X POST --data-binary @"$WORK/backup.json" "$EP/minio/kms/v1/restore")
+[[ "$code" == 400 ]] || fail "restore without backup key got $code"
+kmsapi -f -X POST -H "x-zkfsm-kms-backup-key: $BKEY" --data-binary @"$WORK/backup.json" "$EP/minio/kms/v1/restore?dry-run=true" \
+  | grep -q '"dry_run":true' || fail "restore dry run"
+s3api get-object --bucket kms-local --key k1 "$WORK/r.out" >/dev/null 2>&1 && fail "dry run restored keys"
+WRONG="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+code=$(kmsapi -o /dev/null -w '%{http_code}' -X POST -H "x-zkfsm-kms-backup-key: $WRONG" --data-binary @"$WORK/backup.json" "$EP/minio/kms/v1/restore")
+[[ "$code" == 400 ]] || fail "restore with a wrong backup key got $code"
+kmsapi -f -X POST -H "x-zkfsm-kms-backup-key: $BKEY" --data-binary @"$WORK/backup.json" "$EP/minio/kms/v1/restore" \
+  | grep -q '"restored":' || fail "restore"
+s3api get-object --bucket kms-local --key k1 "$WORK/r.out" >/dev/null && cmp -s "$WORK/obj.bin" "$WORK/r.out" || fail "read after restore"
+ok "local: backup (sealed bundle), dry run, wrong key refused, restore"
 stop
 
 # ---------------------------------------------------------------- static key
