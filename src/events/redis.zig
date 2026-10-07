@@ -141,8 +141,12 @@ const Redis = struct {
         switch (self.mode) {
             .namespace => if (msg.removed)
                 try self.call(&.{ "HDEL", self.key, msg.key })
-            else
-                try self.call(&.{ "HSET", self.key, msg.key, msg.record }),
+            else {
+                // Namespace values are `{"Records":[record]}`, as consumers of this format expect.
+                const v = std.fmt.allocPrint(self.gpa, "{{\"Records\":[{s}]}}", .{msg.record}) catch return error.OutOfMemory;
+                defer self.gpa.free(v);
+                try self.call(&.{ "HSET", self.key, msg.key, v });
+            },
             .access => {
                 const v = std.fmt.allocPrint(self.gpa, "[{{\"Event\":[{s}],\"EventTime\":\"{s}\"}}]", .{ msg.record, msg.event_time }) catch return error.OutOfMemory;
                 defer self.gpa.free(v);
@@ -297,7 +301,7 @@ fn fakeSend(mode: []const u8, msg: target.Message, expect: []const []const u8, r
 }
 
 test "fake server: namespace put, delete, access, pubsub, auth, error reply" {
-    try fakeSend("namespace", .{ .key = "b/o", .body = "{}", .record = "{\"r\":1}" }, &.{"*4\r\n$4\r\nHSET\r\n$2\r\nev\r\n$3\r\nb/o\r\n$7\r\n{\"r\":1}\r\n"}, &.{":1\r\n"}, "");
+    try fakeSend("namespace", .{ .key = "b/o", .body = "{}", .record = "{\"r\":1}" }, &.{"*4\r\n$4\r\nHSET\r\n$2\r\nev\r\n$3\r\nb/o\r\n$21\r\n{\"Records\":[{\"r\":1}]}\r\n"}, &.{":1\r\n"}, "");
     try fakeSend("namespace", .{ .key = "b/o", .body = "{}", .removed = true }, &.{"*3\r\n$4\r\nHDEL\r\n$2\r\nev\r\n$3\r\nb/o\r\n"}, &.{":1\r\n"}, "");
     try fakeSend("access", .{ .key = "b/o", .body = "{}", .record = "{}", .event_time = "T" }, &.{"*3\r\n$5\r\nRPUSH\r\n$2\r\nev\r\n$32\r\n[{\"Event\":[{}],\"EventTime\":\"T\"}]\r\n"}, &.{":1\r\n"}, "");
     const publish_x = "*3\r\n$7\r\nPUBLISH\r\n$2\r\nev\r\n$1\r\nx\r\n";

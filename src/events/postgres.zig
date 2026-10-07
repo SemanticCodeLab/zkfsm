@@ -10,10 +10,8 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Md5 = std.crypto.hash.Md5;
 
-pub const keys = [_][]const u8{
-    "connection_string", "table", "format",   "max_open_connections", "queue_dir", "queue_limit", "comment",
-    "host",              "port",  "username", "password",             "database",
-};
+/// Values split at known keys, so the connection string's own words are not keys here.
+pub const keys = [_][]const u8{ "connection_string", "table", "format", "max_open_connections", "queue_dir", "queue_limit", "comment" };
 
 /// Largest backend message accepted; bigger frames are a protocol error.
 const max_msg = 1 << 20;

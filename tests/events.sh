@@ -296,6 +296,41 @@ else
   echo "skip brokers: EVENTS_BROKERS=0 or docker unavailable"
 fi
 
+if command -v initdb >/dev/null && command -v postgres >/dev/null && command -v psql >/dev/null; then
+  echo "== postgres server (local binaries)"
+  PGP="$(freeport)"
+  echo zkpass >"$WORK/pgpw"
+  initdb -D "$WORK/pg" -U postgres --auth=scram-sha-256 --pwfile="$WORK/pgpw" >"$WORK/initdb.log" 2>&1
+  pg_up() {
+    postgres -D "$WORK/pg" -p "$PGP" -k "$WORK" -c listen_addresses=127.0.0.1 >>"$WORK/pg.log" 2>&1 &
+    PID[pg]=$!
+    for _ in $(seq 100); do PGPASSWORD=zkpass psql -h 127.0.0.1 -p "$PGP" -U postgres -tAc 'select 1' >/dev/null 2>&1 && return 0; sleep 0.2; done
+    echo "postgres did not start"; tail -n 20 "$WORK/pg.log"; exit 1
+  }
+  pg_down() { kill -INT "${PID[pg]}" 2>/dev/null || true; wait "${PID[pg]}" 2>/dev/null || true; unset "PID[pg]"; }
+  pgq() { PGPASSWORD=zkpass psql -h 127.0.0.1 -p "$PGP" -U postgres -tAc "$1"; }
+  pg_up
+  CS="host=127.0.0.1 port=$PGP user=postgres password=zkpass dbname=postgres sslmode=disable"
+  check "postgres namespace target (scram)" "Successfully applied new settings." "$("$MC" admin config set z notify_postgres:lns connection_string="$CS" table=lns format=namespace 2>&1 | tail -n1)"
+  check "postgres access target" "Successfully applied new settings." "$("$MC" admin config set z notify_postgres:lacc connection_string="$CS" table=lacc format=access 2>&1 | tail -n1)"
+  "$MC" mb z/pgb >/dev/null
+  "$MC" event add z/pgb arn:minio:sqs::lns:postgresql --event put,delete >/dev/null
+  "$MC" event add z/pgb arn:minio:sqs::lacc:postgresql --event put,delete >/dev/null
+  echo 1 | "$MC" pipe z/pgb/a.txt >/dev/null
+  echo 2 | "$MC" pipe z/pgb/b.txt >/dev/null
+  "$MC" rm z/pgb/b.txt >/dev/null
+  eventually "namespace table keeps live objects" "pgb/a.txt" pgq 'select key from lns order by key'
+  eventually "access table logs every event" 3 pgq 'select count(*) from lacc'
+  check "namespace row holds the record" "pgb" "$(pgq "select value->'Records'->0->'s3'->'bucket'->>'name' from lns")"
+  pg_down
+  echo 3 | "$MC" pipe z/pgb/c.txt >/dev/null
+  eventually "events queue while postgres is down" 1 metric 'zkfsm_notify_target_queue_length{target_id="lns",target_name="notify_postgres"}'
+  pg_up
+  eventually "postgres catches up after restart" "pgb/a.txt pgb/c.txt" sh -c "PGPASSWORD=zkpass psql -h 127.0.0.1 -p $PGP -U postgres -tAc 'select key from lns order by key' | tr '\n' ' ' | sed 's/ \$//'"
+  eventually "access log complete after restart" 4 pgq 'select count(*) from lacc'
+  pg_down
+fi
+
 echo "== cluster: events on every node"
 stop
 CP=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")

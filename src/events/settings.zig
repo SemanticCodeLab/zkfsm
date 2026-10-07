@@ -60,33 +60,47 @@ pub fn parseLine(a: Allocator, line: []const u8) ParseError!Entry {
         if (!validId(e.id)) return error.InvalidConfig;
     }
     const kind = kinds.bySubsys(e.subsys) orelse return error.UnknownSubsys;
+    // Values may contain spaces (clients drop quotes): a value runs to the next
+    // `<known key>=` that starts a word.
+    const rest = line[i..];
     var kvs: std.ArrayList(Kv) = .empty;
-    while (true) {
-        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
-        if (i >= line.len) break;
-        const ks = i;
-        while (i < line.len and line[i] != '=' and line[i] != ' ') i += 1;
-        if (i >= line.len or line[i] != '=') return error.InvalidConfig;
-        const key = line[ks..i];
-        i += 1;
-        var value: []const u8 = "";
-        if (i < line.len and line[i] == '"') {
-            const end = std.mem.indexOfScalarPos(u8, line, i + 1, '"') orelse return error.InvalidConfig;
-            value = line[i + 1 .. end];
-            i = end + 1;
-        } else {
-            const vs = i;
-            while (i < line.len and line[i] != ' ' and line[i] != '\t') i += 1;
-            value = line[vs..i];
+    var pos: usize = 0;
+    while (pos < rest.len and (rest[pos] == ' ' or rest[pos] == '\t')) pos += 1;
+    if (pos < rest.len) {
+        const first = keyAt(kind, rest, pos) orelse return if (std.mem.indexOfScalar(u8, rest[pos..], '=') != null) error.UnknownKey else error.InvalidConfig;
+        var key = first;
+        var vstart = pos + first.len + 1;
+        while (true) {
+            var j = vstart;
+            var quoted = false;
+            const next: ?[]const u8 = while (j < rest.len) : (j += 1) {
+                if (rest[j] == '"') quoted = !quoted;
+                if (quoted or j == vstart or (rest[j - 1] != ' ' and rest[j - 1] != '\t')) continue;
+                if (keyAt(kind, rest, j)) |k| break k;
+            } else null;
+            var value = std.mem.trim(u8, rest[vstart..j], " \t");
+            if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+            if (value.len > max_value or kvs.items.len == max_kvs) return error.InvalidConfig;
+            try kvs.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+            key = next orelse break;
+            vstart = j + key.len + 1;
         }
-        if (value.len > max_value or kvs.items.len == max_kvs) return error.InvalidConfig;
-        if (!kinds.validKey(kind, key)) return error.UnknownKey;
-        try kvs.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
     }
     e.subsys = try a.dupe(u8, e.subsys);
     e.id = try a.dupe(u8, e.id);
     e.kvs = kvs.items;
     return e;
+}
+
+/// The longest known key of `kind` written as `key=` at `pos`.
+fn keyAt(kind: *const kinds.Kind, s: []const u8, pos: usize) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    const lists = [_][]const []const u8{ &kinds.common_keys, kind.keys };
+    for (lists) |list| for (list) |k| {
+        if (pos + k.len >= s.len or s[pos + k.len] != '=' or !std.mem.eql(u8, s[pos .. pos + k.len], k)) continue;
+        if (best == null or k.len > best.?.len) best = k;
+    };
+    return best;
 }
 
 fn validId(id: []const u8) bool {
@@ -236,6 +250,12 @@ test "parse, merge, render" {
     try t.expectEqualStrings("notify_webhook:1 endpoint=http://h:1/x auth_token=*redacted* queue_dir=/q\n", r);
     try t.expectEqual(@as(usize, 1), (try remove(a, m, m[0], false)).len);
     try t.expect((try parseLine(a, "notify_webhook:1 enable=off")).enabled() == false);
+    const pg = try parseLine(a, "notify_postgres:1 connection_string=host=h port=5 user=u table=t format=access");
+    try t.expectEqualStrings("host=h port=5 user=u", pg.settings().get("connection_string"));
+    try t.expectEqualStrings("t", pg.settings().get("table"));
+    const q = try parseLine(a, "notify_postgres:1 connection_string=\"host=h table=x\" table=t");
+    try t.expectEqualStrings("host=h table=x", q.settings().get("connection_string"));
+    try t.expectEqualStrings("t", q.settings().get("table"));
 }
 
 test "env targets" {

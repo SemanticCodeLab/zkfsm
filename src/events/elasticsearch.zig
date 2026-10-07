@@ -203,7 +203,9 @@ const Elastic = struct {
                 delete = true;
                 writeRequest(w, .DELETE, self.url.host, self.url.port, self.index, msg.key, self.auth, "") catch return error.Unreachable;
             } else {
-                writeRequest(w, .PUT, self.url.host, self.url.port, self.index, msg.key, self.auth, msg.record) catch return error.Unreachable;
+                const doc = std.fmt.allocPrint(self.gpa, "{{\"Records\":[{s}]}}", .{msg.record}) catch return error.OutOfMemory;
+                defer self.gpa.free(doc);
+                writeRequest(w, .PUT, self.url.host, self.url.port, self.index, msg.key, self.auth, doc) catch return error.Unreachable;
             },
             .access => {
                 const body = accessBody(self.gpa, msg) catch return error.OutOfMemory;
@@ -371,11 +373,11 @@ test "fake server: namespace put + delete, access, 404 delete, 4xx and garbage" 
     try scenario("namespace", &.{
         .{ .key = "b/o", .body = "{}", .record = "{\"r\":1}" },
         .{ .key = "b/o", .body = "{}", .removed = true },
-    }, &.{ .{ "PUT", "/ev/_doc/b%2Fo", "{\"r\":1}" }, .{ "DELETE", "/ev/_doc/b%2Fo", "" } }, &.{ "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n", "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" }, null);
+    }, &.{ .{ "PUT", "/ev/_doc/b%2Fo", "{\"Records\":[{\"r\":1}]}" }, .{ "DELETE", "/ev/_doc/b%2Fo", "" } }, &.{ "HTTP/1.1 201 Created\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n", "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" }, null);
     try scenario("access", &.{.{ .key = "b/o", .body = "{}", .record = "{}", .event_time = "T" }}, &.{.{ "POST", "/ev/_doc", "{\"Records\":[{}],\"EventTime\":\"T\"}" }}, &.{ok}, null);
-    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{}" }}, &.{"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}"}, error.Rejected);
-    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{}" }}, &.{"HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"}, error.Rejected);
-    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{}" }}, &.{"garbage\r\n\r\n"}, error.Unreachable);
+    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{\"Records\":[{}]}" }}, &.{"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}"}, error.Rejected);
+    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{\"Records\":[{}]}" }}, &.{"HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"}, error.Rejected);
+    try scenario("namespace", &.{.{ .key = "k", .body = "{}", .record = "{}" }}, &.{.{ "PUT", "/ev/_doc/k", "{\"Records\":[{}]}" }}, &.{"garbage\r\n\r\n"}, error.Unreachable);
 }
 
 fn scenario(format: []const u8, msgs: []const target.Message, reqs: []const struct { []const u8, []const u8, []const u8 }, replies: []const []const u8, want: ?target.SendError) !void {
