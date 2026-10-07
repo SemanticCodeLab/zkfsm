@@ -2,11 +2,13 @@
 const std = @import("std");
 const pem = @import("pem.zig");
 const keys = @import("keys.zig");
+const peer = @import("peer.zig");
 
 pub const LoadError = error{ CannotRead, NoCertificate, BadCertificate, KeyMismatch, BadKey, UnsupportedKey, EncryptedKey, NoKey, OutOfMemory };
 
 const max_file = 1 << 20;
 const max_chain_bytes = 1 << 16;
+const max_client_cas = 256;
 
 pub const Credentials = struct {
     gpa: std.mem.Allocator,
@@ -70,6 +72,42 @@ pub const Credentials = struct {
     }
 };
 
+fn parseCas(gpa: std.mem.Allocator, text: []const u8) LoadError![][]u8 {
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |c| gpa.free(c);
+        list.deinit(gpa);
+    }
+    var it: pem.Iterator = .{ .text = text };
+    while (it.next() catch return error.BadCertificate) |blk| {
+        if (!std.mem.eql(u8, blk.label, "CERTIFICATE")) continue;
+        if (list.items.len == max_client_cas) return error.BadCertificate;
+        const d = pem.decode(gpa, blk.body) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadPem => error.BadCertificate,
+        };
+        list.append(gpa, d) catch {
+            gpa.free(d);
+            return error.OutOfMemory;
+        };
+        _ = try peer.parse(d);
+    }
+    if (list.items.len == 0) return error.NoCertificate;
+    return list.toOwnedSlice(gpa);
+}
+
+fn freeCas(gpa: std.mem.Allocator, cas: [][]u8) void {
+    for (cas) |c| gpa.free(c);
+    if (cas.len > 0) gpa.free(cas);
+}
+
+test "client CA bundle parses" {
+    const cas = try parseCas(std.testing.allocator, @embedFile("testdata/ca.pem"));
+    defer freeCas(std.testing.allocator, cas);
+    try std.testing.expectEqual(1, cas.len);
+    try std.testing.expectError(error.NoCertificate, parseCas(std.testing.allocator, "nothing"));
+}
+
 fn mapRead(e: anytype) LoadError {
     return if (e == error.OutOfMemory) error.OutOfMemory else error.CannotRead;
 }
@@ -81,6 +119,8 @@ pub const Context = struct {
     key_path: []const u8,
     mutex: std.Thread.Mutex = .{},
     current: *Credentials,
+    /// Trusted roots for client certificates (DER); empty means no mutual TLS.
+    client_cas: [][]u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) LoadError!Context {
         return .{ .gpa = gpa, .cert_path = cert_path, .key_path = key_path, .current = try Credentials.fromFiles(gpa, cert_path, key_path) };
@@ -88,6 +128,22 @@ pub const Context = struct {
 
     pub fn deinit(ctx: *Context) void {
         ctx.current.release();
+        freeCas(ctx.gpa, ctx.client_cas);
+        ctx.client_cas = &.{};
+    }
+
+    /// Requests client certificates on every handshake, trusting the CAs in `pem_path`.
+    /// Call before serving; not safe against concurrent handshakes.
+    pub fn setClientCa(ctx: *Context, pem_path: []const u8) LoadError!void {
+        const text = std.fs.cwd().readFileAlloc(ctx.gpa, pem_path, max_file) catch |e| return mapRead(e);
+        defer ctx.gpa.free(text);
+        const cas = try parseCas(ctx.gpa, text);
+        freeCas(ctx.gpa, ctx.client_cas);
+        ctx.client_cas = cas;
+    }
+
+    pub fn hasClientCa(ctx: *const Context) bool {
+        return ctx.client_cas.len > 0;
     }
 
     /// Caller must `release` the result.

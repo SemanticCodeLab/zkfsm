@@ -5,8 +5,10 @@ const codec = @import("codec.zig");
 const record = @import("record.zig");
 
 pub const magic = "ZKBG";
-/// v2 adds the bucket policy and lifecycle rules; v1 configs still decode.
-pub const format_version: u16 = 2;
+/// v2 adds the bucket policy and lifecycle rules, v3 the hard quota and owning
+/// tenant; older configs still decode.
+pub const format_version: u16 = 3;
+pub const max_tenant_len = 64;
 
 pub const Versioning = enum(u8) { unset = 0, enabled = 1, suspended = 2 };
 
@@ -24,11 +26,15 @@ pub const BucketConfig = struct {
     policy: []const u8 = "",
     /// Encoded lifecycle rules (see lifecycle.zig); empty when none.
     lifecycle: []const u8 = "",
+    /// Hard quota in bytes; 0 means none.
+    quota: u64 = 0,
+    /// Tenant that owns the bucket; empty for global buckets.
+    tenant: []const u8 = "",
 };
 
 pub fn encode(cfg: BucketConfig, gpa: std.mem.Allocator) error{ OutOfMemory, InvalidTag }![]u8 {
     if (cfg.tags.len > std.math.maxInt(u16) or cfg.policy.len > std.math.maxInt(u16)) return error.InvalidTag;
-    if (cfg.lifecycle.len > std.math.maxInt(u32)) return error.InvalidTag;
+    if (cfg.lifecycle.len > std.math.maxInt(u32) or cfg.tenant.len > max_tenant_len) return error.InvalidTag;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(cfg, &a.writer) catch return error.OutOfMemory;
@@ -50,6 +56,9 @@ fn encodeTo(cfg: BucketConfig, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll(cfg.policy);
     try codec.putInt(w, u32, @intCast(cfg.lifecycle.len));
     try w.writeAll(cfg.lifecycle);
+    try codec.putInt(w, u64, cfg.quota);
+    try w.writeByte(@intCast(cfg.tenant.len));
+    try w.writeAll(cfg.tenant);
 }
 
 pub fn decode(bytes: []const u8) codec.DecodeError!BucketConfig {
@@ -69,13 +78,19 @@ pub fn decode(bytes: []const u8) codec.DecodeError!BucketConfig {
         cfg.policy = try c.take(try c.int(u16));
         cfg.lifecycle = try c.take(try c.int(u32));
     }
+    if (ver >= 3) {
+        cfg.quota = try c.int(u64);
+        const n = (try c.take(1))[0];
+        if (n > max_tenant_len) return error.Corrupt;
+        cfg.tenant = try c.take(n);
+    }
     if (c.pos != bytes.len) return error.Corrupt;
     return cfg;
 }
 
 test "bucket config roundtrip" {
     const gpa = std.testing.allocator;
-    const cfg: BucketConfig = .{ .versioning = .enabled, .lock_enabled = true, .default_mode = .governance, .default_days = 3, .tags = "ab", .has_tags = true, .policy = "{}", .lifecycle = "LC" };
+    const cfg: BucketConfig = .{ .versioning = .enabled, .lock_enabled = true, .default_mode = .governance, .default_days = 3, .tags = "ab", .has_tags = true, .policy = "{}", .lifecycle = "LC", .quota = 1 << 40, .tenant = "acme" };
     const b = try encode(cfg, gpa);
     defer gpa.free(b);
     const d = try decode(b);
@@ -85,9 +100,11 @@ test "bucket config roundtrip" {
     try std.testing.expectEqualStrings("ab", d.tags);
     try std.testing.expectEqualStrings("{}", d.policy);
     try std.testing.expectEqualStrings("LC", d.lifecycle);
+    try std.testing.expectEqual(@as(u64, 1 << 40), d.quota);
+    try std.testing.expectEqualStrings("acme", d.tenant);
     for (0..b.len) |n| try std.testing.expectError(error.Corrupt, decode(b[0..n]));
     // A v1 config is the v2 one without the policy and lifecycle tail.
-    const v1 = try gpa.dupe(u8, b[0 .. b.len - (2 + 2 + 4 + 2)]);
+    const v1 = try gpa.dupe(u8, b[0 .. b.len - (2 + 2 + 4 + 2 + 8 + 1 + 4)]);
     defer gpa.free(v1);
     v1[4] = 1;
     const o = try decode(v1);

@@ -14,7 +14,7 @@ rank() {
     heal | object) echo 5 ;;
     metrics | iam) echo 6 ;;
     s3 | admin | gateway) echo 7 ;;
-    cluster) echo 8 ;;
+    cluster | replication) echo 8 ;;
     *) echo -1 ;;
   esac
 }

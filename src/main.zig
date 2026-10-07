@@ -13,6 +13,7 @@ const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
 const gateway = @import("gateway/root.zig");
+const replication = @import("replication/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -39,6 +40,7 @@ const usage =
     \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
+    \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -55,6 +57,11 @@ const usage =
     \\  --set-size N     drives per erasure set (default: largest fitting divisor <= 16)
     \\  --cluster-refresh S  seconds between catalog/IAM reloads from the store (default: 10)
     \\  --cluster-ca FILE  extra PEM certificates trusted for peer TLS; repeatable
+    \\identity providers (also settable at runtime with mc admin idp openid|ldap add):
+    \\  --identity-openid "k=v ..."  default OpenID provider, e.g. config_url=... client_id=...
+    \\                   (or $ZKFSM_IDENTITY_OPENID_<KEY>)
+    \\  --identity-ldap "k=v ..."    LDAP directory, e.g. server_addr=host:636 lookup_bind_dn=...
+    \\                   (or $ZKFSM_IDENTITY_LDAP_<KEY>)
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -86,6 +93,9 @@ const Config = struct {
     cluster_refresh_s: u64 = 10,
     cluster_ca: []const []const u8 = &.{},
     gateways: gateway.Config = .{},
+    identity_openid: ?[]const u8 = null,
+    identity_ldap: ?[]const u8 = null,
+    tls_client_ca: ?[]const u8 = null,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -152,6 +162,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.cluster_secret = args[i];
         } else if (std.mem.eql(u8, a, "--cluster-ca")) {
             try cas.append(arena, args[i]);
+        } else if (std.mem.eql(u8, a, "--identity-openid")) {
+            cfg.identity_openid = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
+            cfg.tls_client_ca = args[i];
+        } else if (std.mem.eql(u8, a, "--identity-ldap")) {
+            cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
             cfg.set_size = std.fmt.parseInt(usize, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--cluster-refresh")) {
@@ -301,6 +317,10 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     defer svc.deinit();
+    var tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
+    defer tiers.deinit();
+    svc.tiers = &tiers;
+    startTierLoop(&svc, cfg.lifecycle_interval_s, null);
     if (cfg.scan_interval_s > 0) {
         healer.start(cfg.scan_interval_s * std.time.ns_per_s) catch {
             std.log.err("cannot start healer", .{});
@@ -330,14 +350,24 @@ pub fn run(opts: Options) u8 {
         auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
     }
     defer if (auth.iam) |st| st.deinit();
+    var federation: iam.federation.Federation = .{ .gpa = gpa, .store = &iam_store };
+    defer federation.deinit();
+    if (creds != null) {
+        federation.env = identityEnv(arena, cfg) catch return 2;
+        auth.federation = &federation;
+    }
     const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
     admin.api.validatePrefix(admin_prefix) catch {
         std.log.err("invalid admin prefix {s}: need /seg[/seg...], no trailing slash, '?', '..' or '//'", .{admin_prefix});
         return 2;
     };
     warnShadowedBucket(&svc, arena, admin_prefix);
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    var repl = replication.Replicator.init(gpa, &svc, .{});
+    defer repl.deinit();
+    startReplication(&repl, &svc, auth.iam);
+    var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -349,6 +379,10 @@ pub fn run(opts: Options) u8 {
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
         std.log.info("tls enabled ({s})", .{tp[0]});
     }
     defer if (tls_paths != null) tls_ctx.deinit();
@@ -422,18 +456,31 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var svc: object.ObjectService = undefined;
     var svc_ready = false;
     defer if (svc_ready) svc.deinit();
+    var tiers: object.tier.Registry = undefined;
+    defer if (svc_ready) tiers.deinit();
     var iam_store: iam.Store = undefined;
     var iam_ready = false;
     defer if (iam_ready) iam_store.deinit();
     var auth: s3.sigv4.Config = .{};
     if (creds) |c| auth = .{ .iam = &iam_store, .sts = .{ .key = s3.sigv4.stsIssuerKey(c.secret_key) } };
+    var federation: iam.federation.Federation = .{ .gpa = gpa, .store = &iam_store };
+    defer federation.deinit();
+    if (creds != null) {
+        federation.env = identityEnv(arena, cfg) catch return 2;
+        auth.federation = &federation;
+    }
     const admin_prefix = cfg.admin_prefix orelse std.process.getEnvVarOwned(arena, "ZKFSM_ADMIN_PREFIX") catch admin.api.default_prefix;
     admin.api.validatePrefix(admin_prefix) catch {
         std.log.err("invalid admin prefix {s}", .{admin_prefix});
         return 2;
     };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp() };
-    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{bridge.extension()}, opts.extensions }) catch return 1;
+    // Set up once the object service exists; requests wait behind the gate until then.
+    var repl: replication.Replicator = undefined;
+    var repl_ready = false;
+    defer if (repl_ready) repl.deinit();
+    var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
         tls_ctx = tls.Context.init(gpa, tp[0], tp[1]) catch |e| {
@@ -441,6 +488,10 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             return 2;
         };
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
+        if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
+            std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
+            return 2;
+        };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
     const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
@@ -474,6 +525,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (e != error.Stopped) std.log.err("cannot open the object service: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
         };
+        tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
+        svc.tiers = &tiers;
         svc_ready = true;
         if (creds) |c| {
             while (true) {
@@ -491,6 +544,9 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
                 break;
             }
         }
+        repl = replication.Replicator.init(gpa, &svc, .{ .leader = .{ .ctx = node, .func = clusterLeader } });
+        repl_ready = true;
+        startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         node.start(if (iam_ready) &iam_store else null);
         gateways = gateway.Running.start(.{
             .gpa = gpa,
@@ -501,6 +557,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             break :blk 1;
         };
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
+        startTierLoop(&svc, cfg.lifecycle_interval_s, node);
         if (cfg.lifecycle_interval_s > 0) {
             if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         }
@@ -520,6 +577,19 @@ fn serveThread(server: *s3.Server, addr: std.net.Address, node: *cluster.Node) v
     server.run(addr) catch |e| std.log.err("server failed: {t}", .{e});
     // Unblocks a bootstrap that is still waiting for peers.
     node.stop_ev.set();
+}
+
+fn clusterLeader(ctx: *anyopaque) bool {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    return node.isLeader();
+}
+
+/// Hooks the replication engine into the object service, metrics, and IAM.
+fn startReplication(repl: *replication.Replicator, svc: *object.ObjectService, iam_store: ?*iam.Store) void {
+    repl.site_ctx = .{ .iam = iam_store };
+    svc.replication = repl.sink();
+    metrics.global.extra[0] = .{ .ctx = &repl.stats, .func = replication.stats.Stats.render };
+    repl.start() catch |e| std.log.warn("replication worker not started: {t}", .{e});
 }
 
 fn clusterReady(ctx: *anyopaque) bool {
@@ -600,6 +670,48 @@ fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.
         if (n > 0 or st.locked > 0) std.log.info("lifecycle: {d} expired, {d} noncurrent, {d} markers, {d} uploads, {d} locked", .{
             st.expired, st.noncurrent_expired, st.markers_removed, st.uploads_aborted, st.locked,
         });
+        const t = st.transitioned + st.noncurrent_transitioned;
+        if (t > 0 or st.transition_failed > 0) std.log.info("lifecycle: {d} transitioned, {d} noncurrent transitioned, {d} failed", .{
+            st.transitioned, st.noncurrent_transitioned, st.transition_failed,
+        });
+    }
+}
+
+/// Tier config is sealed with a key derived from the root credentials.
+fn tierKey(creds: ?s3.sigv4.Credentials) ?[32]u8 {
+    const c = creds orelse return null;
+    return object.tier.sealKey(c.access_key, c.secret_key);
+}
+
+/// The remote cleanup journal every minute (or lifecycle interval, if shorter); restore
+/// expiry and tier usage (a full record scan) every 10 minutes, or as often with a short
+/// lifecycle interval. ZKFSM_ILM_DAY_SECONDS shortens lifecycle/restore days (tests).
+fn startTierLoop(svc: *object.ObjectService, lifecycle_interval_s: u64, leader: ?*cluster.Node) void {
+    if (std.process.getEnvVarOwned(svc.gpa, "ZKFSM_ILM_DAY_SECONDS")) |v| {
+        defer svc.gpa.free(v);
+        const n = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (n > 0) {
+            object.transition.day_len_ns = @as(i128, n) * std.time.ns_per_s;
+            std.log.warn("lifecycle days last {d}s (ZKFSM_ILM_DAY_SECONDS)", .{n});
+        }
+    } else |_| {}
+    const interval = if (lifecycle_interval_s == 0) 60 else @min(lifecycle_interval_s, 60);
+    if (std.Thread.spawn(.{}, tierLoop, .{ svc, interval, leader })) |t| t.detach() else |e| std.log.warn("tier worker not started: {t}", .{e});
+}
+
+fn tierLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.Node) void {
+    const scan_every: u64 = if (interval_s < 60) 1 else 10;
+    var pass: u64 = 0;
+    while (true) : (pass += 1) {
+        std.Thread.sleep(interval_s * std.time.ns_per_s);
+        if (leader) |l| if (!l.isLeader()) continue;
+        const st = object.transition.housekeeping(svc, std.time.nanoTimestamp(), pass % scan_every == 0) catch |e| {
+            std.log.warn("tier housekeeping failed: {t}", .{e});
+            continue;
+        };
+        if (st.restores_expired > 0 or st.cleaned > 0) std.log.info("tiers: {d} restored copies expired, {d} remote blobs deleted, {d} deletes pending", .{
+            st.restores_expired, st.cleaned, st.cleanup_pending,
+        });
     }
 }
 
@@ -642,6 +754,39 @@ fn loadCredentials(gpa: std.mem.Allocator) error{ Incomplete, OutOfMemory }!?s3.
         return .{ .access_key = ak orelse return error.Incomplete, .secret_key = sk orelse return error.Incomplete };
     }
     return null;
+}
+
+/// Identity provider settings from the environment, overridden key by key by the flags.
+fn identityEnv(arena: std.mem.Allocator, cfg: Config) error{ BadArgs, OutOfMemory }!iam.idp.EnvConfig {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    var out: iam.idp.EnvConfig = .{};
+    inline for (.{ .{ iam.idp.Kind.openid, "openid" }, .{ iam.idp.Kind.ldap, "ldap" } }) |k| {
+        var list: std.ArrayList(iam.store.Setting) = .empty;
+        try list.appendSlice(arena, try iam.idp.fromEnv(arena, k[0], &env));
+        if (@field(cfg, "identity_" ++ k[1])) |text| {
+            const flag_settings = iam.idp.parseSettings(arena, k[0], text) catch |e| {
+                std.log.err("--identity-{s}: {t}", .{ k[1], e });
+                return error.BadArgs;
+            };
+            for (flag_settings) |fs| {
+                for (list.items) |*x| {
+                    if (std.mem.eql(u8, x.key, fs.key)) {
+                        x.value = fs.value;
+                        break;
+                    }
+                } else try list.append(arena, fs);
+            }
+        }
+        if (list.items.len > 0) {
+            iam.idp.validate(k[0], list.items) catch |e| {
+                std.log.err("identity {s} settings: {t}", .{ k[1], e });
+                return error.BadArgs;
+            };
+            std.log.info("identity: {s} provider from flags/environment", .{k[1]});
+        }
+        @field(out, k[1]) = list.items;
+    }
+    return out;
 }
 
 fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {
@@ -720,4 +865,5 @@ test {
     _ = tls;
     _ = cluster;
     _ = gateway;
+    _ = replication;
 }

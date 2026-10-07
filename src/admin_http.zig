@@ -6,6 +6,7 @@ const admin = @import("admin/root.zig");
 const iam = @import("iam/root.zig");
 const object = @import("object/root.zig");
 const metrics = @import("metrics/root.zig");
+const replication = @import("replication/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -15,6 +16,8 @@ pub const Bridge = struct {
     auth: s3.sigv4.Config,
     svc: *object.ObjectService,
     started_s: i64,
+    /// Remote targets and site replication; also sees IAM changes for peers.
+    repl: ?*replication.Replicator = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -36,13 +39,14 @@ pub const Bridge = struct {
         const now_s = std.time.timestamp();
         const ak = c.auth.access_key;
         var sbuf: iam.Store.SecretBuf = undefined;
+        var tbuf: s3.tenancy.NameBuf = undefined;
         var sts_secret: [iam.sts.secret_key_len]u8 = undefined;
         const secret: []const u8 = if (!std.mem.eql(u8, ak, c.auth.principal)) blk: {
             const issuer = self.auth.sts orelse return denied(c);
             sts_secret = issuer.secretFor(ak);
             break :blk &sts_secret;
         } else store.secretFor(ak, now_s, &sbuf) orelse return denied(c);
-        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s }, .{
+        const req: admin.api.Request = .{
             .method = c.method,
             .target = target,
             .body = body,
@@ -51,9 +55,17 @@ pub const Bridge = struct {
                 .secret = try c.arena.dupe(u8, secret),
                 .principal = c.auth.principal,
                 .session_policy = c.auth.session_policy,
+                .federated_policies = c.auth.federated_policies,
+                .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
-        });
+        };
+        if (self.repl) |r| if (try replication.admin.handle(r, c.arena, store, req)) |res| {
+            try respond(c, res);
+            return true;
+        };
+        const res = try admin.api.handle(c.arena, .{ .store = store, .svc = self.svc, .started_s = self.started_s, .idp_env = if (self.auth.federation) |f| f.env else .{} }, req);
+        if (self.repl) |r| replication.admin.observe(r, c.arena, req, res);
         try respond(c, res);
         return true;
     }
@@ -104,8 +116,10 @@ fn denied(c: *Ctx) ConnError!bool {
 
 fn respond(c: *Ctx, res: admin.api.Response) ConnError!void {
     metrics.global.last_status = @intFromEnum(res.status);
-    try c.req.respond(res.body, .{ .status = res.status, .extra_headers = &.{
+    const hs = [_]std.http.Header{
         .{ .name = "content-type", .value = res.content_type },
         .{ .name = "x-amz-request-id", .value = &c.request_id },
-    } });
+        .{ .name = "x-minio-config-applied", .value = "true" },
+    };
+    try c.req.respond(res.body, .{ .status = res.status, .extra_headers = hs[0..if (res.config_applied) 3 else 2] });
 }
