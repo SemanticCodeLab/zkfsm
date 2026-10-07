@@ -54,7 +54,9 @@ test "retention change rules" {
     const g: Retention = .{ .mode = .governance, .until_ns = 100 };
     const c: Retention = .{ .mode = .compliance, .until_ns = 100 };
     try checkChange(g, .{ .mode = .governance, .until_ns = 200 }, false, 0);
-    try checkChange(g, .{ .mode = .compliance, .until_ns = 100 }, false, 0);
+    // Changing the mode of an active governance lock (even to compliance) needs the bypass.
+    try std.testing.expectError(error.ObjectLocked, checkChange(g, .{ .mode = .compliance, .until_ns = 100 }, false, 0));
+    try checkChange(g, .{ .mode = .compliance, .until_ns = 100 }, true, 0);
     try std.testing.expectError(error.ObjectLocked, checkChange(g, .{}, false, 0));
     try checkChange(g, .{}, true, 0);
     try std.testing.expectError(error.ObjectLocked, checkChange(c, .{ .mode = .governance, .until_ns = 300 }, true, 0));

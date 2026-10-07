@@ -443,7 +443,7 @@ test "head with aws-chunked content encoding" {
     const d = try parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Encoding: deflate, gzip\r\nExpect: 200\r\nContent-Length: 1\r\n\r\n");
     try std.testing.expectEqual(@as(?u64, 1), d.content_length);
     try std.testing.expect(d.expect == null);
-    try std.testing.expectError(error.HttpHeadersInvalid, parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
+    try std.testing.expectError(error.InvalidContentLength, parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
 }
 
 /// Wraps a request body per `Auth`: verifies a declared sha256 at EOF, or

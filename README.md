@@ -33,7 +33,9 @@ start unless `--anonymous` is passed. Defaults: data root `$ZKFSM_DATA`, else
 `./data`; listen `0.0.0.0:9000`. Path-style addressing
 (`http://host:9000/bucket/key`); `--domain s3.example.com` (repeatable, or
 `$ZKFSM_DOMAIN`) adds virtual-host style (`http://bucket.s3.example.com/key`),
-and `--path-prefix /s3` (or `$ZKFSM_PATH_PREFIX`) serves the API under a base
+`--website-domain web.example.com` (repeatable, or `$ZKFSM_WEBSITE_DOMAIN`)
+serves each bucket's static website at `http://bucket.web.example.com/`, and
+`--path-prefix /s3` (or `$ZKFSM_PATH_PREFIX`) serves the API under a base
 path; requests outside it get `404 NoSuchBucket`. `--health-prefix`,
 `--metrics-path`, and `--no-minio-compat` move or trim the operational
 endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
@@ -171,6 +173,40 @@ STS `AssumeRole` (`POST /`, form body) returns temporary credentials for the
 signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
 narrowed by a session `Policy`; standard `sts assume-role` clients work
 unchanged against the server endpoint.
+
+### ACLs, CORS, websites, and form uploads
+
+IAM and bucket policies decide first; when they do not allow a request, bucket
+and object ACLs may still grant it. Canned ACLs (`private`, `public-read`,
+`public-read-write`, `authenticated-read`, `bucket-owner-read`,
+`bucket-owner-full-control`, `log-delivery-write`), `x-amz-grant-*` headers,
+and `AccessControlPolicy` bodies are stored and evaluated; grantees are the
+root (canonical ID `zkfsm`), IAM users and service accounts (by name), and the
+`AllUsers`/`AuthenticatedUsers`/`LogDelivery` groups. Identities without IAM
+grants own the buckets and objects they create. An explicit policy deny always
+wins, and the root is never restricted. Ownership controls
+(`BucketOwnerEnforced` disables ACLs), public access blocks, and
+`x-amz-expected-bucket-owner` apply as in S3.
+
+Bucket CORS rules answer unauthenticated `OPTIONS` preflights and add
+`Access-Control-*` headers to every response for a matching `Origin`. A
+bucket with a website configuration (index and error documents, redirect-all,
+routing rules) is served anonymously on the `--website-domain` endpoint;
+objects must be publicly readable by policy or ACL. Browser-form `POST`
+uploads check the form's POST policy (SigV4 or SigV2 signature, expiration,
+`eq`/`starts-with`/`content-length-range` conditions) and honor
+`success_action_status` and `success_action_redirect`. Legacy SigV2 header and
+presigned (`AWSAccessKeyId`/`Expires`/`Signature`) requests are accepted.
+
+Additional checksums (`x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`,
+`-sha1`, `-sha256`), in headers or aws-chunked trailers (signed or unsigned),
+are verified before the object commits, stored, and returned with
+`x-amz-checksum-mode: ENABLED`; multipart uploads keep per-part checksums and
+produce composite or full-object values. `GetObjectAttributes`, conditional
+writes (`If-None-Match`/`If-Match` on PutObject and CompleteMultipartUpload),
+bucket logging configuration (stored; logs are not delivered), and the
+accelerate and request-payment stubs are available; `x-amz-request-payer` is
+accepted and ignored.
 
 ### Tiering
 

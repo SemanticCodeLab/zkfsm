@@ -495,7 +495,7 @@ test "canned ACLs, grant headers, encoding, and evaluation" {
     try writeXml(&w, h);
     const parsed = try parseXml(a, w.buffered(), "alice");
     try std.testing.expectEqual(@as(usize, 3), parsed.grants.len);
-    try std.testing.expectEqual(Kind.group, parsed.grants[1].kind);
+    try std.testing.expectEqual(Kind.group, parsed.grants[0].kind);
     try std.testing.expectError(error.MalformedACLError, parseXml(a, "<Nope/>", "x"));
     try std.testing.expectError(error.UnresolvableGrantByEmailAddress, validate(null, .{ .owner = "x", .grants = &.{.{ .kind = .email, .value = "a@b", .perm = .READ }} }));
 }

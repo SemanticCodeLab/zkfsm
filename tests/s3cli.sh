@@ -166,7 +166,10 @@ check "cli lifecycle gone" 1 "$(s3cli s3api get-bucket-lifecycle-configuration -
 check "cli get-bucket-acl" "zkfsm" "$(s3cli s3api get-bucket-acl --bucket pubb --query Owner.ID --output text)"
 check "cli get-object-acl" "FULL_CONTROL" "$(s3cli s3api get-object-acl --bucket pubb --key pub.txt --query 'Grants[0].Permission' --output text)"
 check "cli put-object-acl private" 0 "$(s3cli s3api put-object-acl --bucket pubb --key pub.txt --acl private >/dev/null; echo $?)"
-check "cli put-bucket-acl public rejected" 1 "$(s3cli s3api put-bucket-acl --bucket pubb --acl public-read 2>&1 | grep -c NotImplemented)"
+check "cli put-bucket-acl public-read" 0 "$(s3cli s3api put-bucket-acl --bucket pubb --acl public-read >/dev/null; echo $?)"
+check "unsigned list via bucket acl" 1 "$(curl -s "$EP/pubb?list-type=2&prefix=pub" | grep -c '<Key>pub.txt</Key>')"
+check "cli put-bucket-acl private" 0 "$(s3cli s3api put-bucket-acl --bucket pubb --acl private >/dev/null; echo $?)"
+check "unsigned list denied again" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/pubb?list-type=2")"
 for k in a b c d e; do s3cli s3api put-object --bucket pubb --key "v1/$k" --body "$WORK/pub.txt" >/dev/null; done
 check "cli list-objects v1 paginated" 5 "$(s3cli s3api list-objects --bucket pubb --prefix v1/ --page-size 2 --query 'Contents[].Key' --output text | wc -w)"
 check "cli list-objects v1 delimiter" "v1/" "$(s3cli s3api list-objects --bucket pubb --delimiter / --query 'CommonPrefixes[0].Prefix' --output text)"

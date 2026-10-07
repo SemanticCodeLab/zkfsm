@@ -38,7 +38,7 @@ SIZE=$(stat -c %s "$WORK/obj.bin")
 MD5=$(md5sum "$WORK/obj.bin" | cut -d' ' -f1)
 
 check "create bucket" 200 "$(status -X PUT "$EP/smoke")"
-check "create dup bucket" 409 "$(status -X PUT "$EP/smoke")"
+check "re-create own bucket" 200 "$(status -X PUT "$EP/smoke")"
 check "head bucket" 200 "$(status -I "$EP/smoke")"
 check "head missing bucket" 404 "$(status -I "$EP/nope-bucket")"
 check "list buckets" 1 "$(curl -s "$EP/" | grep -c '<Name>smoke</Name>')"
@@ -134,8 +134,8 @@ check "part 1 body" "$(md5sum < "$WORK/p1")" "$(curl -s "$EP/mpb/big?partNumber=
 check "part content-range" "bytes 6000000-6001233/6001234" "$(header content-range "$EP/mpb/big?partNumber=2")"
 check "part parts count" 2 "$(header x-amz-mp-parts-count -I "$EP/mpb/big?partNumber=1")"
 check "part head length" 1234 "$(header content-length -I "$EP/mpb/big?partNumber=2")"
-check "part out of range" 416 "$(status "$EP/mpb/big?partNumber=3")"
-check "part out of range code" 1 "$(curl -s "$EP/mpb/big?partNumber=3" | grep -c '<Code>InvalidPartNumber</Code>')"
+check "part out of range" 400 "$(status "$EP/mpb/big?partNumber=3")"
+check "part out of range code" 1 "$(curl -s "$EP/mpb/big?partNumber=3" | grep -c '<Code>InvalidPart</Code>')"
 check "part with range" 400 "$(status -r 0-1 "$EP/mpb/big?partNumber=1")"
 check "part zero" 400 "$(status "$EP/mpb/big?partNumber=0")"
 check "mp upload gone" 404 "$(status "$EP/mpb/big?uploadId=$UPID")"
@@ -318,11 +318,13 @@ check "get object acl" 1 "$(curl -s "$EP/aclb/k?acl" | grep -c '<Owner><ID>zkfsm
 check "get acl missing object" 404 "$(status "$EP/aclb/nope?acl")"
 check "put bucket acl private" 200 "$(status -X PUT -H 'x-amz-acl: private' "$EP/aclb?acl")"
 check "put object acl private" 200 "$(status -X PUT -H 'x-amz-acl: private' "$EP/aclb/k?acl")"
-check "put object acl public" 501 "$(status -X PUT -H 'x-amz-acl: public-read' "$EP/aclb/k?acl")"
-check "put acl grant header" 501 "$(status -X PUT -H 'x-amz-grant-read: id=x' "$EP/aclb?acl")"
+check "put object acl public" 200 "$(status -X PUT -H 'x-amz-acl: public-read' "$EP/aclb/k?acl")"
+check "object acl shows AllUsers" 1 "$(curl -s "$EP/aclb/k?acl" | grep -c 'global/AllUsers')"
+check "put acl unknown canned" 400 "$(status -X PUT -H 'x-amz-acl: public-everything' "$EP/aclb?acl")"
+check "put acl email grant" 400 "$(status -X PUT -H 'x-amz-grant-read: emailAddress=a@example.com' "$EP/aclb?acl")"
 check "put acl owner body" 200 "$(curl -s "$EP/aclb?acl" | status -X PUT --data-binary @- "$EP/aclb/k?acl")"
 check "single part partNumber=1" 200 "$(status "$EP/aclb/k?partNumber=1")"
-check "single part partNumber=2" 416 "$(status "$EP/aclb/k?partNumber=2")"
+check "single part partNumber=2" 400 "$(status "$EP/aclb/k?partNumber=2")"
 
 # ListObjects v1 (marker pagination).
 for k in a b c/d c/e; do echo -n x | curl -s -o /dev/null -T - "$EP/aclb/v1-$k"; done

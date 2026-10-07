@@ -412,7 +412,7 @@ fn complete(c: *Ctx) OpError!void {
     const req = c.ext.checksum;
     if (req.value_alg) |alg| {
         const f = final orelse return handler.fail(c, .BadDigest);
-        if (f.alg != alg or !std.mem.eql(u8, f.value, req.value)) return handler.fail(c, .BadDigest);
+        if (f.alg != alg or !sameChecksum(f.value, req.value)) return handler.fail(c, .BadDigest);
     }
     if (final) |f| {
         try internal.append(c.arena, .{ .name = checksums.stored_header, .value = try checksums.encodeStored(c.arena, f.alg, f.ctype, f.value) });
@@ -453,6 +453,13 @@ fn completeResult(c: *Ctx, etag: core.ETag, version: core.VersionId, ck: ?checks
     var hdrs: std.ArrayList(Header) = .empty;
     if (!version.eql(ov.null_version_id)) try hdrs.append(c.arena, try versionHeader(c, "x-amz-version-id", version));
     try handler.respondXmlWith(c, .ok, a.written(), hdrs.items);
+}
+
+/// Some clients send a composite value without its "-N" part-count suffix.
+fn sameChecksum(ours: []const u8, theirs: []const u8) bool {
+    if (std.mem.eql(u8, ours, theirs)) return true;
+    const dash = std.mem.lastIndexOfScalar(u8, ours, '-') orelse return false;
+    return std.mem.indexOfScalar(u8, theirs, '-') == null and std.mem.eql(u8, ours[0..dash], theirs);
 }
 
 fn checksumElem(alg: ca.Algorithm) []const u8 {

@@ -318,3 +318,34 @@ def test_list_buckets_pages(s3, bucket):
         nxt = s3.list_buckets(MaxBuckets=1, ContinuationToken=first["ContinuationToken"])
         assert nxt["Buckets"][0]["Name"] == names[1]
     assert bucket in [b["Name"] for b in s3.list_buckets(Prefix=bucket[:6])["Buckets"]]
+
+
+def test_trailing_checksum(s3, bucket):
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    data = b"trailer body " * 50
+    crc = b64(zlib.crc32(data).to_bytes(4, "big"))
+
+    def send(value):
+        body = f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n" + f"x-amz-checksum-crc32:{value}\r\n\r\n".encode()
+        url = f"{os.environ['S3_ENDPOINT']}/{bucket}/trailed"
+        req = AWSRequest(method="PUT", url=url, data=body, headers={
+            "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER", "content-encoding": "aws-chunked",
+            "x-amz-decoded-content-length": str(len(data)), "x-amz-trailer": "x-amz-checksum-crc32",
+            "content-length": str(len(body))})
+        SigV4Auth(Credentials(os.environ["S3_ACCESS_KEY"], os.environ["S3_SECRET_KEY"]), "s3", "us-east-1").add_auth(req)
+        u = urllib.parse.urlparse(url)
+        c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+        c.request("PUT", u.path, body=body, headers=dict(req.headers))
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status, dict((k.lower(), v) for k, v in r.getheaders())
+
+    st, h = send(crc)
+    assert st == 200 and h["x-amz-checksum-crc32"] == crc
+    assert s3.head_object(Bucket=bucket, Key="trailed", ChecksumMode="ENABLED")["ChecksumCRC32"] == crc
+    assert s3.get_object(Bucket=bucket, Key="trailed")["Body"].read() == data
+    st, _ = send(b64(b"\0\0\0\0"))
+    assert st == 400
