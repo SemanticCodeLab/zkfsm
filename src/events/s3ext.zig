@@ -153,22 +153,39 @@ fn listen(n: *notifier.Notifier, c: *Ctx) ConnError!void {
     try bw.writer.writeAll(" ");
     try bw.writer.flush();
     try bw.flush();
+    var idb: [16]u8 = undefined;
+    std.crypto.random.bytes(&idb);
+    const id = std.fmt.bytesToHex(idb, .lower);
+    // With peers, wake often to collect their records; ping on the requested period.
+    const wait_ns: u64 = if (n.peers != null) 500 * std.time.ns_per_ms else ping_s * std.time.ns_per_s;
+    var last_write = std.time.nanoTimestamp();
     while (true) {
-        const recs = try l.take(ping_s * std.time.ns_per_s);
+        var arena = std.heap.ArenaAllocator.init(n.gpa);
+        defer arena.deinit();
+        const recs = try l.take(wait_ns);
         defer {
             for (recs) |r| n.gpa.free(r);
             n.gpa.free(recs);
         }
-        if (recs.len == 0) {
+        const remote = try n.pollPeers(arena.allocator(), &l, &id);
+        for (recs) |r| try writeRecord(&bw, r);
+        for (remote) |r| try writeRecord(&bw, r);
+        const now = std.time.nanoTimestamp();
+        if (recs.len + remote.len > 0) {
+            last_write = now;
+        } else if (now - last_write >= @as(i128, ping_s) * std.time.ns_per_s) {
             bw.writer.writeAll(" ") catch return error.StreamAborted;
-        } else for (recs) |r| {
-            bw.writer.writeAll("{\"Records\":[") catch return error.StreamAborted;
-            bw.writer.writeAll(r) catch return error.StreamAborted;
-            bw.writer.writeAll("]}\n") catch return error.StreamAborted;
-        }
+            last_write = now;
+        } else continue;
         bw.writer.flush() catch return error.StreamAborted;
         bw.flush() catch return error.StreamAborted;
     }
+}
+
+fn writeRecord(bw: *std.http.BodyWriter, r: []const u8) ConnError!void {
+    bw.writer.writeAll("{\"Records\":[") catch return error.StreamAborted;
+    bw.writer.writeAll(r) catch return error.StreamAborted;
+    bw.writer.writeAll("]}\n") catch return error.StreamAborted;
 }
 
 // ---- observer ----

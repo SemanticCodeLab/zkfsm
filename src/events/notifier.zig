@@ -167,6 +167,34 @@ pub const Listener = struct {
     }
 };
 
+/// Other cluster nodes, for ListenBucketNotification across the cluster.
+pub const Peers = struct {
+    ctx: *anyopaque,
+    count: usize,
+    /// Response body of peer `peer`, or null (this node, offline, failed).
+    call: *const fn (ctx: *anyopaque, peer: usize, a: Allocator, body: []const u8) ?[]const u8,
+};
+
+/// A listener held for a peer that polls it; dropped when polls stop.
+const RemoteListen = struct {
+    id: []u8,
+    l: Listener,
+    last_ns: i128,
+};
+
+const PollRequest = struct {
+    id: []const u8,
+    bucket: []const u8 = "",
+    prefix: []const u8 = "",
+    suffix: []const u8 = "",
+    events: []const []const u8 = &.{},
+};
+
+const remote_ttl_ns = 30 * std.time.ns_per_s;
+const max_poll_body = 64 * 1024;
+const max_poll_reply = 4 * 1024 * 1024;
+const max_remote_listens = 256;
+
 const CachedRules = struct {
     arena: std.heap.ArenaAllocator,
     cfg: config.Config,
@@ -193,6 +221,9 @@ pub const Notifier = struct {
     audit_console: bool = false,
     audit_file: ?std.fs.File = null,
     audit_file_mutex: std.Thread.Mutex = .{},
+    peers: ?Peers = null,
+    remote_mutex: std.Thread.Mutex = .{},
+    remotes: std.ArrayList(*RemoteListen) = .empty,
     watcher: ?std.Thread = null,
     watch_stop: std.atomic.Value(bool) = .init(false),
 
@@ -216,6 +247,8 @@ pub const Notifier = struct {
         }
         n.rules.deinit(n.gpa);
         n.listeners.deinit(n.gpa);
+        for (n.remotes.items) |r| n.dropRemote(r);
+        n.remotes.deinit(n.gpa);
         if (n.audit_file) |f| f.close();
     }
 
@@ -498,6 +531,89 @@ pub const Notifier = struct {
             _ = n.n_listeners.fetchSub(1, .release);
             break;
         };
+    }
+
+    // ---- cluster-wide listening ----
+
+    fn dropRemote(n: *Notifier, r: *RemoteListen) void {
+        n.unsubscribe(&r.l);
+        r.l.deinit();
+        n.gpa.free(r.l.bucket);
+        n.gpa.free(r.l.prefix);
+        n.gpa.free(r.l.suffix);
+        n.gpa.free(r.id);
+        n.gpa.destroy(r);
+    }
+
+    /// Serves a peer's poll: registers its filter on first use, returns the records
+    /// seen since the last poll, one JSON object per line.
+    pub fn handlePeer(n: *Notifier, a: Allocator, body: []const u8) error{OutOfMemory}![]const u8 {
+        if (body.len > max_poll_body) return "";
+        const req = std.json.parseFromSliceLeaky(PollRequest, a, body, .{ .ignore_unknown_fields = true }) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            return "";
+        };
+        if (req.id.len == 0 or req.id.len > 64 or req.events.len > names.count) return "";
+        const now = std.time.nanoTimestamp();
+        n.remote_mutex.lock();
+        defer n.remote_mutex.unlock();
+        var i: usize = 0;
+        while (i < n.remotes.items.len) {
+            const r = n.remotes.items[i];
+            if (now - r.last_ns > remote_ttl_ns) {
+                _ = n.remotes.swapRemove(i);
+                n.dropRemote(r);
+            } else i += 1;
+        }
+        const r = for (n.remotes.items) |x| {
+            if (std.mem.eql(u8, x.id, req.id)) break x;
+        } else blk: {
+            if (n.remotes.items.len >= max_remote_listens) return "";
+            var mask = names.Mask.initEmpty();
+            for (req.events) |e| mask.setUnion(names.parse(e) orelse return "");
+            const x = try n.gpa.create(RemoteListen);
+            x.* = .{ .id = try n.gpa.dupe(u8, req.id), .last_ns = now, .l = .{
+                .gpa = n.gpa,
+                .bucket = try n.gpa.dupe(u8, req.bucket),
+                .prefix = try n.gpa.dupe(u8, req.prefix),
+                .suffix = try n.gpa.dupe(u8, req.suffix),
+                .mask = mask,
+            } };
+            try n.remotes.append(n.gpa, x);
+            try n.subscribe(&x.l);
+            break :blk x;
+        };
+        r.last_ns = now;
+        const recs = try r.l.take(0);
+        defer {
+            for (recs) |x| n.gpa.free(x);
+            n.gpa.free(recs);
+        }
+        var out: std.ArrayList(u8) = .empty;
+        for (recs) |x| {
+            if (out.items.len + x.len + 1 > max_poll_reply) break;
+            try out.appendSlice(a, x);
+            try out.append(a, '\n');
+        }
+        return out.items;
+    }
+
+    /// Records other nodes saw for `l` since the last poll, in `a`.
+    pub fn pollPeers(n: *Notifier, a: Allocator, l: *const Listener, id: []const u8) error{OutOfMemory}![]const []const u8 {
+        const p = n.peers orelse return &.{};
+        var evs: std.ArrayList([]const u8) = .empty;
+        inline for (@typeInfo(names.Name).@"enum".fields) |f| {
+            const nm: names.Name = @enumFromInt(f.value);
+            if (names.has(l.mask, nm)) try evs.append(a, nm.text());
+        }
+        const body = try std.json.Stringify.valueAlloc(a, PollRequest{ .id = id, .bucket = l.bucket, .prefix = l.prefix, .suffix = l.suffix, .events = evs.items }, .{});
+        var out: std.ArrayList([]const u8) = .empty;
+        for (0..p.count) |i| {
+            const reply = p.call(p.ctx, i, a, body) orelse continue;
+            var it = std.mem.splitScalar(u8, reply, '\n');
+            while (it.next()) |line| if (line.len > 0) try out.append(a, line);
+        }
+        return out.items;
     }
 
     // ---- audit ----

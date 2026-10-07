@@ -76,6 +76,12 @@ pub const PoolState = struct {
     backends: []backend.StorageBackend,
 };
 
+/// A peer-call handler owned by a higher layer; returns the response body in `arena`.
+pub const Ext = struct {
+    ctx: *anyopaque,
+    handle: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8,
+};
+
 pub const Node = struct {
     gpa: std.mem.Allocator,
     arena_state: std.heap.ArenaAllocator,
@@ -107,6 +113,8 @@ pub const Node = struct {
     /// A note arrived before the object service was up.
     missed: std.atomic.Value(bool) = .init(false),
     iam_persist: IamPersist = undefined,
+    /// Handler for "ext" calls from peers (subsystems above the cluster layer).
+    ext: std.atomic.Value(?*const Ext) = .init(null),
 
     /// Parses the topology and prepares RPC; nothing touches peers yet.
     pub fn create(gpa: std.mem.Allocator, cfg: Config) Error!*Node {
@@ -535,6 +543,22 @@ pub const Node = struct {
             n.router_pools[p] = .{ .sets = ps.backends, .seed = std.mem.readInt(u64, &seed, .little) +% p };
         }
         n.router = .{ .gpa = n.gpa, .pools = n.router_pools };
+    }
+
+    /// Sends `body` to peer `peer`'s "ext" handler; null when the peer is this node,
+    /// offline, or fails.
+    pub fn extCall(n: *Node, peer: usize, arena: std.mem.Allocator, body: []const u8, limit: usize) ?[]u8 {
+        if (peer >= n.topo.nodes.len or peer == n.topo.local) return null;
+        const node: u16 = @intCast(peer);
+        if (!n.rpc.isOnline(node)) return null;
+        var c = n.rpc.call(node, "ext", "", .{ .bytes = body }, .{ .timeout_ms = 5000 }) catch return null;
+        defer c.deinit();
+        if (!c.ok()) return null;
+        return c.readAll(arena, limit) catch null;
+    }
+
+    pub fn nodeCount(n: *const Node) usize {
+        return n.topo.nodes.len;
     }
 
     /// Path of this node's first local drive, if it has one.

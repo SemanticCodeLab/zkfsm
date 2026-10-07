@@ -99,6 +99,10 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (std.mem.eql(u8, op, "lock") or std.mem.eql(u8, op, "refresh") or std.mem.eql(u8, op, "unlock")) return lockOp(n, req, op, body);
     if (std.mem.eql(u8, op, "notify")) return notify(n, req, body);
     if (std.mem.eql(u8, op, "diskinfo")) return diskInfo(n, req, q, arena);
+    if (std.mem.eql(u8, op, "ext")) {
+        const x = n.ext.load(.acquire) orelse return fail(req, .service_unavailable, "starting");
+        return req.respond(try x.handle(x.ctx, arena, body), .{});
+    }
     if (!n.drives_open.load(.acquire)) return fail(req, .service_unavailable, "starting");
     const d = n.localDrive(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
     const lb = d.set.acquire(d.slot) orelse return fail(req, .service_unavailable, "offline");

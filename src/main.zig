@@ -569,8 +569,11 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         const ev_opts = eventOptions(arena, cfg, node.localPath() orelse ".", addr) catch break :blk 2;
         notif = events.Notifier.init(gpa, &svc, ev_opts);
         notif_ready = true;
+        events_ext = .{ .ctx = &notif, .handle = eventsPeerHandle };
         startEvents(&notif, &svc, true);
         svc.events = ev_ext.sink();
+        notif.peers = .{ .ctx = node, .count = node.nodeCount(), .call = eventsPeerCall };
+        node.ext.store(&events_ext, .release);
         node.start(if (iam_ready) &iam_store else null);
         gateways = gateway.Running.start(.{
             .gpa = gpa,
@@ -638,6 +641,18 @@ fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: 
         .endpoint = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, host }),
         .env_targets = targets,
     };
+}
+
+var events_ext: cluster.node.Ext = undefined;
+
+fn eventsPeerCall(ctx: *anyopaque, peer: usize, a: std.mem.Allocator, body: []const u8) ?[]const u8 {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    return node.extCall(peer, a, body, 8 * 1024 * 1024);
+}
+
+fn eventsPeerHandle(ctx: *anyopaque, a: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8 {
+    const n: *events.Notifier = @ptrCast(@alignCast(ctx));
+    return n.handlePeer(a, body);
 }
 
 /// Loads targets, opens the audit console/file loggers, and hooks up metrics.

@@ -297,6 +297,12 @@ sleep 3
 for i in 1 2 3 4; do echo "n$i" | "$MC" pipe "c$i/clb/from-node$i.txt" >/dev/null; done
 eventually "every node publishes its own writes" "from-node1.txt from-node2.txt from-node3.txt from-node4.txt" sh -c "python3 '$H' keys '$HOOK' 's3:ObjectCreated:*' | grep from-node | sort | tr '\n' ' ' | sed 's/ \$//'"
 check "each cluster event delivered once" 4 "$(count "$HOOK" '"Key":"clb/from-node')"
+"$MC" watch c1/clb --events put >"$WORK/cwatch.out" 2>&1 &
+PID[cwatch]=$!
+sleep 2
+for i in 2 3 4; do echo "w$i" | "$MC" pipe "c$i/clb/watched-$i.txt" >/dev/null; done
+eventually "mc watch on one node sees writes on every node" 3 sh -c "grep -c 'clb/watched-' '$WORK/cwatch.out'"
+kill "${PID[cwatch]}" 2>/dev/null || true; unset "PID[cwatch]"
 
 echo "events: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]
