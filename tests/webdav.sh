@@ -26,8 +26,7 @@ PY="${WEBDAV_PYTHON:-python3}"
 BIN="$ROOT/zig-out/bin/zkfsm"
 
 cd "$WORK"
-# RSA: EC handshakes fail ~1% (non-minimal DER ECDSA signatures from std toDer).
-openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 2 \
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout key.pem -out cert.pem -days 2 \
   -subj /CN=localhost -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" 2>/dev/null
 
 start() { # name, args...; waits for the webdav listener
@@ -202,6 +201,21 @@ if [[ -n "$RCLONE" ]]; then
   check "rclone purged" 0 "$(rc lsf dav:rcb | grep -c tree || true)"
 else
   echo "skip rclone (set RCLONE=)"
+fi
+
+# ---- bucket quota: an oversized PUT is refused with 507 ----
+MC="${MC:-$(command -v mc || true)}"
+if [[ -n "$MC" ]] && "$MC" --version 2>/dev/null | grep -q RELEASE; then
+  export MC_CONFIG_DIR="$WORK/mc"
+  "$MC" --insecure alias set z "$S3" "$AK" "$SK" >/dev/null
+  check "mkcol quota bucket" 201 "$(code -X MKCOL "$DAV/qbkt")"
+  check "quota set" 0 "$("$MC" --insecure quota set z/qbkt --size 1MiB >/dev/null 2>&1; echo $?)"
+  check "put under quota" 201 "$(code -T obj.bin "$DAV/qbkt/small.bin")"
+  head -c 2000000 /dev/urandom >over.bin
+  check "put over quota 507" 507 "$(code -T over.bin "$DAV/qbkt/over.bin")"
+  check "over-quota object absent" 404 "$(code "$DAV/qbkt/over.bin")"
+else
+  echo "skip quota (set MC= to a MinIO client)"
 fi
 
 # ---- visible over S3 ----

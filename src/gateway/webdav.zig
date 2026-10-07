@@ -169,7 +169,7 @@ fn fsStatus(e: fsm.Error) Status {
         error.NotEmpty, error.NotDir => .conflict,
         error.Denied => .forbidden,
         error.InvalidPath => .bad_request,
-        error.TooLarge => .insufficient_storage,
+        error.TooLarge, error.QuotaExceeded => .insufficient_storage,
         error.Storage, error.OutOfMemory, error.ReadFailed, error.WriteFailed => .internal_server_error,
     };
 }
@@ -467,7 +467,11 @@ fn put(r: *Req) Error!void {
     const len: ?u64 = if (x.req.head.transfer_encoding == .chunked) null else x.req.head.content_length;
     const buf = try r.arena().alloc(u8, 64 * 1024);
     const body = try x.bodyReader(buf);
-    const info = r.fs.write(r.path, body, len, ctype) catch |e| return fail(x, e);
+    const info = r.fs.write(r.path, body, len, ctype) catch |e| {
+        // Drain a modest rest so the client reads the status instead of a reset.
+        if (e != error.ReadFailed and (len orelse drain_max + 1) <= drain_max) _ = body.discardRemaining() catch {};
+        return fail(x, e);
+    };
     var eb: [core.ETag.quoted_max]u8 = undefined;
     return send(x, if (existed) .no_content else .created, "", &.{.{ .name = "etag", .value = info.etag.quoted(&eb) }});
 }
