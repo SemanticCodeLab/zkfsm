@@ -273,6 +273,11 @@ CPIDS=()
 # ---- third-party S3 backends in docker (optional) ----
 docker_tier() { # NAME IMAGE ENV... -- ARGS
   local name="$1" image="$2"; shift 2
+  # Remove containers left by earlier runs that were killed before cleanup.
+  local old pid
+  for old in $(docker ps -a --filter "name=zkfsm-tiering-$name-" --format '{{.Names}}' 2>/dev/null); do
+    pid="${old##*-}"; kill -0 "$pid" 2>/dev/null || docker rm -f -v "$old" >/dev/null 2>&1
+  done
   local port; port="$(freeport)"
   local envs=(); while [[ "$1" != "--" ]]; do envs+=(-e "$1"); shift; done; shift
   local cname="zkfsm-tiering-$name-$$"
