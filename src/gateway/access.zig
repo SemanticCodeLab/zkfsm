@@ -56,10 +56,61 @@ pub const Access = struct {
         return Principal.of(access_key) catch null;
     }
 
+    /// Root (or a service account of root) reaches every tenant's buckets.
+    pub fn isRoot(a: Access, who: *const Principal) bool {
+        if (who.open) return true;
+        const st = a.iam orelse return true;
+        const v = st.view();
+        defer v.release();
+        if (v.isRoot(who.accessKey())) return true;
+        const sa = v.serviceAccount(who.accessKey()) orelse return false;
+        return v.isRoot(sa.parent);
+    }
+
+    /// The caller's tenant ("" = global); null when its tenant is removed or disabled.
+    pub fn tenant(a: Access, who: *const Principal, buf: *[iam.store.limits.max_name]u8) ?[]const u8 {
+        const st = a.iam orelse return "";
+        if (who.open) return "";
+        const t = st.tenantOf(who.accessKey(), buf) orelse return "";
+        return if (iam.federation.tenantUsable(st, t)) t else null;
+    }
+
+    /// Tenant boundary: non-root callers reach only buckets of their own tenant.
+    pub fn mayReach(a: Access, who: *const Principal, bucket: []const u8) bool {
+        if (a.iam == null or who.open or a.isRoot(who)) return true;
+        var buf: [iam.store.limits.max_name]u8 = undefined;
+        const t = a.tenant(who, &buf) orelse return false;
+        var sfa = std.heap.stackFallback(1024, a.svc.gpa);
+        var arena = std.heap.ArenaAllocator.init(sfa.get());
+        defer arena.deinit();
+        const owner = object.tenancy.tenantOf(a.svc, arena.allocator(), bucket) catch |e| return e == error.NoSuchBucket;
+        return std.mem.eql(u8, owner, t);
+    }
+
+    /// Buckets visible to `who`: all for root, else its tenant's (or the global ones).
+    pub fn visibleBuckets(a: Access, arena: std.mem.Allocator, who: *const Principal) object.Error![]object.BucketInfo {
+        if (a.iam == null or a.isRoot(who)) return a.svc.listBuckets(arena);
+        var buf: [iam.store.limits.max_name]u8 = undefined;
+        const t = a.tenant(who, &buf) orelse return &.{};
+        return object.tenancy.listOwned(a.svc, arena, t);
+    }
+
+    /// Creates a bucket owned by the caller's tenant.
+    pub fn createBucket(a: Access, who: *const Principal, name: []const u8) object.Error!void {
+        var buf: [iam.store.limits.max_name]u8 = undefined;
+        const t = (if (a.isRoot(who)) "" else a.tenant(who, &buf)) orelse return error.InvalidRequest;
+        return object.tenancy.createOwned(a.svc, name, t);
+    }
+
     /// True when `who` may perform `op` on bucket/key. `peer` feeds aws:SourceIp.
     pub fn allowed(a: Access, who: *const Principal, op: Op, bucket: []const u8, key: []const u8, peer: ?std.net.Address, secure: bool) bool {
         if (who.open) return true;
         const st = a.iam orelse return true;
+        if (bucket.len > 0 and !a.mayReach(who, bucket)) return false;
+        if (bucket.len == 0) {
+            var tb: [iam.store.limits.max_name]u8 = undefined;
+            if (a.tenant(who, &tb) == null) return false;
+        }
         var sfa = std.heap.stackFallback(16 * 1024, a.svc.gpa);
         var arena_state = std.heap.ArenaAllocator.init(sfa.get());
         defer arena_state.deinit();

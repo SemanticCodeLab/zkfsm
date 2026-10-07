@@ -1,5 +1,6 @@
-//! STS AssumeRole on `POST /` (form body): issues temporary credentials for the
-//! signing user, optionally narrowed by a session policy.
+//! STS on `POST /` (form body or query): AssumeRole for signed callers, and the
+//! federated actions (web identity, client grants, LDAP, client certificate)
+//! that turn an external identity into temporary credentials with mapped policies.
 const std = @import("std");
 const core = @import("../core/root.zig");
 const iam = @import("../iam/root.zig");
@@ -51,26 +52,17 @@ pub fn prepare(c: *Ctx, in: *sigv4.Input) ConnError!void {
 
 /// Handles the request when it is an STS call; false leaves it to S3 dispatch.
 pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
-    const body = c.body orelse return false;
+    const body = c.body orelse queryForm(c) orelse return false;
     const action = try formParam(c.arena, body, "Action") orelse return false;
-    if (!std.mem.eql(u8, action, "AssumeRole")) {
-        try fail(c, .bad_request, "InvalidAction", "Only AssumeRole is supported.");
-        return true;
-    }
     const issuer = env.auth.sts orelse {
         try fail(c, .not_implemented, "NotImplemented", "STS requires authenticated mode.");
         return true;
     };
-    if (c.auth.anonymous or c.auth.principal.len == 0) {
-        try fail(c, .forbidden, "AccessDenied", "AssumeRole requires a signed request.");
+    const kind = std.meta.stringToEnum(Action, action) orelse {
+        try fail(c, .bad_request, "InvalidAction", "Unsupported STS action.");
         return true;
-    }
-    // Temporary credentials cannot assume further roles.
-    if (!std.mem.eql(u8, c.auth.access_key, c.auth.principal) or c.auth.principal.len == 0) {
-        try fail(c, .forbidden, "AccessDenied", "Temporary credentials cannot call AssumeRole.");
-        return true;
-    }
-    var duration: i64 = 3600;
+    };
+    var duration: ?i64 = null;
     if (try formParam(c.arena, body, "DurationSeconds")) |d| {
         duration = std.fmt.parseInt(i64, d, 10) catch {
             try fail(c, .bad_request, "InvalidParameterValue", "DurationSeconds must be an integer.");
@@ -78,17 +70,80 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
         };
     }
     const pol = try formParam(c.arena, body, "Policy");
-    var creds = issuer.issue(c.arena, .{
-        .parent = c.auth.principal,
-        .duration_s = duration,
-        .session_policy = if (pol) |p| (if (p.len == 0) null else p) else null,
-    }, now_s, std.crypto.random) catch |e| {
+    const session_policy = if (pol) |p| (if (p.len == 0) null else p) else null;
+    var req: iam.sts.Request = .{ .parent = "", .duration_s = duration orelse 3600, .session_policy = session_policy };
+    var extra: [3]Field = undefined;
+    var n_extra: usize = 0;
+    switch (kind) {
+        .AssumeRole => {
+            if (c.auth.anonymous or c.auth.principal.len == 0) {
+                try fail(c, .forbidden, "AccessDenied", "AssumeRole requires a signed request.");
+                return true;
+            }
+            // Temporary credentials cannot assume further roles.
+            if (!std.mem.eql(u8, c.auth.access_key, c.auth.principal)) {
+                try fail(c, .forbidden, "AccessDenied", "Temporary credentials cannot call AssumeRole.");
+                return true;
+            }
+            req.parent = c.auth.principal;
+        },
+        .AssumeRoleWithWebIdentity, .AssumeRoleWithClientGrants => {
+            const fed = env.auth.federation orelse return notConfigured(c);
+            const param = if (kind == .AssumeRoleWithWebIdentity) "WebIdentityToken" else "Token";
+            const token = try formParam(c.arena, body, param) orelse {
+                try fail(c, .bad_request, "MissingParameter", "The identity token is required.");
+                return true;
+            };
+            const role_arn = try formParam(c.arena, body, "RoleArn");
+            const id = fed.webIdentity(c.arena, token, if (role_arn) |r| (if (r.len == 0) null else r) else null, now_s) catch |e| {
+                try webIdentityFail(c, e);
+                return true;
+            };
+            req.parent = id.subject;
+            req.federated_policies = id.policies;
+            req.tenant = id.tenant;
+            if (duration == null) if (id.expires_s) |exp| {
+                req.duration_s = std.math.clamp(exp - now_s, iam.sts.limits.min_duration_s, iam.sts.limits.max_duration_s);
+            };
+            extra[0] = .{ "SubjectFromWebIdentityToken", id.subject };
+            extra[1] = .{ "Audience", id.audience };
+            extra[2] = .{ "Provider", id.issuer };
+            n_extra = 3;
+        },
+        .AssumeRoleWithLDAPIdentity => {
+            const fed = env.auth.federation orelse return notConfigured(c);
+            const user = try formParam(c.arena, body, "LDAPUsername") orelse "";
+            const pass = try formParam(c.arena, body, "LDAPPassword") orelse "";
+            const id = fed.ldapIdentity(c.arena, user, pass) catch |e| {
+                try ldapFail(c, e);
+                return true;
+            };
+            req.parent = id.user_dn;
+            req.federated_policies = id.policies;
+            req.tenant = id.tenant;
+        },
+        .AssumeRoleWithCertificate => {
+            const id = env.client_cert orelse {
+                try fail(c, .forbidden, "AccessDenied", "A verified TLS client certificate is required.");
+                return true;
+            };
+            const st = env.auth.iam orelse return notConfigured(c);
+            if (!st.policyExists(id.common_name)) {
+                try fail(c, .forbidden, "AccessDenied", "No policy matches the certificate subject.");
+                return true;
+            }
+            req.parent = id.common_name;
+            req.federated_policies = id.common_name;
+            if (duration == null) req.duration_s = std.math.clamp(id.not_after_s - now_s, iam.sts.limits.min_duration_s, 3600);
+        },
+    }
+    var creds = issuer.issue(c.arena, req, now_s, std.crypto.random) catch |e| {
         switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidDuration => try fail(c, .bad_request, "InvalidParameterValue", "DurationSeconds must be between 900 and 43200."),
             error.SessionPolicyTooLarge => try fail(c, .bad_request, "PackedPolicyTooLarge", "Session policy is too large."),
             error.InvalidSessionPolicy => try fail(c, .bad_request, "MalformedPolicyDocument", "Session policy is invalid."),
-            error.InvalidParent => try fail(c, .bad_request, "InvalidParameterValue", "Caller identity is not usable for a session."),
+            error.InvalidParent, error.InvalidRoles, error.InvalidTenant => try fail(c, .bad_request, "InvalidParameterValue", "Caller identity is not usable for a session."),
         }
         return true;
     };
@@ -96,21 +151,70 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
     const w = &a.writer;
     var tb: [24]u8 = undefined;
     const exp = core.time.iso8601(@as(i128, creds.expires_s) * std.time.ns_per_s, &tb);
-    writeResponse(w, &creds, exp, &c.request_id) catch return error.OutOfMemory;
+    writeResponse(w, @tagName(kind), &creds, exp, &c.request_id, extra[0..n_extra]) catch return error.OutOfMemory;
     try respond(c, .ok, a.written());
     return true;
 }
 
-fn writeResponse(w: *std.Io.Writer, creds: *const iam.sts.Credentials, exp: []const u8, request_id: []const u8) std.Io.Writer.Error!void {
-    try w.writeAll(xml.declaration ++ "<AssumeRoleResponse xmlns=\"" ++ ns ++ "\"><AssumeRoleResult>");
+const Action = enum {
+    AssumeRole,
+    AssumeRoleWithWebIdentity,
+    AssumeRoleWithClientGrants,
+    AssumeRoleWithLDAPIdentity,
+    AssumeRoleWithCertificate,
+};
+
+const Field = struct { []const u8, []const u8 };
+
+/// `POST /?Action=...` with the parameters in the query (no form body).
+fn queryForm(c: *const Ctx) ?[]const u8 {
+    if (c.method != .POST) return null;
+    const q = std.mem.indexOfScalar(u8, c.target, '?') orelse return null;
+    if (!std.mem.eql(u8, c.target[0..q], "/")) return null;
+    const query = c.target[q + 1 ..];
+    return if (std.mem.indexOf(u8, query, "Action=") != null) query else null;
+}
+
+fn notConfigured(c: *Ctx) ConnError!bool {
+    try fail(c, .bad_request, "InvalidParameterValue", "No identity provider is configured for this action.");
+    return true;
+}
+
+fn webIdentityFail(c: *Ctx, e: iam.federation.Error) ConnError!void {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NoProvider => fail(c, .bad_request, "InvalidParameterValue", "No matching OpenID provider is configured."),
+        error.ProviderUnavailable => fail(c, .bad_request, "IDPCommunicationError", "The identity provider could not be reached."),
+        error.InvalidToken => fail(c, .bad_request, "InvalidIdentityToken", "The web identity token is not valid."),
+        error.ExpiredToken => fail(c, .bad_request, "ExpiredTokenException", "The web identity token has expired."),
+        error.NoPolicy => fail(c, .forbidden, "AccessDenied", "The token grants no known policy."),
+        error.InvalidTenant => fail(c, .forbidden, "AccessDenied", "The token names no active tenant."),
+    };
+}
+
+fn ldapFail(c: *Ctx, e: iam.federation.LdapError) ConnError!void {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NotConfigured => fail(c, .bad_request, "InvalidParameterValue", "LDAP is not configured."),
+        error.InvalidCredentials => fail(c, .forbidden, "AccessDenied", "Invalid LDAP credentials."),
+        error.DirectoryUnavailable => fail(c, .service_unavailable, "ServiceUnavailable", "The LDAP directory could not be reached."),
+        error.NoPolicy => fail(c, .forbidden, "AccessDenied", "No policy is mapped to this LDAP identity."),
+        error.InvalidTenant => fail(c, .forbidden, "AccessDenied", "The configured tenant is not active."),
+    };
+}
+
+fn writeResponse(w: *std.Io.Writer, action: []const u8, creds: *const iam.sts.Credentials, exp: []const u8, request_id: []const u8, extra: []const Field) std.Io.Writer.Error!void {
+    try w.print(xml.declaration ++ "<{s}Response xmlns=\"" ++ ns ++ "\"><{s}Result>", .{ action, action });
     try w.writeAll("<AssumedRoleUser><Arn></Arn><AssumeRoleId></AssumeRoleId></AssumedRoleUser><Credentials>");
     try xml.elem(w, "AccessKeyId", &creds.access_key);
     try xml.elem(w, "SecretAccessKey", &creds.secret_key);
     try xml.elem(w, "SessionToken", creds.session_token);
     try xml.elem(w, "Expiration", exp);
-    try w.writeAll("</Credentials></AssumeRoleResult><ResponseMetadata>");
+    try w.writeAll("</Credentials>");
+    for (extra) |f| try xml.elem(w, f[0], f[1]);
+    try w.print("</{s}Result><ResponseMetadata>", .{action});
     try xml.elem(w, "RequestId", request_id);
-    try w.writeAll("</ResponseMetadata></AssumeRoleResponse>");
+    try w.print("</ResponseMetadata></{s}Response>", .{action});
 }
 
 fn formParam(a: std.mem.Allocator, body: []const u8, name: []const u8) error{OutOfMemory}!?[]const u8 {
@@ -157,10 +261,18 @@ test "AssumeRole response and form parsing" {
     var prng = std.Random.DefaultPrng.init(1);
     var creds = try issuer.issue(a, .{ .parent = "alice", .duration_s = 900 }, 0, prng.random());
     var out: std.Io.Writer.Allocating = .init(a);
-    try writeResponse(&out.writer, &creds, "1970-01-01T00:15:00.000Z", "RID");
+    try writeResponse(&out.writer, "AssumeRole", &creds, "1970-01-01T00:15:00.000Z", "RID", &.{});
     const x = out.written();
     try std.testing.expect(std.mem.indexOf(u8, x, "<AccessKeyId>ASIA") != null);
     try std.testing.expect(std.mem.indexOf(u8, x, "<Expiration>1970-01-01T00:15:00.000Z</Expiration>") != null);
     const tok = try std.fmt.allocPrint(a, "<SessionToken>{s}</SessionToken>", .{creds.session_token});
     try std.testing.expect(std.mem.indexOf(u8, x, tok) != null);
+    try std.testing.expect(std.mem.startsWith(u8, x[std.mem.indexOf(u8, x, "<AssumeRoleResponse").?..], "<AssumeRoleResponse xmlns="));
+
+    var fed: std.Io.Writer.Allocating = .init(a);
+    try writeResponse(&fed.writer, "AssumeRoleWithWebIdentity", &creds, "x", "RID", &.{.{ "SubjectFromWebIdentityToken", "sub<1>" }});
+    const f = fed.written();
+    try std.testing.expect(std.mem.indexOf(u8, f, "<AssumeRoleWithWebIdentityResult>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f, "<SubjectFromWebIdentityToken>sub&lt;1&gt;</SubjectFromWebIdentityToken></AssumeRoleWithWebIdentityResult>") != null);
+    try std.testing.expect(std.mem.endsWith(u8, f, "</AssumeRoleWithWebIdentityResponse>"));
 }

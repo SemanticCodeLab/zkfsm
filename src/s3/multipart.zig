@@ -9,6 +9,7 @@ const xml_read = @import("xml_read.zig");
 const errors = @import("errors.zig");
 const s3v = @import("versioning.zig");
 const sigv4 = @import("sigv4.zig");
+const tenancy = @import("tenancy.zig");
 
 const Ctx = handler.Ctx;
 const ConnError = handler.ConnError;
@@ -168,6 +169,7 @@ fn uploadPart(c: *Ctx) OpError!void {
     const ch = try copyHeaders(c);
     if (ch.source) |raw| {
         const src = try parseCopySource(c.arena, raw);
+        if (!try tenancy.copySourceAllowed(c.svc, c.arena, c.env, c.auth, src, std.time.timestamp())) return handler.fail(c, .AccessDenied);
         var range: ?mp.CopyRange = null;
         if (ch.range) |rh| {
             const spec = core.RangeSpec.parse(rh) catch return error.BadCopySource;
@@ -213,6 +215,7 @@ fn isReplace(directive: ?[]const u8) OpError!bool {
 fn copyObject(c: *Ctx) OpError!void {
     const ch = try copyHeaders(c);
     const src = try parseCopySource(c.arena, ch.source orelse return error.BadCopySource);
+    if (!try tenancy.copySourceAllowed(c.svc, c.arena, c.env, c.auth, src, std.time.timestamp())) return handler.fail(c, .AccessDenied);
     const replace = try isReplace(ch.directive);
     const replace_tags = try isReplace(ch.tagging_directive);
     // S3 rejects a same-key copy that changes nothing.

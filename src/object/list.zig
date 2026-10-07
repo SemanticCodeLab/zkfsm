@@ -7,6 +7,7 @@ pub const Entry = struct {
     size: u64,
     etag: core.ETag,
     mtime_ns: i128,
+    tiered: bool = false,
 };
 
 pub const Params = struct {
