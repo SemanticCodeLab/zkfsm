@@ -55,7 +55,7 @@ recv_stop() { kill -9 "${PID[recv]}" 2>/dev/null || true; wait "${PID[recv]}" 2>
 start() { # extra env assignments...
   env ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" ZKFSM_AUDIT_FILE="$WORK/audit.log" \
     MINIO_NOTIFY_WEBHOOK_ENABLE_ENV=on MINIO_NOTIFY_WEBHOOK_ENDPOINT_ENV="http://127.0.0.1:$WH/env" \
-    "$@" "$BIN" --data "$WORK/d" --listen "127.0.0.1:$P" >>"$WORK/z.log" 2>&1 &
+    ZKFSM_ILM_DAY_SECONDS=2 "$@" "$BIN" --data "$WORK/d" --listen "127.0.0.1:$P" --lifecycle-interval 2 >>"$WORK/z.log" 2>&1 &
   PID[z]=$!
   for _ in $(seq 300); do [[ "$(curl -s -o /dev/null -w '%{http_code}' "$ep/health/ready")" == 200 ]] && return 0; sleep 0.1; done
   echo "server not ready"; tail -n 30 "$WORK/z.log"; exit 1
@@ -176,6 +176,27 @@ before="$(count "$HOOK" '"Key":"photos/img/after-rm.jpg"')"
 echo x | "$MC" pipe z/photos/img/after-rm.jpg >/dev/null
 sleep 1
 check "no events after removal" "$before" "$(count "$HOOK" '"Key":"photos/img/after-rm.jpg"')"
+
+echo "== lifecycle expiration and replication events"
+"$MC" mb z/ilm >/dev/null
+cli s3api put-bucket-notification-configuration --bucket ilm --notification-configuration '{"QueueConfigurations":[{"Id":"ilm","QueueArn":"arn:minio:sqs::1:webhook","Events":["s3:LifecycleExpiration:*"]}]}'
+cli s3api put-bucket-lifecycle-configuration --bucket ilm --lifecycle-configuration '{"Rules":[{"ID":"x","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":1}}]}'
+echo old | "$MC" pipe z/ilm/old.txt >/dev/null
+eventually "lifecycle expiration event" old.txt keys "$HOOK" s3:LifecycleExpiration:Delete ilm
+check "expiration record has no requester" "" "$(grep '"s3:LifecycleExpiration:Delete"' "$HOOK" | head -n1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["Records"][0]["userIdentity"]["principalId"])')"
+P2="$(freeport)"
+ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/dst" --listen "127.0.0.1:$P2" >>"$WORK/dst.log" 2>&1 &
+PID[dst]=$!
+for _ in $(seq 300); do [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$P2/health/ready")" == 200 ]] && break; sleep 0.1; done
+"$MC" alias set dst "http://127.0.0.1:$P2" "$AK" "$SK" >/dev/null
+"$MC" mb z/repsrc dst/repdst >/dev/null
+"$MC" version enable z/repsrc >/dev/null
+"$MC" version enable dst/repdst >/dev/null
+"$MC" replicate add z/repsrc --remote-bucket "http://$AK:$SK@127.0.0.1:$P2/repdst" >/dev/null
+cli s3api put-bucket-notification-configuration --bucket repsrc --notification-configuration '{"QueueConfigurations":[{"Id":"r","QueueArn":"arn:minio:sqs::1:webhook","Events":["s3:Replication:*"]}]}'
+echo rep | "$MC" pipe z/repsrc/r.txt >/dev/null
+eventually "replication completed event" r.txt keys "$HOOK" s3:Replication:OperationCompletedReplication repsrc
+kill -9 "${PID[dst]}" 2>/dev/null || true; wait "${PID[dst]}" 2>/dev/null || true; unset "PID[dst]"
 
 echo "== audit"
 check "audit file has PutObject entries" 1 "$(grep '"name":"PutObject"' "$WORK/audit.log" | grep -c '"object":"img/put.jpg"')"
