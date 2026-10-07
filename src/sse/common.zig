@@ -62,6 +62,7 @@ pub fn readBody(c: *Ctx, max: usize, rejected: *?s3.errors.Code) BodyError![]u8 
     var body_buf: [s3.handler.io_buf_len]u8 = undefined;
     var check_buf: [s3.handler.io_buf_len]u8 = undefined;
     var br: s3.sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+    br.limitTo(c.req.head.content_length);
     return br.body().allocRemaining(c.arena, .limited(max)) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => error.TooLarge,

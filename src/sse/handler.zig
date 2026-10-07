@@ -374,6 +374,7 @@ pub const SseExt = struct {
         var body_buf: [s3.handler.io_buf_len]u8 = undefined;
         var check_buf: [s3.handler.io_buf_len]u8 = undefined;
         var br: s3.sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+        br.limitTo(c.req.head.content_length);
         const plain_len = br.contentLength(c.req.head.content_length) orelse {
             try common.failCustom(c, .length_required, "MissingContentLength", "You must provide the Content-Length HTTP header.");
             return true;
@@ -741,6 +742,7 @@ pub const SseExt = struct {
         var body_buf: [s3.handler.io_buf_len]u8 = undefined;
         var check_buf: [s3.handler.io_buf_len]u8 = undefined;
         var br: s3.sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
+        br.limitTo(c.req.head.content_length);
         const len = br.contentLength(c.req.head.content_length);
         const etag = partPut(c, id, n, br.body(), len, &dek.?, path) catch |e| {
             if (br.failure) |fc| {
@@ -856,17 +858,14 @@ fn putEncrypted(c: *Ctx, bucket: []const u8, key: []const u8, src0: *Reader, len
         .known => |m| in.etag_override = .{ .md5 = m },
         // Without a core hook for post-stream overrides, the MD5 needs the whole body first.
         .compute => if (len <= md5_buffer_limit) {
-            // HashingReader latches EOF: std.http bodies panic when read past it.
-            const hr = try c.arena.create(io.HashingReader(Md5));
-            hr.* = .init(src, Md5.init(.{}), try c.arena.alloc(u8, 8 * 1024));
-            const data = hr.reader.allocRemaining(c.arena, .limited(@intCast(len + 1))) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.StreamTooLong => error.IncompleteBody,
+            // Read exactly `len`: std.http bodies panic when read past their end.
+            const data = try c.arena.alloc(u8, @intCast(len));
+            src.readSliceAll(data) catch |e| return switch (e) {
+                error.EndOfStream => error.IncompleteBody,
                 error.ReadFailed => error.ReadFailed,
             };
-            if (data.len != len) return error.IncompleteBody;
             var d: [16]u8 = undefined;
-            hr.hasher.final(&d);
+            Md5.hash(data, &d, .{});
             in.etag_override = .{ .md5 = d };
             const fixed = try c.arena.create(Reader);
             fixed.* = .fixed(data);
