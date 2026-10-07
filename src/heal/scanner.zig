@@ -36,6 +36,8 @@ pub const ScanResult = struct {
     keys: std.AutoArrayHashMapUnmanaged(PhysicalKey, u32) = .empty,
     temps: std.ArrayList(StaleTemp) = .empty,
     entries: u64 = 0,
+    /// A drive's keys could not all be listed: the pass cannot vouch for every key.
+    incomplete: bool = false,
 
     pub fn deinit(self: *ScanResult, gpa: std.mem.Allocator) void {
         self.keys.deinit(gpa);
@@ -104,8 +106,14 @@ pub const HealthScanner = struct {
         errdefer res.deinit(self.gpa);
         for (0..res.drive_count) |i| {
             res.probes[i] = self.drives.probe(i);
-            if (res.probes[i] != .ok) continue;
-            const h = self.drives.acquire(i) orelse continue;
+            if (res.probes[i] != .ok) {
+                res.incomplete = true;
+                continue;
+            }
+            const h = self.drives.acquire(i) orelse {
+                res.incomplete = true;
+                continue;
+            };
             defer self.drives.release(i);
             switch (h) {
                 .local => |lb| try self.walk(@intCast(i), lb.root, &res),
@@ -125,6 +133,7 @@ pub const HealthScanner = struct {
                 x.vtable.scan(x.ctx, self.gpa, space, after, &page) catch |e| {
                     if (e == error.OutOfMemory) return error.OutOfMemory;
                     std.log.warn("heal scan of remote drive {d} stopped: {t}", .{ drive, e });
+                    res.incomplete = true;
                     return;
                 };
                 for (page.keys.items) |k| {

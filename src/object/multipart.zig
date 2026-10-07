@@ -356,7 +356,8 @@ fn storeUpload(svc: *ObjectService, rec: UploadRecord) Error!void {
     try svc.beginIndexChange();
     // Indexed first: a failed write may still have landed, and a stale entry is skipped on read.
     svc.index.putUpload(rec.upload_id, .{ .bucket = rec.bucket_id, .key = rec.key, .created_ns = rec.created_ns });
-    defer svc.emit(.{ .upload = rec.upload_id });
+    const change: service.Change = .{ .upload = rec.upload_id };
+    defer svc.emitSeq(change, svc.journal(change));
     svc.store.putRecord(placement.uploadKey(rec.upload_id), bytes) catch |e| return service.mapBackend(e);
 }
 
@@ -374,9 +375,10 @@ fn dropUpload(svc: *ObjectService, id: UploadId) void {
         if (!upload.isUpload(bytes)) return;
         const r = upload.decode(arena.allocator(), bytes) catch return;
         svc.beginIndexChange() catch return;
+        const seq = svc.journal(.{ .upload = id });
+        defer svc.emitSeq(.{ .upload = id }, seq);
         svc.store.deleteRecord(placement.uploadKey(id)) catch return;
         svc.index.removeUpload(id);
-        svc.emit(.{ .upload = id });
         break :blk r;
     };
     for (rec.parts) |p| svc.store.delete(placement.dataKey(p.blob)) catch {};

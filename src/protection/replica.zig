@@ -193,6 +193,7 @@ pub const ReplicaStore = struct {
             for (placed, 0..) |_, j| if (committed[j]) holds.lbs[j].?.store().delete(key) catch {};
             return if (self.clustered() and worst == error.IoFailed) error.WriteQuorum else worst;
         }
+        if (ok < placed.len and self.clustered()) self.drives.noteDegraded(key);
         return .{ .size = total, .mtime_ns = core.time.nowNs() };
     }
 
@@ -546,6 +547,7 @@ pub const ReplicaStore = struct {
             if (each.res[j]) |e| worst = worse(worst, e) else ok += 1;
         }
         if (ok < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
+        if (ok < placed.len and self.clustered()) self.drives.noteDegraded(key);
     }
 
     /// Cluster records never move backwards: a drive keeps whichever stamp is newer.

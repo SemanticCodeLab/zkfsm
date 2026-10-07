@@ -227,6 +227,7 @@ pub const ErasureStore = struct {
             for (0..n) |i| if (committed[i]) holds.lbs[i].?.store().delete(key) catch {};
             return if (self.clustered() and worst == error.IoFailed) error.WriteQuorum else worst;
         }
+        if (ok < n and self.clustered()) self.drives.noteDegraded(key);
         return .{ .size = total, .mtime_ns = core.time.nowNs() };
     }
 
@@ -460,11 +461,16 @@ pub const ErasureStore = struct {
             pend[i] = w;
         }
         if (rep.healthy < k) {
-            if (self.dangling(&s)) {
-                std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
-                s.close();
-                for (0..n) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
-                return .{ .purged = true };
+            switch (self.fragments(&s)) {
+                .purge => {
+                    std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
+                    s.close();
+                    for (0..n) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
+                    return .{ .purged = true };
+                },
+                // A write in flight or a recent delete: purged once old enough.
+                .young => return .{},
+                .no => {},
             }
             rep.lost = true;
             return rep;
@@ -510,12 +516,16 @@ pub const ErasureStore = struct {
         return error.IoFailed;
     }
 
-    /// Fewer than k shards while every drive answered, all older than the grace:
-    /// leftovers of an interrupted write or delete, never readable again.
-    fn dangling(self: *const ErasureStore, s: *const Shards) bool {
-        if (!self.clustered() or s.offline > 0) return false;
+    /// Fewer than k shard files while every drive answered: leftovers of an
+    /// interrupted write or a missed delete (a stored object has at least k), never
+    /// readable again. Purged once older than the grace. Corrupt shards of a stored
+    /// object still count as files, so damage is reported as loss, not purged.
+    fn fragments(self: *const ErasureStore, s: *const Shards) enum { no, young, purge } {
+        if (!self.clustered() or s.offline > 0) return .no;
+        const files = self.width() - s.missing;
+        if (files >= self.codec.k) return .no;
         const now = core.time.nowNs();
-        return s.mtime != 0 and now - s.mtime > replica.tombstone_grace_ns;
+        return if (s.mtime != 0 and now - s.mtime > replica.tombstone_grace_ns) .purge else .young;
     }
 
     pub fn healKey(self: *ErasureStore, key: PhysicalKey) KeyReport {

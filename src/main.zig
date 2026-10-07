@@ -545,7 +545,6 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
-    if (svc_ready) svc.collectDeferred(true);
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
     std.log.info("stopped", .{});

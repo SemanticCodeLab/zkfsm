@@ -74,7 +74,14 @@ pub const Cluster = struct {
         lock: *const fn (ctx: *anyopaque, resource: []const u8) Error!u64,
         unlock: *const fn (ctx: *anyopaque, token: u64) void,
         /// Delivers changes to every peer; called with no service lock held.
-        publish: *const fn (ctx: *anyopaque, changes: []const Change) void,
+        /// `seqs[i]` is what `journal` returned for `changes[i]`.
+        publish: *const fn (ctx: *anyopaque, changes: []const Change, seqs: []const u64) void,
+        /// Records a change before its record is written (caller holds `mutex`);
+        /// returns its journal sequence number.
+        journal: *const fn (ctx: *anyopaque, change: Change) u64,
+        /// Takes a data blob no record points at any more; the cluster deletes it
+        /// after a grace, so reads that resolved the old record on any node finish.
+        garbage: *const fn (ctx: *anyopaque, id: core.ObjectId) void,
     };
 };
 
@@ -213,22 +220,30 @@ pub const ObjectService = struct {
     /// Cluster hooks; set right after init, before serving.
     cluster: ?Cluster = null,
     /// Changes made under `mutex`, published when the operation's lock is released.
-    pending: std.ArrayList(Change) = .empty,
+    pending: std.ArrayList(Pending) = .empty,
     pending_mutex: std.Thread.Mutex = .{},
     /// Remote tiers; set right after init when tiering is available.
     tiers: ?*tier_mod.Registry = null,
     /// Replication engine; set right after init, before serving.
     replication: ?replica.Sink = null,
-    /// Cluster mode: replaced blobs wait `gc_grace_ns` before deletion, so a read
-    /// that resolved the old record on another node can still open them.
-    deferred: std.ArrayList(Deferred) = .empty,
-    deferred_mutex: std.Thread.Mutex = .{},
 
-    pub const gc_grace_ns: i128 = 10 * std.time.ns_per_s;
-    const Deferred = struct { id: core.ObjectId, due_ns: i128 };
+    const Pending = struct { change: Change, seq: u64 };
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
+    }
+
+    /// Cluster mode: the key index starts empty; the caller loads or rebuilds it.
+    pub fn initCluster(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
+        var cat = metadata.Catalog.init(gpa);
+        if (store.getRecord(placement.catalog_key, gpa)) |bytes| {
+            defer gpa.free(bytes);
+            cat = metadata.Catalog.decode(gpa, bytes) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Corrupt => error.Corrupt,
+            };
+        } else |e| if (e != error.NotFound) return mapBackend(e);
+        return .{ .gpa = gpa, .store = store, .catalog = cat, .index = index_mod.Index.init(gpa), .persist_index = false };
     }
 
     /// `persist_index` false always rebuilds the key index from records (cluster mode,
@@ -251,39 +266,14 @@ pub const ObjectService = struct {
     pub fn deinit(self: *ObjectService) void {
         self.index.deinit();
         self.catalog.deinit();
-        for (self.pending.items) |c| self.freeChange(c);
+        for (self.pending.items) |p| self.freeChange(p.change);
         self.pending.deinit(self.gpa);
-        self.deferred.deinit(self.gpa);
     }
 
-    /// Deletes a data blob no record points at any more; deferred in cluster mode.
+    /// Deletes a data blob no record points at any more; the cluster defers it.
     pub fn dropBlob(self: *ObjectService, id: core.ObjectId) void {
-        if (self.cluster != null) {
-            self.deferred_mutex.lock();
-            defer self.deferred_mutex.unlock();
-            if (self.deferred.append(self.gpa, .{ .id = id, .due_ns = core.time.nowNs() + gc_grace_ns })) return else |_| {}
-        }
+        if (self.cluster) |c| return c.vtable.garbage(c.ctx, id);
         self.store.delete(placement.dataKey(id)) catch {};
-    }
-
-    /// Deletes deferred blobs whose grace passed (all of them with `all`).
-    pub fn collectDeferred(self: *ObjectService, all: bool) void {
-        const now = core.time.nowNs();
-        while (true) {
-            var batch: [64]core.ObjectId = undefined;
-            var n: usize = 0;
-            {
-                self.deferred_mutex.lock();
-                defer self.deferred_mutex.unlock();
-                // Appended in due order: the due ones are a prefix.
-                while (n < batch.len and n < self.deferred.items.len and (all or self.deferred.items[n].due_ns <= now)) : (n += 1) {
-                    batch[n] = self.deferred.items[n].id;
-                }
-                self.deferred.replaceRangeAssumeCapacity(0, n, &.{});
-            }
-            for (batch[0..n]) |id| self.store.delete(placement.dataKey(id)) catch {};
-            if (n < batch.len) return;
-        }
     }
 
     /// Hands a committed change to the replication engine; replica writes are not re-sent.
@@ -310,14 +300,26 @@ pub const ObjectService = struct {
         if (h.token) |t| c.vtable.unlock(c.ctx, t);
     }
 
-    /// Queues a change for peers. Caller holds `mutex`; the key is copied.
+    /// Journals a change; call before writing the record so a crash cannot hide a
+    /// written change, then queue it with `emitSeq` once written. Caller holds `mutex`.
+    pub fn journal(self: *ObjectService, change: Change) u64 {
+        const cl = self.cluster orelse return 0;
+        return cl.vtable.journal(cl.ctx, change);
+    }
+
+    /// Journals and queues a change that is already written. Caller holds `mutex`.
     pub fn emit(self: *ObjectService, change: Change) void {
+        self.emitSeq(change, self.journal(change));
+    }
+
+    /// Queues a journaled change for peers; the key is copied.
+    pub fn emitSeq(self: *ObjectService, change: Change, seq: u64) void {
         if (self.cluster == null) return;
         var c = change;
         if (c == .record) c.record.key = self.gpa.dupe(u8, change.record.key) catch return;
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
-        self.pending.append(self.gpa, c) catch self.freeChange(c);
+        self.pending.append(self.gpa, .{ .change = c, .seq = seq }) catch self.freeChange(c);
     }
 
     fn freeChange(self: *ObjectService, c: Change) void {
@@ -326,7 +328,7 @@ pub const ObjectService = struct {
 
     pub fn publishPending(self: *ObjectService) void {
         const c = self.cluster orelse return;
-        var changes: std.ArrayList(Change) = blk: {
+        var pend: std.ArrayList(Pending) = blk: {
             self.pending_mutex.lock();
             defer self.pending_mutex.unlock();
             const l = self.pending;
@@ -334,10 +336,19 @@ pub const ObjectService = struct {
             break :blk l;
         };
         defer {
-            for (changes.items) |ch| self.freeChange(ch);
-            changes.deinit(self.gpa);
+            for (pend.items) |p| self.freeChange(p.change);
+            pend.deinit(self.gpa);
         }
-        if (changes.items.len > 0) c.vtable.publish(c.ctx, changes.items);
+        if (pend.items.len == 0) return;
+        const changes = self.gpa.alloc(Change, pend.items.len) catch return;
+        defer self.gpa.free(changes);
+        const seqs = self.gpa.alloc(u64, pend.items.len) catch return;
+        defer self.gpa.free(seqs);
+        for (pend.items, changes, seqs) |p, *ch, *sq| {
+            ch.* = p.change;
+            sq.* = p.seq;
+        }
+        c.vtable.publish(c.ctx, changes, seqs);
     }
 
     /// Mirrors a peer's change in this node's caches.

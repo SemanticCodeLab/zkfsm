@@ -192,6 +192,11 @@ wait_ready 3 60
 NOBJ=$(echo "$OBJS" | wc -w)
 if wait_redundant "$NOBJ" 90; then r=yes; else r=no; fi
 check "heal restored all shards of $NOBJ objects" yes "$r"
+# The key index comes back from node 3's snapshot plus the peers' journals; no node
+# rebuilds it from the records.
+check "returning node resumed its key index from snapshot and journals" 1 "$(grep -c 'key index loaded from snapshot' "$WORK/n3.log" || true)"
+check "no peer rebuilt its key index" 0 "$(cat "$WORK"/n[124].log | grep -c 'rebuilding the key index' || true)"
+check "returning node lists like the others" "$(listing 1)" "$(listing 3)"
 cli 3 s3 cp --no-progress s3://clu/down2 "$WORK/got" >/dev/null
 check "object written while node 3 was down reads via node 3" "$(md5 "$WORK/obj/down2")" "$(md5 "$WORK/got")"
 check "object deleted while node 3 was down stays deleted" 404 "$(cget 3 gone "$WORK/got")"

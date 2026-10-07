@@ -12,6 +12,9 @@ const max_record_len = 16 * 1024 * 1024;
 
 pub const LocalBackend = struct {
     root: std.fs.Dir,
+    /// When set, kept equal to the bytes stored under the key spaces (commits add,
+    /// replacements and deletes subtract), so free space needs no directory walk.
+    usage: ?*std.atomic.Value(u64) = null,
 
     pub const capabilities: iface.Capabilities = .{
         .atomic_rename = true,
@@ -88,11 +91,37 @@ pub const LocalBackend = struct {
     fn commit(self: *LocalBackend, tmp: []const u8, final: []const u8) Error!void {
         const dir = std.fs.path.dirname(final) orelse ".";
         self.root.makePath(dir) catch |e| return mapFs(e);
+        const grow = if (self.usage != null) self.sizeAt(tmp) else 0;
+        const shrink = if (self.usage != null) self.sizeAt(final) else 0;
         self.root.rename(tmp, final) catch |e| return mapFs(e);
+        self.account(grow, shrink);
         // A plain openDir yields an O_PATH fd, which fsync rejects.
         var d = self.root.openDir(dir, .{ .iterate = true }) catch |e| return mapFs(e);
         defer d.close();
         std.posix.fsync(d.fd) catch |e| return mapFs(e);
+    }
+
+    fn sizeAt(self: *LocalBackend, path: []const u8) u64 {
+        const st = self.root.statFile(path) catch return 0;
+        return st.size;
+    }
+
+    fn account(self: *LocalBackend, grow: u64, shrink: u64) void {
+        const u = self.usage orelse return;
+        if (grow >= shrink) {
+            _ = u.fetchAdd(grow - shrink, .monotonic);
+        } else {
+            // Saturate at zero: a drive measured while it changed may undercount.
+            var cur = u.load(.monotonic);
+            while (u.cmpxchgWeak(cur, cur -| (shrink - grow), .monotonic, .monotonic)) |v| cur = v;
+        }
+    }
+
+    /// Deletes a stored file, keeping `usage` in step.
+    fn unlinkKey(self: *LocalBackend, path: []const u8) Error!void {
+        const size = if (self.usage != null) self.sizeAt(path) else 0;
+        self.root.deleteFile(path) catch |e| return mapFs(e);
+        self.account(0, size);
     }
 
     /// Name of the drive identity file at the root of a drive.
@@ -196,7 +225,7 @@ pub const LocalBackend = struct {
 
     fn delete(ctx: *anyopaque, key: PhysicalKey) Error!void {
         var path_buf: [path_max]u8 = undefined;
-        self_(ctx).root.deleteFile(try keyPath(key, &path_buf)) catch |e| return mapFs(e);
+        return self_(ctx).unlinkKey(try keyPath(key, &path_buf));
     }
 
     /// Fixed two-level walk of the fanout; no recursion.
@@ -266,7 +295,7 @@ pub const LocalBackend = struct {
     fn deleteRecord(ctx: *anyopaque, key: PhysicalKey) Error!void {
         if (key.space == .data) return error.InvalidKey;
         var path_buf: [path_max]u8 = undefined;
-        self_(ctx).root.deleteFile(try keyPath(key, &path_buf)) catch |e| return mapFs(e);
+        return self_(ctx).unlinkKey(try keyPath(key, &path_buf));
     }
 
     fn sync(ctx: *anyopaque) Error!void {
@@ -389,4 +418,27 @@ test "pending write commit and abort, format file" {
     try lb.writeFormat("id");
     try std.testing.expectEqualStrings("id", try lb.readFormat(&fb));
     try std.testing.expectError(error.InvalidKey, lb.removeTemp("../x.tmp"));
+}
+
+test "usage follows commits, replacements, and deletes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var lb = try LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+    defer lb.close();
+    var used: std.atomic.Value(u64) = .init(0);
+    lb.usage = &used;
+    const b = lb.backend();
+    const key: PhysicalKey = .{ .space = .data, .hex = "00112233445566778899aabbccddeeff".* };
+    var p = try lb.begin();
+    try p.writeAll("abcdef");
+    try p.commit(key);
+    try std.testing.expectEqual(@as(u64, 6), used.load(.monotonic));
+    const rk: PhysicalKey = .{ .space = .record, .hex = key.hex };
+    try b.putRecord(rk, "1234");
+    try b.putRecord(rk, "12");
+    try std.testing.expectEqual(@as(u64, 8), used.load(.monotonic));
+    try b.delete(key);
+    try b.deleteRecord(rk);
+    try std.testing.expectEqual(@as(u64, 0), used.load(.monotonic));
 }

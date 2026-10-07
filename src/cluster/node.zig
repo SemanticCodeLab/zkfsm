@@ -17,6 +17,8 @@ const locks = @import("locks.zig");
 const router_mod = @import("router.zig");
 const remote_drive = @import("remote_drive.zig");
 const handles = @import("handles.zig");
+const journal_mod = @import("journal.zig");
+const catchup = @import("catchup.zig");
 
 const layout = placement.layout;
 const FormatV2 = layout.FormatV2;
@@ -107,8 +109,20 @@ pub const Node = struct {
     stop_ev: std.Thread.ResetEvent = .{},
     threads: std.ArrayList(std.Thread) = .empty,
     stopped: bool = false,
-    /// A note arrived before the object service was up.
-    missed: std.atomic.Value(bool) = .init(false),
+    /// Per peer: it came back online (IAM and caches may lag).
+    returned: []std.atomic.Value(bool) = &.{},
+    sync_ev: std.Thread.ResetEvent = .{},
+    /// This node's index changes, in order; peers pull what they missed.
+    journal: journal_mod.Journal = undefined,
+    journal_ok: std.atomic.Value(bool) = .init(false),
+    /// How far each peer's journal is applied to our key index.
+    origins: catchup.Origins = undefined,
+    /// Node-local files (journal, index snapshot) on the first local drive.
+    node_dir: ?std.fs.Dir = null,
+    last_snapshot_ms: i64 = 0,
+    /// Our journal position when we started serving (peers pull from there).
+    jopen: std.atomic.Value(u64) = .init(0),
+    gc: Gc = .{},
     iam_persist: IamPersist = undefined,
 
     /// Parses the topology and prepares RPC; nothing touches peers yet.
@@ -140,6 +154,10 @@ pub const Node = struct {
         n.rpc = rpc_mod.Rpc.init(gpa, &n.topo, cfg.secret) catch return error.OutOfMemory;
         errdefer n.rpc.deinit();
         if (n.topo.tls) try n.loadCa();
+        n.returned = try a.alloc(std.atomic.Value(bool), n.topo.nodes.len);
+        for (n.returned) |*r| r.* = .init(false);
+        n.origins = try catchup.Origins.init(gpa, n.topo.nodes.len);
+        errdefer n.origins.deinit();
         n.local_eps = try a.alloc([]?LocalEp, n.topo.pools.len);
         n.remotes = try a.alloc([]?remote_drive.RemoteDrive, n.topo.pools.len);
         for (n.topo.pools, 0..) |pool, p| {
@@ -180,6 +198,10 @@ pub const Node = struct {
         n.locks.deinit();
         n.table.deinit();
         n.leases.deinit();
+        n.origins.deinit();
+        n.gc.deinit(n.gpa);
+        if (n.journal_ok.load(.acquire)) n.journal.deinit();
+        if (n.node_dir) |*d| d.close();
         n.guard.deinit();
         n.rpc.deinit();
         n.threads.deinit(n.gpa);
@@ -187,14 +209,20 @@ pub const Node = struct {
         n.gpa.destroy(n);
     }
 
-    /// Stops background threads (healers, heartbeat, refresh).
+    /// Stops background threads (healers, heartbeat, refresh); saves the index
+    /// snapshot and closes the journal cleanly. Call before the service goes away.
     pub fn stop(n: *Node) void {
         if (n.stopped) return;
         n.stopped = true;
         n.stop_ev.set();
+        n.sync_ev.set();
         for (n.pools) |*p| for (p.sets) |*s| s.healer.stop();
         for (n.threads.items) |t| t.join();
         n.threads.clearRetainingCapacity();
+        if (n.drives_open.load(.acquire)) n.collectGarbage(true);
+        if (n.open.load(.acquire)) if (n.svc.load(.acquire)) |svc| n.saveSnapshot(svc);
+        n.svc.store(null, .release);
+        if (n.journal_ok.load(.acquire)) n.journal.sync(true);
     }
 
     fn spawn(n: *Node, comptime f: anytype) void {
@@ -260,7 +288,13 @@ pub const Node = struct {
             n.stop_ev.timedWait(500 * std.time.ns_per_ms) catch {};
         }
         try n.openSets(seen);
+        // Measured once while no writes can arrive; commits and deletes keep it exact.
+        n.trackUsage();
+        n.openJournal();
         n.drives_open.store(true, .release);
+        // Learn which peers are up, and tell them we are, before serving anything:
+        // a write that misses a live peer's drives would be stored degraded.
+        n.heartbeatRound();
         n.refreshSpace();
         std.log.info("cluster: deployment {s}, protection {s}, {d} set(s)", .{ &std.fmt.bytesToHex(n.deployment, .lower), n.profile.name(), n.setCount() });
     }
@@ -291,10 +325,13 @@ pub const Node = struct {
         }
     }
 
-    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool };
+    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
 
+    /// Asks a peer who it is; once our drives are open the call also tells the peer
+    /// to count us online at once rather than at its next heartbeat.
     fn hello(n: *Node, node: u16) error{ Unreachable, CredentialMismatch }!Hello {
-        var c = n.rpc.call(node, "hello", "", .{ .bytes = "" }, .{ .probe = true, .timeout_ms = 2000 }) catch return error.Unreachable;
+        const q = if (n.drives_open.load(.acquire)) "drives=1" else "";
+        var c = n.rpc.call(node, "hello", q, .{ .bytes = "" }, .{ .probe = true, .timeout_ms = 2000 }) catch return error.Unreachable;
         defer c.deinit();
         if (c.status == 401) {
             std.log.err("cluster: node {s} rejected our requests: cluster secret or root credentials differ", .{n.topo.nodes[node].name});
@@ -320,7 +357,13 @@ pub const Node = struct {
                 have |= 2;
             } else if (std.mem.eql(u8, k, "ready")) {
                 h.ready = std.mem.eql(u8, v, "1");
-            } else if (std.mem.eql(u8, k, "drives")) h.drives = std.mem.eql(u8, v, "1");
+            } else if (std.mem.eql(u8, k, "drives")) {
+                h.drives = std.mem.eql(u8, v, "1");
+            } else if (std.mem.eql(u8, k, "jepoch")) {
+                h.jepoch = std.fmt.parseInt(u64, v, 10) catch 0;
+            } else if (std.mem.eql(u8, k, "jseq")) {
+                h.jseq = std.fmt.parseInt(u64, v, 10) catch 0;
+            } else if (std.mem.eql(u8, k, "jopen")) h.jopen = std.fmt.parseInt(u64, v, 10) catch null;
         }
         if (have != 3) return error.Unreachable;
         return h;
@@ -488,6 +531,8 @@ pub const Node = struct {
     fn openSets(n: *Node, seen: [][]Seen) Error!void {
         const a = n.arena_state.allocator();
         n.pools = try a.alloc(PoolState, n.topo.pools.len);
+        // Empty until opened, so a failed bootstrap stops and frees cleanly.
+        for (n.pools) |*p| p.* = .{ .set_size = 0, .sets = &.{}, .backends = &.{} };
         n.router_pools = try a.alloc(router_mod.Pool, n.topo.pools.len);
         for (n.topo.pools, 0..) |pool, p| {
             var size: usize = 0;
@@ -511,9 +556,10 @@ pub const Node = struct {
                 }
             };
             const ps = &n.pools[p];
-            ps.* = .{ .set_size = size, .sets = try a.alloc(SetState, sets.len), .backends = try a.alloc(backend.StorageBackend, sets.len) };
+            const set_states = try a.alloc(SetState, sets.len);
+            ps.* = .{ .set_size = size, .sets = set_states[0..0], .backends = try a.alloc(backend.StorageBackend, sets.len) };
             for (sets, 0..) |members, si| {
-                const st = &ps.sets[si];
+                const st = &set_states[si];
                 const ms = try a.alloc(placement.drives.Member, members.len);
                 st.endpoints = try a.dupe(u32, members);
                 for (members, ms) |ep, *m| {
@@ -526,10 +572,14 @@ pub const Node = struct {
                     return error.LayoutMismatch;
                 };
                 st.stores = .{};
-                st.strategy = protection.Strategy.init(n.gpa, &st.drives, &st.stores) catch return error.BadLayout;
+                st.strategy = protection.Strategy.init(n.gpa, &st.drives, &st.stores) catch {
+                    st.drives.deinit();
+                    return error.BadLayout;
+                };
                 st.healer = heal.Healer.init(n.gpa, &st.drives, st.strategy, .{});
                 st.healer.leader = .{ .ctx = n, .func = healLeader };
                 ps.backends[si] = st.strategy.backend();
+                ps.sets = set_states[0 .. si + 1];
                 for (members, 0..) |ep, idx| if (n.local_eps[p][ep]) |*le| {
                     le.set = &st.drives;
                     le.slot = @intCast(idx);
@@ -546,16 +596,18 @@ pub const Node = struct {
         return n.router.backend();
     }
 
-    /// Creates the object service once the catalog is readable (needs read quorum).
+    /// Creates the object service once the catalog is readable (needs read quorum),
+    /// then brings its key index up to date: the local snapshot plus what every peer
+    /// journaled since, or a rebuild from the records when that cannot be done.
     pub fn initService(n: *Node, out: *object.ObjectService) Error!void {
         var last_log: i64 = 0;
         while (true) {
             if (n.stop_ev.isSet()) return error.Stopped;
-            if (object.ObjectService.initWith(n.gpa, n.storage(), false)) |svc| {
+            if (object.ObjectService.initCluster(n.gpa, n.storage())) |svc| {
                 out.* = svc;
                 out.cluster = .{ .ctx = n, .vtable = &cluster_vtable };
                 n.svc.store(out, .release);
-                return;
+                break;
             } else |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
                 const now = std.time.timestamp();
@@ -566,6 +618,167 @@ pub const Node = struct {
             }
             n.stop_ev.timedWait(time_ns(1)) catch {};
         }
+        const t0 = std.time.milliTimestamp();
+        if (n.resumeIndex(out)) {
+            std.log.info("cluster: key index loaded from snapshot and peer journals in {d} ms", .{std.time.milliTimestamp() - t0});
+            return;
+        }
+        while (true) {
+            if (n.stop_ev.isSet()) return error.Stopped;
+            if (n.rebuildIndex(out)) |_| {
+                std.log.info("cluster: key index rebuilt from records in {d} ms", .{std.time.milliTimestamp() - t0});
+                return;
+            } else |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                std.log.info("cluster: key index rebuild: {t}; retrying", .{e});
+            }
+            n.stop_ev.timedWait(time_ns(1)) catch {};
+        }
+    }
+
+    // ---- key index: journal, snapshot, catch-up ----
+
+    fn openJournal(n: *Node) void {
+        find: for (n.local_eps) |eps| for (eps) |e| if (e) |le| {
+            var root = std.fs.cwd().openDir(le.path, .{}) catch continue;
+            defer root.close();
+            n.node_dir = root.makeOpenPath("node", .{}) catch continue;
+            break :find;
+        };
+        n.journal = journal_mod.Journal.open(n.gpa, n.node_dir);
+        n.journal_ok.store(true, .release);
+    }
+
+    fn journalFn(ctx: *anyopaque, change: object.service.Change) u64 {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        _ = n.origins.dirty.fetchAdd(1, .monotonic);
+        return n.journal.append(.{ .change = change });
+    }
+
+    /// Full rebuild from the records. Peers count as caught up to the heads they
+    /// reported before it started; changes after that arrive as notes or pulls.
+    fn rebuildIndex(n: *Node, svc: *object.ObjectService) object.Error!void {
+        const heads = try n.gpa.alloc(catchup.Origins.Want, n.topo.nodes.len);
+        defer n.gpa.free(heads);
+        n.origins.heads(heads);
+        heads[n.topo.local] = .{ .epoch = 0, .seq = 0 };
+        try svc.reloadCatalog();
+        try svc.rebuildIndex();
+        n.origins.rebuilt(heads);
+        _ = n.origins.dirty.fetchAdd(1, .monotonic);
+    }
+
+    /// Loads the snapshot and pulls every peer's journal past it. False (with the
+    /// index cleared) when any part is missing: no snapshot, a lost journal epoch,
+    /// or a peer that cannot be asked.
+    fn resumeIndex(n: *Node, svc: *object.ObjectService) bool {
+        const dir = n.node_dir orelse return false;
+        const bytes = dir.readFileAlloc(n.gpa, catchup.snapshot_name, 1 << 34) catch return false;
+        defer n.gpa.free(bytes);
+        const marks = blk: {
+            svc.mutex.lock();
+            defer svc.mutex.unlock();
+            break :blk catchup.decode(n.gpa, svc, bytes, n.deployment, n.topo.nodes.len) catch |e| {
+                std.log.warn("cluster: index snapshot unusable ({t}); rebuilding", .{e});
+                return false;
+            };
+        };
+        defer n.gpa.free(marks);
+        n.origins.restore(marks);
+        const ok = n.resumeFrom(svc, marks);
+        if (!ok) {
+            svc.mutex.lock();
+            defer svc.mutex.unlock();
+            svc.index.clear();
+        }
+        return ok;
+    }
+
+    fn resumeFrom(n: *Node, svc: *object.ObjectService, marks: []const catchup.Origins.Want) bool {
+        // Our own changes after the snapshot, then every peer's.
+        const own = marks[n.topo.local];
+        if (own.epoch != n.journal.head().epoch) return false;
+        n.applyOwn(svc, own) catch return false;
+        for (0..n.topo.nodes.len) |i| {
+            const node: u16 = @intCast(i);
+            if (node == n.topo.local) continue;
+            if (!n.rpc.isOnline(node)) {
+                std.log.info("cluster: node {s} is down; its changes need a rebuild", .{n.topo.nodes[i].name});
+                return false;
+            }
+            n.pull(svc, node) catch return false;
+            if (n.origins.want(node) != null) return false;
+        }
+        return true;
+    }
+
+    fn applyOwn(n: *Node, svc: *object.ObjectService, from: catchup.Origins.Want) error{ OutOfMemory, Gone }!void {
+        var after = from.seq;
+        while (true) {
+            const page = try n.journal.read(n.gpa, from.epoch, after, pull_page);
+            defer n.gpa.free(page.bytes);
+            var it: journal_mod.PageIter = .{ .bytes = page.bytes };
+            while (it.next() catch return error.Gone) |e| {
+                if (e.note == .change) svc.applyChange(e.note.change);
+                after = e.seq;
+            }
+            if (!page.more) return;
+        }
+    }
+
+    const PullError = error{ Unreachable, Gone };
+
+    /// Applies a peer's journal entries past our watermark (when it is behind).
+    fn pull(n: *Node, svc: *object.ObjectService, node: u16) PullError!void {
+        while (true) {
+            const w = n.origins.want(node) orelse return;
+            if (w.epoch == 0) return error.Gone;
+            var qb: [96]u8 = undefined;
+            const q = std.fmt.bufPrint(&qb, "e={d}&after={d}&max={d}", .{ w.epoch, w.seq, pull_page }) catch unreachable;
+            var c = n.rpc.call(node, "jread", q, .{ .bytes = "" }, .{ .timeout_ms = 10_000 }) catch return error.Unreachable;
+            defer c.deinit();
+            if (c.status == 409) return error.Gone;
+            if (!c.ok()) return error.Unreachable;
+            const body = c.readAll(n.gpa, pull_page + 64 * 1024) catch return error.Unreachable;
+            defer n.gpa.free(body);
+            var it: journal_mod.PageIter = .{ .bytes = body };
+            var last = w.seq;
+            var count: usize = 0;
+            while (it.next() catch return error.Unreachable) |e| {
+                if (e.note == .change) svc.applyChange(e.note.change);
+                last = e.seq;
+                count += 1;
+            }
+            n.origins.pulled(node, w.epoch, last, !c.meta.more);
+            if (count > 0) std.log.info("cluster: caught up {d} change(s) from {s}", .{ count, n.topo.nodes[node].name });
+            if (!c.meta.more) return;
+        }
+    }
+
+    /// Writes the index snapshot with the watermarks it reflects.
+    fn saveSnapshot(n: *Node, svc: *object.ObjectService) void {
+        const dir = n.node_dir orelse return;
+        const marks = n.gpa.alloc(catchup.Origins.Want, n.topo.nodes.len) catch return;
+        defer n.gpa.free(marks);
+        const dirty = n.origins.dirty.load(.monotonic);
+        const bytes = blk: {
+            // Under the service lock every applied change is in the index and every
+            // own journal entry is reflected.
+            svc.mutex.lock();
+            defer svc.mutex.unlock();
+            if (svc.index.stale) return;
+            n.origins.marks(marks);
+            const h = n.journal.lastAppended();
+            marks[n.topo.local] = .{ .epoch = h.epoch, .seq = h.stable };
+            break :blk catchup.encode(n.gpa, svc, n.deployment, marks) catch return;
+        };
+        defer n.gpa.free(bytes);
+        catchup.save(dir, bytes) catch |e| {
+            std.log.warn("cluster: index snapshot not saved: {t}", .{e});
+            return;
+        };
+        _ = n.origins.dirty.fetchSub(dirty, .monotonic);
+        n.last_snapshot_ms = std.time.milliTimestamp();
     }
 
     fn time_ns(s: u64) u64 {
@@ -587,11 +800,9 @@ pub const Node = struct {
         };
         n.spawn(refreshLoop);
         n.spawn(spaceLoop);
+        n.spawn(syncLoop);
+        n.jopen.store(n.journal.lastAppended().stable, .release);
         n.open.store(true, .release);
-        // Notes that arrived before the service existed were dropped: catch up.
-        if (n.missed.swap(false, .acq_rel)) if (n.svc.load(.acquire)) |svc| {
-            svc.applyChange(.resync);
-        };
     }
 
     // ---- health ----
@@ -621,22 +832,92 @@ pub const Node = struct {
         return best == n.topo.local;
     }
 
+    /// Runs on heartbeat and RPC threads: never blocks, the sync thread does the work.
     fn onPeerChange(ctx: *anyopaque, node: u16, up: bool) void {
         const n: *Node = @ptrCast(@alignCast(ctx));
         if (!up) return;
-        // A returning node may miss shards and cached state: heal and resync it.
+        n.returned[node].store(true, .release);
+        n.sync_ev.set();
+        // Sets are still being opened during bootstrap.
+        if (!n.drives_open.load(.acquire)) return;
+        // A returning node may miss shards: heal them.
         for (n.pools) |*p| for (p.sets) |*s| {
             for (s.drives.drives) |d| if (d.node == node) {
                 s.healer.wake();
                 break;
             };
         };
-        if (n.open.load(.acquire)) n.sendNotes(node, &.{.{ .change = .resync }});
+    }
+
+    /// Keeps the key index current: pulls journal entries from peers that are
+    /// behind (a returning peer, a lost note), rebuilds only when a pull cannot
+    /// work (a peer lost its journal), and saves the snapshot now and then.
+    fn syncLoop(n: *Node) void {
+        while (true) {
+            n.sync_ev.timedWait(time_ns(1)) catch {};
+            n.sync_ev.reset();
+            if (n.stop_ev.isSet()) return;
+            if (!n.open.load(.acquire)) continue;
+            const svc = n.svc.load(.acquire) orelse continue;
+            for (n.returned) |*r| {
+                if (!r.swap(false, .acq_rel)) continue;
+                if (n.iam_store.load(.acquire)) |s| s.reload() catch {};
+            }
+            var rebuild = false;
+            for (0..n.topo.nodes.len) |i| {
+                const node: u16 = @intCast(i);
+                // A peer that just said hello is pulled once our heartbeat knows its head.
+                if (node == n.topo.local or !n.rpc.isOnline(node) or !n.origins.knowsHead(node)) continue;
+                n.pull(svc, node) catch |e| switch (e) {
+                    error.Gone => rebuild = true,
+                    error.Unreachable => {},
+                };
+            }
+            if (rebuild) {
+                std.log.warn("cluster: a peer's journal does not reach back far enough; rebuilding the key index", .{});
+                n.rebuildIndex(svc) catch |e| std.log.warn("cluster: key index rebuild: {t}", .{e});
+            }
+            const now = std.time.milliTimestamp();
+            if (n.origins.dirty.load(.monotonic) > 0 and now - n.last_snapshot_ms > snapshot_every_ms) n.saveSnapshot(svc);
+        }
     }
 
     // ---- change notifications ----
 
-    const cluster_vtable: object.service.Cluster.VTable = .{ .lock = lockFn, .unlock = unlockFn, .publish = publishFn };
+    const cluster_vtable: object.service.Cluster.VTable = .{ .lock = lockFn, .unlock = unlockFn, .publish = publishFn, .journal = journalFn, .garbage = garbageFn };
+
+    // ---- deferred blob deletion ----
+
+    fn garbageFn(ctx: *anyopaque, id: core.ObjectId) void {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        if (!n.gc.add(n.gpa, id, gc_grace_ns, true)) n.storage().delete(placement.dataKey(id)) catch {};
+    }
+
+    /// Deletes blobs whose grace passed (all with `all`) and tells the next online
+    /// peer about new ones, so they go even if this node dies before their time.
+    fn collectGarbage(n: *Node, all: bool) void {
+        var due: std.ArrayListUnmanaged(core.ObjectId) = .empty;
+        defer due.deinit(n.gpa);
+        var fresh: std.ArrayListUnmanaged(core.ObjectId) = .empty;
+        defer fresh.deinit(n.gpa);
+        n.gc.take(n.gpa, core.time.nowNs(), all, &due, &fresh);
+        for (due.items) |id| n.storage().delete(placement.dataKey(id)) catch {};
+        if (fresh.items.len == 0 or all) return;
+        const next = n.successor() orelse return;
+        const notes = n.gpa.alloc(wire.Note, fresh.items.len) catch return;
+        defer n.gpa.free(notes);
+        for (fresh.items, notes) |id, *o| o.* = .{ .garbage = id.bytes };
+        n.sendNotes(next, notes);
+    }
+
+    fn successor(n: *Node) ?u16 {
+        const count = n.topo.nodes.len;
+        for (1..count) |k| {
+            const node: u16 = @intCast((n.topo.local + k) % count);
+            if (n.rpc.isOnline(node)) return node;
+        }
+        return null;
+    }
 
     fn lockFn(ctx: *anyopaque, resource: []const u8) object.Error!u64 {
         const n: *Node = @ptrCast(@alignCast(ctx));
@@ -652,12 +933,24 @@ pub const Node = struct {
         n.locks.unlock(token);
     }
 
-    fn publishFn(ctx: *anyopaque, changes: []const object.service.Change) void {
+    /// Sends each change with its journal mark, then lets the entries turn stable:
+    /// a peer that sees the head move without the note knows it missed one.
+    fn publishFn(ctx: *anyopaque, changes: []const object.service.Change, seqs: []const u64) void {
         const n: *Node = @ptrCast(@alignCast(ctx));
-        const notes = n.gpa.alloc(wire.Note, changes.len) catch return;
+        defer n.journal.finish(seqs);
+        const notes = n.gpa.alloc(wire.Note, 2 * changes.len) catch return;
         defer n.gpa.free(notes);
-        for (changes, notes) |c, *o| o.* = .{ .change = c };
-        n.broadcast(notes);
+        const epoch = n.journal.head().epoch;
+        var k: usize = 0;
+        for (changes, seqs) |c, sq| {
+            if (sq != 0) {
+                notes[k] = .{ .mark = .{ .epoch = epoch, .seq = sq } };
+                k += 1;
+            }
+            notes[k] = .{ .change = c };
+            k += 1;
+        }
+        n.broadcast(notes[0..k]);
     }
 
     /// Sends notes to every online peer at once.
@@ -683,33 +976,57 @@ pub const Node = struct {
         c.deinit();
     }
 
-    /// Applies a peer's note to this node's caches.
-    pub fn applyNote(n: *Node, note: wire.Note) void {
-        switch (note) {
+    /// Applies a peer's notes to this node's caches; a mark before a change says
+    /// which journal entry it is, so the watermark can follow.
+    pub fn applyNotes(n: *Node, from: u16, it: *wire.NoteIter) void {
+        var mark: ?wire.Mark = null;
+        while (it.next() catch null) |note| switch (note) {
+            .mark => |m| mark = m,
+            .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, false),
             .iam => if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.warn("iam reload failed: {t}", .{e}),
             .change => |c| {
-                const svc = n.svc.load(.acquire) orelse {
-                    n.missed.store(true, .release);
-                    return;
-                };
+                defer mark = null;
+                // Before the service exists the startup catch-up covers it.
+                const svc = n.svc.load(.acquire) orelse continue;
                 svc.applyChange(c);
                 if (c == .resync) if (n.iam_store.load(.acquire)) |s| s.reload() catch {};
+                if (mark) |m| if (from < n.topo.nodes.len) n.origins.applied(from, m);
             },
-        }
+        };
     }
 
     // ---- background loops ----
 
+    /// One hello to every peer at once; their answers set our view of them.
+    fn heartbeatRound(n: *Node) void {
+        const Each = struct {
+            fn f(nn: *Node, i: usize) void {
+                const node: u16 = @intCast(i);
+                if (node == nn.topo.local) return;
+                // A peer still bootstrapping cannot serve drive I/O yet.
+                const h = nn.hello(node) catch return nn.rpc.setOnline(node, false);
+                nn.rpc.setOnline(node, h.drives);
+                if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, std.time.milliTimestamp())) nn.sync_ev.set();
+            }
+        };
+        protection.fanout.run(n.topo.nodes.len, true, n, Each.f);
+    }
+
+    /// A peer's hello says its drives are open: it is up, whatever our last probe saw.
+    pub fn peerSaysUp(n: *Node, node: u16) void {
+        if (node == n.topo.local or node >= n.topo.nodes.len) return;
+        n.rpc.setOnline(node, true);
+    }
+
     fn heartbeatLoop(n: *Node) void {
         while (!n.stop_ev.isSet()) {
-            for (0..n.topo.nodes.len) |i| {
-                const node: u16 = @intCast(i);
-                if (node == n.topo.local) continue;
-                // A peer still bootstrapping cannot serve drive I/O yet.
-                if (n.hello(node)) |h| n.rpc.setOnline(node, h.drives) else |_| n.rpc.setOnline(node, false);
-            }
+            n.heartbeatRound();
             _ = n.leases.sweep(std.time.milliTimestamp());
-            if (n.svc.load(.acquire)) |svc| svc.collectDeferred(false);
+            if (n.journal_ok.load(.acquire)) {
+                n.journal.expireStuck(std.time.milliTimestamp());
+                n.journal.sync(false);
+            }
+            if (n.drives_open.load(.acquire)) n.collectGarbage(false);
             n.stop_ev.timedWait(heartbeat_ns) catch {};
         }
     }
@@ -720,34 +1037,43 @@ pub const Node = struct {
             n.stop_ev.timedWait(time_ns(@max(n.cfg.refresh_s, 1))) catch {};
             if (n.stop_ev.isSet()) return;
             round += 1;
-            if (n.svc.load(.acquire)) |svc| {
-                svc.reloadCatalog() catch |e| std.log.debug("catalog refresh: {t}", .{e});
-                // A full index rebuild is the slow backstop for lost notifications.
-                if (round % 60 == 0) svc.rebuildIndex() catch |e| std.log.warn("key index refresh: {t}", .{e});
-            }
+            // Lost notes are found through the journal heads peers report.
+            if (n.svc.load(.acquire)) |svc| svc.reloadCatalog() catch |e| std.log.debug("catalog refresh: {t}", .{e});
             if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.debug("iam refresh: {t}", .{e});
         }
     }
 
+    fn trackUsage(n: *Node) void {
+        for (n.pools, 0..) |*ps, p| for (ps.sets) |*st| for (st.endpoints, 0..) |ep, slot| {
+            if (n.local_eps[p][ep]) |*le| {
+                measure(le);
+                st.drives.drives[slot].kind.local.usage = &le.used;
+            }
+        };
+    }
+
     fn spaceLoop(n: *Node) void {
         while (true) {
-            n.stop_ev.timedWait(time_ns(30)) catch {};
+            n.stop_ev.timedWait(time_ns(space_refresh_s)) catch {};
             if (n.stop_ev.isSet()) return;
             n.refreshSpace();
         }
     }
 
     /// Pool room: per drive, capacity minus what this deployment stores there.
+    /// Drives not heard from yet are estimated from the pool's known ones, so a
+    /// peer that is late to report cannot tilt the choice between pools.
     fn refreshSpace(n: *Node) void {
         for (n.topo.pools, 0..) |pool, p| {
             var free: u64 = 0;
+            var known: u64 = 0;
             for (pool.endpoints, 0..) |_, i| {
-                if (n.local_eps[p][i]) |*le| {
-                    measure(le);
-                    free += le.total.load(.monotonic) -| le.used.load(.monotonic);
-                } else if (n.remoteSpace(p, i)) |f| free += f;
+                const f = if (n.local_eps[p][i]) |*le| localFree(le) else n.remoteSpace(p, i);
+                free += f orelse continue;
+                known += 1;
             }
-            if (p < n.router_pools.len) n.router_pools[p].free.store(free, .monotonic);
+            if (known == 0 or p >= n.router_pools.len) continue;
+            n.router_pools[p].free.store(free / known * pool.endpoints.len, .monotonic);
         }
     }
 
@@ -769,15 +1095,22 @@ pub const Node = struct {
             if (std.mem.startsWith(u8, line, "total ")) total = std.fmt.parseInt(u64, line[6..], 10) catch 0;
             if (std.mem.startsWith(u8, line, "used ")) used = std.fmt.parseInt(u64, line[5..], 10) catch 0;
         }
-        return total -| used;
+        // Zero capacity: the owner has not measured the drive yet.
+        return if (total == 0) null else total -| used;
     }
 };
 
-const heartbeat_ns = std.time.ns_per_s;
+const space_refresh_s = 5;
 
-/// Capacity from statvfs and bytes held under the drive's key spaces.
-fn measure(le: *LocalEp) void {
-    var dir = std.fs.cwd().openDir(le.path, .{ .iterate = true }) catch return;
+/// Capacity from statfs (cheap), minus the tracked usage; null until measured.
+fn localFree(le: *LocalEp) ?u64 {
+    statCapacity(le);
+    const total = le.total.load(.monotonic);
+    return if (total == 0) null else total -| le.used.load(.monotonic);
+}
+
+fn statCapacity(le: *LocalEp) void {
+    var dir = std.fs.cwd().openDir(le.path, .{}) catch return;
     defer dir.close();
     // struct statfs on 64-bit Linux: type, bsize, blocks, ..., frsize at word 9.
     var st: [16]u64 = @splat(0);
@@ -785,6 +1118,65 @@ fn measure(le: *LocalEp) void {
         const unit = if (st[9] != 0) st[9] else st[1];
         le.total.store(st[2] *| unit, .monotonic);
     }
+}
+
+const heartbeat_ns = std.time.ns_per_s;
+/// Replaced blobs outlive their record this long (reads that resolved it finish).
+const gc_grace_ns: i128 = 10 * std.time.ns_per_s;
+/// A peer deletes our garbage after this, in case we could not.
+const backup_grace_ns: i128 = 30 * std.time.ns_per_s;
+
+/// Blobs waiting out their grace: ours (announced to a peer once) and peers'.
+const Gc = struct {
+    mutex: std.Thread.Mutex = .{},
+    own: std.ArrayListUnmanaged(Item) = .empty,
+    backup: std.ArrayListUnmanaged(Item) = .empty,
+    announce: std.ArrayListUnmanaged(core.ObjectId) = .empty,
+
+    const Item = struct { id: core.ObjectId, due_ns: i128 };
+    const cap = 1 << 20;
+
+    fn deinit(g: *Gc, gpa: std.mem.Allocator) void {
+        g.own.deinit(gpa);
+        g.backup.deinit(gpa);
+        g.announce.deinit(gpa);
+    }
+
+    /// False when the list is full; the caller deletes at once then.
+    fn add(g: *Gc, gpa: std.mem.Allocator, id: core.ObjectId, grace: i128, own: bool) bool {
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        const list = if (own) &g.own else &g.backup;
+        if (list.items.len >= cap) return false;
+        list.append(gpa, .{ .id = id, .due_ns = core.time.nowNs() + grace }) catch return false;
+        if (own) g.announce.append(gpa, id) catch {};
+        return true;
+    }
+
+    /// Moves due ids (lists are in due order) into `due`, new ones into `fresh`.
+    fn take(g: *Gc, gpa: std.mem.Allocator, now: i128, all: bool, due: *std.ArrayListUnmanaged(core.ObjectId), fresh: *std.ArrayListUnmanaged(core.ObjectId)) void {
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        for ([_]*std.ArrayListUnmanaged(Item){ &g.own, &g.backup }) |list| {
+            var k: usize = 0;
+            while (k < list.items.len and (all or list.items[k].due_ns <= now)) : (k += 1) {
+                due.append(gpa, list.items[k].id) catch break;
+            }
+            list.replaceRangeAssumeCapacity(0, k, &.{});
+        }
+        fresh.appendSlice(gpa, g.announce.items) catch return;
+        g.announce.clearRetainingCapacity();
+    }
+};
+/// Bytes of journal entries per pull.
+const pull_page = 1024 * 1024;
+const snapshot_every_ms = 60_000;
+
+/// Capacity, and bytes held under the drive's key spaces by a full walk (startup only).
+fn measure(le: *LocalEp) void {
+    statCapacity(le);
+    var dir = std.fs.cwd().openDir(le.path, .{ .iterate = true }) catch return;
+    defer dir.close();
     var used: u64 = 0;
     for ([_][]const u8{ "data", "record", "system" }) |sub| {
         var d = dir.openDir(sub, .{ .iterate = true }) catch continue;
