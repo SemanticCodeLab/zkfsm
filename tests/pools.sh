@@ -297,7 +297,7 @@ rm -rf "$WORK"/n*/a* "$WORK"/n*/b* "$WORK/obj" "$WORK"/n*.log
 read -r -a PC <<<"$(pool c)"
 read -r -a PD <<<"$(pool d)"
 read -r -a PE <<<"$(pool e)"
-RATE=4
+RATE=1
 POOLS=(--data "${PC[@]}" --data "${PD[@]}")
 start_all
 aliases
@@ -310,7 +310,7 @@ check "appended pool starts empty" 0 "$(keyfiles e)"
 check "rebalance status before any run" 1 "$("$MC" admin rebalance status z1 >/dev/null 2>&1 && echo 0 || echo 1)"
 id=$("$MC" admin rebalance start --json z1 | jget id)
 check "rebalance started with an id" yes "$([[ ${#id} -ge 32 ]] && echo yes || echo no)"
-sleep 12
+sleep 8
 "$MC" admin rebalance stop z2 >/dev/null
 st=$("$MC" admin rebalance status --json z3)
 check "stopped rebalance reports Stopped" yes "$(echo "$st" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("yes" if any(p["status"]=="Stopped" for p in d["pools"]) else "no")')"
