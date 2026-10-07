@@ -10,6 +10,9 @@ const errors = @import("errors.zig");
 const s3v = @import("versioning.zig");
 const sigv4 = @import("sigv4.zig");
 const tenancy = @import("tenancy.zig");
+const checksums = @import("checksums.zig");
+const acl = @import("acl.zig");
+const ca = core.checksum_algos;
 
 const Ctx = handler.Ctx;
 const ConnError = handler.ConnError;
@@ -99,9 +102,25 @@ fn uploadId(c: *Ctx) OpError!mp.UploadId {
     return mp.UploadId.parseHex(s) catch error.NoSuchUpload;
 }
 
+/// Upload-level checksum choice: `ALG:TYPE`.
+const upload_cksum_header = object.internal_prefix ++ "obj-mpcksum";
+
 fn create(c: *Ctx) OpError!void {
+    if (!try checksums.checkHeaders(c)) return;
     var in: object.PutInput = .{ .content_type = c.content_type };
     if (!try s3v.putExtras(c, &in)) return;
+    var hdrs: std.ArrayList(Header) = .empty;
+    const req = c.ext.checksum;
+    if (req.algorithm orelse req.value_alg) |alg| {
+        const ctype = req.ctype orelse ca.ChecksumType.defaultFor(alg);
+        if (!ctype.supports(alg)) return handler.fail(c, .InvalidRequest);
+        var list: std.ArrayList(object.Header) = .empty;
+        try list.appendSlice(c.arena, in.internal);
+        try list.append(c.arena, .{ .name = upload_cksum_header, .value = try std.fmt.allocPrint(c.arena, "{s}:{s}", .{ alg.wireName(), ctype.wireName() }) });
+        in.internal = list.items;
+        try hdrs.append(c.arena, .{ .name = "x-amz-checksum-algorithm", .value = alg.wireName() });
+        try hdrs.append(c.arena, .{ .name = "x-amz-checksum-type", .value = ctype.wireName() });
+    } else if (req.ctype != null) return handler.fail(c, .InvalidRequest);
     const id = try mp.create(c.svc, c.route.bucket, c.route.key, in);
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
@@ -110,7 +129,25 @@ fn create(c: *Ctx) OpError!void {
     try xml.elem(w, "Key", c.route.key);
     try xml.elem(w, "UploadId", &id.toHex());
     try w.writeAll("</InitiateMultipartUploadResult>");
-    try handler.respondXml(c, .ok, a.written());
+    try handler.respondXmlWith(c, .ok, a.written(), hdrs.items);
+}
+
+const UploadChecksum = struct { alg: ca.Algorithm, ctype: ca.ChecksumType };
+
+fn uploadChecksum(c: *Ctx, rec: mp.UploadRecord) OpError!?UploadChecksum {
+    const v = try mp.uploadHeader(c.arena, rec, upload_cksum_header) orelse return null;
+    const colon = std.mem.indexOfScalar(u8, v, ':') orelse return null;
+    return .{
+        .alg = ca.Algorithm.parse(v[0..colon]) orelse return null,
+        .ctype = ca.ChecksumType.parse(v[colon + 1 ..]) orelse return null,
+    };
+}
+
+/// Owner recorded with the upload (its ACL header), else the deployment root.
+fn uploadOwner(c: *Ctx, rec: mp.UploadRecord) OpError![]const u8 {
+    const v = try mp.uploadHeader(c.arena, rec, acl.object_header) orelse return acl.owner_id;
+    const parsed = try acl.decode(c.arena, v) orelse return acl.owner_id;
+    return parsed.owner;
 }
 
 fn partNumber(c: *Ctx) OpError!u16 {
@@ -169,7 +206,7 @@ fn uploadPart(c: *Ctx) OpError!void {
     const ch = try copyHeaders(c);
     if (ch.source) |raw| {
         const src = try parseCopySource(c.arena, raw);
-        if (!try tenancy.copySourceAllowed(c.svc, c.arena, c.env, c.auth, src, std.time.timestamp())) return handler.fail(c, .AccessDenied);
+        if (!try @import("access.zig").copySourceAllowed(c, src)) return handler.fail(c, .AccessDenied);
         var range: ?mp.CopyRange = null;
         if (ch.range) |rh| {
             const spec = core.RangeSpec.parse(rh) catch return error.BadCopySource;
@@ -179,17 +216,31 @@ fn uploadPart(c: *Ctx) OpError!void {
         const etag = try mp.uploadPartCopy(c.svc, c.route.bucket, c.route.key, id, n, src, range);
         return copyResult(c, "CopyPartResult", etag, core.time.nowNs(), &.{});
     }
+    if (!try checksums.checkHeaders(c)) return;
     var body_buf: [handler.io_buf_len]u8 = undefined;
     var check_buf: [handler.io_buf_len]u8 = undefined;
     var br: sigv4.BodyReader = .init(c.auth, try c.req.readerExpectContinue(&body_buf), &check_buf);
     br.limitTo(c.req.head.content_length);
     const len = br.contentLength(c.req.head.content_length);
-    const etag = mp.uploadPart(c.svc, c.route.bucket, c.route.key, id, n, br.body(), len) catch |e| {
+    var ck_buf: [handler.io_buf_len]u8 = undefined;
+    var ver = checksums.Verifier.init(c.ext.checksum, br.body(), &br, &ck_buf);
+    var part_ck: mp.PartChecksum = .{};
+    if (ver) |*v| {
+        v.part = &part_ck;
+        v.expect_len = len;
+        if (v.finishEmpty()) |fc| return handler.fail(c, fc);
+    }
+    const source = if (ver) |*v| &v.reader else br.body();
+    const etag = mp.uploadPartWith(c.svc, c.route.bucket, c.route.key, id, n, source, len, if (ver != null) &part_ck else null) catch |e| {
         if (br.failure) |fc| return handler.fail(c, fc);
+        if (ver) |v| if (v.failure) |fc| return handler.fail(c, fc);
         return e;
     };
     var eb: [core.ETag.quoted_max]u8 = undefined;
-    try handler.respondEmpty(c, .ok, &.{.{ .name = "etag", .value = etag.quoted(&eb) }});
+    var hdrs: std.ArrayList(Header) = .empty;
+    try hdrs.append(c.arena, .{ .name = "etag", .value = etag.quoted(&eb) });
+    if (ver) |*v| try hdrs.append(c.arena, .{ .name = v.alg.headerName(), .value = try c.arena.dupe(u8, v.text()) });
+    try handler.respondEmpty(c, .ok, hdrs.items);
 }
 
 fn copyResult(c: *Ctx, root: []const u8, etag: core.ETag, mtime_ns: i128, extra: []const Header) OpError!void {
@@ -215,7 +266,7 @@ fn isReplace(directive: ?[]const u8) OpError!bool {
 fn copyObject(c: *Ctx) OpError!void {
     const ch = try copyHeaders(c);
     const src = try parseCopySource(c.arena, ch.source orelse return error.BadCopySource);
-    if (!try tenancy.copySourceAllowed(c.svc, c.arena, c.env, c.auth, src, std.time.timestamp())) return handler.fail(c, .AccessDenied);
+    if (!try @import("access.zig").copySourceAllowed(c, src)) return handler.fail(c, .AccessDenied);
     const replace = try isReplace(ch.directive);
     const replace_tags = try isReplace(ch.tagging_directive);
     // S3 rejects a same-key copy that changes nothing.
@@ -278,11 +329,101 @@ fn parseCompleteBody(arena: std.mem.Allocator, body: []const u8) (xml_read.Error
     return refs.items;
 }
 
+/// Checksum elements a client may list per part in CompleteMultipartUpload.
+fn refChecksums(arena: std.mem.Allocator, body: []const u8, n: usize) OpError![]?[]const u8 {
+    const out = try arena.alloc(?[]const u8, n);
+    @memset(out, null);
+    var sc: xml_read.Scanner = .{ .s = body };
+    var i: usize = 0;
+    while (try sc.next("Part")) |part| : (i += 1) {
+        if (i >= n) break;
+        inline for (.{ "ChecksumCRC32", "ChecksumCRC32C", "ChecksumCRC64NVME", "ChecksumSHA1", "ChecksumSHA256" }) |name| {
+            var ps: xml_read.Scanner = .{ .s = part };
+            if (try ps.next(name)) |v| out[i] = std.mem.trim(u8, v, " \t\r\n");
+        }
+    }
+    return out;
+}
+
+const Final = struct { alg: ca.Algorithm, ctype: ca.ChecksumType, value: []const u8, parts: ?[]const u8 };
+
+/// Whole-object checksum from the stored part checksums; null when a part has none.
+fn finalChecksum(c: *Ctx, rec: mp.UploadRecord, uc: UploadChecksum, refs: []const mp.PartRef, given: []const ?[]const u8) OpError!?Final {
+    const digests = try c.arena.alloc([]const u8, refs.len);
+    const lens = try c.arena.alloc(ca.Part, refs.len);
+    var texts: std.ArrayList(u8) = .empty;
+    for (refs, 0..) |r, i| {
+        const part = rec.findPart(r.number) orelse return error.InvalidPart;
+        const raw = try c.arena.dupe(u8, part.checksum_bytes[0..part.checksum_len]);
+        if (raw.len != uc.alg.digestLen()) return null;
+        var tb: [ca.max_text_len]u8 = undefined;
+        const t = ca.encodeBase64(raw, &tb) catch return null;
+        if (given[i]) |g| if (!std.mem.eql(u8, g, t)) return error.InvalidPart;
+        digests[i] = raw;
+        lens[i] = .{ .digest = raw, .len = part.size };
+        if (i > 0) try texts.append(c.arena, ',');
+        try texts.appendSlice(c.arena, t);
+    }
+    var vb: [ca.max_text_len]u8 = undefined;
+    const value: []const u8 = switch (uc.ctype) {
+        .composite => ca.composite(uc.alg, digests, &vb) catch return null,
+        .full_object => blk: {
+            var db: [ca.max_digest_len]u8 = undefined;
+            const d = ca.combineParts(uc.alg, lens, &db) catch return null;
+            break :blk ca.encodeBase64(d, &vb) catch return null;
+        },
+    };
+    return .{
+        .alg = uc.alg,
+        .ctype = uc.ctype,
+        .value = try c.arena.dupe(u8, value),
+        .parts = if (checksums.partsFit(texts.items.len)) texts.items else null,
+    };
+}
+
 fn complete(c: *Ctx) OpError!void {
     const id = try uploadId(c);
     const body = try readXmlBody(c);
     const refs = try parseCompleteBody(c.arena, body);
-    const info = try mp.complete(c.svc, c.route.bucket, c.route.key, id, refs);
+    const given = try refChecksums(c.arena, body, refs.len);
+    var opts: mp.CompleteOptions = .{ .conditions = .{ .if_match = c.ext.if_match, .if_none_match = c.ext.if_none_match } };
+    var final: ?Final = null;
+    var internal: std.ArrayList(object.Header) = .empty;
+    try internal.append(c.arena, .{ .name = checksums.upload_header, .value = try c.arena.dupe(u8, &id.toHex()) });
+    if (mp.listParts(c.svc, c.arena, c.route.bucket, c.route.key, id)) |rec| {
+        if (try uploadChecksum(c, rec)) |uc| final = try finalChecksum(c, rec, uc, refs, given);
+    } else |e| switch (e) {
+        error.NoSuchUpload => return completedBefore(c, id),
+        else => return e,
+    }
+    const req = c.ext.checksum;
+    if (req.value_alg) |alg| {
+        const f = final orelse return handler.fail(c, .BadDigest);
+        if (f.alg != alg or !std.mem.eql(u8, f.value, req.value)) return handler.fail(c, .BadDigest);
+    }
+    if (final) |f| {
+        try internal.append(c.arena, .{ .name = checksums.stored_header, .value = try checksums.encodeStored(c.arena, f.alg, f.ctype, f.value) });
+        if (f.parts) |pv| try internal.append(c.arena, .{ .name = checksums.parts_header, .value = pv });
+    }
+    opts.internal = internal.items;
+    const info = mp.completeWith(c.svc, c.route.bucket, c.route.key, id, refs, opts) catch |e| switch (e) {
+        error.NoSuchUpload => return completedBefore(c, id),
+        else => return e,
+    };
+    try completeResult(c, info.etag, info.version_id, if (final) |f| checksums.Stored{ .alg = f.alg, .ctype = f.ctype, .value = f.value } else null);
+}
+
+/// A retried CompleteMultipartUpload of an upload that already became the current object.
+fn completedBefore(c: *Ctx, id: mp.UploadId) OpError!void {
+    const info = ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, null) catch return error.NoSuchUpload;
+    if (info.delete_marker) return error.NoSuchUpload;
+    for (info.internal) |h| if (std.mem.eql(u8, h.name, checksums.upload_header) and std.mem.eql(u8, h.value, &id.toHex())) {
+        return completeResult(c, info.etag, info.version_id, checksums.stored(info));
+    };
+    return error.NoSuchUpload;
+}
+
+fn completeResult(c: *Ctx, etag: core.ETag, version: core.VersionId, ck: ?checksums.Stored) OpError!void {
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     var eb: [core.ETag.quoted_max]u8 = undefined;
@@ -290,11 +431,25 @@ fn complete(c: *Ctx) OpError!void {
     try xml.elem(w, "Location", std.mem.sliceTo(c.target, '?'));
     try xml.elem(w, "Bucket", c.route.bucket);
     try xml.elem(w, "Key", c.route.key);
-    try xml.elem(w, "ETag", info.etag.quoted(&eb));
+    try xml.elem(w, "ETag", etag.quoted(&eb));
+    if (ck) |k| {
+        try xml.elem(w, checksumElem(k.alg), k.value);
+        try xml.elem(w, "ChecksumType", k.ctype.wireName());
+    }
     try w.writeAll("</CompleteMultipartUploadResult>");
     var hdrs: std.ArrayList(Header) = .empty;
-    if (!info.version_id.eql(ov.null_version_id)) try hdrs.append(c.arena, try versionHeader(c, "x-amz-version-id", info.version_id));
+    if (!version.eql(ov.null_version_id)) try hdrs.append(c.arena, try versionHeader(c, "x-amz-version-id", version));
     try handler.respondXmlWith(c, .ok, a.written(), hdrs.items);
+}
+
+fn checksumElem(alg: ca.Algorithm) []const u8 {
+    return switch (alg) {
+        .crc32 => "ChecksumCRC32",
+        .crc32c => "ChecksumCRC32C",
+        .crc64nvme => "ChecksumCRC64NVME",
+        .sha1 => "ChecksumSHA1",
+        .sha256 => "ChecksumSHA256",
+    };
 }
 
 fn maxParam(c: *Ctx, name: []const u8) OpError!usize {
@@ -302,8 +457,6 @@ fn maxParam(c: *Ctx, name: []const u8) OpError!usize {
     const n = std.fmt.parseInt(usize, s, 10) catch return error.InvalidPartNumber;
     return @min(n, max_list);
 }
-
-const owner = "<ID>zkfsm</ID><DisplayName>zkfsm</DisplayName>";
 
 fn listParts(c: *Ctx) OpError!void {
     const id = try uploadId(c);
@@ -318,7 +471,19 @@ fn listParts(c: *Ctx) OpError!void {
     try xml.elem(w, "Bucket", c.route.bucket);
     try xml.elem(w, "Key", c.route.key);
     try xml.elem(w, "UploadId", &id.toHex());
-    try w.print("<Initiator>{s}</Initiator><Owner>{s}</Owner><StorageClass>STANDARD</StorageClass>", .{ owner, owner });
+    const who = try uploadOwner(c, rec);
+    try w.writeAll("<Initiator>");
+    try xml.elem(w, "ID", who);
+    try xml.elem(w, "DisplayName", who);
+    try w.writeAll("</Initiator><Owner>");
+    try xml.elem(w, "ID", who);
+    try xml.elem(w, "DisplayName", who);
+    try w.writeAll("</Owner><StorageClass>STANDARD</StorageClass>");
+    const uc = try uploadChecksum(c, rec);
+    if (uc) |u| {
+        try xml.elem(w, "ChecksumAlgorithm", u.alg.wireName());
+        try xml.elem(w, "ChecksumType", u.ctype.wireName());
+    }
     try xml.elemInt(w, "PartNumberMarker", marker);
     try xml.elemInt(w, "MaxParts", max);
     var shown: usize = 0;
@@ -339,6 +504,10 @@ fn listParts(c: *Ctx) OpError!void {
         try xml.elem(bw, "LastModified", core.time.iso8601(p.created_ns, &tb));
         try xml.elem(bw, "ETag", (core.ETag{ .md5 = p.md5 }).quoted(&eb));
         try xml.elemInt(bw, "Size", p.size);
+        if (uc) |u| if (p.checksum_len == u.alg.digestLen()) {
+            var cb: [ca.max_text_len]u8 = undefined;
+            try xml.elem(bw, checksumElem(u.alg), ca.encodeBase64(p.checksum(), &cb) catch "");
+        };
         try bw.writeAll("</Part>");
         shown += 1;
         last = p.number;
@@ -415,7 +584,14 @@ fn listUploads(c: *Ctx) OpError!void {
         try bw.writeAll("<Upload>");
         try xml.elem(bw, "Key", u.key);
         try xml.elem(bw, "UploadId", &hex);
-        try bw.print("<Initiator>{s}</Initiator><Owner>{s}</Owner><StorageClass>STANDARD</StorageClass>", .{ owner, owner });
+        const who = try uploadOwner(c, u);
+        try bw.writeAll("<Initiator>");
+        try xml.elem(bw, "ID", who);
+        try xml.elem(bw, "DisplayName", who);
+        try bw.writeAll("</Initiator><Owner>");
+        try xml.elem(bw, "ID", who);
+        try xml.elem(bw, "DisplayName", who);
+        try bw.writeAll("</Owner><StorageClass>STANDARD</StorageClass>");
         try xml.elem(bw, "Initiated", core.time.iso8601(u.created_ns, &tb));
         try bw.writeAll("</Upload>");
         shown += 1;

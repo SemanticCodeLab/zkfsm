@@ -93,7 +93,7 @@ pub fn withoutAwsChunked(arena: std.mem.Allocator, v: []const u8) error{OutOfMem
     while (it.next()) |tok| {
         const t = std.mem.trim(u8, tok, " ");
         if (t.len == 0 or std.ascii.eqlIgnoreCase(t, "aws-chunked")) continue;
-        if (out.items.len > 0) try out.append(arena, ',');
+        if (out.items.len > 0) try out.appendSlice(arena, ", ");
         try out.appendSlice(arena, t);
     }
     return out.items;
@@ -365,8 +365,12 @@ fn putLockConfig(c: *Ctx) DispatchError!void {
     var d: ov.LockDefault = .{};
     if (elemText(body, "DefaultRetention")) |dr| {
         d.mode = parseMode(elemText(dr, "Mode") orelse "") orelse return handler.fail(c, .MalformedXML);
-        if (elemText(dr, "Days")) |s| d.days = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .MalformedXML);
-        if (elemText(dr, "Years")) |s| d.years = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .MalformedXML);
+        const days = elemText(dr, "Days");
+        const years = elemText(dr, "Years");
+        if (days != null and years != null) return handler.fail(c, .MalformedXML);
+        if (days) |s| d.days = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .InvalidRetentionPeriod);
+        if (years) |s| d.years = std.fmt.parseInt(u32, s, 10) catch return handler.fail(c, .InvalidRetentionPeriod);
+        if (d.days == 0 and d.years == 0) return handler.fail(c, .InvalidRetentionPeriod);
     }
     try ov.setLockConfig(c.svc, c.route.bucket, d);
     try handler.respondEmpty(c, .ok, &.{});
@@ -375,6 +379,7 @@ fn putLockConfig(c: *Ctx) DispatchError!void {
 // ---- object retention, legal hold, tagging ----
 
 fn getRetention(c: *Ctx) DispatchError!void {
+    if (!(try ov.getConfig(c.svc, c.arena, c.route.bucket)).lock_enabled) return handler.fail(c, .InvalidRequest);
     const info = try ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, try versionParam(c));
     if (info.delete_marker) return handler.fail(c, .MethodNotAllowed);
     if (info.retention_mode == .none) return handler.fail(c, .NoSuchObjectLockConfiguration);
@@ -443,7 +448,14 @@ fn objectTagging(c: *Ctx) DispatchError!void {
     }
 }
 
-fn writeTagging(c: *Ctx, tags: []const object.Tag, version: ?core.VersionId) DispatchError!void {
+fn writeTagging(c: *Ctx, unsorted: []const object.Tag, version: ?core.VersionId) DispatchError!void {
+    // Tag sets are unordered; answer in key order.
+    const tags = try c.arena.dupe(object.Tag, unsorted);
+    std.mem.sort(object.Tag, tags, {}, struct {
+        fn lt(_: void, x: object.Tag, y: object.Tag) bool {
+            return std.mem.order(u8, x.key, y.key) == .lt;
+        }
+    }.lt);
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     try xml.openRoot(w, "Tagging");

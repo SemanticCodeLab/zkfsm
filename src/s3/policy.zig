@@ -15,10 +15,12 @@ pub fn route(c: *Ctx) DispatchError!bool {
     if (c.route.key.len != 0) return false;
     if ((try handler.param(c, "policyStatus")) != null) {
         if (c.method != .GET) return failed(c, .MethodNotAllowed);
-        const doc = try object.policy.get(c.svc, c.arena, c.route.bucket) orelse return failed(c, .NoSuchBucketPolicy);
+        const doc = try object.policy.get(c.svc, c.arena, c.route.bucket);
+        // Public through the policy or through a public bucket ACL.
+        const public = (if (doc) |d| try isPublic(c.arena, d) else false) or (try @import("acl.zig").bucketAcl(c.svc, c.arena, c.route.bucket)).isPublic();
         var a: std.Io.Writer.Allocating = .init(c.arena);
         try xml.openRoot(&a.writer, "PolicyStatus");
-        try xml.elemBool(&a.writer, "IsPublic", try isPublic(c.arena, doc));
+        try xml.elemBool(&a.writer, "IsPublic", public);
         try xml.close(&a.writer, "PolicyStatus");
         try handler.respondXml(c, .ok, a.written());
         return true;
@@ -39,6 +41,7 @@ pub fn route(c: *Ctx) DispatchError!bool {
                 error.MalformedPolicy => failed(c, .MalformedPolicy),
             };
             try c.svc.headBucket(c.route.bucket);
+            if (try isPublic(c.arena, body) and (try @import("bucket_extras.zig").publicAccess(c)).block_public_policy) return failed(c, .AccessDenied);
             try object.policy.set(c.svc, c.route.bucket, body);
             try handler.respondEmpty(c, .no_content, &.{});
         },
@@ -66,17 +69,26 @@ pub fn validate(arena: std.mem.Allocator, doc: []const u8, bucket: []const u8) e
     };
     for (p.statements) |s| {
         if (s.principal == null) return error.MalformedPolicy;
+        // NotPrincipal only makes sense with Deny.
+        if (s.not_principal and s.effect == .allow) return error.MalformedPolicy;
         const rs = s.resources orelse return error.MalformedPolicy;
         for (rs) |r| if (!coversOnly(r, bucket)) return error.MalformedPolicy;
     }
 }
 
+/// The resource names this bucket or its objects, possibly through wildcards.
 fn coversOnly(resource: []const u8, bucket: []const u8) bool {
     const base = "arn:aws:s3:::";
     if (!std.mem.startsWith(u8, resource, base)) return false;
     const rest = resource[base.len..];
-    if (!std.mem.startsWith(u8, rest, bucket)) return false;
-    return rest.len == bucket.len or rest[bucket.len] == '/';
+    const wild = std.mem.indexOfAny(u8, rest, "*?") orelse {
+        if (!std.mem.startsWith(u8, rest, bucket)) return false;
+        return rest.len == bucket.len or rest[bucket.len] == '/';
+    };
+    // Up to the first wildcard the pattern must agree with `bucket/`.
+    const fixed = rest[0..wild];
+    if (fixed.len <= bucket.len) return std.mem.startsWith(u8, bucket, fixed);
+    return std.mem.startsWith(u8, fixed, bucket) and fixed[bucket.len] == '/';
 }
 
 /// Public when an unconditional Allow names every principal.
@@ -105,6 +117,8 @@ test "bucket policy validation and public status" {
     try std.testing.expect(try isPublic(a, public));
     try std.testing.expectError(error.MalformedPolicy, validate(a, public, "other"));
     try std.testing.expectError(error.MalformedPolicy, validate(a, public, "pu"));
+    try std.testing.expect(coversOnly("arn:aws:s3:::*", "pub") and coversOnly("arn:aws:s3:::p*/x", "pub"));
+    try std.testing.expect(!coversOnly("arn:aws:s3:::other*", "pub") and !coversOnly("arn:aws:s3:::pubx*", "pub"));
     try std.testing.expectError(error.MalformedPolicy, validate(a, "not json", "pub"));
     const no_principal =
         \\{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::pub/*"}]}

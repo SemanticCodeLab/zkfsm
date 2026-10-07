@@ -78,7 +78,7 @@ pub fn route(c: *Ctx) DispatchError!bool {
     const count = info.part_sizes.len / 8;
     if (want.parts and count > 0 and info.logical_size == null) {
         try w.writeAll("<ObjectParts>");
-        try xml.elemInt(w, "TotalPartsCount", count);
+        try xml.elemInt(w, "PartsCount", count);
         try xml.elemInt(w, "PartNumberMarker", marker);
         try xml.elemInt(w, "MaxParts", max_parts);
         var shown: usize = 0;

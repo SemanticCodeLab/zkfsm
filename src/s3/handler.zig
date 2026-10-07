@@ -62,6 +62,8 @@ pub const Ctx = struct {
     extra: []const Header = &.{},
     /// Status for a served object other than 200/206 (website error documents).
     status_override: ?std.http.Status = null,
+    /// Request headers, copied (valid after the body is read).
+    headers: []const Header = &.{},
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -98,11 +100,12 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         error.OutsidePrefix => return fail(&ctx, .NoSuchBucket),
     };
     if (ctx.route.website) return website.serve(&ctx);
-    try cors.prepare(&ctx);
     if (try cors.preflight(&ctx)) return;
+    try cors.prepare(&ctx);
+    var in = try sigv4.Input.fromRequest(arena, req);
+    ctx.headers = in.headers;
     if (try postobject.handle(&ctx)) return;
     const now_s = std.time.timestamp();
-    var in = try sigv4.Input.fromRequest(arena, req);
     if (ctx.route.vhost) in.vhost_bucket = ctx.route.bucket;
     try sts.prepare(&ctx, &in);
     switch (try sigv4.verify(arena, env.auth, in, now_s)) {
@@ -139,15 +142,36 @@ pub fn authorize(c: *Ctx, request: authz.Request, now_s: i64) ConnError!bool {
             return false;
         };
     }
-    if (try authz.allowed(c.arena, env, c.auth, ar, now_s)) return true;
+    ar.extra = access.conditionKeys(c, ar) catch |e| {
+        try failDispatch(c, e);
+        return false;
+    };
+    switch (try authz.decide(c.arena, env, c.auth, ar, now_s)) {
+        .allow => return expectedOwnerOk(c),
+        .explicit_deny => return denyWith(c, .AccessDenied),
+        .implicit_deny => {},
+    }
     const v = access.fallback(c, ar, now_s) catch |e| {
         try failDispatch(c, e);
         return false;
     };
     return switch (v) {
-        .allow => true,
+        .allow => expectedOwnerOk(c),
         .deny => |code| denyWith(c, code),
     };
+}
+
+/// `x-amz-expected-bucket-owner` must name the bucket's owner.
+fn expectedOwnerOk(c: *Ctx) ConnError!bool {
+    if (c.route.bucket.len == 0) return true;
+    for (c.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-amz-expected-bucket-owner")) {
+        const owner = (acl.bucketAcl(c.svc, c.arena, c.route.bucket) catch |e| {
+            try failDispatch(c, e);
+            return false;
+        }).owner;
+        if (!std.mem.eql(u8, std.mem.trim(u8, h.value, " "), owner)) return denyWith(c, .AccessDenied);
+    };
+    return true;
 }
 
 fn denyWith(c: *Ctx, code: Code) ConnError!bool {
@@ -280,9 +304,11 @@ fn createBucket(c: *Ctx) DispatchError!void {
     const location: ?[]const u8 = if (versioning.elemText(body, "LocationConstraint")) |l| (if (l.len > 0) l else null) else null;
     object.tenancy.createOwned(c.svc, c.route.bucket, c.tenant) catch |e| switch (e) {
         error.BucketAlreadyExists => {
-            const owner = (try acl.bucketAcl(c.svc, c.arena, c.route.bucket)).owner;
+            const cur = try acl.bucketAcl(c.svc, c.arena, c.route.bucket);
             const tenant = object.tenancy.tenantOf(c.svc, c.arena, c.route.bucket) catch "";
-            if (!std.mem.eql(u8, owner, who.id) or !std.mem.eql(u8, tenant, c.tenant)) return fail(c, .BucketAlreadyExists);
+            if (!std.mem.eql(u8, cur.owner, who.id) or !std.mem.eql(u8, tenant, c.tenant)) return fail(c, .BucketAlreadyExists);
+            // Only a plain re-create is a no-op; one that would change the ACL conflicts.
+            if (c.ext.acl.present() or cur.grants.len > 1 or cur.isPublic()) return fail(c, .BucketAlreadyExists);
             return respondEmpty(c, .ok, &hdrs);
         },
         else => return e,
@@ -343,8 +369,9 @@ fn listObjects(c: *Ctx) DispatchError!void {
         try keyElem(w, url, "Marker", p.start_after);
     }
     try xml.elemInt(w, "MaxKeys", p.max_keys);
-    try xml.elemBool(w, "IsTruncated", res.is_truncated);
-    if (res.is_truncated) if (res.next_marker) |m| {
+    const truncated = res.is_truncated and p.max_keys > 0;
+    try xml.elemBool(w, "IsTruncated", truncated);
+    if (truncated) if (res.next_marker) |m| {
         if (v2) {
             const hex = try c.arena.alloc(u8, m.len * 2);
             for (m, 0..) |byte, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable; // 2 hex chars fit
@@ -416,6 +443,7 @@ fn putObject(c: *Ctx) DispatchError!void {
     var source = br.body();
     var stored_value: []u8 = "";
     if (ver) |*v| {
+        v.expect_len = in.content_length;
         source = &v.reader;
         // Filled in once the body is read (put encodes internal headers after the body).
         const prefix = try std.fmt.allocPrint(c.arena, "{s}:FULL_OBJECT:", .{v.alg.wireName()});
@@ -427,6 +455,7 @@ fn putObject(c: *Ctx) DispatchError!void {
         try list.append(c.arena, .{ .name = checksums.stored_header, .value = stored_value });
         in.internal = list.items;
         v.slot = stored_value;
+        if (v.finishEmpty()) |code| return fail(c, code);
     }
     const info = c.svc.put(c.route.bucket, c.route.key, source, in) catch |e| {
         if (br.failure) |code| return fail(c, code);
@@ -453,9 +482,11 @@ fn getObject(c: *Ctx) DispatchError!void {
     const info = try versioning.lookupForRead(c) orelse return;
     var range: ?core.Range = null;
     var parts_count: ?usize = null;
+    var part_n: ?u16 = null;
     if (try param(c, "partNumber")) |pn| {
         if (c.range != null) return fail(c, .InvalidRequest);
         const n = std.fmt.parseInt(u16, pn, 10) catch return fail(c, .InvalidArgument);
+        part_n = n;
         const sel = partRange(info, n) catch return fail(c, if (n == 0) .InvalidArgument else .InvalidPart);
         range = sel.range;
         parts_count = sel.count;
@@ -479,6 +510,8 @@ fn getObject(c: *Ctx) DispatchError!void {
     try versioning.objectHeaders(c, info, (try param(c, "versionId")) != null, &hdrs);
     if (c.method == .GET) try versioning.applyResponseOverrides(c, &hdrs);
     if (!try versioning.checkRead(c, info, etag, hdrs.items)) return;
+    if (c.ext.checksum.mode_enabled and (range == null or parts_count != null))
+        try checksums.responseHeaders(c, info, if (parts_count != null) part_n else null, &hdrs);
     try hdrs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id });
     try hdrs.appendSlice(c.arena, c.extra);
     if (parts_count) |n| try hdrs.append(c.arena, .{ .name = "x-amz-mp-parts-count", .value = try std.fmt.allocPrint(c.arena, "{d}", .{n}) });
@@ -596,6 +629,8 @@ pub fn fail(c: *Ctx, code: Code) ConnError!void {
 
 pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
     metrics.global.last_status = @intFromEnum(code.status());
+    // Refusing before reading the body: no `100 Continue` (the connection then closes).
+    if (c.req.server.reader.state == .received_head) c.req.head.expect = null;
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const resource = std.mem.sliceTo(c.target, '?');
     errors.writeBody(&a.writer, code, resource, &c.request_id) catch return error.OutOfMemory;

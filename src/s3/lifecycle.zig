@@ -23,8 +23,9 @@ pub fn route(c: *Ctx) DispatchError!bool {
                 try handler.fail(c, .NoSuchLifecycleConfiguration);
                 return true;
             };
+            const legacy = try object.bucket_meta.get(c.svc, c.arena, c.route.bucket, .lifecycle_legacy) orelse "";
             var a: std.Io.Writer.Allocating = .init(c.arena);
-            try write(&a.writer, rules);
+            try writeWith(&a.writer, rules, legacy);
             try handler.respondXml(c, .ok, a.written());
         },
         .PUT => {
@@ -39,10 +40,12 @@ pub fn route(c: *Ctx) DispatchError!bool {
                 return true;
             };
             try object.lifecycle.set(c.svc, c.route.bucket, rules);
+            try object.bucket_meta.set(c.svc, c.route.bucket, .lifecycle_legacy, try legacyMarks(c.arena, body, rules.len));
             try handler.respondEmpty(c, .ok, &.{});
         },
         .DELETE => {
             try object.lifecycle.set(c.svc, c.route.bucket, null);
+            try object.bucket_meta.set(c.svc, c.route.bucket, .lifecycle_legacy, null);
             try handler.respondEmpty(c, .no_content, &.{});
         },
         else => try handler.fail(c, .MethodNotAllowed),
@@ -63,7 +66,35 @@ pub fn parse(arena: std.mem.Allocator, doc: []const u8) ParseError![]Rule {
         try rules.append(arena, try parseRule(arena, body));
     }
     if (rules.items.len == 0) return error.MalformedXML;
+    // IDs are unique, at most 255 characters, and generated when absent.
+    for (rules.items, 0..) |*r, i| {
+        if (r.id.len > 255) return error.InvalidArgument;
+        for (rules.items[0..i]) |o| if (r.id.len > 0 and std.mem.eql(u8, o.id, r.id)) return error.InvalidArgument;
+    }
+    for (rules.items) |*r| if (r.id.len == 0) {
+        r.id = try std.fmt.allocPrint(arena, "{s}", .{&core.ObjectId.random().toHex()});
+    };
     return rules.items;
+}
+
+/// One '1'/'0' per rule: whether it used the legacy rule-level Prefix (echoed back as such).
+fn legacyMarks(arena: std.mem.Allocator, doc: []const u8, n: usize) error{OutOfMemory}!?[]const u8 {
+    var top: xml_read.Scanner = .{ .s = doc };
+    const root = (top.next("LifecycleConfiguration") catch return null) orelse return null;
+    const out = try arena.alloc(u8, n);
+    @memset(out, '0');
+    var any = false;
+    var sc: xml_read.Scanner = .{ .s = root };
+    var i: usize = 0;
+    while (sc.next("Rule") catch null) |body| : (i += 1) {
+        if (i >= n) break;
+        const has_filter = (child(body, "Filter") catch null) != null;
+        if (!has_filter and (child(body, "Prefix") catch null) != null) {
+            out[i] = '1';
+            any = true;
+        }
+    }
+    return if (any) out else null;
 }
 
 fn child(s: []const u8, name: []const u8) ParseError!?[]const u8 {
@@ -166,11 +197,16 @@ fn parseFilter(arena: std.mem.Allocator, f: []const u8) ParseError!object.lifecy
 }
 
 pub fn write(w: *std.Io.Writer, rules: []const Rule) std.Io.Writer.Error!void {
+    return writeWith(w, rules, "");
+}
+
+/// `legacy[i] == '1'` writes rule i's prefix as a rule-level `<Prefix>` instead of a `<Filter>`.
+pub fn writeWith(w: *std.Io.Writer, rules: []const Rule, legacy: []const u8) std.Io.Writer.Error!void {
     try xml.openRoot(w, "LifecycleConfiguration");
-    for (rules) |r| {
+    for (rules, 0..) |r, i| {
         try w.writeAll("<Rule>");
         if (r.id.len > 0) try xml.elem(w, "ID", r.id);
-        try writeFilter(w, r.filter);
+        if (i < legacy.len and legacy[i] == '1') try xml.elem(w, "Prefix", r.filter.prefix) else try writeFilter(w, r.filter);
         try xml.elem(w, "Status", if (r.enabled) "Enabled" else "Disabled");
         if (r.expiration_days != null or r.expiration_date_ns != null or r.expired_object_delete_marker) {
             try w.writeAll("<Expiration>");

@@ -42,8 +42,10 @@ start_server() { # layout
   esac
   PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
   export EP="http://127.0.0.1:$PORT"
+  # Virtual-host and website endpoints on loopback names ({bucket}.localhost resolves locally).
+  export S3_DOMAIN=localhost S3_WEBSITE_DOMAIN=s3-website.localhost
   ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "${data[@]}" --listen "127.0.0.1:$PORT" \
-    --scan-interval 0 2>"$TOP/$1.server.log" &
+    --scan-interval 0 --domain "$S3_DOMAIN" --website-domain "$S3_WEBSITE_DOMAIN" 2>"$TOP/$1.server.log" &
   PID=$!
   for _ in $(seq 100); do curl -s -o /dev/null "$EP/health/live" && return 0; sleep 0.1; done
   echo "server did not start:"; cat "$TOP/$1.server.log"; exit 1

@@ -96,6 +96,58 @@ fn mayList(c: *Ctx, ar: authz.Request, who: acl.Caller, bacl: acl.Acl, pab: extr
     return authz.allowed(c.arena, c.env, c.auth, list, now_s);
 }
 
+fn one(arena: std.mem.Allocator, v: []const u8) error{OutOfMemory}![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = v;
+    return out;
+}
+
+/// Request-specific policy condition keys: selected headers, request and existing object tags.
+pub fn conditionKeys(c: *Ctx, ar: authz.Request) DispatchError![]const iam.context.Entry {
+    var list: std.ArrayList(iam.context.Entry) = .empty;
+    const names = [_]struct { []const u8, []const u8 }{
+        .{ "referer", "aws:Referer" },
+        .{ "user-agent", "aws:UserAgent" },
+        .{ "x-amz-acl", "s3:x-amz-acl" },
+        .{ "x-amz-grant-read", "s3:x-amz-grant-read" },
+        .{ "x-amz-grant-write", "s3:x-amz-grant-write" },
+        .{ "x-amz-grant-read-acp", "s3:x-amz-grant-read-acp" },
+        .{ "x-amz-grant-write-acp", "s3:x-amz-grant-write-acp" },
+        .{ "x-amz-grant-full-control", "s3:x-amz-grant-full-control" },
+        .{ "x-amz-copy-source", "s3:x-amz-copy-source" },
+        .{ "x-amz-metadata-directive", "s3:x-amz-metadata-directive" },
+        .{ "x-amz-server-side-encryption", "s3:x-amz-server-side-encryption" },
+        .{ "x-amz-storage-class", "s3:x-amz-storage-class" },
+    };
+    for (c.headers) |h| {
+        for (names) |n| if (std.ascii.eqlIgnoreCase(h.name, n[0])) {
+            try list.append(c.arena, .{ .key = n[1], .values = try one(c.arena, std.mem.trim(u8, h.value, " ")) });
+        };
+        if (std.ascii.eqlIgnoreCase(h.name, "x-amz-tagging")) {
+            const tags = s3v.parseTagQuery(c.arena, h.value) catch continue;
+            const keys = try c.arena.alloc([]const u8, tags.len);
+            for (tags, keys) |t, *k| {
+                k.* = t.key;
+                try list.append(c.arena, .{ .key = try std.fmt.allocPrint(c.arena, "s3:RequestObjectTag/{s}", .{t.key}), .values = try one(c.arena, t.value) });
+            }
+            try list.append(c.arena, .{ .key = "s3:RequestObjectTagKeys", .values = keys });
+        }
+    }
+    if (try handler.param(c, "versionId")) |v| try list.append(c.arena, .{ .key = "s3:VersionId", .values = try one(c.arena, v) });
+    // Existing tags cost a metadata read: only when the bucket policy refers to them.
+    if (ar.key.len > 0) if (ar.bucket_policy) |doc| if (std.mem.indexOf(u8, doc, "ExistingObjectTag") != null) {
+        const version = s3v.versionParam(c) catch null;
+        if (object.versioning.headVersion(c.svc, c.arena, ar.bucket, ar.key, version)) |info| {
+            for (try object.decodeTags(c.arena, info.tags)) |t|
+                try list.append(c.arena, .{ .key = try std.fmt.allocPrint(c.arena, "s3:ExistingObjectTag/{s}", .{t.key}), .values = try one(c.arena, t.value) });
+        } else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    };
+    return list.items;
+}
+
 /// RestrictPublicBuckets: a public bucket policy grants nothing to anonymous callers.
 pub fn restrictPolicy(c: *Ctx, ar: *authz.Request) DispatchError!void {
     const doc = ar.bucket_policy orelse return;
@@ -120,4 +172,21 @@ pub fn anonymousMayRead(c: *Ctx, key: []const u8) DispatchError!bool {
     c.route.key = key;
     c.route.query = "";
     return (try fallback(c, ar, now_s)) == .allow;
+}
+
+/// Read access to a copy source: IAM and policies, else the source object's ACL.
+pub fn copySourceAllowed(c: *Ctx, src: object.copy.Source) DispatchError!bool {
+    const now_s = std.time.timestamp();
+    if (try @import("tenancy.zig").copySourceAllowed(c.svc, c.arena, c.env, c.auth, src, now_s)) return true;
+    if (c.env.auth.iam == null) return true;
+    const who = acl.callerOf(c.env.auth, c.auth);
+    const info = object.versioning.headVersion(c.svc, c.arena, src.bucket, src.key, src.version) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    if (info.delete_marker) return false;
+    const pab = try extras.publicAccessOf(c.svc, c.arena, src.bucket);
+    const oacl = try acl.objectAcl(c.arena, info);
+    if (!who.anonymous and std.mem.eql(u8, who.id, oacl.owner)) return true;
+    return grants(oacl, who, .READ, pab.ignore_public_acls);
 }

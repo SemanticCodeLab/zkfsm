@@ -90,6 +90,23 @@ pub fn uploadPart(
     source: *std.Io.Reader,
     content_length: ?u64,
 ) Error!core.ETag {
+    return uploadPartWith(svc, bucket, key, id, number, source, content_length, null);
+}
+
+/// Additional checksum of a part, filled by the caller's reader once the body is read.
+pub const PartChecksum = struct { len: u8 = 0, bytes: [upload.max_checksum_len]u8 = @splat(0) };
+
+/// `uploadPart` that records `checksum` (read after the body is stored) with the part.
+pub fn uploadPartWith(
+    svc: *ObjectService,
+    bucket: []const u8,
+    key: []const u8,
+    id: UploadId,
+    number: u16,
+    source: *std.Io.Reader,
+    content_length: ?u64,
+    checksum: ?*const PartChecksum,
+) Error!core.ETag {
     if (number == 0 or number > max_part_number) return error.InvalidPartNumber;
     const bid = try svc.bucketId(bucket);
     if (content_length) |n| try quota.precheck(svc, bucket, null, n);
@@ -108,7 +125,11 @@ pub fn uploadPart(
     if (content_length) |n| if (hr.count != n) return error.IncompleteBody;
     var digest: [16]u8 = undefined;
     hr.hasher.final(&digest);
-    const part: Part = .{ .number = number, .size = hr.count, .md5 = digest, .blob = oid, .created_ns = core.time.nowNs() };
+    var part: Part = .{ .number = number, .size = hr.count, .md5 = digest, .blob = oid, .created_ns = core.time.nowNs() };
+    if (checksum) |ck| {
+        part.checksum_len = ck.len;
+        part.checksum_bytes = ck.bytes;
+    }
 
     var replaced: ?core.ObjectId = null;
     {
@@ -177,6 +198,17 @@ pub fn uploadPartCopy(
 /// Validates the client's part list, concatenates the parts into the final object,
 /// then drops the upload and every part blob. ETag is md5(part md5s) with a part count.
 pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: UploadId, refs: []const PartRef) Error!service.ObjectInfo {
+    return completeWith(svc, bucket, key, id, refs, .{});
+}
+
+pub const CompleteOptions = struct {
+    /// If-Match / If-None-Match against the current object, checked atomically at commit.
+    conditions: @import("conditional.zig").Conditions = .{},
+    /// Internal headers added to the object's (replacing same-named ones from the upload).
+    internal: []const service.Header = &.{},
+};
+
+pub fn completeWith(svc: *ObjectService, bucket: []const u8, key: []const u8, id: UploadId, refs: []const PartRef, opts: CompleteOptions) Error!service.ObjectInfo {
     const bid = try svc.bucketId(bucket);
     const held = try svc.clusterLock("upload", &id.toHex(), "");
     defer svc.clusterUnlock(held);
@@ -228,12 +260,14 @@ pub fn complete(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Up
         .system = rec.system,
         .part_sizes = sizes,
     };
+    for (opts.internal) |h| obj.internal_meta = try @import("objmeta.zig").withHeader(a, obj.internal_meta, h.name, h.value);
     // Versioning assigns the version id and applies lock defaults.
     const garbage = try versioning.commitPut(svc, bucket, &obj, .{
         .content_type = rec.content_type,
         .tags = rec.tags,
         .retention = if (rec.retention_mode != .none) .{ .mode = rec.retention_mode, .until_ns = rec.retain_until_ns } else null,
         .legal_hold = rec.legal_hold,
+        .conditions = opts.conditions,
     });
     keep_blob = true;
     garbage.collect(svc);
@@ -271,6 +305,13 @@ pub fn abort(svc: *ObjectService, bucket: []const u8, key: []const u8, id: Uploa
     defer arena.deinit();
     _ = try loadUploadLocked(svc, arena.allocator(), bid, key, id);
     dropUpload(svc, id);
+}
+
+/// Value of one internal header of an upload record, if set.
+pub fn uploadHeader(arena: std.mem.Allocator, rec: UploadRecord, name: []const u8) Error!?[]const u8 {
+    const hs = metadata.headers.decode(arena, rec.internal_meta) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Corrupt;
+    for (hs) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+    return null;
 }
 
 /// The upload with its sorted part list; strings and parts live in `arena`.

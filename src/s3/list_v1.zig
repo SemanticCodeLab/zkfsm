@@ -32,13 +32,15 @@ pub fn list(c: *Ctx) DispatchError!void {
     const f: Fmt = .{ .url = url };
     try xml.openRoot(w, "ListBucketResult");
     try xml.elem(w, "Name", c.route.bucket);
-    try f.elem(w, "Prefix", p.prefix);
+    // Prefix is echoed as sent: clients only URL-decode keys, markers, and the delimiter.
+    try xml.elem(w, "Prefix", p.prefix);
     try f.elem(w, "Marker", p.start_after);
     try xml.elemInt(w, "MaxKeys", p.max_keys);
     if (p.delimiter.len > 0) try f.elem(w, "Delimiter", p.delimiter);
     if (url) try xml.elem(w, "EncodingType", "url");
-    try xml.elemBool(w, "IsTruncated", res.is_truncated);
-    if (res.is_truncated) if (res.next_marker) |m| try f.elem(w, "NextMarker", m);
+    const truncated = res.is_truncated and p.max_keys > 0;
+    try xml.elemBool(w, "IsTruncated", truncated);
+    if (truncated) if (res.next_marker) |m| try f.elem(w, "NextMarker", m);
     for (res.contents) |e| {
         var tb: [24]u8 = undefined;
         var eb: [core.ETag.quoted_max]u8 = undefined;

@@ -71,7 +71,7 @@ pub fn checkHeaders(c: *Ctx) handler.ConnError!bool {
     if (r.value_alg) |alg| {
         var raw: [ca.max_digest_len]u8 = undefined;
         _ = ca.decodeBase64(alg, r.value, &raw) catch {
-            try handler.fail(c, .InvalidRequest);
+            try handler.fail(c, .BadDigest);
             return false;
         };
         if (r.algorithm) |a| if (a != alg) {
@@ -98,9 +98,15 @@ pub const Verifier = struct {
     text_len: u8 = 0,
     /// Stored-header value whose tail receives the checksum text at the end of the body.
     slot: []u8 = &.{},
+    /// Multipart part record that receives the raw digest at the end of the body.
+    part: ?*object.multipart.PartChecksum = null,
     reader: std.Io.Reader,
 
     /// Null when the request asks for no checksum.
+    /// Body length when known: the check runs as soon as it is reached, since
+    /// consumers that stop at the declared length never ask for the end.
+    expect_len: ?u64 = null,
+
     pub fn init(r: RequestChecksums, in: *std.Io.Reader, body: ?*const sigv4.BodyReader, buffer: []u8) ?Verifier {
         const alg = r.bodyAlgorithm() orelse return null;
         return .{
@@ -131,20 +137,40 @@ pub const Verifier = struct {
         self.hasher.update(dest[0..n]);
         self.size += n;
         w.advance(n);
-        if (n < dest.len) {
+        if (n < dest.len or (self.expect_len != null and self.size >= self.expect_len.?)) {
             try self.finish();
             if (n == 0) return error.EndOfStream;
         }
         return n;
     }
 
+    /// Empty bodies may never be read; check them up front. Null or the failure code.
+    pub fn finishEmpty(self: *Verifier) ?Code {
+        if (self.done or (self.expect_len orelse 1) != 0) return null;
+        self.finish() catch return self.failure orelse .IncompleteBody;
+        return null;
+    }
+
     fn finish(self: *Verifier) std.Io.Reader.StreamError!void {
         self.done = true;
+        // Read on to the end of a chunked body so its trailer (if any) is parsed.
+        if (self.body) |b| if (b.auth.mode == .chunked_unsigned or b.auth.mode == .chunked_signed_trailer) {
+            var tmp: [1]u8 = undefined;
+            const extra = self.in.readSliceShort(&tmp) catch |e| return e;
+            if (extra != 0) {
+                self.failure = .IncompleteBody;
+                return error.ReadFailed;
+            }
+        };
         const d = self.hasher.final(&self.digest_buf);
         self.digest_len = @intCast(d.len);
         const t = ca.encodeBase64(d, &self.text_buf) catch unreachable; // digest fits
         self.text_len = @intCast(t.len);
         if (self.slot.len >= t.len) @memcpy(self.slot[self.slot.len - t.len ..], t);
+        if (self.part) |p| {
+            p.len = @intCast(d.len);
+            @memcpy(p.bytes[0..d.len], d);
+        }
         var want = self.expected;
         if (want.len == 0) if (self.body) |b| if (b.trailer()) |tr| {
             if (Algorithm.fromHeaderName(tr.name) == self.alg) want = tr.value;
@@ -197,10 +223,9 @@ pub fn partsFit(total_len: usize) bool {
 pub fn responseHeaders(c: *Ctx, info: object.ObjectInfo, part: ?u16, out: *std.ArrayList(Header)) error{OutOfMemory}!void {
     const s = stored(info) orelse return;
     if (part) |n| {
-        if (s.ctype != .composite) return;
         const v = partValue(info, n) orelse return;
         try out.append(c.arena, .{ .name = s.alg.headerName(), .value = v });
-        try out.append(c.arena, .{ .name = "x-amz-checksum-type", .value = ChecksumType.composite.wireName() });
+        try out.append(c.arena, .{ .name = "x-amz-checksum-type", .value = s.ctype.wireName() });
         return;
     }
     try out.append(c.arena, .{ .name = s.alg.headerName(), .value = s.value });

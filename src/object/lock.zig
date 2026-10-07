@@ -24,8 +24,9 @@ pub fn checkDelete(r: Retention, legal_hold: bool, bypass_governance: bool, now_
 /// Tightening is always allowed; loosening governance needs bypass; compliance never loosens.
 pub fn checkChange(old: Retention, new: Retention, bypass_governance: bool, now_ns: i128) error{ObjectLocked}!void {
     if (!isActive(old, now_ns)) return;
+    // Any mode change of an active governance lock needs the bypass, as does weakening it.
     const weaker = new.mode == .none or new.until_ns < old.until_ns or
-        (old.mode == .compliance and new.mode != .compliance);
+        (old.mode == .compliance and new.mode != .compliance) or (old.mode == .governance and new.mode != .governance);
     if (!weaker) return;
     if (old.mode == .governance and bypass_governance) return;
     return error.ObjectLocked;

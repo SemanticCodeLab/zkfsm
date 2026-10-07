@@ -196,7 +196,9 @@ pub fn setLockConfig(svc: *Svc, bucket: []const u8, d: LockDefault) Error!void {
     if (d.mode != .none and ((d.days == 0) == (d.years == 0))) return error.InvalidRequest;
     try updateConfig(svc, bucket, d, struct {
         fn f(x: LockDefault, c: *BucketConfig) Error!void {
-            if (!c.lock_enabled) return error.InvalidBucketState;
+            // Object Lock can be turned on later for a bucket with versioning enabled.
+            if (!c.lock_enabled and c.versioning != .enabled) return error.InvalidBucketState;
+            c.lock_enabled = true;
             c.default_mode = x.mode;
             c.default_days = x.days;
             c.default_years = x.years;

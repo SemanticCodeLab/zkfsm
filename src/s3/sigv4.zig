@@ -200,7 +200,15 @@ fn checkV2(arena: std.mem.Allocator, src: Source, in: Input, p: sigv2.Parsed, au
         break :blk rawQueryValue(q, "Expires");
     } else null;
     const sts = try sigv2.stringToSign(arena, in.method, in.target, in.headers, expires_raw, in.vhost_bucket);
-    if (!sigv2.verifySignature(sigv2.sign(secret, sts), p.signature)) return deny(.SignatureDoesNotMatch);
+    if (!sigv2.verifySignature(sigv2.sign(secret, sts), p.signature)) {
+        // Some clients sign a bucket-level path-style resource as `/bucket/`.
+        const q = std.mem.indexOfScalar(u8, in.target, '?') orelse in.target.len;
+        const path = in.target[0..q];
+        if (in.vhost_bucket != null or path.len < 2 or std.mem.indexOfScalarPos(u8, path, 1, '/') != null) return deny(.SignatureDoesNotMatch);
+        const alt = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, in.target[q..] });
+        const sts2 = try sigv2.stringToSign(arena, in.method, alt, in.headers, expires_raw, null);
+        if (!sigv2.verifySignature(sigv2.sign(secret, sts2), p.signature)) return deny(.SignatureDoesNotMatch);
+    }
     // Chunked bodies are not signed per chunk under V2; their framing is still decoded.
     if (auth.mode == .chunked_signed or auth.mode == .chunked_signed_trailer) auth.mode = .chunked_unsigned;
     return .{ .ok = auth.* };
@@ -362,12 +370,21 @@ fn canonicalRequest(
 pub fn parseHead(arena: std.mem.Allocator, head: []const u8) std.http.Server.Request.Head.ParseError!std.http.Server.Request.Head {
     const Head = std.http.Server.Request.Head;
     var h = Head.parse(head) catch |e| blk: {
-        if (e != error.HttpTransferEncodingUnsupported) return e;
+        if (e != error.HttpTransferEncodingUnsupported and e != error.HttpHeadersInvalid) return e;
         var a: Writer.Allocating = .init(arena);
         stripChunkedEncoding(&a.writer, head) catch return e;
-        break :blk try Head.parse(a.written());
+        break :blk Head.parse(a.written()) catch {
+            // Content-Encoding is object metadata here, never decoded: parse without it.
+            var b: Writer.Allocating = .init(arena);
+            stripContentEncoding(&b.writer, head) catch return e;
+            break :blk try Head.parse(b.written());
+        };
     };
     h.target = originForm(h.target);
+    // Only `100-continue` means anything; other Expect values are ignored.
+    if (h.expect) |x| if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, x, " "), "100-continue")) {
+        h.expect = null;
+    };
     return h;
 }
 
@@ -378,6 +395,16 @@ fn originForm(target: []const u8) []const u8 {
         return rest[i..];
     };
     return target;
+}
+
+fn stripContentEncoding(w: *Writer, head: []const u8) Writer.Error!void {
+    const name = "content-encoding:";
+    var lines = std.mem.splitScalar(u8, head, '\n');
+    while (lines.next()) |l| {
+        if (lines.peek() == null) return w.writeAll(l);
+        if (l.len >= name.len and std.ascii.eqlIgnoreCase(l[0..name.len], name)) continue;
+        try w.print("{s}\n", .{l});
+    }
 }
 
 fn stripChunkedEncoding(w: *Writer, head: []const u8) Writer.Error!void {
@@ -413,6 +440,10 @@ test "head with aws-chunked content encoding" {
     const p = try parseHead(arena.allocator(), "GET http://b.s3.local:9000/k?acl HTTP/1.1\r\nHost: b.s3.local:9000\r\n\r\n");
     try std.testing.expectEqualStrings("/k?acl", p.target);
     try std.testing.expectEqualStrings("/", originForm("http://host"));
+    const d = try parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Encoding: deflate, gzip\r\nExpect: 200\r\nContent-Length: 1\r\n\r\n");
+    try std.testing.expectEqual(@as(?u64, 1), d.content_length);
+    try std.testing.expect(d.expect == null);
+    try std.testing.expectError(error.HttpHeadersInvalid, parseHead(arena.allocator(), "PUT /b/k HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
 }
 
 /// Wraps a request body per `Auth`: verifies a declared sha256 at EOF, or

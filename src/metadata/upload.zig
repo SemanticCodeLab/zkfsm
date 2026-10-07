@@ -6,8 +6,9 @@ const record = @import("record.zig");
 const headers = @import("headers.zig");
 
 pub const magic = "ZKMU";
-/// v2 adds user/internal metadata and system headers; v1 still decodes.
-pub const format_version: u16 = 2;
+/// v2 adds user/internal metadata and system headers, v3 per-part checksums; older still decode.
+pub const format_version: u16 = 3;
+pub const max_checksum_len = 32;
 pub const max_parts = 10000;
 
 pub const Error = codec.DecodeError || error{ KeyTooLong, MetadataTooLarge, OutOfMemory };
@@ -22,6 +23,13 @@ pub const Part = struct {
     /// Data blob holding the part bytes.
     blob: core.ObjectId,
     created_ns: i128,
+    /// Raw additional checksum of the part (x-amz-checksum-*); empty when none.
+    checksum_len: u8 = 0,
+    checksum_bytes: [max_checksum_len]u8 = @splat(0),
+
+    pub fn checksum(p: *const Part) []const u8 {
+        return p.checksum_bytes[0..p.checksum_len];
+    }
 };
 
 pub const UploadRecord = struct {
@@ -89,6 +97,8 @@ fn encodeTo(r: UploadRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(&p.md5);
         try w.writeAll(&p.blob.bytes);
         try codec.putInt(w, i128, p.created_ns);
+        try w.writeByte(p.checksum_len);
+        try w.writeAll(p.checksum_bytes[0..p.checksum_len]);
     }
 }
 
@@ -135,6 +145,14 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) Error!UploadRecord {
         p.md5 = try c.fixed(16);
         p.blob = .{ .bytes = try c.fixed(16) };
         p.created_ns = try c.int(i128);
+        p.checksum_len = 0;
+        p.checksum_bytes = @splat(0);
+        if (ver >= 3) {
+            const n_ck = (try c.take(1))[0];
+            if (n_ck > max_checksum_len) return error.Corrupt;
+            @memcpy(p.checksum_bytes[0..n_ck], try c.take(n_ck));
+            p.checksum_len = n_ck;
+        }
     }
     if (c.pos != bytes.len) return error.Corrupt;
     r.parts = parts;
@@ -147,7 +165,7 @@ test "upload record roundtrip and truncation" {
     defer arena.deinit();
     const parts = [_]Part{
         .{ .number = 1, .size = 5, .md5 = [_]u8{1} ** 16, .blob = core.ObjectId.random(), .created_ns = 7 },
-        .{ .number = 3, .size = 9, .md5 = [_]u8{3} ** 16, .blob = core.ObjectId.random(), .created_ns = 8 },
+        .{ .number = 3, .size = 9, .md5 = [_]u8{3} ** 16, .blob = core.ObjectId.random(), .created_ns = 8, .checksum_len = 4, .checksum_bytes = [_]u8{ 1, 2, 3, 4 } ++ [_]u8{0} ** 28 },
     };
     const r: UploadRecord = .{
         .upload_id = UploadId.random(),
@@ -173,6 +191,8 @@ test "upload record roundtrip and truncation" {
     try std.testing.expect(d.legal_hold and d.retention_mode == .governance and d.retain_until_ns == 5);
     try std.testing.expectEqual(@as(usize, 2), d.parts.len);
     try std.testing.expectEqual(@as(u64, 9), d.findPart(3).?.size);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, d.findPart(3).?.checksum());
+    try std.testing.expectEqual(@as(usize, 0), d.findPart(1).?.checksum().len);
     try std.testing.expect(d.findPart(2) == null);
     try std.testing.expectEqualStrings(r.user_meta, d.user_meta);
     try std.testing.expectEqualStrings("en", d.system.content_language);

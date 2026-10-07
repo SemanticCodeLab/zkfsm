@@ -123,9 +123,9 @@ pub fn privateAcl(arena: std.mem.Allocator, owner: []const u8) error{OutOfMemory
 }
 
 /// Expands a canned ACL; error.InvalidArgument for unknown names.
+/// Group and bucket-owner grants come first, the owner's FULL_CONTROL last.
 pub fn canned(arena: std.mem.Allocator, name: []const u8, owner: []const u8, bucket_owner: []const u8) ParseError!Acl {
     var g: std.ArrayList(Grant) = .empty;
-    try g.append(arena, .{ .kind = .id, .value = owner, .perm = .FULL_CONTROL });
     if (std.mem.eql(u8, name, "private")) {} else if (std.mem.eql(u8, name, "public-read")) {
         try g.append(arena, .{ .kind = .group, .value = all_users, .perm = .READ });
     } else if (std.mem.eql(u8, name, "public-read-write")) {
@@ -143,6 +143,7 @@ pub fn canned(arena: std.mem.Allocator, name: []const u8, owner: []const u8, buc
     } else if (std.mem.eql(u8, name, "aws-exec-read")) {
         // Read access for an exec service has no counterpart here; owner only.
     } else return error.InvalidArgument;
+    try g.append(arena, .{ .kind = .id, .value = owner, .perm = .FULL_CONTROL });
     return .{ .owner = owner, .grants = g.items };
 }
 
@@ -475,7 +476,7 @@ test "canned ACLs, grant headers, encoding, and evaluation" {
     const back = (try decode(a, enc)).?;
     try std.testing.expectEqualStrings("alice", back.owner);
     try std.testing.expectEqual(@as(usize, 2), back.grants.len);
-    try std.testing.expectEqualStrings(all_users, back.grants[1].value);
+    try std.testing.expectEqualStrings(all_users, back.grants[0].value);
 
     var req: RequestAcl = .{};
     try req.capture(a, .{ .name = "x-amz-grant-read", .value = "id=\"bob\", uri=\"" ++ all_users ++ "\"" });

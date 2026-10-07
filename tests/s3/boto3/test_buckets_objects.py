@@ -28,9 +28,10 @@ def test_create_list_delete_bucket(s3):
 
 
 def test_create_existing_bucket(s3, bucket):
-    with pytest.raises(ClientError) as e:
-        s3.create_bucket(Bucket=bucket)
-    assert code(e) in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists")
+    # Re-creating a bucket the caller owns succeeds (us-east-1 semantics) and keeps its contents.
+    s3.put_object(Bucket=bucket, Key="keep", Body=b"x")
+    s3.create_bucket(Bucket=bucket)
+    assert s3.get_object(Bucket=bucket, Key="keep")["Body"].read() == b"x"
 
 
 @pytest.mark.parametrize("name", ["ab", "UPPER", "a" * 64, "bad_name", "-lead", "192.168.1.1"])
@@ -465,7 +466,6 @@ def test_presigned_response_override(s3, bucket):
     assert urllib.request.urlopen(url).headers["Content-Type"] == "text/weird"
 
 
-@pytest.mark.xfail(reason="browser-form POST object uploads are not implemented", strict=False)
 def test_presigned_post(s3, bucket):
     import urllib.request
     import urllib.error
@@ -484,7 +484,6 @@ def test_presigned_post(s3, bucket):
 
 # Auth
 
-@pytest.mark.xfail(reason="SigV2 (query or header) auth is not supported; SigV4 only", strict=False)
 def test_presigned_sigv2(s3, bucket):
     import urllib.request
     import boto3
@@ -530,17 +529,27 @@ def test_signed_payload(s3, bucket):
     assert c.get_object(Bucket=bucket, Key="s")["Body"].read() == b"signed"
 
 
-@pytest.mark.xfail(reason="virtual-host-style addressing is not implemented yet", strict=False)
 def test_virtual_host_style(s3, bucket):
     import botocore.config
     import boto3
     s3.put_object(Bucket=bucket, Key="v", Body=b"vh")
-    ep = s3.meta.endpoint_url.replace("127.0.0.1", "localhost")
+    # run.sh starts the server with --domain localhost.
+    ep = s3.meta.endpoint_url.replace("127.0.0.1", os.environ.get("S3_DOMAIN", "localhost"))
     c = boto3.client("s3", endpoint_url=ep, aws_access_key_id=os.environ["S3_ACCESS_KEY"],
                      aws_secret_access_key=os.environ["S3_SECRET_KEY"], region_name="us-east-1",
                      config=botocore.config.Config(s3={"addressing_style": "virtual"}))
-    # bucket.localhost resolves to loopback on most systems (RFC 6761).
-    assert c.get_object(Bucket=bucket, Key="v")["Body"].read() == b"vh"
+    # {bucket}.localhost is loopback (RFC 6761); resolve it here rather than rely on the system resolver.
+    import socket
+    real = socket.getaddrinfo
+
+    def resolve(host, *a, **kw):
+        return real("127.0.0.1" if host.endswith(".localhost") else host, *a, **kw)
+    socket.getaddrinfo = resolve
+    try:
+        assert c.get_object(Bucket=bucket, Key="v")["Body"].read() == b"vh"
+        assert [o["Key"] for o in c.list_objects_v2(Bucket=bucket)["Contents"]] == ["v"]
+    finally:
+        socket.getaddrinfo = real
 
 
 def test_bucket_policy(s3, bucket):
