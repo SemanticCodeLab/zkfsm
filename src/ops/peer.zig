@@ -28,15 +28,18 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     const o: *Ops = @ptrCast(@alignCast(ctx));
     const n = o.node orelse return fail(req, .not_found, "op");
     if (req.head.method != .POST) return fail(req, .method_not_allowed, "method");
-    var h: auth.Fields = .{ .method = "POST", .target = req.head.target, .node = "", .time = "", .nonce = "", .body = "" };
+    // Reading the body invalidates the head's buffer.
+    const target = try arena.dupe(u8, req.head.target);
+    var h: auth.Fields = .{ .method = "POST", .target = target, .node = "", .time = "", .nonce = "", .body = "" };
     var sig: []const u8 = "";
     var it = req.iterateHeaders();
     while (it.next()) |hd| {
-        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_node)) h.node = hd.value;
-        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_time)) h.time = hd.value;
-        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_nonce)) h.nonce = hd.value;
-        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_body)) h.body = hd.value;
-        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_sig)) sig = hd.value;
+        const v = try arena.dupe(u8, hd.value);
+        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_node)) h.node = v;
+        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_time)) h.time = v;
+        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_nonce)) h.nonce = v;
+        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_body)) h.body = v;
+        if (std.ascii.eqlIgnoreCase(hd.name, auth.header_sig)) sig = v;
     }
     n.guard.verify(n.secret, h, sig, std.time.milliTimestamp()) catch |e| {
         return fail(req, if (e == error.Busy) .service_unavailable else .unauthorized, @errorName(e));
@@ -51,7 +54,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     };
     if (!std.mem.eql(u8, &auth.bodyDigest(body), h.body)) return fail(req, .bad_request, "digest");
 
-    const path = req.head.target[prefix.len..];
+    const path = target[prefix.len..];
     const q = std.mem.indexOfScalar(u8, path, '?');
     const op = path[0 .. q orelse path.len];
     const query = if (q) |i| path[i + 1 ..] else "";

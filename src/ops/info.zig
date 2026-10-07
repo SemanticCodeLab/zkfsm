@@ -8,6 +8,8 @@ const root = @import("root.zig");
 const report = @import("report.zig");
 const fmt = @import("fmt.zig");
 
+/// Serializes as {} (an empty tuple would be []).
+const Empty = struct {};
 const Allocator = std.mem.Allocator;
 const Ops = root.Ops;
 const Ctx = admin.api.Ctx;
@@ -78,7 +80,7 @@ const Server = struct {
     drives: []const Disk = &.{},
     poolNumber: ?usize = null,
     poolNumbers: []const usize = &.{},
-    mem_stats: struct {} = .{},
+    mem_stats: Empty = .{},
     edition: []const u8 = "",
     is_leader: bool = false,
     ilm_expiry_in_progress: bool = false,
@@ -179,7 +181,7 @@ pub fn serverInfo(o: *Ops, c: *const Ctx) Error!Response {
         .buckets = Count{ .count = buckets },
         .objects = Count{ .count = objects },
         .usage = .{ .size = size },
-        .services = .{},
+        .services = Empty{},
         .backend = .{
             .backendType = "Erasure",
             .onlineDisks = online,
@@ -255,7 +257,7 @@ pub fn bgHealStatus(o: *Ops, c: *const Ctx) Error!Response {
         .ScannedItemsCount = scanned,
         .HealDisks = heal_disks.items,
         .sets = sets.items,
-        .mrf = .{},
+        .mrf = Empty{},
         .sc_parity = sc,
     });
 }

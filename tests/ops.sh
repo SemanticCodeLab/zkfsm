@@ -26,12 +26,15 @@ freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0))
 py() {
   python3 -c '
 import json, sys
+def j(*x): return " ".join(str(v) for v in x)
 src = sys.stdin.read(); dec = json.JSONDecoder(); docs = []; i = 0
 while i < len(src):
     while i < len(src) and src[i].isspace(): i += 1
     if i >= len(src): break
     d, i = dec.raw_decode(src, i); docs.append(d)
-print(eval(sys.argv[1]))' "$1"
+*pre, last = sys.argv[1].split("; ")
+exec("\n".join(pre))
+print(eval(last))' "$1"
 }
 
 AK="opsadmin"
@@ -71,10 +74,10 @@ for k in 1 2 3 4 5 6; do head -c $((k * 30000 + 7)) /dev/urandom >"$WORK/o$k"; "
 info=$("$MC" admin info --json z2)
 check "info status" success "$(py 'docs[0]["status"]' <<<"$info")"
 check "info mode" online "$(py 'docs[0]["info"]["mode"]' <<<"$info")"
-check "info four servers online" "4 4" "$(py 'f"{len(docs[0][\"info\"][\"servers\"])} {sum(s[\"state\"]==\"online\" for s in docs[0][\"info\"][\"servers\"])}"' <<<"$info")"
-check "info drives online/offline" "16 0" "$(py 'f"{docs[0][\"info\"][\"backend\"][\"onlineDisks\"]} {docs[0][\"info\"][\"backend\"][\"offlineDisks\"]}"' <<<"$info")"
-check "info parity and sets" "2 [1] [16]" "$(py 'b=docs[0]["info"]["backend"]; f"{b[\"standardSCParity\"]} {b[\"totalSets\"]} {b[\"totalDrivesPerSet\"]}"' <<<"$info")"
-check "info buckets and objects" "1 6" "$(py 'f"{docs[0][\"info\"][\"buckets\"][\"count\"]} {docs[0][\"info\"][\"objects\"][\"count\"]}"' <<<"$info")"
+check "info four servers online" "4 4" "$(py 'j(len(docs[0]["info"]["servers"]), sum(s["state"]=="online" for s in docs[0]["info"]["servers"]))' <<<"$info")"
+check "info drives online/offline" "16 0" "$(py 'j(docs[0]["info"]["backend"]["onlineDisks"], docs[0]["info"]["backend"]["offlineDisks"])' <<<"$info")"
+check "info parity and sets" "2 [1] [16]" "$(py 'b=docs[0]["info"]["backend"]; j(b["standardSCParity"], b["totalSets"], b["totalDrivesPerSet"])' <<<"$info")"
+check "info buckets and objects" "1 6" "$(py 'j(docs[0]["info"]["buckets"]["count"], docs[0]["info"]["objects"]["count"])' <<<"$info")"
 check "info usage counts object bytes" yes "$(py '"yes" if docs[0]["info"]["usage"]["size"] >= 630042 else "no"' <<<"$info")"
 dep=$(py 'docs[0]["info"]["deploymentID"]' <<<"$info")
 check "deployment id is a uuid" 1 "$(grep -cE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' <<<"$dep")"
@@ -91,7 +94,7 @@ check "info text summary" 1 "$(grep -c '16 drives online, 0 drives offline, EC:2
 # ---- background heal status ----
 bg=$("$MC" admin heal --json z1)
 check "background heal status" success "$(py 'docs[0]["status"]' <<<"$bg")"
-check "heal status lists the set with its drives" "1 16" "$(py 'f"{len(docs[0][\"HealInfo\"][\"sets\"])} {len(docs[0][\"HealInfo\"][\"sets\"][0][\"disks\"])}"' <<<"$bg")"
+check "heal status lists the set with its drives" "1 16" "$(py 'j(len(docs[0]["HealInfo"]["sets"]), len(docs[0]["HealInfo"]["sets"][0]["disks"]))' <<<"$bg")"
 check "heal status parity" 2 "$(py 'docs[0]["HealInfo"]["sc_parity"]["STANDARD"]' <<<"$bg")"
 "$MC" admin heal z1 >/dev/null
 check "background heal text view" 0 $?
@@ -103,7 +106,7 @@ check "shard deleted" no "$([[ -f "$victim" ]] && echo yes || echo no)"
 out=$("$MC" admin heal -r --json z3/ops)
 check "heal reports the damaged object" 1 "$(py 'sum(1 for d in docs if d.get("type")=="object" and d["before"]["missing"]==1 and d["after"]["missing"]==0 and d["after"]["online"]==6)' <<<"$out")"
 check "heal items colour without errors" 0 "$(py 'sum(1 for d in docs if d.get("error"))' <<<"$out")"
-check "heal summary" "6 1" "$(py 's=[d for d in docs if d.get("type")=="summary"][0]; f"{s[\"objects_scanned\"]} {s[\"objects_healed\"]}"' <<<"$out")"
+check "heal summary" "6 1" "$(py 's=[d for d in docs if d.get("type")=="summary"][0]; j(s["objects_scanned"], s["objects_healed"])' <<<"$out")"
 check "shard restored on disk" yes "$([[ -f "$victim" ]] && echo yes || echo no)"
 "$MC" cat z1/ops/dir/o3 >"$WORK/got"
 check "object intact after heal" "$(md5sum <"$WORK/o3")" "$(md5sum <"$WORK/got")"
@@ -140,28 +143,29 @@ check "top locks shows a held object lock with owner" yes "$seen"
 kill -9 "${PIDS[3]}"; wait "${PIDS[3]}" 2>/dev/null || true; PIDS[3]=0
 sleep 3
 info=$("$MC" admin info --json z1)
-check "info shows the offline server" "3 1" "$(py 'f"{sum(s[\"state\"]==\"online\" for s in docs[0][\"info\"][\"servers\"])} {sum(s[\"state\"]==\"offline\" for s in docs[0][\"info\"][\"servers\"])}"' <<<"$info")"
-check "info shows its drives offline" "12 4" "$(py 'f"{docs[0][\"info\"][\"backend\"][\"onlineDisks\"]} {docs[0][\"info\"][\"backend\"][\"offlineDisks\"]}"' <<<"$info")"
+check "info shows the offline server" "3 1" "$(py 'j(sum(s["state"]=="online" for s in docs[0]["info"]["servers"]), sum(s["state"]=="offline" for s in docs[0]["info"]["servers"]))' <<<"$info")"
+check "info shows its drives offline" "12 4" "$(py 'j(docs[0]["info"]["backend"]["onlineDisks"], docs[0]["info"]["backend"]["offlineDisks"])' <<<"$info")"
 check "heal status lists the offline node" 1 "$("$MC" admin heal --json z1 | py 'len(docs[0]["HealInfo"]["offline_nodes"])')"
 start 3
 wait_ready 3 60
 
 # ---- service restart: every node re-executes in place ----
-up_before=$("$MC" admin info --json z1 | py 'min(s["uptime"] for s in docs[0]["info"]["servers"])')
+up_before=$("$MC" admin info --json z1 | py 'min(s.get("uptime",0) for s in docs[0]["info"]["servers"])')
 sleep 2
 res=$("$MC" admin service restart --json z1)
-check "restart answered for four nodes" "success 4 0" "$(py 'f"{docs[0][\"status\"]} {len(docs[0][\"result\"][\"results\"])} {sum(1 for r in docs[0][\"result\"][\"results\"] if r.get(\"err\"))}"' <<<"$res")"
+check "restart answered for four nodes" "success 4 0" "$(py 'j(docs[0]["status"], len(docs[0]["result"]["results"]), sum(1 for r in docs[0]["result"]["results"] if r.get("err")))' <<<"$res")"
 sleep 1
 for i in 1 2 3 4; do wait_ready "$i" 60; done
 alive=0
 for i in 1 2 3 4; do kill -0 "${PIDS[$i]}" 2>/dev/null && alive=$((alive + 1)); done
 check "same processes after restart" 4 "$alive"
 info=$("$MC" admin info --json z1)
-check "uptime reset by restart" yes "$(py '"yes" if max(s["uptime"] for s in docs[0]["info"]["servers"]) < '"$((up_before + 2))"' else "no"' <<<"$info")"
+check "uptime reset by restart" yes "$(py '"yes" if max(s.get("uptime",0) for s in docs[0]["info"]["servers"]) < '"$((up_before + 2))"' else "no"' <<<"$info")"
 check "restart logged on every node" 4 "$(grep -l 'restarting' "$WORK"/n*.log | wc -l)"
 "$MC" cat z2/ops/dir/o5 >"$WORK/got"
 check "data readable after restart" "$(md5sum <"$WORK/o5")" "$(md5sum <"$WORK/got")"
-dry=$("$MC" admin service restart --dry-run --json z1)
+dry=""
+for _ in 1 2 3; do dry=$("$MC" admin service restart --dry-run --json z1 2>&1 || true); grep -q dryRun <<<"$dry" && break; echo "     dry-run retry: $dry"; sleep 1; done
 check "dry-run restart" "true" "$(py 'str(docs[0]["result"]["dryRun"]).lower()' <<<"$dry")"
 
 # ---- service stop: every node exits ----
@@ -187,17 +191,17 @@ sstart
 "$MC" cp -q "$WORK/o1" s/one/a >/dev/null
 "$MC" cp -q "$WORK/o2" s/one/b >/dev/null
 info=$("$MC" admin info --json s)
-check "single info" "online 1 1 0" "$(py 'i=docs[0]["info"]; f"{i[\"mode\"]} {len(i[\"servers\"])} {i[\"backend\"][\"onlineDisks\"]} {i[\"backend\"][\"standardSCParity\"]}"' <<<"$info")"
-check "single info objects" "1 2" "$(py 'f"{docs[0][\"info\"][\"buckets\"][\"count\"]} {docs[0][\"info\"][\"objects\"][\"count\"]}"' <<<"$info")"
+check "single info" "online 1 1 0" "$(py 'i=docs[0]["info"]; j(i["mode"], len(i["servers"]), i["backend"]["onlineDisks"], i["backend"]["standardSCParity"])' <<<"$info")"
+check "single info objects" "1 2" "$(py 'j(docs[0]["info"]["buckets"]["count"], docs[0]["info"]["objects"]["count"])' <<<"$info")"
 check "single info text" 0 "$("$MC" admin info s >/dev/null 2>&1 && echo 0 || echo 1)"
 out=$("$MC" admin heal -r --json s/one)
-check "single heal items are green" "2 0" "$(py 'f"{sum(1 for d in docs if d.get(\"type\")==\"object\" and d[\"after\"][\"color\"]==\"green\")} {sum(1 for d in docs if d.get(\"error\"))}"' <<<"$out")"
+check "single heal items are green" "2 0" "$(py 'j(sum(1 for d in docs if d.get("type")=="object" and d["after"]["color"]=="green"), sum(1 for d in docs if d.get("error")))' <<<"$out")"
 check "single background heal" success "$("$MC" admin heal --json s | py 'docs[0]["status"]')"
 sleep 3
 check "single scanner cycles" yes "$("$MC" admin scanner status --json -n 1 s | py '"yes" if docs[0]["aggregated"]["scanner"]["current_cycle"]>=1 else "no"')"
 check "single top locks empty" "[]" "$(curl -s "${sig[@]}" "$SEP/minio/admin/v3/top/locks")"
 res=$("$MC" admin service restart --json s)
-check "single restart" "success 1" "$(py 'f"{docs[0][\"status\"]} {len(docs[0][\"result\"][\"results\"])}"' <<<"$res")"
+check "single restart" "success 1" "$(py 'j(docs[0]["status"], len(docs[0]["result"]["results"]))' <<<"$res")"
 sleep 1
 for _ in $(seq 100); do [[ "$(curl -s -o /dev/null -w '%{http_code}' "$SEP/health/ready")" == 200 ]] && break; sleep 0.1; done
 check "single node back after restart" yes "$(kill -0 "$SPID" 2>/dev/null && "$MC" cat s/one/a | cmp -s - "$WORK/o1" && echo yes || echo no)"

@@ -7,6 +7,8 @@ const root = @import("root.zig");
 const report = @import("report.zig");
 const fmt = @import("fmt.zig");
 
+/// Serializes as {} (an empty tuple would be []).
+const Empty = struct {};
 const Allocator = std.mem.Allocator;
 const Ops = root.Ops;
 const Ctx = admin.api.Ctx;
@@ -53,7 +55,7 @@ pub fn scannerJson(a: Allocator, reports: []const report.Report, buckets: usize,
         .cycle_complete_times = times.items,
         .ongoing_buckets = if (since != 0) buckets else 0,
         .life_time_ops = ops,
-        .last_minute = .{},
+        .last_minute = Empty{},
         .active = active.items,
     }, .{});
 }
