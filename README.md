@@ -332,6 +332,32 @@ pushed to peers with versioning, object lock, policy, lifecycle, tags, encryptio
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
 
+### Protocol gateways
+
+FTP/FTPS, SFTP, WebDAV, and OpenStack Swift serve the same namespace as S3, each on
+its own port and off unless its flag is given. Logins are IAM access keys and secrets;
+every operation is authorized by the same IAM and bucket policies, tenant boundaries,
+and bucket quotas as S3. In the file protocols buckets are top-level directories and
+`/` in keys forms the tree (empty directories are zero-byte `dir/` markers).
+
+```sh
+zkfsm --data /data --tls-cert cert.pem --tls-key key.pem \
+  --ftp :2121 --ftps :990 --ftp-passive-ports 30000-30100 \
+  --sftp :2222 --webdav :8443 --swift :8080
+```
+
+- FTP: RFC 959/3659 incl. MLSD/MLST, REST resume, APPE, RNFR/RNTO, SIZE/MDTM, PASV/EPSV;
+  explicit (AUTH TLS) and implicit FTPS on the TLS certificate.
+- SFTP: own SSH-2 (curve25519-sha256, mlkem768x25519-sha256; ssh-ed25519, rsa-sha2-256/512;
+  chacha20-poly1305, aes256/128-gcm; strict kex), password or `--sftp-authorized-keys`.
+- WebDAV: RFC 4918 class 1 and 2 (PROPFIND, MKCOL, COPY, MOVE, LOCK/UNLOCK), Basic auth
+  over HTTPS.
+- Swift: account/container/object API, json/xml/plain listings, DLO and SLO, temp URLs,
+  `/info`; tempauth at `/auth/v1.0` and Keystone v3 tokens (`--swift-keystone`, projects
+  mapped to IAM keys with `--swift-keystone-map`).
+
+`zkfsm --help` lists every gateway flag.
+
 ## Compatibility
 
 `tests/s3/run.sh` drives each client against a single drive and against six
