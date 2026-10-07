@@ -6,7 +6,9 @@
                            while OUTFILE.fail exists.
   nats-sub ADDR SUBJECT OUT  NATS subscriber appending each message payload as a line.
   count FILE PATTERN       lines of FILE containing PATTERN.
-  keys FILE EVENT          object keys of records named EVENT in FILE (one per line).
+  keys FILE EVENT [BUCKET] object keys of records named EVENT in FILE (one per line).
+  js-create ADDR STREAM SUBJECT  creates an in-memory JetStream stream.
+  js-count ADDR STREAM     messages stored in a JetStream stream.
 """
 import json
 import os
@@ -59,7 +61,31 @@ def nats_sub(addr, subject, out):
                 o.write(data.replace(b"\n", b" ") + b"\n")
 
 
-def keys(path, event):
+def js_request(addr, subject, payload):
+    host, port = addr.rsplit(":", 1)
+    s = socket.create_connection((host, int(port)), timeout=10)
+    f = s.makefile("rb")
+    f.readline()
+    s.sendall(b'CONNECT {"verbose":false}\r\nSUB _INBOX.t 1\r\nPUB ' + subject.encode() + b" _INBOX.t "
+              + str(len(payload)).encode() + b"\r\n" + payload + b"\r\n")
+    while True:
+        line = f.readline()
+        if not line:
+            raise SystemExit("no reply")
+        if line.startswith(b"MSG"):
+            return json.loads(f.read(int(line.split()[-1])))
+
+
+def js_create(addr, stream, subject):
+    js_request(addr, "$JS.API.STREAM.CREATE." + stream,
+               json.dumps({"name": stream, "subjects": [subject], "storage": "memory"}).encode())
+
+
+def js_count(addr, stream):
+    print(js_request(addr, "$JS.API.STREAM.INFO." + stream, b"")["state"]["messages"])
+
+
+def keys(path, event, bucket=None):
     if not os.path.exists(path):
         return
     for line in open(path, encoding="utf-8"):
@@ -71,7 +97,9 @@ def keys(path, event):
         except ValueError:
             continue
         for r in d.get("Records") or []:
-            if r.get("eventName") == event:
+            name = r.get("eventName", "")
+            hit = name.startswith(event[:-1]) if event.endswith("*") else name == event
+            if hit and (bucket is None or r["s3"]["bucket"]["name"] == bucket):
                 print(urllib.parse.unquote_plus(r["s3"]["object"]["key"]))
 
 
@@ -84,4 +112,5 @@ def count(path, pattern):
 
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
-    {"recv": recv, "nats-sub": nats_sub, "keys": keys, "count": count}[cmd](*args)
+    {"recv": recv, "nats-sub": nats_sub, "keys": keys, "count": count,
+     "js-create": js_create, "js-count": js_count}[cmd](*args)
