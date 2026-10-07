@@ -13,6 +13,7 @@ const admin_http = @import("admin_http.zig");
 const tls = @import("tls/root.zig");
 const cluster = @import("cluster/root.zig");
 const replication = @import("replication/root.zig");
+const pools = @import("pools/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -438,6 +439,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .refresh_s = cfg.cluster_refresh_s,
     }) catch return 2;
     defer node.destroy();
+    var pool_mgr = pools.Manager.init(gpa, node);
+    defer pool_mgr.stop();
 
     var svc: object.ObjectService = undefined;
     var svc_ready = false;
@@ -465,7 +468,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var repl_ready = false;
     defer if (repl_ready) repl.deinit();
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .pools = &pool_mgr };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &.{ bridge.extension(), repl_ext.extension() }, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -506,6 +509,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (e != error.Stopped) std.log.err("cluster bootstrap failed: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
         };
+        // Pool modes must be set before the first catalog read.
+        pool_mgr.load();
         node.initService(&svc) catch |e| {
             if (e != error.Stopped) std.log.err("cannot open the object service: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
@@ -533,6 +538,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         repl_ready = true;
         startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         node.start(if (iam_ready) &iam_store else null);
+        pool_mgr.start();
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
         if (cfg.lifecycle_interval_s > 0) {
@@ -543,6 +549,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    pool_mgr.stop();
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
     std.log.info("stopped", .{});
@@ -841,4 +848,5 @@ test {
     _ = tls;
     _ = cluster;
     _ = replication;
+    _ = pools;
 }

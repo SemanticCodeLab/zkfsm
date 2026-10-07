@@ -7,6 +7,7 @@ const iam = @import("iam/root.zig");
 const object = @import("object/root.zig");
 const metrics = @import("metrics/root.zig");
 const replication = @import("replication/root.zig");
+const pools = @import("pools/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -18,6 +19,8 @@ pub const Bridge = struct {
     started_s: i64,
     /// Remote targets and site replication; also sees IAM changes for peers.
     repl: ?*replication.Replicator = null,
+    /// Pool decommission and rebalance (cluster mode).
+    pools: ?*pools.Manager = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -60,6 +63,13 @@ pub const Bridge = struct {
             },
             .now_s = now_s,
         };
+        if (self.pools) |pm| {
+            const pc: admin.api.Ctx = .{ .a = c.arena, .env = .{ .store = store, .svc = self.svc }, .req = req };
+            if (try pools.admin.handle(pm, &pc)) |res| {
+                try respond(c, res);
+                return true;
+            }
+        }
         if (self.repl) |r| if (try replication.admin.handle(r, c.arena, store, req)) |res| {
             try respond(c, res);
             return true;

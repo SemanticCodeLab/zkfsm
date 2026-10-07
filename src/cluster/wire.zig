@@ -103,6 +103,8 @@ pub const max_notify = 4 * 1024 * 1024;
 pub const Note = union(enum) {
     change: object.service.Change,
     iam,
+    /// Pool decommission/rebalance state changed: reload it.
+    pools,
 };
 
 pub fn encodeNotes(gpa: std.mem.Allocator, notes: []const Note) error{OutOfMemory}![]u8 {
@@ -122,6 +124,7 @@ pub fn encodeNotes(gpa: std.mem.Allocator, notes: []const Note) error{OutOfMemor
 fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
     switch (n) {
         .iam => try w.writeByte('i'),
+        .pools => try w.writeByte('p'),
         .change => |c| switch (c) {
             .catalog => try w.writeByte('c'),
             .resync => try w.writeByte('x'),
@@ -164,6 +167,7 @@ pub const NoteIter = struct {
 fn decodeNote(e: []const u8) error{BadNote}!Note {
     switch (e[0]) {
         'i' => return .iam,
+        'p' => return .pools,
         'c' => return .{ .change = .catalog },
         'x' => return .{ .change = .resync },
         'u' => {
