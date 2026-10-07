@@ -109,6 +109,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     const lb = d.set.acquire(d.slot) orelse return fail(req, .service_unavailable, "offline");
     defer d.set.release(d.slot);
     const l = lb.local;
+    if (std.mem.eql(u8, op, "fresh")) return req.respond(if (d.set.drives[d.slot].fresh.load(.acquire)) "1" else "0", .{});
     if (std.mem.eql(u8, op, "sync")) {
         l.backend().sync() catch |e| return fail(req, statusOf(e), @errorName(e));
         return req.respond("", .{});

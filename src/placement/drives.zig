@@ -347,6 +347,20 @@ pub const DriveSet = struct {
         return if (f.sameSlot(want)) .ok else .foreign;
     }
 
+    /// True when one of drives `idx` was formatted empty and is not fully healed yet;
+    /// remote drives are asked (unreachable ones count as fresh, to stay safe).
+    pub fn anyFresh(self: *DriveSet, idx: []const u8) bool {
+        for (idx) |i| {
+            const d = &self.drives[i];
+            const fresh = switch (d.kind) {
+                .local => d.fresh.load(.acquire),
+                .remote => |x| x.vtable.fresh(x.ctx) catch true,
+            };
+            if (fresh) return true;
+        }
+        return false;
+    }
+
     pub fn isLocal(self: *const DriveSet, i: usize) bool {
         return self.drives[i].kind == .local;
     }

@@ -464,7 +464,7 @@ pub const ErasureStore = struct {
                 std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
                 s.close();
                 for (0..n) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
-                return .{};
+                return .{ .purged = true };
             }
             rep.lost = true;
             return rep;

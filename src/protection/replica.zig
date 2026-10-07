@@ -25,6 +25,8 @@ pub const KeyReport = struct {
     unrepaired: u8 = 0,
     /// Replicas were present but none verified.
     lost: bool = false,
+    /// Leftovers of a missed delete or a failed write were removed.
+    purged: bool = false,
 };
 
 const stripe_count = 64;
@@ -387,15 +389,17 @@ pub const ReplicaStore = struct {
         var bad: [max_drives]u8 = undefined;
         var nbad: usize = 0;
         var corrupt = false;
+        var newest_ns: i128 = 0;
         for (placed, 0..) |_, j| {
             const lb = holds.lbs[j] orelse {
                 rep.unrepaired += 1;
                 continue;
             };
             switch (self.check(lb, key)) {
-                .ok => {
+                .ok => |meta| {
                     rep.healthy += 1;
                     if (good == null) good = lb;
+                    newest_ns = @max(newest_ns, meta.mtime_ns);
                 },
                 .missing => {
                     bad[nbad] = @intCast(j);
@@ -416,6 +420,15 @@ pub const ReplicaStore = struct {
             rep.unrepaired += @intCast(if (corrupt) nbad else 0);
             return rep;
         };
+        if (self.clustered() and !corrupt and rep.unrepaired == 0 and rep.healthy < quorum(placed.len) and
+            newest_ns != 0 and core.time.nowNs() - newest_ns > tombstone_grace_ns and !self.drives.anyFresh(placed))
+        {
+            // Below a write quorum with every drive answering: a delete some drive
+            // missed, or a failed write. Never a live object, so remove the rest.
+            std.log.warn("purging {d} leftover replica(s) of {s} (missed delete or failed write)", .{ rep.healthy, &key.hex });
+            for (placed, 0..) |_, j| if (holds.lbs[j]) |lb| lb.store().delete(key) catch {};
+            return .{ .purged = true };
+        }
         for (bad[0..nbad]) |j| {
             const d = placed[j];
             self.copy(src, holds.lbs[j].?, key) catch |e| {
@@ -742,6 +755,18 @@ pub const ReplicaStore = struct {
             return rep;
         };
         const win = reps[b].present;
+        if (!win.tombstone and self.staleCopy(reps[0..placed.len], win.stamp, placed)) {
+            std.log.warn("purging stale copies of record {s} (missed delete or failed write)", .{&key.hex});
+            for (placed) |d| {
+                const lb = self.drives.acquire(d) orelse continue;
+                defer self.drives.release(d);
+                switch (lb) {
+                    .local => |l| shard.deleteRecordIf(l, self.gpa, key, win.stamp) catch {},
+                    .ext => |x| x.vtable.deleteRecordIf(x.ctx, key, win.stamp) catch {},
+                }
+            }
+            return .{ .purged = true };
+        }
         var all_same = true;
         for (reps[0..placed.len]) |r| {
             const same = r == .present and r.present.stamp == win.stamp;
@@ -777,6 +802,20 @@ pub const ReplicaStore = struct {
             if (ok) rep.repaired += 1 else rep.unrepaired += 1;
         }
         return rep;
+    }
+
+    /// A record on fewer drives than a write quorum while every other drive answered
+    /// "missing", older than the grace and with no drive freshly replaced: a leftover.
+    fn staleCopy(self: *ReplicaStore, reps: []const Replica, stamp: u64, placed: []const u8) bool {
+        var present: usize = 0;
+        for (reps) |r| switch (r) {
+            .present => present += 1,
+            .missing => {},
+            .offline, .corrupt => return false,
+        };
+        const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
+        if (present >= quorum(reps.len) or now -| stamp <= tombstone_grace_ns) return false;
+        return !self.drives.anyFresh(placed);
     }
 
     /// Union of keys across online drives, deduplicated.
@@ -972,4 +1011,71 @@ test "empty object and quorum failure" {
     var src2: std.Io.Reader = .fixed("x");
     try testing.expectError(error.IoFailed, b.put(key, &src2, .{}));
     try testing.expectError(error.IoFailed, readAll(b, key, null));
+}
+
+test "cluster heal purges missed-delete leftovers and stale record copies, never live data" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+    var members: [4]placement.drives.Member = undefined;
+    var nb: [4]u8 = undefined;
+    for (&members, 0..) |*m, i| {
+        const name = try std.fmt.bufPrint(&nb, "d{d}", .{i});
+        try tmp.dir.makePath(name);
+        m.* = .{ .path = try tmp.dir.realpath(name, &bufs[i]), .node = @intCast(i) };
+    }
+    const tmpl: placement.layout.FormatV2 = .{ .deployment = @splat(1), .layout = @splat(2), .pool = 0, .set = 0, .index = 0, .set_size = 4, .profile = .{ .replica = 3 } };
+    var set = try DriveSet.openCluster(gpa, &members, tmpl, false);
+    defer set.deinit();
+    var store = ReplicaStore.init(gpa, &set);
+    const b = store.backend();
+    const old_ns: i128 = core.time.nowNs() - 2 * @as(i128, tombstone_grace_ns);
+
+    // Data: one copy left of three (a delete that missed a drive) is purged once old.
+    const k1: PhysicalKey = .{ .space = .data, .hex = "11111111111111111111111111111111".* };
+    var src: std.Io.Reader = .fixed("leftover");
+    _ = try b.put(k1, &src, .{});
+    var pbuf: [max_drives]u8 = undefined;
+    const pl = set.placed(k1, &pbuf);
+    var kb: [64]u8 = undefined;
+    const rel = try iface.local.keyPath(k1, @ptrCast(&kb));
+    var pb: [160]u8 = undefined;
+    for (pl[1..]) |d| try tmp.dir.deleteFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ d, rel }));
+    // Young leftovers are left alone: a write may still be in flight.
+    try testing.expect(!store.healKey(k1).purged);
+    for (pl[1..]) |d| try tmp.dir.deleteFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ d, rel }));
+    {
+        var f = try tmp.dir.openFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ pl[0], rel }), .{ .mode = .read_write });
+        defer f.close();
+        try f.updateTimes(old_ns, old_ns);
+    }
+    // A freshly replaced drive may be the reason copies are missing: keep it.
+    set.drives[pl[1]].fresh.store(true, .release);
+    try testing.expect(!store.healKey(k1).purged);
+    set.drives[pl[1]].fresh.store(false, .release);
+    for (pl[1..]) |d| try tmp.dir.deleteFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ d, rel }));
+    const r1 = store.healKey(k1);
+    try testing.expect(r1.purged and !r1.lost);
+    try testing.expectError(error.NotFound, b.stat(k1));
+
+    // Data on a write quorum (two of three) is live: repaired, not purged.
+    const k2: PhysicalKey = .{ .space = .data, .hex = "22222222222222222222222222222222".* };
+    var src2: std.Io.Reader = .fixed("live");
+    _ = try b.put(k2, &src2, .{});
+    const pl2 = set.placed(k2, &pbuf);
+    const rel2 = try iface.local.keyPath(k2, @ptrCast(&kb));
+    try tmp.dir.deleteFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ pl2[2], rel2 }));
+    const r2 = store.healKey(k2);
+    try testing.expect(!r2.purged and r2.repaired == 1);
+
+    // Record: an old copy on one drive only (a failed write) is purged, not spread.
+    const k3: PhysicalKey = .{ .space = .record, .hex = "33333333333333333333333333333333".* };
+    const pl3 = set.placed(k3, &pbuf);
+    const framed = try shard.frameRecord2(gpa, "stale", @intCast(old_ns), false);
+    defer gpa.free(framed);
+    try set.drives[pl3[0]].kind.local.backend().putRecord(k3, framed);
+    const r3 = store.healKey(k3);
+    try testing.expect(r3.purged and !r3.lost);
+    try testing.expectError(error.NotFound, b.getRecord(k3, gpa));
 }

@@ -114,8 +114,8 @@ const fresh_retry_ns = 30 * std.time.ns_per_s;
 
 pub fn logReport(r: Report) void {
     std.log.info(
-        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
-        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
+        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} purged={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
+        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.keys_purged, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
     );
 }
 

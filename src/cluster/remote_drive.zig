@@ -45,7 +45,17 @@ pub const RemoteDrive = struct {
         .scan = scan,
         .online = online,
         .deleteRecordIf = deleteRecordIf,
+        .fresh = freshFn,
     };
+
+    fn freshFn(ctx: *anyopaque) Error!bool {
+        var c = try cast(ctx).exchange("fresh", null, "", "");
+        defer c.deinit();
+        var b: [1]u8 = undefined;
+        if (c.body_left != 1) return error.IoFailed;
+        c.readInto(&b) catch |e| return mapCall(e);
+        return b[0] == '1';
+    }
 
     fn cast(ctx: *anyopaque) *RemoteDrive {
         return @ptrCast(@alignCast(ctx));
