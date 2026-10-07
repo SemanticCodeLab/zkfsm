@@ -17,6 +17,7 @@ tests/s3cli.sh             # SigV4 + IAM with an S3 CLI and the MinIO client (se
 tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Compatibility)
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
+tests/replication.sh       # bucket and site replication across three deployments (set MC)
 ```
 
 ## Run
@@ -171,6 +172,166 @@ signing user, for 900 to 43200 seconds (`DurationSeconds`), optionally
 narrowed by a session `Policy`; standard `sts assume-role` clients work
 unchanged against the server endpoint.
 
+### Tiering
+
+Lifecycle `Transition` and `NoncurrentVersionTransition` rules move object data
+to a remote tier; the local record keeps the metadata, version id, lock state
+and a pointer, and `x-amz-storage-class` reports the tier name. GET and HEAD
+work unchanged (GETs, including ranges, stream from the tier); deleting or
+overwriting a tiered version queues its remote data in a cleanup journal that
+is retried until the tier answers.
+
+```sh
+mc ilm tier add minio myzk WARM --endpoint https://warm:9000 \
+   --access-key AK --secret-key SK --bucket tier --prefix hot1/
+mc ilm rule add myzk/data --transition-days 30 --transition-tier WARM \
+   --noncurrent-transition-days 7 --noncurrent-transition-tier WARM
+mc ilm restore --days 3 myzk/data/report.pdf    # temporary local copy
+mc ilm tier ls|info|verify|edit|rm myzk ...
+```
+
+Tier types: `s3` and `minio` (any S3-compatible endpoint, including another
+zkfsm), `azure` (account name and key), and `gcs` (a credentials file holding an
+HMAC interoperability key pair: `{"access_key": ..., "secret_key": ...}`). Adding
+a tier probes the backend and requires an empty bucket/prefix unless `--force`
+is given. Tier definitions live in cluster-wide system state, sealed with
+XChaCha20-Poly1305 under a key derived from the root credentials (changing the
+root secret makes them unreadable until it is restored); listings redact
+secrets. `POST ?restore` (`RestoreObject`, `Days`) makes a local copy that
+expires after the given days (`x-amz-restore` shows the expiry). While a tier is
+unreachable, reads of its data fail with `503` and transitions wait for the
+next lifecycle pass. Usage per tier is reported by `mc ilm tier info` and as
+`zkfsm_tier_*` series in `/metrics`. The cleanup journal is retried every
+minute; restore expiry and the usage scan run every 10 minutes (both follow
+`--lifecycle-interval` when it is shorter than a minute).
+
+### External identity
+
+Federated STS actions turn an external identity into temporary credentials
+whose rights are a list of canned or stored policies (still narrowed by an
+optional session `Policy`). The session token carries the policy names and the
+tenant, so no per-session server state exists; every node accepts the tokens.
+
+- **OpenID Connect** (`AssumeRoleWithWebIdentity`, `AssumeRoleWithClientGrants`):
+  providers are added with `mc idp openid add ALIAS [NAME] config_url=...
+  client_id=... [claim_name=policy] [claim_prefix=] [scopes=...]
+  [redirect_uri=...] [role_policy=...] [tenant=...|tenant_claim=...]`
+  (`ls`, `info`, `update`, `rm` as usual), or at startup with
+  `--identity-openid "k=v ..."` / `$ZKFSM_IDENTITY_OPENID_<KEY>` (shown as the
+  default provider `_`). The server reads the discovery document, caches the
+  JWKS for an hour, refetches it when a token names an unknown key id (at most
+  every 10 s per provider, and keeps the old keys if the refetch fails), and
+  verifies RS256/384/512 and ES256/384 signatures, `exp`/`nbf` (60 s leeway),
+  `iss` (the discovered issuer) and `aud`/`azp` (the client id). Policies come
+  from the claim (a JSON array or a comma-separated string; names that do not
+  exist are dropped, none left is AccessDenied). A provider with
+  `role_policy` is selected by its role ARN `arn:zkfsm:iam:::role/<name>`
+  (listed by `mc idp openid ls`) and grants exactly that policy list.
+- **LDAP / Active Directory** (`AssumeRoleWithLDAPIdentity`, `LDAPUsername`
+  and `LDAPPassword`): `mc idp ldap add ALIAS server_addr=host:636
+  lookup_bind_dn=... lookup_bind_password=... user_dn_search_base_dn=...
+  user_dn_search_filter=(uid=%s) [group_search_base_dn=...
+  group_search_filter=(&(objectclass=groupOfNames)(member=%d))]
+  [server_starttls=on | server_insecure=on] [tls_skip_verify=on]
+  [tls_ca_file=...] [tenant=...]`. The built-in LDAPv3 client binds as the
+  lookup account, finds exactly one user entry (the username is escaped per
+  RFC 4515), binds as that DN with the password (empty passwords are refused),
+  then collects group DNs. LDAPS is the default; StartTLS and plain TCP are
+  opt-in. Policies are attached to user or group DNs with `mc idp ldap policy
+  attach|detach ALIAS POLICY --user DN | --group DN` and listed with
+  `mc idp ldap policy entities`. A directory that is down gives
+  ServiceUnavailable; wrong credentials and unknown users both give
+  AccessDenied.
+- **Client certificates** (`AssumeRoleWithCertificate`): with
+  `--tls-client-ca FILE` the TLS listener asks clients for a certificate
+  (optional for every other request). A client presenting a certificate that
+  chains to that CA gets credentials whose policy is the one named by the
+  certificate's subject Common Name, for at most an hour and never past the
+  certificate's expiry.
+
+Secrets in IdP settings (`client_secret`, `lookup_bind_password`) are stored
+in the IAM state and shown redacted by `info`. Configuration changes apply
+immediately on every node (they live in the IAM store).
+
+### Bucket quotas
+
+`mc quota set ALIAS/BUCKET --size 10GiB`, `mc quota info`, `mc quota clear`
+(admin `set-bucket-quota` / `get-bucket-quota`, actions `admin:SetBucketQuota`
+and `admin:GetBucketQuota`). A hard quota rejects writes that would take the
+bucket past the limit with `QuotaExceeded` (HTTP 400): PutObject (checked
+before the body is read when its length is known, and again at commit),
+CopyObject, UploadPart, and CompleteMultipartUpload. Usage is the sum of all
+stored versions (delete markers excluded), kept in the key index next to the
+names, so it is exact after every write, delete, and restart, and every
+cluster node sees the same value. An overwrite in an unversioned bucket only
+needs room for the difference. `get-bucket-quota` also reports `usage` and
+`objects`.
+
+### Multi-tenancy
+
+Users already isolate through policies; tenants add a hard boundary on top,
+like separate accounts sharing one server (the equivalent of the
+project-scoped buckets other servers get from Keystone).
+
+- A tenant is a name (`a-z0-9-`). A user belongs to at most one tenant; its
+  service accounts and STS sessions inherit it. Federated sessions get it
+  from the provider (`tenant=` fixed, or `tenant_claim=` for OpenID).
+- A bucket created by a tenant identity is owned by that tenant. Tenant
+  identities see (ListBuckets) and reach only their tenant's buckets, global
+  identities only global buckets, whatever their policies say; a copy source
+  in another tenant is refused as well. Bucket names stay globally unique.
+  Root (and root's service accounts) reach everything. Anonymous requests
+  are governed by bucket policies only, so a tenant can still publish a
+  bucket on purpose.
+- Tenant identities get no admin API rights except self-service (their own
+  service accounts). Disabling a tenant blocks all of its identities at once.
+- Admin routes (root or `admin:TenantAdmin`; sign with SigV4 like any admin
+  call, e.g. `curl --aws-sigv4 aws:amz:us-east-1:s3 --user KEY:SECRET -X PUT`):
+  `PUT /minio/admin/v3/tenant/add?name=T`, `DELETE .../tenant/remove?name=T`
+  (only when it has no users or buckets), `GET .../tenant/list` (users,
+  buckets, and usage per tenant), `PUT .../tenant/set-status?name=T&status=enabled|disabled`,
+  `PUT .../tenant/assign-user?name=T&accessKey=U` (empty `name` makes the
+  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`.
+
+### Replication
+
+Bucket replication (both buckets versioned):
+
+```sh
+mc replicate add src/photos --remote-bucket http://KEY:SECRET@dr.example:9000/photos \
+  --replicate "delete,delete-marker,existing-objects,metadata-sync"
+mc replicate status src/photos
+mc replicate resync start src/photos --remote-bucket <arn>
+```
+
+- Rules: ID, Priority, Status, Filter (prefix, tag, And), Destination ARN and
+  StorageClass, DeleteMarkerReplication, DeleteReplication, ExistingObjectReplication,
+  ReplicaModifications. Targets are managed through the admin API
+  (`set-remote-target`, `list-remote-targets`, `remove-remote-target`, encrypted bodies).
+- Every change is queued as a durable record before the client gets its answer and
+  delivered asynchronously with exponential backoff (1 s up to 30 s), so a crash or
+  target outage loses nothing. Version ids and times, user metadata, tags, retention,
+  legal hold, and multipart layout (same ETag) are kept. Objects carry
+  `x-amz-replication-status` PENDING/COMPLETED/FAILED/REPLICA; replicas are never sent
+  back, so two-way (active-active) setups do not loop. Per-target bandwidth limits apply.
+- `/metrics` carries `zkfsm_replication_*` counters per bucket and target.
+- In a cluster every node queues, the leader delivers.
+
+Site replication links deployments for all buckets, bucket configuration, IAM, and
+objects in every direction:
+
+```sh
+mc admin replicate add site1 site2 site3
+mc admin replicate info site1
+mc admin replicate status site1
+mc admin replicate rm site1 site3 --force
+```
+
+Sites share a `site-replicator-0` service account. New buckets are versioned and
+pushed to peers with versioning, object lock, policy, lifecycle, tags, encryption, and
+CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
+out on join. STS session tokens validate across sites only when root credentials match.
+
 ## Compatibility
 
 `tests/s3/run.sh` drives each client against a single drive and against six
@@ -205,12 +366,14 @@ Pre-1.0. Working today and covered by tests:
   DeleteObjects, multipart uploads (incl. UploadPartCopy), versioning with
   delete markers and ListObjectVersions, object lock (governance, compliance,
   legal hold), object and bucket tagging, conditional requests, lifecycle
-  expiration (current, noncurrent, delete markers, incomplete uploads),
+  expiration (current, noncurrent, delete markers, incomplete uploads) and
+  transition to remote tiers (S3-compatible, Azure, GCS) with RestoreObject,
   bucket policies (including anonymous access), GET/HEAD by `partNumber`,
   canned private ACLs, and ListObjects v1.
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
-  evaluation, STS session tokens.
+  evaluation, STS session tokens; OpenID Connect, LDAP, and client
+  certificate federation; tenants; hard bucket quotas.
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and
@@ -225,5 +388,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: SSE, bucket
-notifications, lifecycle transitions, non-private ACLs, TLS termination
+notifications, non-private ACLs, TLS termination
 (run behind a proxy).

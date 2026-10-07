@@ -131,7 +131,11 @@ pub const Exchange = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Transient,
         };
-        errdefer x.req.deinit();
+        // A failed exchange must not return its (possibly dead) connection to the pool.
+        errdefer {
+            if (x.req.connection) |c| c.closing = true;
+            x.req.deinit();
+        }
         const payload: ?[]const u8 = o.body orelse if (o.method.requestHasBody()) @as([]const u8, "") else null;
         if (payload) |b| {
             x.req.transfer_encoding = .{ .content_length = b.len };

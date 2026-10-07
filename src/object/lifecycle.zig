@@ -1,5 +1,5 @@
-//! Bucket lifecycle: rule storage and the expiration pass. The pass takes the
-//! current time as an argument so tests can run it deterministically.
+//! Bucket lifecycle: rule storage and the expiration/transition pass. The pass takes
+//! the current time as an argument so tests can run it deterministically.
 //! Due times follow S3: creation (or noncurrent) time plus N days, rounded up to midnight UTC.
 const std = @import("std");
 const core = @import("../core/root.zig");
@@ -7,6 +7,7 @@ const metadata = @import("../metadata/root.zig");
 const service = @import("service.zig");
 const versioning = @import("versioning.zig");
 const multipart = @import("multipart.zig");
+const transition = @import("transition.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -32,6 +33,11 @@ pub fn set(svc: *Svc, bucket: []const u8, rules: ?[]const Rule) Error!void {
     defer svc.gpa.free(enc);
     if (rules) |rs| {
         try validate(rs);
+        for (rs) |r| for ([_][]const u8{ r.transition_tier, r.noncurrent_transition_tier }) |t| {
+            if (t.len == 0) continue;
+            const reg = svc.tiers orelse return error.InvalidStorageClass;
+            if (!reg.exists(t)) return error.InvalidStorageClass;
+        };
         enc = metadata.lifecycle.encode(svc.gpa, rs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.InvalidRule => error.InvalidRequest,
@@ -50,8 +56,16 @@ pub fn validate(rules: []const Rule) error{InvalidRequest}!void {
     for (rules, 0..) |r, i| {
         if (r.id.len > 0) for (rules[0..i]) |p| if (std.mem.eql(u8, p.id, r.id)) return error.InvalidRequest;
         const any_action = r.expiration_days != null or r.expiration_date_ns != null or r.expired_object_delete_marker or
-            r.noncurrent_days != null or r.abort_upload_days != null;
+            r.noncurrent_days != null or r.abort_upload_days != null or r.hasTransition();
         if (!any_action) return error.InvalidRequest;
+        if ((r.transition_days != null or r.transition_date_ns != null) != (r.transition_tier.len > 0)) return error.InvalidRequest;
+        if (r.transition_days != null and r.transition_date_ns != null) return error.InvalidRequest;
+        if (r.transition_date_ns) |d| if (@mod(d, day_ns) != 0) return error.InvalidRequest;
+        if ((r.noncurrent_transition_days != null) != (r.noncurrent_transition_tier.len > 0)) return error.InvalidRequest;
+        if (r.noncurrent_transition_newer) |n| if (r.noncurrent_transition_days == null or n == 0 or n > 100) return error.InvalidRequest;
+        // Data must move before it expires.
+        if (r.transition_days) |t| if (r.expiration_days) |e| if (t >= e) return error.InvalidRequest;
+        if (r.noncurrent_transition_days) |t| if (r.noncurrent_days) |e| if (t >= e) return error.InvalidRequest;
         if (r.expiration_days != null and r.expiration_date_ns != null) return error.InvalidRequest;
         if (r.expired_object_delete_marker and (r.expiration_days != null or r.expiration_date_ns != null)) return error.InvalidRequest;
         if (r.expiration_date_ns) |d| if (@mod(d, day_ns) != 0) return error.InvalidRequest;
@@ -71,6 +85,10 @@ pub const Stats = struct {
     uploads_aborted: usize = 0,
     /// Actions skipped because retention or a legal hold protects the version.
     locked: usize = 0,
+    transitioned: usize = 0,
+    noncurrent_transitioned: usize = 0,
+    /// Transitions that failed (tier unreachable); retried next pass.
+    transition_failed: usize = 0,
 };
 
 /// Applies every bucket's rules as of `now_ns`. Failures on one bucket do not stop the others.
@@ -130,13 +148,20 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
     const cur: ?Record = if (versions[0].current) versions[0].rec else null;
     const older = if (cur != null) versions[1..] else versions;
     if (cur) |c| if (!c.flags.delete_marker) {
-        for (rules) |r| {
+        const expired = for (rules) |r| {
             if (!r.enabled or !try matches(a, r.filter, c)) continue;
             const due = if (r.expiration_days) |d| dueAt(c.created_ns, d) <= now else if (r.expiration_date_ns) |d| d <= now else false;
             if (!due) continue;
             if (try act(svc, bucket, key, null, c.created_ns, st)) st.expired += 1;
+            break true;
+        } else false;
+        if (!expired and c.tier.len == 0) for (rules) |r| {
+            if (!r.enabled or r.transition_tier.len == 0 or !try matches(a, r.filter, c)) continue;
+            const due = if (r.transition_days) |d| dueAt(c.created_ns, d) <= now else if (r.transition_date_ns) |d| d <= now else false;
+            if (!due) continue;
+            count(try transition.transition(svc, bucket, c, r.transition_tier), &st.transitioned, st);
             break;
-        }
+        };
     } else if (older.len == 0) {
         for (rules) |r| {
             if (!r.enabled or !r.expired_object_delete_marker or !try matches(a, r.filter, c)) continue;
@@ -155,13 +180,29 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
             successor_ns = o.rec.created_ns;
             index += 1;
         }
-        for (rules) |r| {
+        const expired = for (rules) |r| {
             const days = r.noncurrent_days orelse continue;
             if (!r.enabled or index < (r.newer_noncurrent_versions orelse 0)) continue;
             if (dueAt(successor_ns, days) > now or !try matches(a, r.filter, o.rec)) continue;
             if (try act(svc, bucket, key, o.rec.versionId(), null, st)) st.noncurrent_expired += 1;
+            break true;
+        } else false;
+        if (expired or o.rec.tier.len > 0 or o.rec.flags.delete_marker) continue;
+        for (rules) |r| {
+            const days = r.noncurrent_transition_days orelse continue;
+            if (!r.enabled or index < (r.noncurrent_transition_newer orelse 0)) continue;
+            if (dueAt(successor_ns, days) > now or !try matches(a, r.filter, o.rec)) continue;
+            count(try transition.transition(svc, bucket, o.rec, r.noncurrent_transition_tier), &st.noncurrent_transitioned, st);
             break;
         }
+    }
+}
+
+fn count(o: transition.Outcome, done: *usize, st: *Stats) void {
+    switch (o) {
+        .done => done.* += 1,
+        .failed => st.transition_failed += 1,
+        .skipped => {},
     }
 }
 
@@ -203,10 +244,7 @@ fn mapMp(e: multipart.Error) Error {
 }
 
 /// `start + days`, rounded up to the next midnight UTC.
-pub fn dueAt(start_ns: i128, days: u32) i128 {
-    const t = start_ns + @as(i128, days) * day_ns;
-    return @divFloor(t + day_ns - 1, day_ns) * day_ns;
-}
+pub const dueAt = transition.dueAt;
 
 fn matches(a: std.mem.Allocator, f: Filter, r: Record) Error!bool {
     if (!std.mem.startsWith(u8, r.key, f.prefix)) return false;
