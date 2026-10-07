@@ -86,7 +86,13 @@ fn readBody(c: *Ctx) ConnError!?[]const u8 {
         return null;
     }
     var buf: [s3.handler.io_buf_len]u8 = undefined;
-    const r = try c.req.readerExpectContinue(&buf);
+    const r = if (c.method.requestHasBody()) try c.req.readerExpectContinue(&buf) else blk: {
+        // std hands DELETE a shared constant "ending" reader; admin DELETEs carry bodies.
+        const flush = c.req.head.expect != null;
+        try c.req.writeExpectContinue();
+        if (flush) try c.req.server.out.flush();
+        break :blk c.req.server.reader.bodyReader(&buf, c.req.head.transfer_encoding, c.req.head.content_length);
+    };
     const body = if (c.req.head.content_length) |len|
         r.readAlloc(c.arena, @intCast(len)) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

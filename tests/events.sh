@@ -75,6 +75,10 @@ check "config set applies live" "Successfully applied new settings." "$("$MC" ad
 check "config get shows the endpoint" 1 "$("$MC" admin config get z notify_webhook:1 | grep -c "endpoint=http://127.0.0.1:$WH/hook")"
 check "unknown key rejected" 1 "$("$MC" admin config set z notify_webhook:2 nope=1 >/dev/null 2>&1 && echo 0 || echo 1)"
 check "invalid endpoint rejected" 1 "$("$MC" admin config set z notify_webhook:2 endpoint=ftp://x >/dev/null 2>&1 && echo 0 || echo 1)"
+"$MC" admin config set z notify_webhook:tmp endpoint="http://127.0.0.1:$WH/tmp" >/dev/null
+check "config reset removes a target" "'notify_webhook:tmp' is successfully reset." "$("$MC" admin config reset z notify_webhook:tmp 2>&1 | tail -n1)"
+check "reset target gone" 0 "$("$MC" admin config get z notify_webhook | grep -c 'notify_webhook:tmp' || true)"
+check "help lists target keys" 1 "$("$MC" admin config set z notify_kafka 2>&1 | grep -c '^sasl_mechanism ')"
 check "metrics list the target" 1 "$(metric 'zkfsm_notify_target_online{target_id="1",target_name="notify_webhook"}')"
 check "env target is running" 1 "$(metric 'zkfsm_notify_target_online{target_id="ENV",target_name="notify_webhook"}')"
 
