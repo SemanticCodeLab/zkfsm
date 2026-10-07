@@ -7,14 +7,14 @@ cd "$(dirname "$0")/../src"
 rank() {
   case "$1" in
     core) echo 0 ;;
-    io | device | metadata | tls) echo 1 ;;
+    io | device | metadata | tls | kms | select) echo 1 ;;
     backend) echo 2 ;;
     placement) echo 3 ;;
     protection) echo 4 ;;
     heal | object) echo 5 ;;
     metrics | iam) echo 6 ;;
     s3 | admin | gateway) echo 7 ;;
-    cluster | replication) echo 8 ;;
+    cluster | replication | sse) echo 8 ;;
     pools | ops) echo 9 ;;
     *) echo -1 ;;
   esac

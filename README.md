@@ -332,6 +332,56 @@ pushed to peers with versioning, object lock, policy, lifecycle, tags, encryptio
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
 
+### Server-side encryption and KMS
+
+SSE-S3, SSE-KMS and SSE-C work on PutObject, GetObject/HeadObject (with
+ranges), multipart uploads (one data key per upload, each part its own
+stream), CopyObject and UploadPartCopy (re-encrypting between any two modes),
+and bucket default encryption (`mc encrypt set sse-s3|sse-kms KEY ALIAS/BUCKET`,
+`mc encrypt info`, `mc encrypt clear`). SSE-C needs no KMS; SSE-S3 and SSE-KMS
+need one of these backends:
+
+```sh
+zkfsm --data /d --kms-secret-key "my-key:$(head -c 32 /dev/urandom | base64)"  # static key, or $MINIO_KMS_SECRET_KEY
+zkfsm --data /d --kms-backend vault     # VAULT_ADDR + VAULT_TOKEN or VAULT_ROLE_ID/VAULT_SECRET_ID,
+                                        # ZKFSM_KMS_VAULT_ENGINE=transit (default) | kv2, VAULT_NAMESPACE
+zkfsm --data /d --kms-backend kms-api   # cloud KMS (TrentService JSON API): AWS_ACCESS_KEY_ID,
+                                        # AWS_SECRET_ACCESS_KEY, AWS_REGION, ZKFSM_KMS_API_ENDPOINT
+zkfsm --data /d --kms-backend local --kms-dir ./keys   # plaintext key files, development only
+```
+
+`--kms-default-key` names the key for SSE-S3 and for SSE-KMS requests without a
+key id (default `zkfsm-sse-s3`, created at startup when the backend allows it;
+the static key's name for `static`). Keys are managed with
+`mc admin kms key create|list|status` and `/minio/kms/v1/{status,version,apis,
+key/create,key/rotate,key/list,key/status}`, gated by `kms:*` policy actions.
+`POST /minio/kms/v1/backup` returns a digest-checked manifest of all keys; with
+`x-zkfsm-kms-backup-key: <64 hex>` it also carries the key records (local and
+KV2 backends) sealed under that key. `POST /minio/kms/v1/restore[?dry-run=true]`
+takes the same document back and never overwrites existing keys.
+
+Storage: the blob is DARE ciphertext (64 KiB AES-256-GCM packages bound to the
+object path and part number); the sealed data key lives in internal record
+headers that are never sent to clients. HEAD and listings report the plaintext
+size. The ETag is the plaintext MD5 for SSE-S3 (bodies over 8 MiB without a
+known MD5 get the ciphertext MD5) and the ciphertext MD5 for SSE-KMS and SSE-C,
+which, as on other S3 servers, is not an MD5 of the data. Multipart ETags are
+over the ciphertext parts. SSE-C keys are required on every UploadPart.
+
+### S3 Select
+
+`SelectObjectContent` (`POST /bucket/key?select&select-type=2`, `mc sql`) runs
+SQL over CSV (header modes, custom delimiters and quotes), JSON (document and
+lines), either uncompressed or GZIP, and Parquet (plain and dictionary
+encodings; uncompressed, snappy, gzip and zstd pages; data page v1 and v2),
+including encrypted objects and `ScanRange`. Supported: projections, `WHERE`,
+`LIMIT`, `COUNT/SUM/MIN/MAX/AVG`, `CAST`, `LIKE ... ESCAPE`, `IN`, `BETWEEN`,
+`IS [NOT] NULL/MISSING`, `CASE`, `COALESCE`, `NULLIF`, string and date
+functions (`SUBSTRING`, `TRIM`, `UPPER`, `LOWER`, `CHAR_LENGTH`, `EXTRACT`,
+`DATE_ADD`, `DATE_DIFF`, `TO_STRING`, `TO_TIMESTAMP`, `UTCNOW`). Results stream
+as event-stream `Records`, `Progress`, `Stats` and `End` frames, CSV or JSON.
+`tests/select.sh` checks every case against DuckDB.
+
 ### Protocol gateways
 
 FTP/FTPS, SFTP, WebDAV, and OpenStack Swift serve the same namespace as S3, each on
@@ -399,7 +449,9 @@ Pre-1.0. Working today and covered by tests:
 - **Security**: SigV4 header and presigned auth, aws-chunked uploads, payload
   hash checks; IAM users, groups, service accounts, S3 policy
   evaluation, STS session tokens; OpenID Connect, LDAP, and client
-  certificate federation; tenants; hard bucket quotas.
+  certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
+  SSE-C with static, Vault, cloud KMS-API, and local key backends.
+- **S3 Select**: SQL over CSV, JSON and Parquet.
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and
@@ -413,6 +465,6 @@ Pre-1.0. Working today and covered by tests:
 Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
-Not yet: SSE, bucket
+Not yet: bucket
 notifications, non-private ACLs, TLS termination
 (run behind a proxy).
