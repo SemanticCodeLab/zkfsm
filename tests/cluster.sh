@@ -120,6 +120,38 @@ check "with the bytes it started on" "$(md5 "$WORK/big1")" "$(md5 "$WORK/bigread
 check "overwritten object is gone" 404 "$(cget 1 big "$WORK/got")"
 rm -f "$WORK/big1" "$WORK/big2" "$WORK/bigread"
 
+# ---- S3 load cannot starve internal RPC: node 1's S3 workers are all held ----
+# 300 keep-alive clients pin node 1's 256 S3 workers; peers still reach it over RPC.
+python3 - "${PORT[1]}" >"$WORK/hog.log" 2>&1 <<'EOF' &
+import socket, sys, time
+port = int(sys.argv[1])
+socks = []
+for _ in range(300):
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(b"GET /health/live HTTP/1.1\r\nhost: x\r\n\r\n")
+    socks.append(s)
+print("open", flush=True)
+time.sleep(20)
+EOF
+hog=$!
+for _ in $(seq 100); do grep -q open "$WORK/hog.log" && break; sleep 0.1; done
+sleep 1
+check "node 1 S3 workers saturated" 000 "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$(ep 1)/health/live" || true)"
+off0=$(grep -c "127.0.0.1:${PORT[1]} is offline" "$WORK/n2.log" || true)
+n1a=$(find "$WORK"/n1/d* -path '*/data/*' -type f | wc -l)
+for k in 1 2 3 4 5 6; do
+  head -c $((k * 1000 + 3)) /dev/urandom >"$WORK/obj/sat$k"
+  [[ "$(cput 2 "sat$k" "$WORK/obj/sat$k")" == 200 ]] || echo "put sat$k failed"
+done
+n1b=$(find "$WORK"/n1/d* -path '*/data/*' -type f | wc -l)
+check "node 1 took its shards of writes made meanwhile" yes "$([[ $((n1b - n1a)) -ge 6 ]] && echo yes || echo no)"
+cget 2 sat3 "$WORK/got" >/dev/null
+check "and reads through node 2 work" "$(md5 "$WORK/obj/sat3")" "$(md5 "$WORK/got")"
+check "node 1 stayed online for its peers" "$off0" "$(grep -c "127.0.0.1:${PORT[1]} is offline" "$WORK/n2.log" || true)"
+kill "$hog" 2>/dev/null || true
+wait "$hog" 2>/dev/null || true
+OBJS=$(ls "$WORK/obj")
+
 # ---- IAM: a user added on node 1 authenticates on node 2 ----
 if [[ -n "$MC" ]]; then
   "$MC" admin user add z1 alice alice-secret-123 >/dev/null

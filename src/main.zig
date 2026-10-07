@@ -481,13 +481,15 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     }
     defer if (tls_paths != null) tls_ctx.deinit();
     const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    var limits = cfg.limits;
+    limits.rpc_workers = cluster.rpc.Rpc.serverWorkers(node.topo.nodes.len);
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
         .auth = auth,
         .extensions = extensions,
         .tls = if (tls_paths != null) &tls_ctx else null,
-        .limits = cfg.limits,
+        .limits = limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
         .raw_routes = &routes,

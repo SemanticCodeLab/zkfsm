@@ -7,6 +7,7 @@ const placement = @import("../placement/root.zig");
 const shard = @import("shard.zig");
 const erasure = @import("erasure.zig");
 const replica = @import("replica.zig");
+const fanout = @import("fanout.zig");
 
 const Error = iface.Error;
 const PhysicalKey = iface.PhysicalKey;
@@ -201,18 +202,27 @@ pub const ErasureStore = struct {
         const mtx = self.meta.stripe(key);
         mtx.lock();
         defer mtx.unlock();
-        var committed: [max_n]bool = @splat(false);
-        var ok: usize = 0;
-        for (0..n) |i| if (pend[i]) |*w| {
-            var pw = w.*;
-            pend[i] = null;
-            pw.commit(key) catch |e| {
-                worst = ReplicaStore.worse(worst, e);
-                continue;
-            };
-            committed[i] = true;
-            ok += 1;
+        const Commit = struct {
+            pend: *[max_n]?Pending,
+            key: PhysicalKey,
+            res: [max_n]?Error = @splat(null),
+            done: [max_n]bool = @splat(false),
+            fn f(c: *@This(), i: usize) void {
+                var pw = c.pend[i] orelse return;
+                c.pend[i] = null;
+                if (pw.commit(c.key)) |_| {
+                    c.done[i] = true;
+                } else |e| c.res[i] = e;
+            }
         };
+        var cm: Commit = .{ .pend = &pend, .key = key };
+        fanout.run(n, holds.parallel(), &cm, Commit.f);
+        const committed = cm.done;
+        var ok: usize = 0;
+        for (0..n) |i| {
+            if (cm.res[i]) |e| worst = ReplicaStore.worse(worst, e);
+            ok += @intFromBool(committed[i]);
+        }
         if (ok < self.writeQuorum()) {
             for (0..n) |i| if (committed[i]) holds.lbs[i].?.store().delete(key) catch {};
             return if (self.clustered() and worst == error.IoFailed) error.WriteQuorum else worst;
@@ -231,15 +241,35 @@ pub const ErasureStore = struct {
     fn openShards(self: *ErasureStore, holds: *const Holds, key: PhysicalKey) Shards {
         var s: Shards = .{};
         const n = self.width();
-        var headers: [max_n]?Header = @splat(null);
+        const Open = struct {
+            holds: *const Holds,
+            key: PhysicalKey,
+            files: [max_n]?ShardFile = @splat(null),
+            err: [max_n]?Error = @splat(null),
+            headers: [max_n]?Header = @splat(null),
+            fn f(c: *@This(), i: usize) void {
+                const lb = c.holds.lbs[i] orelse return;
+                var file = lb.openRead(c.key) catch |e| {
+                    c.err[i] = e;
+                    return;
+                };
+                var hb: [header_len]u8 = undefined;
+                const got = file.preadAll(&hb, 0) catch 0;
+                c.files[i] = file;
+                c.headers[i] = Header.decode(hb[0..got]);
+            }
+        };
+        var op: Open = .{ .holds = holds, .key = key };
+        fanout.run(n, holds.parallel(), &op, Open.f);
+        const headers = op.headers;
         for (0..n) |i| {
-            const lb = holds.lbs[i] orelse {
+            if (holds.lbs[i] == null) {
                 s.bad[i] = true;
                 s.down[i] = true;
                 s.offline += 1;
                 continue;
-            };
-            const f = lb.openRead(key) catch |e| {
+            }
+            if (op.err[i]) |e| {
                 if (e == error.NotFound) {
                     s.missing += 1;
                 } else {
@@ -248,11 +278,8 @@ pub const ErasureStore = struct {
                 }
                 s.bad[i] = true;
                 continue;
-            };
-            s.files[i] = f;
-            var hb: [header_len]u8 = undefined;
-            const got = s.files[i].?.preadAll(&hb, 0) catch 0;
-            headers[i] = Header.decode(hb[0..got]);
+            }
+            s.files[i] = op.files[i];
             if (headers[i] == null) s.drop(i);
         }
         // The header shared by the most shards wins.

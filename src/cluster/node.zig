@@ -660,12 +660,19 @@ pub const Node = struct {
         n.broadcast(notes);
     }
 
+    /// Sends notes to every online peer at once.
     pub fn broadcast(n: *Node, notes: []const wire.Note) void {
-        for (0..n.topo.nodes.len) |i| {
-            const node: u16 = @intCast(i);
-            if (node == n.topo.local or !n.rpc.isOnline(node)) continue;
-            n.sendNotes(node, notes);
-        }
+        const Each = struct {
+            n: *Node,
+            notes: []const wire.Note,
+            fn f(c: *@This(), i: usize) void {
+                const node: u16 = @intCast(i);
+                if (node == c.n.topo.local or !c.n.rpc.isOnline(node)) return;
+                c.n.sendNotes(node, c.notes);
+            }
+        };
+        var each: Each = .{ .n = n, .notes = notes };
+        protection.fanout.run(n.topo.nodes.len, true, &each, Each.f);
     }
 
     fn sendNotes(n: *Node, node: u16, notes: []const wire.Note) void {

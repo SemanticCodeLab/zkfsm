@@ -22,7 +22,7 @@ const max_small_body = 17 * 1024 * 1024;
 const max_read = 8 * 1024 * 1024;
 
 pub fn route(n: *Node) s3.server.RawRoute {
-    return .{ .prefix = rpc.prefix, .ctx = n, .serve = serve };
+    return .{ .prefix = rpc.prefix, .ctx = n, .serve = serve, .preamble = rpc.preamble };
 }
 
 const Query = struct {

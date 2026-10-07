@@ -1,5 +1,7 @@
 //! HTTP listener: a fixed worker pool serves accepted connections (keep-alive request
 //! loop). A watchdog enforces the idle and header deadlines and the shutdown drain.
+//! With a preamble route, a classifier sorts new connections by their first bytes so
+//! internal RPC has its own bounded pool that S3 load cannot occupy.
 const std = @import("std");
 const posix = std.posix;
 const object = @import("../object/root.zig");
@@ -22,6 +24,8 @@ pub const Limits = struct {
     header_timeout_s: u32 = 10,
     /// How long shutdown waits for in-flight requests.
     shutdown_timeout_s: u32 = 30,
+    /// Workers for preamble (internal RPC) connections; 0 serves them in the S3 pool.
+    rpc_workers: u32 = 0,
 };
 
 const Phase = enum(u8) { free, idle, head, busy };
@@ -34,6 +38,9 @@ pub const RawRoute = struct {
     prefix: []const u8,
     ctx: *anyopaque,
     serve: *const fn (ctx: *anyopaque, req: *std.http.Server.Request, arena: std.mem.Allocator) RawError!void,
+    /// Connections that open with these bytes (before TLS) belong to this route and
+    /// are served by the RPC pool; the bytes are consumed.
+    preamble: ?[]const u8 = null,
 };
 
 /// Readiness override (cluster quorum); default is a storage sync probe.
@@ -136,10 +143,16 @@ pub const Server = struct {
         defer self.listen_fd.store(-1, .seq_cst);
         std.log.info("zkfsm listening on {f}", .{addr});
 
+        const preamble = self.rpcPreamble();
+        const n_rpc: usize = if (preamble != null) self.limits.rpc_workers else 0;
         const items = try self.gpa.alloc(std.net.Server.Connection, @max(1, self.limits.max_conns));
         defer self.gpa.free(items);
         var queue: Queue = .{ .items = items };
-        const slots = try self.gpa.alloc(Slot, @max(1, self.limits.workers));
+        const rpc_items = try self.gpa.alloc(std.net.Server.Connection, @max(1, 2 * n_rpc));
+        defer self.gpa.free(rpc_items);
+        var rpc_queue: Queue = .{ .items = rpc_items };
+        const n_s3: usize = @max(1, self.limits.workers);
+        const slots = try self.gpa.alloc(Slot, n_s3 + n_rpc);
         defer self.gpa.free(slots);
         for (slots) |*s| s.* = .{};
         const threads = try self.gpa.alloc(std.Thread, slots.len);
@@ -155,12 +168,25 @@ pub const Server = struct {
         var started: usize = 0;
         defer {
             queue.close();
+            rpc_queue.close();
             for (threads[0..started]) |t| t.join();
         }
-        for (slots, threads) |*s, *t| {
-            t.* = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, worker, .{ self, &queue, s }) catch return error.ThreadFailed;
+        for (slots, threads, 0..) |*s, *t, i| {
+            const rpc = i >= n_s3;
+            t.* = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, worker, .{ self, if (rpc) &rpc_queue else &queue, s, rpc }) catch return error.ThreadFailed;
             started += 1;
         }
+        var cls: ?Classifier = null;
+        if (n_rpc > 0) {
+            cls = Classifier.init(self, preamble.?, &queue, &rpc_queue) catch return error.ThreadFailed;
+        }
+        defer if (cls) |*c| c.deinit();
+        var cls_thread: ?std.Thread = null;
+        if (cls) |*c| cls_thread = std.Thread.spawn(.{}, Classifier.loop, .{c}) catch return error.ThreadFailed;
+        defer if (cls_thread) |t| {
+            cls.?.stop.store(true, .seq_cst);
+            t.join();
+        };
 
         while (!self.stopping.load(.seq_cst)) {
             const conn = listener.accept() catch |e| {
@@ -170,33 +196,47 @@ pub const Server = struct {
                 std.Thread.sleep(10 * std.time.ns_per_ms);
                 continue;
             };
-            self.admit(&queue, conn);
+            if (cls) |*c| c.add(conn) else self.admit(&queue, conn);
         }
         const grace = @as(u64, self.limits.shutdown_timeout_s) * std.time.ns_per_s;
         self.drain_deadline.store(now() + grace, .seq_cst);
         std.log.info("shutting down: draining in-flight requests (up to {d}s)", .{self.limits.shutdown_timeout_s});
     }
 
-    fn admit(self: *Server, queue: *Queue, conn: std.net.Server.Connection) void {
+    fn rpcPreamble(self: *const Server) ?[]const u8 {
+        for (self.raw_routes) |r| if (r.preamble) |p| return p;
+        return null;
+    }
+
+    fn setTimeouts(self: *Server, fd: posix.socket_t) void {
         const timeout = posix.timeval{ .sec = @intCast(self.limits.idle_timeout_s), .usec = 0 };
-        posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-        posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
+
+    fn refuse(self: *Server, conn: std.net.Server.Connection) void {
+        _ = self;
+        _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);
+        _ = posix.write(conn.stream.handle, "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
+        conn.stream.close();
+    }
+
+    fn admit(self: *Server, queue: *Queue, conn: std.net.Server.Connection) void {
+        self.setTimeouts(conn.stream.handle);
         if (self.open_conns.fetchAdd(1, .seq_cst) >= self.limits.max_conns or !queue.push(conn)) {
             _ = self.open_conns.fetchSub(1, .seq_cst);
-            _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);
-            _ = posix.write(conn.stream.handle, "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
-            conn.stream.close();
+            self.refuse(conn);
         }
     }
 
-    fn worker(self: *Server, queue: *Queue, slot: *Slot) void {
+    fn worker(self: *Server, queue: *Queue, slot: *Slot, rpc: bool) void {
         while (queue.pop()) |conn| {
             {
                 slot.mutex.lock();
                 defer slot.mutex.unlock();
                 slot.fd = conn.stream.handle;
             }
-            self.serveConn(conn, slot);
+            self.serveConn(conn, slot, rpc);
             {
                 // Cleared before close so the watchdog never shuts a reused descriptor.
                 slot.mutex.lock();
@@ -206,7 +246,7 @@ pub const Server = struct {
                 slot.deadline = 0;
             }
             conn.stream.close();
-            _ = self.open_conns.fetchSub(1, .seq_cst);
+            if (!rpc) _ = self.open_conns.fetchSub(1, .seq_cst);
         }
     }
 
@@ -263,7 +303,8 @@ pub const Server = struct {
         }
     }
 
-    fn serveConn(self: *Server, conn: std.net.Server.Connection, slot: *Slot) void {
+    /// Serves one connection's requests; `rpc` connections reach raw routes and ops only.
+    fn serveConn(self: *Server, conn: std.net.Server.Connection, slot: *Slot, rpc: bool) void {
         var rbuf: [16 * 1024]u8 = undefined;
         var wbuf: [16 * 1024]u8 = undefined;
         var sr = conn.stream.reader(&rbuf);
@@ -309,6 +350,9 @@ pub const Server = struct {
                 r.serve(r.ctx, &req, arena.allocator()) catch return;
             } else if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;
+            } else if (rpc) {
+                req.respond("", .{ .status = .not_found, .keep_alive = false }) catch {};
+                return;
             } else if (self.open_gate != null and !self.open_gate.?.load(.acquire)) {
                 req.respond("server is starting\n", .{ .status = .service_unavailable, .keep_alive = false }) catch {};
                 return;
@@ -324,6 +368,130 @@ pub const Server = struct {
                 };
             }
             if (!keep_alive or !bodyDone(&http.reader)) return;
+        }
+    }
+};
+
+/// Sorts new connections by their first bytes: the preamble sends one to the RPC
+/// queue, anything else to the S3 queue. Connections that stay silent past the header
+/// timeout are dropped. Runs on one thread over epoll.
+const Classifier = struct {
+    server: *Server,
+    magic: []const u8,
+    s3: *Queue,
+    rpc: *Queue,
+    epfd: i32,
+    mutex: std.Thread.Mutex = .{},
+    pending: std.AutoHashMapUnmanaged(posix.socket_t, Pending) = .empty,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    const Pending = struct { conn: std.net.Server.Connection, deadline: u64 };
+    const linux = std.os.linux;
+
+    fn init(server: *Server, magic: []const u8, s3: *Queue, rpc: *Queue) error{EpollFailed}!Classifier {
+        const fd = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        if (linux.E.init(fd) != .SUCCESS) return error.EpollFailed;
+        return .{ .server = server, .magic = magic, .s3 = s3, .rpc = rpc, .epfd = @intCast(fd) };
+    }
+
+    fn deinit(c: *Classifier) void {
+        var it = c.pending.valueIterator();
+        while (it.next()) |p| p.conn.stream.close();
+        c.pending.deinit(c.server.gpa);
+        posix.close(c.epfd);
+    }
+
+    fn add(c: *Classifier, conn: std.net.Server.Connection) void {
+        const fd = conn.stream.handle;
+        c.server.setTimeouts(fd);
+        {
+            c.mutex.lock();
+            defer c.mutex.unlock();
+            if (c.pending.count() >= c.server.limits.max_conns) return c.server.refuse(conn);
+            const head_ns = @as(u64, c.server.limits.header_timeout_s) * std.time.ns_per_s;
+            c.pending.put(c.server.gpa, fd, .{ .conn = conn, .deadline = now() + head_ns }) catch return c.server.refuse(conn);
+        }
+        var ev: linux.epoll_event = .{ .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ONESHOT, .data = .{ .fd = fd } };
+        if (linux.E.init(linux.epoll_ctl(c.epfd, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS) {
+            if (c.take(fd)) |p| c.server.refuse(p.conn);
+        }
+    }
+
+    fn take(c: *Classifier, fd: posix.socket_t) ?Pending {
+        c.mutex.lock();
+        defer c.mutex.unlock();
+        const kv = c.pending.fetchRemove(fd) orelse return null;
+        return kv.value;
+    }
+
+    fn loop(c: *Classifier) void {
+        var events: [64]linux.epoll_event = undefined;
+        while (!c.stop.load(.seq_cst)) {
+            const rc = linux.epoll_wait(c.epfd, &events, events.len, 100);
+            const n: usize = if (linux.E.init(rc) == .SUCCESS) rc else 0;
+            for (events[0..n]) |ev| c.ready(ev.data.fd);
+            c.expire();
+        }
+    }
+
+    fn ready(c: *Classifier, fd: posix.socket_t) void {
+        var buf: [16]u8 = undefined;
+        const want = @min(buf.len, c.magic.len);
+        const rc = linux.recvfrom(fd, &buf, want, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
+        const err = linux.E.init(rc);
+        if (err == .AGAIN or err == .INTR) return c.rearm(fd);
+        const got: usize = if (err == .SUCCESS) rc else 0;
+        const p = c.take(fd) orelse return;
+        // EOF or an error before any byte.
+        if (got == 0) return p.conn.stream.close();
+        const seen = buf[0..got];
+        if (std.mem.eql(u8, seen, c.magic[0..want])) {
+            // Consume the preamble; it is already buffered, so this does not block.
+            var sink: [16]u8 = undefined;
+            const r = linux.recvfrom(fd, &sink, want, linux.MSG.DONTWAIT, null, null);
+            if (linux.E.init(r) != .SUCCESS or r != want) return p.conn.stream.close();
+            if (!c.rpc.push(p.conn)) c.server.refuse(p.conn);
+            return;
+        }
+        if (std.mem.startsWith(u8, c.magic, seen)) {
+            // A proper prefix so far: wait for the rest.
+            c.mutex.lock();
+            c.pending.put(c.server.gpa, fd, p) catch {
+                c.mutex.unlock();
+                return c.server.refuse(p.conn);
+            };
+            c.mutex.unlock();
+            return c.rearm(fd);
+        }
+        c.server.admit(c.s3, p.conn);
+    }
+
+    fn rearm(c: *Classifier, fd: posix.socket_t) void {
+        var ev: linux.epoll_event = .{ .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ONESHOT, .data = .{ .fd = fd } };
+        if (linux.E.init(linux.epoll_ctl(c.epfd, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
+            if (c.take(fd)) |p| p.conn.stream.close();
+        }
+    }
+
+    /// Drops connections that sent nothing classifiable before their deadline.
+    fn expire(c: *Classifier) void {
+        const t = now();
+        var dead: [64]Pending = undefined;
+        var n: usize = 0;
+        {
+            c.mutex.lock();
+            defer c.mutex.unlock();
+            var it = c.pending.iterator();
+            while (it.next()) |kv| if (kv.value_ptr.deadline < t) {
+                dead[n] = kv.value_ptr.*;
+                n += 1;
+                if (n == dead.len) break;
+            };
+            for (dead[0..n]) |p| _ = c.pending.remove(p.conn.stream.handle);
+        }
+        for (dead[0..n]) |p| {
+            _ = metrics.global.counters.conn_errors.fetchAdd(1, .monotonic);
+            p.conn.stream.close();
         }
     }
 };

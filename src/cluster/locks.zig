@@ -3,8 +3,11 @@
 //! crashed holders expire.
 const std = @import("std");
 const rpc_mod = @import("rpc.zig");
+const fanout = @import("../protection/root.zig").fanout;
 
 pub const max_resource = 1400;
+/// Nodes a lock bitmask can address.
+pub const max_nodes = 256;
 pub const lease_ms: i64 = 30 * std.time.ms_per_s;
 const refresh_every_ns = 10 * std.time.ns_per_s;
 const acquire_timeout_ms: i64 = 30 * std.time.ms_per_s;
@@ -169,24 +172,36 @@ pub const Manager = struct {
         m.release(h.resource, uid, h.granted);
     }
 
-    /// Sends `op` to every reachable node; returns the bitmask of nodes that said yes.
+    /// Sends `op` to every reachable node at once; returns the bitmask of nodes that said yes.
     fn ask(m: *Manager, resource: []const u8, uid: u64, op: []const u8) u256 {
-        var granted: u256 = 0;
         var bb: [max_resource + 32]u8 = undefined;
         const body = encodeBody(&bb, resource, uid) catch return 0;
-        const now = std.time.milliTimestamp();
-        for (0..m.nodes()) |i| {
-            const node: u16 = @intCast(i);
-            const yes = if (node == m.rpc.self_node) blk: {
-                if (std.mem.eql(u8, op, "lock")) break :blk m.table.lock(resource, uid, now) catch false;
-                break :blk m.table.refresh(resource, uid, now);
-            } else blk: {
-                var c = m.rpc.call(node, op, "", .{ .bytes = body }, .{ .timeout_ms = call_timeout_ms }) catch break :blk false;
-                defer c.deinit();
-                break :blk c.ok();
-            };
-            if (yes) granted |= @as(u256, 1) << @intCast(node);
-        }
+        const Each = struct {
+            m: *Manager,
+            resource: []const u8,
+            uid: u64,
+            op: []const u8,
+            body: []const u8,
+            now: i64,
+            yes: [max_nodes]bool = @splat(false),
+            fn f(c: *@This(), i: usize) void {
+                const node: u16 = @intCast(i);
+                c.yes[i] = if (node == c.m.rpc.self_node) blk: {
+                    if (std.mem.eql(u8, c.op, "lock")) break :blk c.m.table.lock(c.resource, c.uid, c.now) catch false;
+                    break :blk c.m.table.refresh(c.resource, c.uid, c.now);
+                } else blk: {
+                    var call = c.m.rpc.call(node, c.op, "", .{ .bytes = c.body }, .{ .timeout_ms = call_timeout_ms }) catch break :blk false;
+                    defer call.deinit();
+                    break :blk call.ok();
+                };
+            }
+        };
+        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp() };
+        fanout.run(m.nodes(), true, &each, Each.f);
+        var granted: u256 = 0;
+        for (0..m.nodes()) |i| if (each.yes[i]) {
+            granted |= @as(u256, 1) << @intCast(i);
+        };
         return granted;
     }
 
@@ -194,25 +209,31 @@ pub const Manager = struct {
     fn release(m: *Manager, resource: []const u8, uid: u64, granted: u256) void {
         var bb: [max_resource + 32]u8 = undefined;
         const body = encodeBody(&bb, resource, uid) catch return;
-        for (0..m.nodes()) |i| {
-            if (granted & (@as(u256, 1) << @intCast(i)) == 0) continue;
-            const node: u16 = @intCast(i);
-            if (node == m.rpc.self_node) {
-                m.table.unlock(resource, uid);
-                continue;
-            }
-            var attempt: u8 = 0;
-            while (attempt < 3) : (attempt += 1) {
-                if (m.rpc.call(node, "unlock", "", .{ .bytes = body }, .{ .timeout_ms = call_timeout_ms })) |c| {
-                    var cc = c;
-                    cc.deinit();
-                    break;
-                } else |e| {
-                    if (e == error.NodeOffline) break;
-                    std.Thread.sleep(20 * std.time.ns_per_ms);
+        const Each = struct {
+            m: *Manager,
+            resource: []const u8,
+            uid: u64,
+            body: []const u8,
+            granted: u256,
+            fn f(c: *@This(), i: usize) void {
+                if (c.granted & (@as(u256, 1) << @intCast(i)) == 0) return;
+                const node: u16 = @intCast(i);
+                if (node == c.m.rpc.self_node) return c.m.table.unlock(c.resource, c.uid);
+                var attempt: u8 = 0;
+                while (attempt < 3) : (attempt += 1) {
+                    if (c.m.rpc.call(node, "unlock", "", .{ .bytes = c.body }, .{ .timeout_ms = call_timeout_ms })) |call| {
+                        var cc = call;
+                        cc.deinit();
+                        return;
+                    } else |e| {
+                        if (e == error.NodeOffline) return;
+                        std.Thread.sleep(20 * std.time.ns_per_ms);
+                    }
                 }
             }
-        }
+        };
+        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .body = body, .granted = granted };
+        fanout.run(m.nodes(), @popCount(granted) > 1, &each, Each.f);
     }
 
     fn refreshLoop(m: *Manager) void {
