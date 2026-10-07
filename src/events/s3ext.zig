@@ -204,7 +204,8 @@ fn end(ptr: *anyopaque, c: *Ctx, status: u16) void {
         var arena = std.heap.ArenaAllocator.init(n.gpa);
         defer arena.deinit();
         const entry = audit.entry(arena.allocator(), c, status, n.opts.deployment_id, n.opts.endpoint) catch return;
-        n.audit(entry);
+        var tb: [24]u8 = undefined;
+        n.audit(entry, &c.request_id, record.timeText(std.time.nanoTimestamp(), &tb));
     }
 }
 

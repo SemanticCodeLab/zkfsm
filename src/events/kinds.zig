@@ -40,6 +40,15 @@ pub const all = [_]Kind{
     .{ .subsys = "notify_pulsar", .arn_type = "pulsar", .env = "PULSAR", .keys = &pulsar.keys, .create = pulsar.create },
     .{ .subsys = "audit_webhook", .arn_type = "", .env = "WEBHOOK", .keys = &webhook.keys, .create = webhook.create, .audit = true },
     .{ .subsys = "audit_kafka", .arn_type = "", .env = "KAFKA", .keys = &kafka.keys, .create = kafka.create, .audit = true },
+    .{ .subsys = "audit_nats", .arn_type = "", .env = "NATS", .keys = &nats.keys, .create = nats.create, .audit = true },
+    .{ .subsys = "audit_mqtt", .arn_type = "", .env = "MQTT", .keys = &mqtt.keys, .create = mqtt.create, .audit = true },
+    .{ .subsys = "audit_redis", .arn_type = "", .env = "REDIS", .keys = &redis.keys, .create = redis.create, .audit = true },
+    .{ .subsys = "audit_postgres", .arn_type = "", .env = "POSTGRES", .keys = &postgres.keys, .create = postgres.create, .audit = true },
+    .{ .subsys = "audit_mysql", .arn_type = "", .env = "MYSQL", .keys = &mysql.keys, .create = mysql.create, .audit = true },
+    .{ .subsys = "audit_amqp", .arn_type = "", .env = "AMQP", .keys = &amqp.keys, .create = amqp.create, .audit = true },
+    .{ .subsys = "audit_pulsar", .arn_type = "", .env = "PULSAR", .keys = &pulsar.keys, .create = pulsar.create, .audit = true },
+    .{ .subsys = "audit_elasticsearch", .arn_type = "", .env = "ELASTICSEARCH", .keys = &elasticsearch.keys, .create = elasticsearch.create, .audit = true },
+    .{ .subsys = "audit_nsq", .arn_type = "", .env = "NSQ", .keys = &nsq.keys, .create = nsq.create, .audit = true },
 };
 
 pub fn bySubsys(name: []const u8) ?*const Kind {

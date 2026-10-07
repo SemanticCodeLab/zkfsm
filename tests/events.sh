@@ -21,6 +21,7 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+trap 'echo "events.sh: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 pass=0
 fail=0
@@ -325,6 +326,10 @@ if command -v initdb >/dev/null && command -v postgres >/dev/null && command -v 
   "$MC" rm z/pgb/b.txt >/dev/null
   eventually "namespace table keeps live objects" "pgb/a.txt" pgq 'select key from lns order by key'
   eventually "access table logs every event" 3 pgq 'select count(*) from lacc'
+  check "audit to postgres" "Successfully applied new settings." "$("$MC" admin config set z audit_postgres:pa connection_string="$CS" table=auditlog 2>&1 | tail -n1)"
+  echo au | "$MC" pipe z/other/audited-pg.txt >/dev/null
+  eventually "audit rows in postgres" 1 sh -c "PGPASSWORD=zkpass psql -h 127.0.0.1 -p $PGP -U postgres -tAc \"select count(*) > 0 from auditlog where event_data->'api'->>'object' = 'audited-pg.txt'\" | sed 's/t/1/;s/f/0/'"
+  "$MC" admin config reset z audit_postgres:pa >/dev/null
   check "namespace row holds the record" "pgb" "$(pgq "select value->'Records'->0->'s3'->'bucket'->>'name' from lns")"
   pg_down
   echo 3 | "$MC" pipe z/pgb/c.txt >/dev/null

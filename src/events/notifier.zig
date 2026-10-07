@@ -330,7 +330,14 @@ pub const Notifier = struct {
 
     fn startRunner(n: *Notifier, a: Allocator, e: settings.Entry) StartError!*Runner {
         const kind = kinds.bySubsys(e.subsys) orelse return error.InvalidConfig;
-        const s = e.settings();
+        var s = e.settings();
+        // Audit logs are append-only: table/list formats default to access.
+        if (kind.audit and s.get("format").len == 0 and kinds.validKey(kind, "format")) {
+            const kvs = try a.alloc(target.Kv, s.kvs.len + 1);
+            @memcpy(kvs[0..s.kvs.len], s.kvs);
+            kvs[s.kvs.len] = .{ .key = "format", .value = "access" };
+            s = .{ .kvs = kvs };
+        }
         const limit = s.int(u32, "queue_limit", n.opts.default_queue_limit) catch return error.InvalidConfig;
         const client = try kind.create(n.gpa, s);
         errdefer client.deinit();
@@ -622,8 +629,8 @@ pub const Notifier = struct {
         return n.has_audit.load(.acquire) or n.audit_console or n.audit_file != null;
     }
 
-    /// Hands one audit entry (JSON) to every audit logger.
-    pub fn audit(n: *Notifier, entry: []const u8) void {
+    /// Hands one audit entry (JSON) to every audit logger; `key` is the request id.
+    pub fn audit(n: *Notifier, entry: []const u8, key: []const u8, time: []const u8) void {
         if (n.audit_console) std.debug.print("{s}\n", .{entry});
         if (n.audit_file) |f| {
             n.audit_file_mutex.lock();
@@ -632,7 +639,7 @@ pub const Notifier = struct {
             f.writeAll("\n") catch {};
         }
         if (!n.has_audit.load(.acquire)) return;
-        const msg: target.Message = .{ .body = entry };
+        const msg: target.Message = .{ .key = key, .body = entry, .record = entry, .event_time = time };
         n.mutex.lock();
         defer n.mutex.unlock();
         for (n.runners.items) |r| if (r.kind.audit) r.enqueue(&msg);
