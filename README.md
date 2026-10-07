@@ -363,8 +363,9 @@ mc watch z/photos --events put
   `s3:Replication:*`, `s3:BucketCreated`, `s3:BucketRemoved`; records use the MinIO JSON
   layout. ListenBucketNotification (`mc watch`) streams events from every node of a cluster.
 - Audit: one MinIO-layout JSON entry per request (API name, status, timings, identity,
-  tenant, request and response headers with credentials redacted) to `audit_webhook`
-  and `audit_kafka` targets, stderr (`ZKFSM_AUDIT_CONSOLE=on`), or a file
+  tenant, request and response headers with credentials redacted) to `audit_<type>`
+  targets of every type above (`audit_webhook`, `audit_kafka`, ...; table and list
+  formats default to `access`), stderr (`ZKFSM_AUDIT_CONSOLE=on`), or a file
   (`ZKFSM_AUDIT_FILE=path`).
 - `/metrics` carries `zkfsm_notify_target_*` and `zkfsm_audit_target_*` per target
   (sent, failed, dropped, queue length, online). In a cluster each node publishes the
