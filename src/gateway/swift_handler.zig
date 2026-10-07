@@ -110,6 +110,9 @@ pub const Ctx = struct {
             error.IncompleteBody => c.fail(.request_timeout, "The body was shorter than declared."),
             error.ObjectLocked => c.fail(.forbidden, "The object is locked."),
             error.NoSpace => c.fail(.insufficient_storage, "Out of space."),
+            error.QuotaExceeded => c.fail(.payload_too_large, "Bucket quota exceeded."),
+            error.TierUnavailable, error.RestoreInProgress => c.fail(.service_unavailable, "Object data is not available yet."),
+            error.InvalidObjectState, error.InvalidStorageClass => c.fail(.bad_request, "Invalid object state."),
             error.WriteQuorum, error.ReadQuorum, error.LockTimeout => c.fail(.service_unavailable, "Storage is unavailable."),
             error.InvalidRequest, error.InvalidVersionId, error.InvalidBucketState, error.MethodNotAllowed, error.NoSuchTagSet => c.fail(.bad_request, "Invalid request."),
             error.OutOfMemory => error.OutOfMemory,
@@ -336,7 +339,7 @@ pub fn usage(c: *Ctx, bucket: []const u8, budget: *usize) Usage {
 }
 
 fn visibleBuckets(c: *Ctx) ConnError!?[]object.BucketInfo {
-    const all = c.svc().listBuckets(c.a) catch |e| {
+    const all = c.st.access.visibleBuckets(c.a, &c.who) catch |e| {
         try c.failObj(e);
         return null;
     };
@@ -448,7 +451,7 @@ fn containerPut(c: *Ctx) ConnError!void {
     if (!c.allowed(.create_bucket, c.container, "")) return c.denied();
     const changes = (try containerMetaChanges(c)) orelse return;
     var status: Status = .created;
-    c.svc().createBucket(c.container) catch |e| switch (e) {
+    c.st.access.createBucket(&c.who, c.container) catch |e| switch (e) {
         error.BucketAlreadyExists => status = .accepted,
         else => return c.failObj(e),
     };

@@ -268,8 +268,28 @@ check "s3 meta from swift" 1 "$(s3 -I "$EP/big/flat.bin" | grep -ci 'x-amz-meta-
 s3 -X PUT --data-binary @a.txt "$EP/big/from-s3.txt" >/dev/null
 check "s3 object via swift" hello "$(curl -s "${T[@]}" "$SURL/big/from-s3.txt")"
 
-# ---- Keystone v3 ----
+# ---- quotas and tenants ----
 "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null
+check "quota container" 0 "$(ok "$SWIFT" post quota)"
+check "quota set" 0 "$(ok "$MC" quota set z/quota --size 1MiB)"
+head -c 400000 /dev/urandom >"$WORK/400k"
+check "put under quota" 201 "$(status -X PUT --data-binary @400k "${T[@]}" "$SURL/quota/a")"
+check "put over quota" 413 "$(status -X PUT --data-binary @big.bin "${T[@]}" "$SURL/quota/b")"
+check "copy over quota" 413 "$(status -X COPY -H 'Destination: quota/c' "${T[@]}" "$SURL/big/flat.bin")"
+admin() { curl -s -o /dev/null -w '%{http_code}' -X "$1" --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/minio/admin/v3$2"; }
+"$MC" admin user add z tenuser tenusersecret1 >/dev/null
+"$MC" admin policy attach z readwrite --user tenuser >/dev/null
+check "tenant add" 200 "$(admin PUT '/tenant/add?name=acme')"
+check "tenant assign" 200 "$(admin PUT '/tenant/assign-user?name=acme&accessKey=tenuser')"
+TT=$(header x-auth-token -H 'X-Auth-User: acme:tenuser' -H 'X-Auth-Key: tenusersecret1' "$SW/auth/v1.0")
+TH=(-H "X-Auth-Token: $TT")
+check "tenant sees no global buckets" 204 "$(status "${TH[@]}" "$SW/v1/AUTH_acme")"
+check "tenant container put" 201 "$(status -X PUT "${TH[@]}" "$SW/v1/AUTH_acme/acme-box")"
+check "tenant lists own container" acme-box "$(curl -s "${TH[@]}" "$SW/v1/AUTH_acme" | xargs)"
+check "tenant cannot read global" 403 "$(status "${TH[@]}" "$SW/v1/AUTH_acme/big/flat.bin")"
+check "root sees tenant container" 1 "$(curl -s "${T[@]}" "$SURL" | grep -c '^acme-box$')"
+
+# ---- Keystone v3 ----
 check "mc user add" 0 "$(ok "$MC" admin user add z rouser rousersecret1)"
 check "mc readonly policy" 0 "$(ok "$MC" admin policy attach z readonly --user rouser)"
 KS=(--auth-version 3 --os-auth-url "$KSURL/v3" --os-user-domain-name Default --os-project-domain-name Default)
