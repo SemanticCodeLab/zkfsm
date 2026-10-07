@@ -265,6 +265,8 @@ pub const Meta = struct {
     size: ?u64 = null,
     mtime_ns: ?i128 = null,
     more: bool = false,
+    /// Read lease id; 0 when none.
+    handle: u64 = 0,
     err_buf: [64]u8 = undefined,
     err_len: u8 = 0,
 
@@ -364,6 +366,8 @@ pub const Call = struct {
                 c.meta.size = std.fmt.parseInt(u64, value, 10) catch return error.BadResponse;
             } else if (std.ascii.eqlIgnoreCase(name, "x-zkfsm-mtime")) {
                 c.meta.mtime_ns = std.fmt.parseInt(i128, value, 10) catch return error.BadResponse;
+            } else if (std.ascii.eqlIgnoreCase(name, "x-zkfsm-handle")) {
+                c.meta.handle = std.fmt.parseInt(u64, value, 10) catch return error.BadResponse;
             } else if (std.ascii.eqlIgnoreCase(name, "x-zkfsm-more")) {
                 c.meta.more = std.mem.eql(u8, value, "1");
             } else if (std.ascii.eqlIgnoreCase(name, "x-zkfsm-error")) {

@@ -99,6 +99,11 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (std.mem.eql(u8, op, "lock") or std.mem.eql(u8, op, "refresh") or std.mem.eql(u8, op, "unlock")) return lockOp(n, req, op, body);
     if (std.mem.eql(u8, op, "notify")) return notify(n, req, body);
     if (std.mem.eql(u8, op, "diskinfo")) return diskInfo(n, req, q, arena);
+    if (std.mem.eql(u8, op, "pread")) return pread(n, req, q);
+    if (std.mem.eql(u8, op, "close")) {
+        n.leases.close(q.int(u64, "h") orelse return fail(req, .bad_request, "h"));
+        return req.respond("", .{});
+    }
     if (!n.drives_open.load(.acquire)) return fail(req, .service_unavailable, "starting");
     const d = n.localDrive(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
     const lb = d.set.acquire(d.slot) orelse return fail(req, .service_unavailable, "offline");
@@ -111,6 +116,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (std.mem.eql(u8, op, "scan")) return scan(n, req, q, l, arena);
     const key = wire.parseKey(q.get("k") orelse "") orelse return fail(req, .bad_request, "key");
     if (std.mem.eql(u8, op, "read")) return read(req, q, l, key);
+    if (std.mem.eql(u8, op, "open")) return openLease(n, req, q, l, key);
     if (std.mem.eql(u8, op, "stat")) {
         const m = l.backend().stat(key) catch |e| return fail(req, statusOf(e), @errorName(e));
         return respondMeta(req, "", m.size, m.mtime_ns);
@@ -233,13 +239,56 @@ fn read(req: *Request, q: Query, l: *LocalBackend, key: PhysicalKey) RawError!vo
         } else if (off > size or len > size - off) return fail(req, .range_not_satisfiable, "range");
     }
     if (len > max_read and q.get("all") == null) return fail(req, .payload_too_large, "len");
+    return sendRange(req, file, size, st.mtime, off, len, null);
+}
+
+/// Opens a blob for a peer's positional reads and sends its first window. A blob
+/// larger than the window stays open under a lease the peer reads by id.
+fn openLease(n: *Node, req: *Request, q: Query, l: *LocalBackend, key: PhysicalKey) RawError!void {
+    const want = q.int(u64, "len") orelse return fail(req, .bad_request, "len");
+    if (want > max_read) return fail(req, .payload_too_large, "len");
+    var file = l.openRead(key) catch |e| return fail(req, statusOf(e), @errorName(e));
+    const st = file.stat() catch {
+        file.close();
+        return fail(req, .internal_server_error, "io");
+    };
+    if (st.size <= want) {
+        defer file.close();
+        return sendRange(req, file, st.size, st.mtime, 0, st.size, null);
+    }
+    const now = std.time.milliTimestamp();
+    const id = n.leases.open(file, now) catch |e| return fail(req, .service_unavailable, @errorName(e));
+    const f = n.leases.acquire(id, now) orelse return fail(req, .internal_server_error, "lease");
+    defer n.leases.release(id, std.time.milliTimestamp());
+    return sendRange(req, f, st.size, st.mtime, 0, want, id);
+}
+
+/// Reads through a lease; 410 once it expired or was closed.
+fn pread(n: *Node, req: *Request, q: Query) RawError!void {
+    const id = q.int(u64, "h") orelse return fail(req, .bad_request, "h");
+    const off = q.int(u64, "off") orelse return fail(req, .bad_request, "off");
+    const want = q.int(u64, "len") orelse return fail(req, .bad_request, "len");
+    if (want > max_read) return fail(req, .payload_too_large, "len");
+    const f = n.leases.acquire(id, std.time.milliTimestamp()) orelse return fail(req, .gone, "lease");
+    defer n.leases.release(id, std.time.milliTimestamp());
+    const st = f.stat() catch return fail(req, .internal_server_error, "io");
+    const len = if (off >= st.size) 0 else @min(want, st.size - off);
+    return sendRange(req, f, st.size, st.mtime, off, len, null);
+}
+
+fn sendRange(req: *Request, file: std.fs.File, size: u64, mtime: i128, off: u64, len: u64, lease: ?u64) RawError!void {
     var sb: [24]u8 = undefined;
     var mb: [48]u8 = undefined;
-    var wbuf: [64 * 1024]u8 = undefined;
-    var bw = try req.respondStreaming(&wbuf, .{ .content_length = len, .respond_options = .{ .extra_headers = &.{
+    var hb: [24]u8 = undefined;
+    const meta = [_]std.http.Header{
         .{ .name = "x-zkfsm-size", .value = std.fmt.bufPrint(&sb, "{d}", .{size}) catch unreachable },
-        .{ .name = "x-zkfsm-mtime", .value = std.fmt.bufPrint(&mb, "{d}", .{st.mtime}) catch unreachable },
-    } } });
+        .{ .name = "x-zkfsm-mtime", .value = std.fmt.bufPrint(&mb, "{d}", .{mtime}) catch unreachable },
+        .{ .name = "x-zkfsm-handle", .value = std.fmt.bufPrint(&hb, "{d}", .{lease orelse 0}) catch unreachable },
+    };
+    var wbuf: [64 * 1024]u8 = undefined;
+    var bw = try req.respondStreaming(&wbuf, .{ .content_length = len, .respond_options = .{
+        .extra_headers = if (lease != null) &meta else meta[0..2],
+    } });
     var buf: [64 * 1024]u8 = undefined;
     var done: u64 = 0;
     while (done < len) {

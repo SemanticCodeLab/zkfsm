@@ -69,6 +69,7 @@ pub const Healer = struct {
     }
 
     /// Starts the background loop; a pass runs at once if a drive is fresh.
+    /// `interval_ns` 0 runs only woken passes.
     pub fn start(self: *Healer, interval_ns: u64) error{SpawnFailed}!void {
         self.stop_ev.reset();
         self.thread = std.Thread.spawn(.{}, loop, .{ self, interval_ns }) catch return error.SpawnFailed;
@@ -87,10 +88,12 @@ pub const Healer = struct {
                 if (d.fresh.load(.acquire)) break true;
             } else false;
             if (!(first and fresh)) {
-                // Sleep in short steps so a wake request is served promptly.
+                // Sleep in short steps so a wake request is served promptly. Interval 0:
+                // no periodic passes; woken ones only, retried while a drive is fresh.
+                const limit: u64 = if (interval_ns > 0) interval_ns else if (fresh) fresh_retry_ns else std.math.maxInt(u64);
                 var waited: u64 = 0;
-                while (waited < interval_ns and !self.wake_flag.load(.acquire)) : (waited += wake_step_ns) {
-                    self.stop_ev.timedWait(@min(wake_step_ns, interval_ns - waited)) catch {};
+                while (waited < limit and !self.wake_flag.load(.acquire)) : (waited += wake_step_ns) {
+                    self.stop_ev.timedWait(@min(wake_step_ns, limit - waited)) catch {};
                     if (self.stop_ev.isSet()) return;
                 }
             }
@@ -107,6 +110,7 @@ pub const Healer = struct {
 };
 
 const wake_step_ns = std.time.ns_per_s;
+const fresh_retry_ns = 30 * std.time.ns_per_s;
 
 pub fn logReport(r: Report) void {
     std.log.info(
