@@ -26,7 +26,7 @@ trap cleanup EXIT
 pass=0
 fail=0
 check() { # name expected actual
-  if [[ "$2" == "$3" ]]; then pass=$((pass + 1)); echo "ok   $1"
+  if [[ "$2" == "$3" ]]; then pass=$((pass + 1)); echo "ok   $1 ($SECONDS s)"
   else fail=$((fail + 1)); echo "FAIL $1: expected [$2] got [$3]"; fi
 }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
@@ -51,10 +51,11 @@ read -r -a PA <<<"$(pool a)"
 read -r -a PB <<<"$(pool b)"
 POOLS=()
 RATE=64
+DRATE=2
 
 start() { # node
   local i="$1"
-  ZKFSM_REBALANCE_MBPS="$RATE" ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" "${POOLS[@]}" --listen "127.0.0.1:${PORT[$i]}" \
+  ZKFSM_REBALANCE_MBPS="$RATE" ZKFSM_DECOMMISSION_MBPS="$DRATE" ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" "${POOLS[@]}" --listen "127.0.0.1:${PORT[$i]}" \
     --node-address "127.0.0.1:${PORT[$i]}" --protection EC:4+2 --scan-interval 20 >>"$WORK/n$i.log" 2>&1 &
   PIDS[$i]=$!
 }
@@ -207,6 +208,11 @@ check "pool 1 not scheduled" "0001-01-01T00:00:00Z" "$(decom 2 "$CMD_A" startTim
 check "unknown pool refused" 1 "$("$MC" admin decommission start z1 "http://nowhere:9000/x" >/dev/null 2>&1 && echo 0 || echo 1)"
 
 "$MC" admin decommission start z1 "$CMD_A" >/dev/null
+# Cancel and restart before any move: canceled state is visible, then it runs.
+"$MC" admin decommission cancel z2 "$CMD_A" >/dev/null
+check "cancel shows canceled" true "$(decom 1 "$CMD_A" canceled)"
+"$MC" admin decommission start z2 "$CMD_A" >/dev/null
+check "restart after cancel" false "$(decom 1 "$CMD_A" canceled)"
 check "decommission started" yes "$([[ "$(decom 3 "$CMD_A" startTime)" != 0001* ]] && echo yes || echo no)"
 check "second start of another pool refused while draining" 1 "$("$MC" admin decommission start z1 "$CMD_B" >/dev/null 2>&1 && echo 0 || echo 1)"
 check "rebalance refused while draining" 1 "$("$MC" admin rebalance start z1 >/dev/null 2>&1 && echo 0 || echo 1)"
@@ -226,11 +232,6 @@ cli 1 s3api put-bucket-versioning --bucket tver --versioning-configuration Statu
 traffic "$T" &
 TPID=$!
 sleep 3
-# Cancel and restart once mid-way: canceled state is visible, then resumes.
-"$MC" admin decommission cancel z2 "$CMD_A" >/dev/null
-check "cancel shows canceled" true "$(decom 1 "$CMD_A" canceled)"
-"$MC" admin decommission start z2 "$CMD_A" >/dev/null
-check "restart after cancel" false "$(decom 1 "$CMD_A" canceled)"
 for _ in $(seq 300); do
   [[ "$(decom "$T" "$CMD_A" objectsDecommissioned)" =~ ^[1-9] ]] && break
   sleep 0.2
@@ -284,6 +285,7 @@ POOLS=(--data "${PA[@]}")
 start 1
 code=0
 for _ in $(seq 300); do kill -0 "${PIDS[1]}" 2>/dev/null || break; sleep 0.1; done
+kill -0 "${PIDS[1]}" 2>/dev/null && { echo "node still running:"; tail -n 20 "$WORK/n1.log"; kill -9 "${PIDS[1]}"; }
 wait "${PIDS[1]}" 2>/dev/null || code=$?
 PIDS[1]=0
 check "startup refuses a layout missing a live pool" yes "$([[ $code -ne 0 ]] && echo yes || echo no)"

@@ -116,6 +116,8 @@ pub const Node = struct {
     orig: []u32 = &.{},
     /// Deployment pools that finished decommissioning (bit per index).
     retired: u64 = 0,
+    /// Deployment pools ever formatted; recorded in drive formats.
+    pool_count: u32 = 0,
     /// Called when a peer announces a pool state change.
     pools_hook: ?Hook = null,
 
@@ -274,6 +276,7 @@ pub const Node = struct {
             n.stop_ev.timedWait(500 * std.time.ns_per_ms) catch {};
         }
         try n.openSets(seen);
+        n.recordPoolCount(seen);
         n.drives_open.store(true, .release);
         n.refreshSpace();
         std.log.info("cluster: deployment {s}, protection {s}, {d} set(s)", .{ &std.fmt.bytesToHex(n.deployment, .lower), n.profile.name(), n.setCount() });
@@ -412,6 +415,7 @@ pub const Node = struct {
             std.crypto.random.bytes(&d);
             n.deployment = d;
             n.profile = n.cfg.profile orelse n.defaultProfile();
+            n.pool_count = @intCast(n.topo.pools.len);
             for (0..n.topo.pools.len) |p| try n.formatPool(p, seen[p]);
             return false;
         }
@@ -442,12 +446,14 @@ pub const Node = struct {
     fn resolvePools(n: *Node, seen: [][]Seen, dep: [16]u8) Error!bool {
         var retired: u64 = 0;
         var present: u64 = 0;
+        var count: u32 = 0;
         var known = try n.gpa.alloc(bool, seen.len);
         defer n.gpa.free(known);
         for (seen, 0..) |s, p| {
             known[p] = false;
             for (s) |e| if (e == .fmt and std.mem.eql(u8, &e.fmt.deployment, &dep)) {
                 retired |= e.fmt.retired;
+                count = @max(count, e.fmt.pools);
                 if (e.fmt.pool >= router_mod.max_pools - 1) return error.LayoutMismatch;
                 if (known[p] and n.orig[p] != e.fmt.pool) {
                     std.log.err("cluster: pool {d} mixes drives of deployment pools {d} and {d}", .{ p + 1, n.orig[p] + 1, e.fmt.pool + 1 });
@@ -476,8 +482,13 @@ pub const Node = struct {
             fresh = true;
         };
         // Judged once every pool is formatted (a peer may be formatting right now).
-        if (fresh) return true;
-        const missing = ~(present | retired) & ((@as(u64, 1) << @intCast(64 - @clz(present | retired))) -% 1);
+        if (fresh) {
+            n.pool_count = next;
+            return true;
+        }
+        const hi: u32 = @max(count, @as(u32, @intCast(64 - @clz(present | retired))));
+        n.pool_count = @max(hi, next);
+        const missing = ~(present | retired) & ((@as(u64, 1) << @intCast(@min(hi, 63))) -% 1);
         if (missing != 0) {
             std.log.err("cluster: deployment pool {d} is missing from the endpoint list and was not decommissioned", .{@ctz(missing) + 1});
             return error.LayoutMismatch;
@@ -513,6 +524,25 @@ pub const Node = struct {
             c.format.retired = n.retired;
         };
         return failed;
+    }
+
+    /// Local drives learn how many pools the deployment has, so dropping one that
+    /// was never decommissioned is refused even when only older drives remain.
+    fn recordPoolCount(n: *Node, seen: [][]Seen) void {
+        for (seen, 0..) |s, p| for (s, 0..) |e, i| {
+            if (n.local_eps[p][i] == null) continue;
+            const f = switch (e) {
+                .fmt => |f| f,
+                else => continue,
+            };
+            if (f.pools >= n.pool_count and f.retired == n.retired) continue;
+            var g = f;
+            g.pools = @max(f.pools, n.pool_count);
+            g.retired |= n.retired;
+            var buf: [layout.format_max]u8 = undefined;
+            const bytes = g.encode(&buf) catch continue;
+            n.writeFormat(p, i, bytes) catch std.log.warn("cluster: cannot update the format of {s}", .{n.topo.pools[p].endpoints[i].url});
+        };
     }
 
     /// Deployment index of endpoint-list pool `p`.
@@ -560,7 +590,7 @@ pub const Node = struct {
         std.log.info("cluster: formatting pool {d}: {d} set(s) of {d} drives, {s}", .{ p + 1, sets.len, size, n.profile.name() });
         for (sets, 0..) |members, si| for (members, 0..) |ep, idx| {
             if (s[ep] != .none) continue;
-            const f: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = @intCast(idx), .set_size = @intCast(size), .profile = n.profile, .retired = n.retired };
+            const f: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = @intCast(idx), .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
             var buf: [layout.format_max]u8 = undefined;
             const bytes = f.encode(&buf) catch return error.BadLayout;
             n.writeFormat(p, ep, bytes) catch std.log.warn("cluster: cannot format {s}", .{n.topo.pools[p].endpoints[ep].url});
@@ -618,7 +648,7 @@ pub const Node = struct {
                     const e = pool.endpoints[ep];
                     m.* = .{ .path = if (n.local_eps[p][ep]) |le| le.path else e.url, .node = e.node, .remote = if (n.remotes[p][ep]) |*rd| rd.ext() else null };
                 }
-                const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile, .retired = n.retired };
+                const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
                 st.drives = placement.DriveSet.openCluster(n.gpa, ms, tmpl, true) catch |e| {
                     std.log.err("cluster: pool {d} set {d}: {t}", .{ p + 1, si + 1, e });
                     return error.LayoutMismatch;

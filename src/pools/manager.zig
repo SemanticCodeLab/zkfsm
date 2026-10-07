@@ -35,6 +35,8 @@ pub const Manager = struct {
     node: *Node,
     /// Bytes per second for rebalance moves; 0 = unthrottled.
     rebalance_rate: u64,
+    /// Same for decommission moves (ZKFSM_DECOMMISSION_MBPS); 0 by default.
+    decom_rate: u64,
     stop_ev: std.Thread.ResetEvent = .{},
     wake_ev: std.Thread.ResetEvent = .{},
     thread: ?std.Thread = null,
@@ -46,7 +48,8 @@ pub const Manager = struct {
 
     pub fn init(gpa: std.mem.Allocator, node: *Node) Manager {
         const mbps = if (std.posix.getenv("ZKFSM_REBALANCE_MBPS")) |v| std.fmt.parseInt(u64, v, 10) catch 64 else 64;
-        return .{ .gpa = gpa, .node = node, .rebalance_rate = mbps * 1024 * 1024 };
+        const dm = if (std.posix.getenv("ZKFSM_DECOMMISSION_MBPS")) |v| std.fmt.parseInt(u64, v, 10) catch 0 else 0;
+        return .{ .gpa = gpa, .node = node, .rebalance_rate = mbps * 1024 * 1024, .decom_rate = dm * 1024 * 1024 };
     }
 
     fn router(m: *Manager) *Router {
@@ -434,6 +437,8 @@ pub const Manager = struct {
         var prog: Progress = .{ .last_persist = std.time.nanoTimestamp() };
         var idle: usize = 0;
         const r = m.router();
+        const started = std.time.nanoTimestamp();
+        var total: u64 = 0;
         while (true) {
             var left: usize = 0;
             var moved: usize = 0;
@@ -453,6 +458,8 @@ pub const Manager = struct {
                         prog.add(res);
                         moved += 1;
                         kinds[@intFromEnum(res.outcome)] += 1;
+                        total += res.bytes;
+                        throttle(&m.stop_ev, m.decom_rate, started, total);
                     } else |e| {
                         if (e == error.OutOfMemory) return error.OutOfMemory;
                         std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
@@ -608,7 +615,7 @@ pub const Manager = struct {
                         if (e == error.OutOfMemory) return error.OutOfMemory;
                         std.log.warn("pools: rebalance cannot move key {s}: {t}", .{ &key.hex, e });
                     }
-                    m.throttle(started, moved_bytes);
+                    throttle(&m.stop_ev, m.rebalance_rate, started, moved_bytes);
                     if (std.time.nanoTimestamp() - last_persist >= persist_ns) {
                         if (try m.persistRebal(id, srcs.items, null, goal) == .stop) return;
                         for (srcs.items) |*x| {
@@ -636,11 +643,11 @@ pub const Manager = struct {
         m.applyModes(try m.loadFresh(arena.allocator()));
     }
 
-    fn throttle(m: *Manager, started: i128, bytes: u64) void {
-        if (m.rebalance_rate == 0) return;
-        const due: i128 = @divTrunc(@as(i128, bytes) * std.time.ns_per_s, m.rebalance_rate);
+    fn throttle(ev: *std.Thread.ResetEvent, rate: u64, started: i128, bytes: u64) void {
+        if (rate == 0) return;
+        const due: i128 = @divTrunc(@as(i128, bytes) * std.time.ns_per_s, rate);
         const ahead = due - (std.time.nanoTimestamp() - started);
-        if (ahead > 0) m.stop_ev.timedWait(@intCast(@min(ahead, std.time.ns_per_s))) catch {};
+        if (ahead > 0) ev.timedWait(@intCast(@min(ahead, std.time.ns_per_s))) catch {};
     }
 };
 
