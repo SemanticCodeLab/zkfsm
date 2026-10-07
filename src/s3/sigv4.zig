@@ -231,16 +231,20 @@ fn check(
     while (hit.next()) |n| has_host = has_host or std.mem.eql(u8, n, "host");
     if (!has_host) return deny(.AuthorizationHeaderMalformed);
 
-    const creq = canonicalRequest(arena, in, p.signed_headers, payload_hash, presigned) catch |e| switch (e) {
-        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-        error.InvalidUri => return deny(.InvalidURI),
-    };
-    var sts: Writer.Allocating = .init(arena);
-    sv.writeStringToSign(&sts.writer, amz_date, scope, creq) catch return error.OutOfMemory;
     const key = sv.signingKey(secret, scope.date, scope.region, scope.service);
-    const want = sv.sign(key, sts.written());
-    if (p.signature.len != want.len or !std.crypto.timing_safe.eql(sv.Hex, want, p.signature[0..64].*))
-        return deny(.SignatureDoesNotMatch);
+    // Some clients keep repeated query names in request order instead of sorting
+    // their values; accept either canonical form.
+    const want = for ([_]bool{ false, true }) |keep_order| {
+        if (keep_order and !repeatedQueryName(in.target)) return deny(.SignatureDoesNotMatch);
+        const creq = canonicalRequest(arena, in, p.signed_headers, payload_hash, presigned, keep_order) catch |e| switch (e) {
+            error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+            error.InvalidUri => return deny(.InvalidURI),
+        };
+        var sts: Writer.Allocating = .init(arena);
+        sv.writeStringToSign(&sts.writer, amz_date, scope, creq) catch return error.OutOfMemory;
+        const w = sv.sign(key, sts.written());
+        if (p.signature.len == w.len and std.crypto.timing_safe.eql(sv.Hex, w, p.signature[0..64].*)) break w;
+    } else return deny(.SignatureDoesNotMatch);
     auth.key = key;
     auth.seed = want;
     auth.amz_date = amz_date;
@@ -254,6 +258,7 @@ fn canonicalRequest(
     signed_headers: []const u8,
     payload_hash: []const u8,
     presigned: bool,
+    keep_order: bool,
 ) (Writer.Error || router.Error)![]const u8 {
     var a: Writer.Allocating = .init(arena);
     const w = &a.writer;
@@ -275,7 +280,7 @@ fn canonicalRequest(
             try params.append(arena, .{ .name = name, .value = value });
         }
     }
-    try sv.writeCanonicalQuery(arena, w, params.items);
+    if (keep_order) try writeQueryKeepOrder(arena, w, params.items) else try sv.writeCanonicalQuery(arena, w, params.items);
     try w.writeByte('\n');
 
     var names = std.mem.splitScalar(u8, signed_headers, ';');
@@ -292,6 +297,40 @@ fn canonicalRequest(
     }
     try w.print("\n{s}\n{s}", .{ signed_headers, payload_hash });
     return a.written();
+}
+
+/// Canonical query sorted by name only; repeated names keep request order.
+fn writeQueryKeepOrder(arena: std.mem.Allocator, w: *Writer, params: []const sv.Param) (Writer.Error || error{OutOfMemory})!void {
+    const enc = try arena.alloc(sv.Param, params.len);
+    for (params, enc) |p, *e| {
+        var n: Writer.Allocating = .init(arena);
+        var v: Writer.Allocating = .init(arena);
+        sv.uriEncode(&n.writer, p.name, false) catch return error.OutOfMemory;
+        sv.uriEncode(&v.writer, p.value, false) catch return error.OutOfMemory;
+        e.* = .{ .name = n.written(), .value = v.written() };
+    }
+    std.sort.insertion(sv.Param, enc, {}, struct {
+        fn lt(_: void, a: sv.Param, b: sv.Param) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lt);
+    for (enc, 0..) |p, i| {
+        if (i > 0) try w.writeByte('&');
+        try w.print("{s}={s}", .{ p.name, p.value });
+    }
+}
+
+fn repeatedQueryName(target: []const u8) bool {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return false;
+    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
+    var n: usize = 0;
+    while (it.next()) |pair| : (n += 1) {
+        if (n > 64) return false;
+        const k = pair[0 .. std.mem.indexOfScalar(u8, pair, '=') orelse pair.len];
+        var rest = it;
+        while (rest.next()) |o| if (std.mem.eql(u8, k, o[0 .. std.mem.indexOfScalar(u8, o, '=') orelse o.len])) return true;
+    }
+    return false;
 }
 
 /// Parses an HTTP head, tolerating `Content-Encoding: aws-chunked`, which
@@ -693,7 +732,7 @@ fn signedGet(a: std.mem.Allocator, ak: []const u8, sk: []const u8, token: []cons
     });
     const signed = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token";
     const in: Input = .{ .method = "GET", .target = "/b/k", .headers = hdrs.items };
-    const creq = try canonicalRequest(a, in, signed, sv.empty_sha256_hex, false);
+    const creq = try canonicalRequest(a, in, signed, sv.empty_sha256_hex, false, false);
     const scope: sv.Scope = .{ .date = "20130524", .region = "us-east-1", .service = "s3" };
     var sts: Writer.Allocating = .init(a);
     try sv.writeStringToSign(&sts.writer, "20130524T000000Z", scope, creq);

@@ -151,6 +151,7 @@ fn listen(n: *notifier.Notifier, c: *Ctx) ConnError!void {
     } });
     // Pings keep proxies and clients from timing the stream out.
     try bw.writer.writeAll(" ");
+    try bw.writer.flush();
     try bw.flush();
     while (true) {
         const recs = try l.take(ping_s * std.time.ns_per_s);
@@ -165,6 +166,7 @@ fn listen(n: *notifier.Notifier, c: *Ctx) ConnError!void {
             bw.writer.writeAll(r) catch return error.StreamAborted;
             bw.writer.writeAll("]}\n") catch return error.StreamAborted;
         }
+        bw.writer.flush() catch return error.StreamAborted;
         bw.flush() catch return error.StreamAborted;
     }
 }

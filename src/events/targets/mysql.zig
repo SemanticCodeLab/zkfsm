@@ -563,7 +563,7 @@ const My = struct {
     fn createSql(p: *My) E![]const u8 {
         p.out.clearRetainingCapacity();
         const sql = switch (p.format) {
-            .namespace => "CREATE TABLE IF NOT EXISTS {s} (key_name VARCHAR(2048), value JSON, PRIMARY KEY (key_name))",
+            .namespace => "CREATE TABLE IF NOT EXISTS {s} (key_name VARCHAR(3072) NOT NULL, key_hash CHAR(64) GENERATED ALWAYS AS (SHA2(key_name, 256)) STORED NOT NULL PRIMARY KEY, value JSON) CHARACTER SET = utf8mb4 COLLATE = utf8mb4_bin ROW_FORMAT = DYNAMIC",
             .access => "CREATE TABLE IF NOT EXISTS {s} (event_time DATETIME NOT NULL, event_data JSON)",
         };
         var it = std.mem.splitSequence(u8, sql, "{s}");
@@ -946,7 +946,7 @@ test "fake server namespace upsert and delete (native_password)" {
     try r2;
     try testing.expect(f.auth_ok);
     try testing.expectEqualStrings(
-        "CREATE TABLE IF NOT EXISTS ev (key_name VARCHAR(2048), value JSON, PRIMARY KEY (key_name))\n" ++
+        "CREATE TABLE IF NOT EXISTS ev (key_name VARCHAR(3072) NOT NULL, key_hash CHAR(64) GENERATED ALWAYS AS (SHA2(key_name, 256)) STORED NOT NULL PRIMARY KEY, value JSON) CHARACTER SET = utf8mb4 COLLATE = utf8mb4_bin ROW_FORMAT = DYNAMIC\n" ++
             "INSERT INTO ev (key_name, value) VALUES (CONVERT(X'622F6F27' USING utf8mb4), CONVERT(X'7B7D' USING utf8mb4)) ON DUPLICATE KEY UPDATE value=VALUES(value)\n" ++
             "DELETE FROM ev WHERE key_name = CONVERT(X'622F6F27' USING utf8mb4)\n",
         f.queries.items,
