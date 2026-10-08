@@ -48,6 +48,10 @@ pub const Config = struct {
     list_page_size: u16 = 1000,
     /// SigV4 service name in the credential scope.
     service: []const u8 = "s3",
+    /// Sent on every object write when set (tiers with a storage class).
+    storage_class: []const u8 = "",
+    /// Lowercase header carrying `storage_class` (GCS uses x-goog-storage-class).
+    storage_class_header: []const u8 = "x-amz-storage-class",
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -401,10 +405,25 @@ pub const S3Client = struct {
         return if (if_absent) &if_none_match_star else &.{};
     }
 
+    /// Conditional and storage-class headers of an object write.
+    fn writeHeaders(self: *const S3Client, if_absent: bool, buf: *[2]sign.Header) []const sign.Header {
+        var n: usize = 0;
+        if (if_absent) {
+            buf[n] = if_none_match_star[0];
+            n += 1;
+        }
+        if (self.cfg.storage_class.len > 0) {
+            buf[n] = .{ .name = self.cfg.storage_class_header, .value = self.cfg.storage_class };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     fn putSingle(self: *S3Client, name: []const u8, body: []const u8, if_absent: bool) PutError!void {
         var b: Built = .{};
         var x: rhttp.Exchange = undefined;
-        try self.call(&x, .{ .method = .PUT, .key = name, .body = body, .headers = self.condHeaders(if_absent) }, &b);
+        var hb: [2]sign.Header = undefined;
+        try self.call(&x, .{ .method = .PUT, .key = name, .body = body, .headers = self.writeHeaders(if_absent, &hb) }, &b);
         defer x.deinit();
         if (x.info.status == .precondition_failed) return error.PreconditionFailed;
         if (x.info.status != .ok) return self.failX("PUT", &x);
@@ -435,7 +454,8 @@ pub const S3Client = struct {
     }
 
     fn createUpload(self: *S3Client, name: []const u8) Error![]u8 {
-        const r = try self.callSmall(.{ .method = .POST, .key = name, .params = &.{.{ .name = "uploads", .value = "" }} });
+        var hb: [2]sign.Header = undefined;
+        const r = try self.callSmall(.{ .method = .POST, .key = name, .params = &.{.{ .name = "uploads", .value = "" }}, .headers = self.writeHeaders(false, &hb) });
         defer self.gpa.free(r.body);
         if (r.status != .ok) return self.failure("CreateMultipartUpload", r.status, r.body);
         const raw = xml.find(r.body, "UploadId") orelse return error.IoFailed;

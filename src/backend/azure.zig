@@ -33,6 +33,8 @@ pub const Config = struct {
     block_size: usize = 16 * MiB,
     retry: rhttp.RetryPolicy = .{},
     list_page_size: u16 = 5000,
+    /// Access tier (Hot, Cool, Cold, Archive) set on every blob written.
+    access_tier: []const u8 = "",
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -389,6 +391,7 @@ pub const AzureClient = struct {
         }
         const cond: []const u8 = if (opts.if_absent) "*" else "";
         if (n < bs) {
+            var hb: [2]Header = undefined;
             var b: Built = .{};
             var x: rhttp.Exchange = undefined;
             try self.call(&x, .{
@@ -396,7 +399,7 @@ pub const AzureClient = struct {
                 .blob = name,
                 .body = buf[0..n],
                 .if_none_match = cond,
-                .ms_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+                .ms_headers = self.writeHeaders(&.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }}, &hb),
             }, &b);
             defer x.deinit();
             if (x.info.status == .precondition_failed or x.info.status == .conflict) return error.PreconditionFailed;
@@ -438,7 +441,19 @@ pub const AzureClient = struct {
         if (x.info.status != .created) return self.failX("PutBlock", &x);
     }
 
+    /// `base` plus x-ms-access-tier when configured.
+    fn writeHeaders(self: *const AzureClient, base: []const Header, buf: *[2]Header) []const Header {
+        @memcpy(buf[0..base.len], base);
+        var n = base.len;
+        if (self.cfg.access_tier.len > 0) {
+            buf[n] = .{ .name = "x-ms-access-tier", .value = self.cfg.access_tier };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     fn putBlockList(self: *AzureClient, name: []const u8, count: u32, cond: []const u8) PutError!void {
+        var hb: [2]Header = undefined;
         var doc: Writer.Allocating = .init(self.gpa);
         defer doc.deinit();
         const w = &doc.writer;
@@ -453,6 +468,7 @@ pub const AzureClient = struct {
             .blob = name,
             .params = &.{.{ .name = "comp", .value = "blocklist" }},
             .if_none_match = cond,
+            .ms_headers = self.writeHeaders(&.{}, &hb),
             .body = doc.written(),
         });
         defer self.gpa.free(r.body);
