@@ -1,0 +1,30 @@
+# Four servers x four drives, EC:4+2, self-signed TLS, one bootstrap user and bucket.
+# Requires: kubectl create secret generic s3-root --from-literal=accessKey=admin --from-literal=secretKey=change-me-please
+#           kubectl create secret generic s3-app --from-literal=accessKey=app --from-literal=secretKey=app-secret-123
+apiVersion: zkfsm.io/v1
+kind: Cluster
+metadata:
+  name: s3
+spec:
+  image: ghcr.io/semanticcodelab/zkfsm:latest
+  credsSecret: s3-root
+  protection: EC:4+2
+  pools:
+    - name: pool-0
+      servers: 4
+      drivesPerServer: 4
+      size: 10Gi
+      # storageClassName: zkfsm-direct   # local drives from the zkfsm CSI driver
+  tls:
+    mode: selfSigned
+  iam:
+    policies:
+      - name: app-rw
+        document: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::app","arn:aws:s3:::app/*"]}]}'
+    users:
+      - secretName: s3-app
+        policies: [app-rw]
+    buckets:
+      - name: app
+  # kms: {backend: static, defaultKey: k1, secretName: s3-kms}
+  # ingress: {enabled: true, host: s3.example.test, className: nginx}
