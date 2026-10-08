@@ -85,7 +85,7 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
         .svc = svc,
         .method = req.head.method,
         .target = try arena.dupe(u8, req.head.target),
-        .route = undefined,
+        .route = .{ .bucket = "", .key = "", .query = "" },
         .range = null,
         .content_type = try arena.dupe(u8, req.head.content_type orelse ""),
         .copy_source = false,

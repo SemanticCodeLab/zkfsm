@@ -115,6 +115,15 @@ fn writeS3(s: *Stringify, c: *const s3.handler.Ctx, h: Http) WError!void {
     try s.endObject();
 }
 
+/// Internode calls show as the RPC path they were served under.
+fn writePath(s: *Stringify, sp: *const core.trace.Span, path: []const u8) WError!void {
+    const plain = for (path) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') break false;
+    } else true;
+    if (sp.typ == .internal and plain) return s.print("\"/zkfsm/rpc/v1/{s}\"", .{path});
+    try s.write(path);
+}
+
 /// Internal span: path from a `path`, `key`, or `rpc.op` attribute; others go to `custom`.
 pub fn spanEntry(a: std.mem.Allocator, node: []const u8, sp: *const core.trace.Span) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(a);
@@ -141,7 +150,7 @@ fn writeSpan(s: *Stringify, node: []const u8, sp: *const core.trace.Span) WError
     try s.objectField("time");
     try s.write(logs.rfc3339Nano(sp.start_ns, &tb));
     try s.objectField("path");
-    try s.write(if (path.len > 0) path else sp.name);
+    try writePath(s, sp, if (path.len > 0) path else sp.name);
     try s.objectField("dur");
     try s.write(@as(u64, @intCast(@max(0, sp.end_ns - sp.start_ns))));
     if (bytes > 0) {
@@ -151,6 +160,41 @@ fn writeSpan(s: *Stringify, node: []const u8, sp: *const core.trace.Span) WError
     if (sp.err) |e| {
         try s.objectField("error");
         try s.write(e);
+    }
+    // mc reads the HTTP section of internal (internode) traces unconditionally.
+    if (sp.typ == .internal) {
+        var status: i64 = if (sp.err != null) 500 else 200;
+        for (sp.attributes()) |at| if (at.value == .int and std.mem.eql(u8, at.key, "http.response.status_code")) {
+            status = at.value.int;
+        };
+        try s.objectField("http");
+        try s.beginObject();
+        try s.objectField("request");
+        try s.beginObject();
+        try s.objectField("time");
+        try s.write(logs.rfc3339Nano(sp.start_ns, &tb));
+        try s.objectField("proto");
+        try s.write("HTTP/1.1");
+        try s.objectField("method");
+        try s.write("POST");
+        try s.objectField("path");
+        try writePath(s, sp, if (path.len > 0) path else sp.name);
+        try s.objectField("client");
+        try s.write(node);
+        try s.endObject();
+        try s.objectField("response");
+        try s.beginObject();
+        try s.objectField("time");
+        try s.write(logs.rfc3339Nano(sp.end_ns, &tb));
+        try s.objectField("statuscode");
+        try s.write(status);
+        try s.endObject();
+        try s.objectField("stats");
+        try s.beginObject();
+        try s.objectField("latency");
+        try s.write(@as(u64, @intCast(@max(0, sp.end_ns - sp.start_ns))));
+        try s.endObject();
+        try s.endObject();
     }
     if (sp.n_attrs > 0) {
         try s.objectField("custom");

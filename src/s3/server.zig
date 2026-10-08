@@ -283,7 +283,10 @@ pub const Server = struct {
             in = &t.reader;
             out = &t.writer;
         }
-        var counting: Counting = .{ .inner = out };
+        var cbuf: [4096]u8 = undefined;
+        var counting: Counting = .{ .inner = out, .interface = .{ .buffer = &cbuf, .vtable = &Counting.vtable } };
+        metrics.global.tx_pending = &counting.interface;
+        defer metrics.global.tx_pending = null;
         var http = std.http.Server.init(in, &counting.interface);
         var client_cert: ?authz.ClientCert = null;
         if (secure) |t| if (t.peerIdentity()) |p| {
@@ -353,28 +356,36 @@ fn bodyDone(r: *std.http.Reader) bool {
     return false;
 }
 
-/// Unbuffered pass-through feeding written bytes to `metrics.global.tx`.
+/// Buffered pass-through feeding written bytes to `metrics.global.tx`.
 const Counting = struct {
     inner: *std.Io.Writer,
-    interface: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain, .flush = flush } },
+    interface: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn push(self: *Counting, bytes: []const u8) std.Io.Writer.Error!void {
+        try self.inner.writeAll(bytes);
+        metrics.global.tx.feed(bytes);
+    }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Counting = @fieldParentPtr("interface", w);
+        try self.push(w.buffered());
+        w.end = 0;
         var n: usize = 0;
         for (data[0 .. data.len - 1]) |d| {
-            try self.inner.writeAll(d);
+            try self.push(d);
             n += d.len;
         }
         const last = data[data.len - 1];
-        for (0..splat) |_| try self.inner.writeAll(last);
-        n += last.len * splat;
-        for (data[0 .. data.len - 1]) |d| metrics.global.tx.feed(d);
-        for (0..splat) |_| metrics.global.tx.feed(last);
-        return n;
+        for (0..splat) |_| try self.push(last);
+        return n + last.len * splat;
     }
 
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *Counting = @fieldParentPtr("interface", w);
+        try self.push(w.buffered());
+        w.end = 0;
         try self.inner.flush();
     }
 };

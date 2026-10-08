@@ -171,7 +171,7 @@ pub const Observe = struct {
         const o: *Observe = @ptrCast(@alignCast(ptr));
         const end_ns = std.time.nanoTimestamp();
         const dur: u64 = @intCast(@max(0, end_ns - c.start_ns));
-        const tx = metrics.global.tx.body;
+        const tx = metrics.global.txBody();
         const rx: u64 = c.auth.decoded_length orelse c.req.head.content_length orelse 0;
         const admin_op = admin.api.match(o.opts.admin_prefix, c.target);
         const idx: usize = if (admin_op != null)
@@ -225,7 +225,10 @@ pub const Observe = struct {
                 o.hub.publishTrace(hub.tt.s3, status >= 400, dur, line)
             else |_| {}
         }
-        if (admin_op == null) if (o.delivery) |d| d.record(c, status, tx, dur);
+        if (admin_op == null) if (o.delivery) |d| {
+            d.record(c, status, tx, dur);
+            if (idx == @intFromEnum(iam.actions.Op.put_bucket_logging) or idx == @intFromEnum(iam.actions.Op.delete_bucket)) d.invalidate(c.route.bucket);
+        };
     }
 
     // ------------------------------------------------------------ admin streams
@@ -300,6 +303,12 @@ pub const Observe = struct {
         } } }) catch return error.WriteFailed;
     }
 
+    /// Sends what is buffered to the client now.
+    fn push(bw: *std.http.BodyWriter) ConnError!void {
+        bw.writer.flush() catch return error.WriteFailed;
+        bw.flush() catch return error.WriteFailed;
+    }
+
     fn streamTrace(o: *Observe, c: *Ctx, f: hub.Filter) ConnError!void {
         const sub = try o.hub.subscribe(.trace, f);
         defer o.hub.unsubscribe(sub);
@@ -308,7 +317,7 @@ pub const Observe = struct {
         const peer_id = std.fmt.bytesToHex(id, .lower);
         var buf: [16 * 1024]u8 = undefined;
         var bw = try openStream(c, &buf);
-        try bw.writer.flush();
+        try push(&bw);
         try o.pump(&bw, sub, .trace, &peer_id, f, "");
     }
 
@@ -323,7 +332,7 @@ pub const Observe = struct {
                 bw.writer.writeByte('\n') catch return error.WriteFailed;
             }
         }
-        bw.writer.flush() catch return error.WriteFailed;
+        try push(&bw);
         var id: [16]u8 = undefined;
         std.crypto.random.bytes(&id);
         const peer_id = std.fmt.bytesToHex(id, .lower);
@@ -355,7 +364,7 @@ pub const Observe = struct {
                 wrote = true;
                 idle_ms = 0;
             }
-            if (wrote) bw.writer.flush() catch return error.WriteFailed;
+            if (wrote) try push(bw);
         }
     }
 
@@ -385,7 +394,7 @@ pub const Observe = struct {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             return "";
         };
-        if (req.id.len == 0 or req.id.len > 31) return "";
+        if (req.id.len == 0 or req.id.len > 32) return "";
         const stream = std.meta.stringToEnum(hub.Stream, req.stream) orelse return "";
         if (stream == .log and req.node.len > 0 and !std.mem.eql(u8, req.node, o.opts.node)) return "";
         o.hub.expire(10 * std.time.ns_per_s);

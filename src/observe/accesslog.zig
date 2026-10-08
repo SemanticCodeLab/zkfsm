@@ -107,6 +107,13 @@ pub const Delivery = struct {
         return t;
     }
 
+    /// Drops the cached configuration (after PutBucketLogging on this node).
+    pub fn invalidate(d: *Delivery, bucket: []const u8) void {
+        d.cache_mutex.lock();
+        defer d.cache_mutex.unlock();
+        _ = d.cache.remove(bucket);
+    }
+
     /// Journals one record for a finished request (called from the S3 observer).
     pub fn record(d: *Delivery, c: *Ctx, status: u16, tx: u64, dur_ns: u64) void {
         const bucket = c.route.bucket;
@@ -563,7 +570,7 @@ pub fn formatRecord(w: *std.Io.Writer, c: *Ctx, status: u16, tx: u64, dur_ns: u6
     try w.print(" {d} ", .{status});
     try dash(w, c.err_code);
     if (tx > 0) try w.print(" {d} ", .{tx}) else try w.writeAll(" - ");
-    const size: ?u64 = if (c.method == .PUT and c.route.key.len > 0) c.req.head.content_length else if (c.method == .GET and c.route.key.len > 0 and status / 100 == 2) tx else null;
+    const size: ?u64 = if (c.method == .PUT and c.route.key.len > 0) (c.auth.decoded_length orelse c.req.head.content_length) else if (c.method == .GET and c.route.key.len > 0 and status / 100 == 2) tx else null;
     if (size) |s| try w.print("{d} ", .{s}) else try w.writeAll("- ");
     const ms = dur_ns / std.time.ns_per_ms;
     try w.print("{d} {d} ", .{ ms, ms });

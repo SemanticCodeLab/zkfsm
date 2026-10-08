@@ -77,6 +77,15 @@ pub const global = struct {
     pub threadlocal var last_status: u10 = 200;
     /// Body bytes of the response being written on this thread.
     pub threadlocal var tx: Tx = .{};
+    /// The connection's output buffer whose bytes `tx` has not seen yet.
+    pub threadlocal var tx_pending: ?*std.Io.Writer = null;
+
+    /// Response body bytes so far, including bytes still buffered.
+    pub fn txBody() u64 {
+        var t = tx;
+        if (tx_pending) |w| t.feed(w.buffered());
+        return t.body;
+    }
     /// Set once at startup, before serving.
     pub var extra: [4]?Renderer = .{ null, null, null, null };
 };
