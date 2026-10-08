@@ -41,7 +41,7 @@ pub const Run = struct {
     hc: std.http.Client,
 
     pub fn init(env: Env, j: *Job, s: spec.Job, attempt: u32) Run {
-        return .{ .env = env, .job = j, .spec = s, .attempt = attempt, .now_ns = std.time.nanoTimestamp(), .hc = .{ .allocator = j.gpa } };
+        return .{ .env = env, .job = j, .spec = s, .attempt = attempt, .now_ns = std.time.nanoTimestamp(), .failures = j.pass_failed, .hc = .{ .allocator = j.gpa } };
     }
 
     pub fn deinit(r: *Run) void {
@@ -58,6 +58,7 @@ pub const Run = struct {
 
     fn failed(r: *Run, d: job_mod.Counters, what: []const u8, key: []const u8, why: []const u8) void {
         r.failures = true;
+        r.job.markPassFailed();
         r.job.add(d);
         std.log.warn("batch {s}: {s} {s} failed: {s}", .{ &r.job.id, what, key, why });
     }
@@ -78,6 +79,7 @@ pub const Run = struct {
 
     fn fatal(r: *Run, why: []const u8) void {
         r.failures = true;
+        r.job.markPassFailed();
         r.job.setState(r.job.getState(), why);
         std.log.warn("batch {s}: pass stopped: {s}", .{ &r.job.id, why });
     }
@@ -141,7 +143,7 @@ pub const Run = struct {
         const svc = r.env.svc;
         if (!info.version_id.eql(ov.null_version_id)) {
             if (ov.headVersion(svc, a, rep.target.bucket, tkey, info.version_id)) |t| {
-                if (!t.delete_marker and std.meta.eql(t.etag, info.etag)) return .present;
+                if (!t.delete_marker) return .present;
             } else |_| {}
         }
         const seal = crypt.sealing(a, info) catch |e| return .{ .failed = @errorName(e) };
@@ -202,14 +204,19 @@ pub const Run = struct {
         return res.ok();
     }
 
+    /// Copies through its own buffer: the client's writer may be unbuffered.
     const Pipe = struct {
         plain: *crypt.Plain,
+        buf: []u8,
         fn write(ctx: *anyopaque, w: *std.Io.Writer) error{ WriteFailed, SourceFailed }!void {
             const p: *Pipe = @ptrCast(@alignCast(ctx));
-            p.plain.reader().streamExact64(w, p.plain.size) catch |e| return switch (e) {
-                error.WriteFailed => error.WriteFailed,
-                else => error.SourceFailed,
-            };
+            var left = p.plain.size;
+            while (left > 0) {
+                const n = p.plain.reader().readSliceShort(p.buf[0..@intCast(@min(left, p.buf.len))]) catch return error.SourceFailed;
+                if (n == 0) return error.SourceFailed;
+                try w.writeAll(p.buf[0..n]);
+                left -= n;
+            }
         }
     };
 
@@ -219,16 +226,17 @@ pub const Run = struct {
         var eb: [core.ETag.quoted_max]u8 = undefined;
         const etag = std.mem.trim(u8, info.etag.quoted(&eb), "\"");
         const q = versionParam(a, info.version_id, &.{}) catch return .{ .failed = "out of memory" };
+        // Version ids are kept, so an existing id is this version (ETags may differ by part layout).
         if (!info.version_id.eql(ov.null_version_id)) {
             if (client.send(&r.hc, a, remoteOf(t), .{ .method = .HEAD, .path = path, .query = q })) |h| {
-                if (h.status == 200 and std.mem.eql(u8, h.etag, etag)) return .present;
+                if (h.status == 200) return .present;
             } else |_| {}
         }
         const seal = crypt.sealing(a, info) catch |e| return .{ .failed = @errorName(e) };
         var plain = crypt.open(a, r.env.sse, r.env.svc, info, rep.source.bucket, key) catch |e| return .{ .failed = @errorName(e) };
         defer plain.deinit();
         const hs = remoteHeaders(a, info, seal, etag) catch return .{ .failed = "out of memory" };
-        var pipe: Pipe = .{ .plain = &plain };
+        var pipe: Pipe = .{ .plain = &plain, .buf = a.alloc(u8, 64 * 1024) catch return .{ .failed = "out of memory" } };
         const res = client.send(&r.hc, a, remoteOf(t), .{
             .method = .PUT,
             .path = path,
@@ -361,8 +369,7 @@ pub const Run = struct {
         }
         if (!v.eql(ov.null_version_id)) {
             if (ov.headVersion(r.env.svc, a, rep.target.bucket, tkey, v)) |t| {
-                var eb: [core.ETag.quoted_max]u8 = undefined;
-                if (!t.delete_marker and std.mem.eql(u8, std.mem.trim(u8, t.etag.quoted(&eb), "\""), e.etag)) {
+                if (!t.delete_marker) {
                     if (r.attempt == 0) r.job.add(.{ .objects = 1 });
                     return;
                 }

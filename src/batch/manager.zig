@@ -154,6 +154,7 @@ pub const Manager = struct {
             attempt += 1;
             j.mutex.lock();
             j.retry_attempts = attempt;
+            j.pass_failed = false;
             j.counters.objects_failed = 0;
             j.counters.bytes_failed = 0;
             j.counters.delete_markers_failed = 0;

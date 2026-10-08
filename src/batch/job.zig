@@ -41,6 +41,7 @@ pub const Record = struct {
     spec: []const u8,
     checkpoint: []const u8 = "",
     retry_attempts: u32 = 0,
+    pass_failed: bool = false,
     counters: Counters = .{},
     last_bucket: []const u8 = "",
     last_object: []const u8 = "",
@@ -63,6 +64,8 @@ pub const Job = struct {
     counters: Counters = .{},
     updated_ns: i128 = 0,
     retry_attempts: u32 = 0,
+    /// The current pass already failed some object (survives restarts).
+    pass_failed: bool = false,
     /// Last fully processed key; a resumed run lists after it.
     checkpoint: std.ArrayList(u8) = .empty,
     last_bucket: std.ArrayList(u8) = .empty,
@@ -110,6 +113,12 @@ pub const Job = struct {
         j.updated_ns = std.time.nanoTimestamp();
     }
 
+    pub fn markPassFailed(j: *Job) void {
+        j.mutex.lock();
+        defer j.mutex.unlock();
+        j.pass_failed = true;
+    }
+
     pub fn setCheckpoint(j: *Job, key: []const u8) void {
         j.mutex.lock();
         defer j.mutex.unlock();
@@ -149,6 +158,7 @@ pub const Job = struct {
             .spec = j.yaml,
             .checkpoint = try a.dupe(u8, j.checkpoint.items),
             .retry_attempts = j.retry_attempts,
+            .pass_failed = j.pass_failed,
             .counters = j.counters,
             .last_bucket = try a.dupe(u8, j.last_bucket.items),
             .last_object = try a.dupe(u8, j.last_object.items),
@@ -166,6 +176,7 @@ pub const Job = struct {
         j.counters = r.counters;
         j.updated_ns = r.updated_ns;
         j.retry_attempts = r.retry_attempts;
+        j.pass_failed = r.pass_failed;
         try j.checkpoint.appendSlice(gpa, r.checkpoint);
         j.setText(&j.last_bucket, r.last_bucket);
         j.setText(&j.last_object, r.last_object);

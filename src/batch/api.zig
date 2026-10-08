@@ -172,6 +172,8 @@ pub const Api = struct {
             const final = !st.active() or now - t0 > max_stream_ns;
             report.realtime(&w, r, host, now, final) catch return error.WriteFailed;
             bw.writer.writeByte('\n') catch return error.WriteFailed;
+            // Drain the body buffer into a chunk, then push it to the socket.
+            bw.writer.flush() catch return error.WriteFailed;
             bw.flush() catch return error.WriteFailed;
             if (final) break;
             std.Thread.sleep(interval);
