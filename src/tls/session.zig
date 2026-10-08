@@ -81,6 +81,8 @@ pub const Session = struct {
     failed: ?Error = null,
     ccs_seen: u8 = 0,
     v12: bool = false,
+    /// TLS 1.2 ServerHello carries the RFC 8446 downgrade marker when 1.3 is enabled.
+    downgrade_sentinel: bool = true,
     /// TLS 1.2: a ChangeCipherSpec is due before the client Finished.
     ccs12_armed: bool = false,
     early_skip: usize = 0,
@@ -117,7 +119,7 @@ pub const Session = struct {
         s.writer.buffer = &s.wbuf;
         const creds = ctx.acquire();
         defer creds.release();
-        s.handshake(creds, ctx.client_cas, ctx.min_version) catch |e| {
+        s.handshake(creds, ctx.client_cas, ctx.min_version, ctx.max_version) catch |e| {
             s.sendAlertFor(e);
             s.destroy();
             return e;
@@ -173,7 +175,7 @@ pub const Session = struct {
 
     // ---- handshake ----
 
-    fn handshake(s: *Session, creds: *config.Credentials, cas: []const []const u8, min: config.Version) Error!void {
+    fn handshake(s: *Session, creds: *config.Credentials, cas: []const []const u8, min: config.Version, max: config.Version) Error!void {
         s.hs_buf = try s.gpa.alloc(u8, max_handshake_msg + 4);
         defer s.freeHandshake();
         const flight = try s.gpa.alloc(u8, max_flight);
@@ -184,7 +186,8 @@ pub const Session = struct {
         const msg = try s.readHandshake();
         if (msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch = try parseHello(msg);
-        if (ch.tls13) {
+        s.downgrade_sentinel = max == .tls13;
+        if (ch.tls13 and max == .tls13) {
             inline for (suite_fields) |sf| {
                 if (ch.offersSuite(sf[0].suite_id)) return s.run(sf[0], sf[1], creds, cas, msg, ch, flight);
             }
@@ -230,7 +233,7 @@ pub const Session = struct {
 
         var server_random: [32]u8 = undefined;
         std.crypto.random.bytes(server_random[0..24]);
-        server_random[24..].* = t12.downgrade_sentinel;
+        if (s.downgrade_sentinel) server_random[24..].* = t12.downgrade_sentinel;
 
         var x_kp: X25519.KeyPair = undefined;
         var p_kp: P256.KeyPair = undefined;

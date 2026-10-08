@@ -1,5 +1,5 @@
 //! Loopback tests: the outbound client against our own server with client CAs
-//! (TLS 1.3), and against `openssl s_server -tls1_2` when openssl is installed.
+//! (TLS 1.3 and 1.2), and against `openssl s_server -tls1_2` when openssl is installed.
 const std = @import("std");
 const config = @import("config.zig");
 const session = @import("session.zig");
@@ -120,6 +120,33 @@ test "mutual TLS 1.3 against our server with every client key type" {
     var kb: [512]u8 = undefined;
     const n = try roundTrip(&f, &ctx, .{ .skip_verify = true, .client_cert_file = f.path(&cb, "mtls_client_p256.pem"), .client_key_file = f.path(&kb, "mtls_client_p256.key") }, &cn);
     try testing.expectEqualStrings("client-p256", cn[0..n]);
+}
+
+test "mutual TLS 1.2 against our own 1.2 server" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var b: [4][512]u8 = undefined;
+    var ctx = try config.Context.init(testing.allocator, f.path(&b[0], "mtls_server.pem"), f.path(&b[1], "mtls_server.key"));
+    defer ctx.deinit();
+    try ctx.setClientCa(f.path(&b[2], "mtls_ca.pem"));
+    ctx.max_version = .tls12;
+    var ca_buf: [512]u8 = undefined;
+    const ca = f.path(&ca_buf, "mtls_ca.pem");
+    inline for (.{ "p256", "rsa" }) |kind| {
+        var cb: [512]u8 = undefined;
+        var kb: [512]u8 = undefined;
+        var cn: [64]u8 = undefined;
+        const n = try roundTrip(&f, &ctx, .{
+            .ca_file = ca,
+            .server_name = "localhost",
+            .client_cert_file = f.path(&cb, "mtls_client_" ++ kind ++ ".pem"),
+            .client_key_file = f.path(&kb, "mtls_client_" ++ kind ++ ".key"),
+        }, &cn);
+        try testing.expectEqualStrings("client-" ++ kind, cn[0..n]);
+    }
+    // A client that insists on 1.3 refuses the 1.2-only server.
+    var cn: [64]u8 = undefined;
+    try testing.expectError(error.TlsFailed, roundTrip(&f, &ctx, .{ .ca_file = ca, .server_name = "localhost", .min_version = .tls_1_3 }, &cn));
 }
 
 fn haveOpenssl() bool {

@@ -134,6 +134,8 @@ pub const Context = struct {
     client_cas: [][]u8 = &.{},
     /// Lowest protocol version accepted; 1.3 is always preferred when offered.
     min_version: Version = .tls12,
+    /// Newest version offered; 1.2 here is for tests against 1.2-only peers.
+    max_version: Version = .tls13,
 
     pub fn init(gpa: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) LoadError!Context {
         return .{ .gpa = gpa, .cert_path = cert_path, .key_path = key_path, .current = try Credentials.fromFiles(gpa, cert_path, key_path) };
