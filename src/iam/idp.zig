@@ -32,7 +32,8 @@ pub const ldap_keys = [_][]const u8{
     "enable",                 "server_addr",           "lookup_bind_dn",       "lookup_bind_password",
     "user_dn_search_base_dn", "user_dn_search_filter", "group_search_base_dn", "group_search_filter",
     "tls_skip_verify",        "server_insecure",       "server_starttls",      "tls_ca_file",
-    "comment",                "tenant",                "srv_record_name",
+    "comment",                "tenant",                "srv_record_name",      "tls_client_cert",
+    "tls_client_key",
 };
 
 const secret_keys = [_][]const u8{ "client_secret", "lookup_bind_password" };
@@ -198,6 +199,8 @@ pub const Ldap = struct {
     server_insecure: bool,
     server_starttls: bool,
     tls_ca_file: []const u8,
+    tls_client_cert: []const u8,
+    tls_client_key: []const u8,
     tenant: []const u8,
 
     pub fn from(s: []const Setting) Ldap {
@@ -214,6 +217,8 @@ pub const Ldap = struct {
             .server_insecure = flag(s, "server_insecure", false),
             .server_starttls = flag(s, "server_starttls", false),
             .tls_ca_file = get(s, "tls_ca_file") orelse "",
+            .tls_client_cert = get(s, "tls_client_cert") orelse "",
+            .tls_client_key = get(s, "tls_client_key") orelse "",
             .tenant = get(s, "tenant") orelse "",
         };
     }
