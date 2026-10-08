@@ -62,6 +62,7 @@ pub const Bridge = struct {
                 .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
+            .kdf = if (pbkdf2Requested(c)) .pbkdf2_aes_gcm else .argon2id_aes_gcm,
         };
         if (self.events) |n| if (try events.admin.handle(n, c.arena, store, req)) |res| {
             try respond(c, res);
@@ -120,6 +121,14 @@ fn readBody(c: *Ctx) ConnError!?[]const u8 {
         }
     }
     return body;
+}
+
+/// Header the web console sends: sealed responses use the cheap PBKDF2 derivation.
+pub const kdf_header = "x-zkfsm-admin-kdf";
+
+fn pbkdf2Requested(c: *Ctx) bool {
+    for (c.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, kdf_header)) return std.ascii.eqlIgnoreCase(h.value, "pbkdf2");
+    return false;
 }
 
 fn denied(c: *Ctx) ConnError!bool {

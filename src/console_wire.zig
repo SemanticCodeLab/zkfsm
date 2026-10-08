@@ -52,7 +52,7 @@ pub const Flags = struct {
 };
 
 fn seal(a: Allocator, secret: []const u8, plain: []const u8) console.SealError![]u8 {
-    return admin.sio.encrypt(a, secret, plain) catch |e| switch (e) {
+    return admin.sio.encryptAlg(a, .pbkdf2_aes_gcm, secret, plain) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.Failed,
     };

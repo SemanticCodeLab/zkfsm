@@ -7,6 +7,9 @@ Keys are generated with the openssl CLI (RS256 and ES256). Endpoints:
   GET  /token?sub=..&...      a signed JWT; query params become claims
                               (alg=RS256|ES256, kid=..., ttl=seconds, policy/groups lists
                               comma-separated -> arrays when name ends with [])
+  GET  /auth?redirect_uri=..&state=..&client_id=..   authorization-code login: redirects
+                              back with a code for sub=sso-user, policy=readwrite
+  POST /token                 exchanges that code (form body) for {"id_token": ...}
   POST /rotate                replace the RSA key (new kid); old tokens stop validating
   GET  /stats                 fetch counters as JSON
 Prints the listening port on stdout, then serves until killed.
@@ -24,7 +27,8 @@ import urllib.parse
 
 WORK = tempfile.mkdtemp(prefix="mock-idp-")
 LOCK = threading.Lock()
-STATS = {"discovery": 0, "jwks": 0}
+STATS = {"discovery": 0, "jwks": 0, "auth": 0, "exchange": 0}
+CODES = {}
 
 
 def b64u(b):
@@ -111,6 +115,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, json.dumps({"keys": keys}))
         if u.path == "/stats":
             return self.reply(200, json.dumps(STATS))
+        if u.path == "/auth":
+            q = dict(urllib.parse.parse_qsl(u.query))
+            STATS["auth"] += 1
+            code = b64u(os.urandom(12))
+            with LOCK:
+                CODES[code] = {"aud": q.get("client_id", "zkfsm"), "redirect_uri": q.get("redirect_uri", "")}
+            sep = "&" if "?" in q.get("redirect_uri", "") else "?"
+            loc = "%s%scode=%s&state=%s" % (q.get("redirect_uri", ""), sep, code, urllib.parse.quote(q.get("state", "")))
+            self.send_response(302)
+            self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if u.path == "/token":
             q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
             alg = q.pop("alg", "RS256")
@@ -131,6 +148,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404, "{}")
 
     def do_POST(self):
+        if self.path == "/token":
+            n = int(self.headers.get("Content-Length") or 0)
+            form = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode()))
+            with LOCK:
+                grant = CODES.pop(form.get("code", ""), None)
+            if not grant or form.get("grant_type") != "authorization_code" or form.get("redirect_uri") != grant["redirect_uri"]:
+                return self.reply(400, json.dumps({"error": "invalid_grant"}))
+            STATS["exchange"] += 1
+            now = int(time.time())
+            claims = {"iss": self.base(), "aud": grant["aud"], "iat": now, "exp": now + 3600, "sub": "sso-user", "policy": "readwrite"}
+            with LOCK:
+                tok = sign("RS256", None, claims)
+            return self.reply(200, json.dumps({"id_token": tok, "access_token": "opaque", "token_type": "Bearer"}))
         if self.path == "/rotate":
             with LOCK:
                 GEN[0] += 1

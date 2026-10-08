@@ -21,7 +21,7 @@ import { SiteReplication } from "./pages/SiteReplication";
 import { Tiers } from "./pages/Tiers";
 import { Events } from "./pages/Events";
 import { Settings } from "./pages/Settings";
-import { applyTheme, getTheme, setTheme, Theme } from "./lib/theme";
+import { applyTheme, getTheme, onThemeChange, setTheme, Theme } from "./lib/theme";
 
 const nav: { section?: string; path: string; label: string }[] = [
   { path: "/", label: "Dashboard" },
@@ -91,6 +91,7 @@ function App() {
     session.current().then(setSess, () => setSess(null));
   }, []);
   useEffect(() => applyTheme(theme), [theme]);
+  useEffect(() => onThemeChange(setT), []);
   if (sess === undefined) return <div class="loading">Loading…</div>;
   if (sess === null) return <Login onLogin={setSess} />;
   const active = (p: string) => (p === "/" ? route.path === "/" : route.path === p || route.path.startsWith(`${p}/`));
@@ -122,9 +123,7 @@ function App() {
             class="btn btn-ghost btn-sm"
             aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
             onClick={() => {
-              const t = theme === "dark" ? "light" : "dark";
-              setTheme(t);
-              setT(t);
+              setTheme(theme === "dark" ? "light" : "dark");
             }}
           >
             {theme === "dark" ? "Light" : "Dark"} theme

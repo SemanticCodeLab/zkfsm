@@ -82,6 +82,8 @@ pub const Console = struct {
         const c: *Console = @ptrCast(@alignCast(ptr));
         // No length and not chunked means no body; std's discard logic needs it explicit.
         if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
+        // Head bytes live in the read buffer and are overwritten once the body is read.
+        req.head.target = try arena.dupe(u8, req.head.target);
         const target = req.head.target;
         const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
         if (std.mem.startsWith(u8, path, "/api/")) return c.api(req, arena, path);
@@ -265,10 +267,11 @@ pub const Console = struct {
         var it = req.iterateHeaders();
         while (it.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "x-console-encrypt")) encrypt = true;
-            if (forwardRequestHeader(h.name)) try fwd.append(a, .{ .name = try std.ascii.allocLowerString(a, h.name), .value = h.value });
+            if (forwardRequestHeader(h.name)) try fwd.append(a, .{ .name = try std.ascii.allocLowerString(a, h.name), .value = try a.dupe(u8, h.value) });
         }
         var body = try readBody(req, a, limits.max_body) orelse return jsonError(req, .payload_too_large, "EntityTooLarge", "Request body is too large; upload in parts.");
         const admin = c.isAdminPath(path);
+        if (admin) try fwd.append(a, .{ .name = "x-zkfsm-admin-kdf", .value = "pbkdf2" });
         if (encrypt and admin and body.len > 0) body = c.hooks.seal(a, s.secret_key, body) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Failed => return jsonError(req, .internal_server_error, "SealFailed", "Cannot encrypt the request."),
@@ -301,7 +304,10 @@ pub const Console = struct {
         var hs: std.ArrayList(Header) = .empty;
         try hs.appendSlice(a, &proxy_security_headers);
         var hit = res.head.iterateHeaders();
-        while (hit.next()) |h| if (forwardResponseHeader(h.name)) try hs.append(a, h);
+        while (hit.next()) |h| {
+            if (attachment != null and std.ascii.eqlIgnoreCase(h.name, "content-disposition")) continue;
+            if (forwardResponseHeader(h.name)) try hs.append(a, h);
+        }
         if (attachment) |name| {
             var v: Writer.Allocating = .init(a);
             v.writer.writeAll("attachment; filename*=UTF-8''") catch return error.OutOfMemory;
@@ -320,16 +326,20 @@ pub const Console = struct {
             };
             return req.respond(body, .{ .status = status, .extra_headers = hs.items, .keep_alive = req.head.keep_alive });
         }
-        const len: ?u64 = if (res.head.transfer_encoding == .chunked) null else res.head.content_length orelse if (res.hasBody()) null else 0;
+        if (req.head.method == .HEAD) {
+            // HEAD keeps the upstream length; std writes it only for bodies it sends.
+            if (res.head.content_length) |n| try hs.append(a, .{ .name = "content-length", .value = try std.fmt.allocPrint(a, "{d}", .{n}) });
+            return req.respond("", .{ .status = status, .extra_headers = hs.items, .transfer_encoding = .none, .keep_alive = false });
+        }
+        if (!res.hasBody()) return req.respond("", .{ .status = status, .extra_headers = hs.items, .keep_alive = req.head.keep_alive });
+        const len: ?u64 = if (res.head.transfer_encoding == .chunked) null else res.head.content_length;
         var buf: [16 * 1024]u8 = undefined;
         var bw = try req.respondStreaming(&buf, .{ .content_length = len, .respond_options = .{ .status = status, .extra_headers = hs.items, .keep_alive = req.head.keep_alive and len != null } });
-        if (res.hasBody() and req.head.method != .HEAD) {
-            const rd = res.bodyReader();
-            _ = rd.streamRemaining(&bw.writer) catch |e| switch (e) {
-                error.WriteFailed => return error.WriteFailed,
-                error.ReadFailed => return error.WriteFailed, // upstream cut: the client sees a short body
-            };
-        }
+        const rd = res.bodyReader();
+        _ = rd.streamRemaining(&bw.writer) catch |e| switch (e) {
+            error.WriteFailed => return error.WriteFailed,
+            error.ReadFailed => return error.WriteFailed, // upstream cut: the client sees a short body
+        };
         try bw.end();
     }
 

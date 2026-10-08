@@ -71,6 +71,9 @@ pub const Request = struct {
     body: []const u8,
     caller: Caller,
     now_s: i64,
+    /// Key derivation for sealed responses: PBKDF2 when the client asks for it
+    /// (the web console), else the madmin default Argon2id.
+    kdf: sio.Algorithm = .argon2id_aes_gcm,
 };
 
 pub const Response = struct {
@@ -129,7 +132,7 @@ pub const Ctx = struct {
 
     pub fn encrypted(c: *const Ctx, v: anytype) Error!Response {
         const plain = try std.json.Stringify.valueAlloc(c.a, v, .{ .emit_null_optional_fields = false });
-        const ct = sio.encrypt(c.a, c.req.caller.secret, plain) catch |e| return switch (e) {
+        const ct = sio.encryptAlg(c.a, c.req.kdf, c.req.caller.secret, plain) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => fail(c.a, .internal_server_error, "XMinioInternalError", "payload encryption failed"),
         };

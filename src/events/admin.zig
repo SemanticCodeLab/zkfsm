@@ -133,7 +133,7 @@ fn get(n: *notifier.Notifier, a: Allocator, req: Request, key: []const u8) Error
     }
     if (picked.items.len == 0 and id == null) try picked.append(a, try withAllKeys(a, .{ .subsys = sub, .kvs = &.{.{ .key = "enable", .value = "off" }} }));
     const text = try settings.render(a, picked.items, false);
-    const ct = admin.sio.encrypt(a, req.caller.secret, text) catch |e| return switch (e) {
+    const ct = admin.sio.encryptAlg(a, req.kdf, req.caller.secret, text) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => api.fail(a, .internal_server_error, "XMinioInternalError", "payload encryption failed"),
     };

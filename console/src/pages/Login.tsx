@@ -1,12 +1,13 @@
 import { useEffect, useState } from "preact/hooks";
 import { LoginMethods, Session, session } from "../lib/api";
-import { Button, TextInput } from "../components/ui";
+import { Button, TextInput, Toggle } from "../components/ui";
 
 export function Login({ onLogin }: { onLogin: (s: Session) => void }) {
   const [ak, setAk] = useState("");
   const [sk, setSk] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ldap, setLdap] = useState(false);
   const [methods, setMethods] = useState<LoginMethods>({ password: true, openid: [] });
   useEffect(() => {
     session.methods().then(setMethods, () => {});
@@ -23,7 +24,7 @@ export function Login({ onLogin }: { onLogin: (s: Session) => void }) {
           setBusy(true);
           setErr(null);
           try {
-            onLogin(await session.login(ak, sk));
+            onLogin(await session.login(ak, sk, ldap));
           } catch (x) {
             setErr((x as Error).message || "Login failed");
           } finally {
@@ -34,8 +35,9 @@ export function Login({ onLogin }: { onLogin: (s: Session) => void }) {
         <h1>zkfsm console</h1>
         {methods.password && (
           <>
-            <TextInput label="Access key" value={ak} onInput={setAk} autoComplete="username" autoFocus required name="accessKey" />
-            <TextInput label="Secret key" value={sk} onInput={setSk} type="password" autoComplete="current-password" required name="secretKey" />
+            {methods.ldap && <Toggle label="Log in with directory (LDAP) account" checked={ldap} onChange={setLdap} />}
+            <TextInput label={ldap ? "Username" : "Access key"} value={ak} onInput={setAk} autoComplete="username" autoFocus required name="accessKey" />
+            <TextInput label={ldap ? "Password" : "Secret key"} value={sk} onInput={setSk} type="password" autoComplete="current-password" required name="secretKey" />
             {err && (
               <div class="notice notice-error" role="alert">
                 {err}

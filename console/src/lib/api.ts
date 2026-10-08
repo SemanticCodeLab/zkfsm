@@ -24,6 +24,7 @@ export interface Session {
 
 export interface LoginMethods {
   password: boolean;
+  ldap?: boolean;
   openid: { name: string; label: string }[];
 }
 
@@ -124,11 +125,11 @@ export async function json<T = unknown>(path: string, opts: CallOpts = {}): Prom
 export const session = {
   methods: () => json<LoginMethods>("/api/v1/login/methods"),
   current: () => json<Session>("/api/v1/session"),
-  login: (accessKey: string, secretKey: string) =>
+  login: (accessKey: string, secretKey: string, ldap = false) =>
     json<Session>("/api/v1/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ accessKey, secretKey }),
+      body: JSON.stringify({ accessKey, secretKey, ldap }),
     }),
   logout: () => raw("/api/v1/logout", { method: "POST" }),
   openidStart: (name: string) => `/api/v1/oidc/start?provider=${encodeURIComponent(name)}`,
@@ -137,6 +138,7 @@ export const session = {
 export interface Drive {
   path: string;
   pool: number;
+  set: number;
   state: "ok" | "offline" | "missing" | "corrupt" | string;
   totalBytes: number;
   freeBytes: number;
@@ -152,8 +154,8 @@ export interface ClusterInfo {
   drives: Drive[];
   capacity: { totalBytes: number; freeBytes: number; usedBytes: number };
   usage: { buckets: number; objects: number; bytes: number };
-  heal: { running: boolean; lastScan: string | null; scanned: number; healed: number; failed: number } | null;
-  features: Record<string, boolean>; // e.g. kms, siteReplication, openid, ldap, tiering, events
+  heal: { running: boolean; lastScan: string | null; passes: number; scanned: number; healed: number; failed: number; lost: number } | null;
+  features: { cluster: boolean; heal: boolean };
 }
 
 export const cluster = {
