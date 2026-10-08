@@ -110,7 +110,7 @@ check "openid info redirect_uri" "http://127.0.0.1:9001/oauth_callback" "$(echo 
 JAR="$WORK/oidc.jar"
 qget() { python3 -c "import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).query).get(sys.argv[2],[''])[0])" "$1" "$2"; }
 oidc_start() { # -> IdP authorize URL (cookie stored in $JAR)
-  curl -s -c "$JAR" -o /dev/null -w '%{redirect_url}' "$EP/minio/admin/v3/oidc/authorize/corp$1"
+  curl -s -c "$JAR" -o /dev/null -w '%{redirect_url}' "$EP/minio/admin/v3/oidc/authorize/corp${1:-}"
 }
 idp_code() { # authorize URL -> callback URL from the IdP redirect
   curl -s -o /dev/null -w '%{redirect_url}' "$1"
@@ -143,7 +143,7 @@ AU="$(oidc_start '?redirect_after=/browser/teamb')"
 curl -s "$IDP/login?sub=coder&policy=teamb-rw" >/dev/null
 CB="$(idp_code "$AU")"
 LOC="$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' "$EP/minio/admin/v3/oidc/callback/corp?code=$(qget "$CB" code)&state=$(qget "$CB" state)")"
-check "redirect_after gets credentials in fragment" "/browser/teamb#accessKey=ASIA" "$(echo "$LOC" | sed -E 's|^https?://[^/]*||' | cut -c1-33)"
+check "redirect_after gets credentials in fragment" "/browser/teamb#accessKey=ASIA" "$(echo "$LOC" | sed -E 's|^https?://[^/]*||' | cut -c1-29)"
 check "open redirect refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/authorize/corp?redirect_after=//evil.example")"
 check "unknown provider" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/authorize/nope")"
 curl -s "$IDP/login?sub=code-user" >/dev/null

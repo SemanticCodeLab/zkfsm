@@ -554,4 +554,16 @@ test "idp-config, ldap mappings, and tenants over the admin API" {
     const alice: api.Caller = .{ .access_key = "alice", .secret = "alicesecret", .principal = "alice", .tenant = "acme" };
     try testing.expectEqual(std.http.Status.forbidden, (try H.call(a, &st, alice, .GET, "/minio/admin/v3/tenant/list", "")).status);
     try testing.expectEqual(std.http.Status.not_implemented, (try H.call(a, &st, root, .GET, "/minio/admin/v3/get-bucket-quota?bucket=b", "")).status);
+
+    try testing.expectEqual(std.http.Status.ok, (try H.call(a, &st, root, .PUT, "/minio/admin/v3/tenant/set-quota?name=acme&requests=5&rate=1000", "")).status);
+    try testing.expectEqual(@as(u64, 5), iam.ratelimit.get(&st, .tenant, "acme").requests);
+    try testing.expectEqual(std.http.Status.not_found, (try H.call(a, &st, root, .PUT, "/minio/admin/v3/tenant/set-quota?name=none&requests=5", "")).status);
+
+    try iam.sessions.record(&st, .{ .access_key = "ASIAX", .parent = "cn=u,dc=x", .provider = "ldap", .issued_ms = 1, .expires_s = 5000 }, 1000);
+    const lk = try sio.decrypt(a, "rootsecret", (try H.call(a, &st, root, .GET, "/minio/admin/v3/idp/ldap/list-access-keys-bulk?all=true", "")).body);
+    try testing.expect(std.mem.indexOf(u8, lk, "\"accessKey\":\"ASIAX\"") != null);
+    try testing.expectEqual(std.http.Status.bad_request, (try H.call(a, &st, root, .POST, "/minio/admin/v3/revoke-tokens/ldap?user=cn%3Du%2Cdc%3Dx", "")).status);
+    try testing.expectEqual(std.http.Status.no_content, (try H.call(a, &st, root, .POST, "/minio/admin/v3/revoke-tokens/ldap?user=cn%3Du%2Cdc%3Dx&fullRevoke=true", "")).status);
+    try testing.expect(iam.sessions.revoked(&st, .{ .access_key = "ASIAX", .parent = "cn=u,dc=x", .expires_s = 5000, .session_policy = null, .provider = .ldap, .issued_ms = 1 }));
+    try testing.expectEqual(std.http.Status.forbidden, (try H.call(a, &st, alice, .POST, "/minio/admin/v3/revoke-tokens/builtin?user=bob&fullRevoke=true", "")).status);
 }
