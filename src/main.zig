@@ -16,6 +16,7 @@ const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
+const tables = @import("tables/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -406,7 +407,8 @@ pub fn run(opts: Options) u8 {
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var tables_route = tables.Tables.init(&svc, auth);
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -436,6 +438,7 @@ pub fn run(opts: Options) u8 {
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+        .raw_routes = &.{tables_route.route()},
     };
     var gateways = gateway.Running.start(.{
         .gpa = gpa,
@@ -529,7 +532,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var tables_route = tables.Tables.init(&svc, auth);
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -544,7 +548,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    const routes = [_]s3.server.RawRoute{ cluster.server.route(node), tables_route.route() };
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -994,6 +998,7 @@ test {
     _ = replication;
     _ = events;
     _ = sse;
+    _ = tables;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
 }

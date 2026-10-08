@@ -34,6 +34,8 @@ pub const RawRoute = struct {
     prefix: []const u8,
     ctx: *anyopaque,
     serve: *const fn (ctx: *anyopaque, req: *std.http.Server.Request, arena: std.mem.Allocator) RawError!void,
+    /// When set, decides the match instead of `prefix` (e.g. by signing scope).
+    accept: ?*const fn (ctx: *anyopaque, req: *const std.http.Server.Request) bool = null,
 };
 
 /// Readiness override (cluster quorum); default is a storage sync probe.
@@ -240,8 +242,11 @@ pub const Server = struct {
         return metrics.isReady(self.svc);
     }
 
-    fn rawRoute(self: *Server, target: []const u8) ?RawRoute {
-        for (self.raw_routes) |r| if (std.mem.startsWith(u8, target, r.prefix)) return r;
+    fn rawRoute(self: *Server, req: *const std.http.Server.Request) ?RawRoute {
+        for (self.raw_routes) |r| {
+            const hit = if (r.accept) |f| f(r.ctx, req) else std.mem.startsWith(u8, req.head.target, r.prefix);
+            if (hit) return r;
+        }
         return null;
     }
 
@@ -311,7 +316,7 @@ pub const Server = struct {
                 },
             };
             const keep_alive = req.head.keep_alive;
-            if (self.rawRoute(req.head.target)) |r| {
+            if (self.rawRoute(&req)) |r| {
                 r.serve(r.ctx, &req, arena.allocator()) catch return;
             } else if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;

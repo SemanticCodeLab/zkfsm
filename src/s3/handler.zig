@@ -130,7 +130,7 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     }
     if (try sts.route(&ctx, env, now_s)) return;
     // STS-scoped signatures are only valid for STS calls.
-    if (std.mem.eql(u8, ctx.auth.scope.service, "sts")) return fail(&ctx, .AccessDenied);
+    if (std.mem.eql(u8, ctx.auth.scope.service, "sts") or std.mem.eql(u8, ctx.auth.scope.service, "s3tables")) return fail(&ctx, .AccessDenied);
     for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
     const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
     if (!try authorize(&ctx, ar, now_s)) return;

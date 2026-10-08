@@ -40,6 +40,8 @@ pub const Input = struct {
     headers: []const Header,
     /// Bucket taken from a virtual-host Host header (SigV2 signs it into the resource).
     vhost_bucket: ?[]const u8 = null,
+    /// Canonical path encoded twice (non-S3 signers); null decides by signing name.
+    double_encode: ?bool = null,
 
     pub fn header(in: Input, name: []const u8) ?[]const u8 {
         for (in.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -294,7 +296,7 @@ fn check(
         break :blk &sts_secret;
     } else src.store.secretFor(ak, src.now_s, &sbuf) orelse return deny(.InvalidAccessKeyId);
     const scope = p.cred.scope;
-    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !(std.mem.eql(u8, scope.service, "s3") or std.mem.eql(u8, scope.service, "sts")))
+    if (!std.mem.eql(u8, scope.date, amz_date[0..8]) or !(std.mem.eql(u8, scope.service, "s3") or std.mem.eql(u8, scope.service, "sts") or std.mem.eql(u8, scope.service, "s3tables")))
         return deny(.AuthorizationHeaderMalformed);
     var has_host = false;
     var hit = std.mem.splitScalar(u8, p.signed_headers, ';');
@@ -306,7 +308,7 @@ fn check(
     // their values; accept either canonical form.
     const want = for ([_]bool{ false, true }) |keep_order| {
         if (keep_order and !repeatedQueryName(in.target)) return deny(.SignatureDoesNotMatch);
-        const creq = canonicalRequest(arena, in, p.signed_headers, payload_hash, presigned, keep_order) catch |e| switch (e) {
+        const creq = canonicalRequest(arena, in, p.signed_headers, payload_hash, presigned, keep_order, in.double_encode orelse std.mem.eql(u8, scope.service, "s3tables")) catch |e| switch (e) {
             error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
             error.InvalidUri => return deny(.InvalidURI),
         };
@@ -329,11 +331,14 @@ fn canonicalRequest(
     payload_hash: []const u8,
     presigned: bool,
     keep_order: bool,
+    /// Non-S3 signing names encode the already-encoded path a second time.
+    double_encode: bool,
 ) (Writer.Error || router.Error)![]const u8 {
     var a: Writer.Allocating = .init(arena);
     const w = &a.writer;
     const q = std.mem.indexOfScalar(u8, in.target, '?');
-    const path = try router.percentDecode(arena, in.target[0 .. q orelse in.target.len], false);
+    const raw = in.target[0 .. q orelse in.target.len];
+    const path = if (double_encode) raw else try router.percentDecode(arena, raw, false);
     try w.print("{s}\n", .{in.method});
     try sv.uriEncode(w, path, true);
     try w.writeByte('\n');
@@ -870,7 +875,7 @@ fn signedGet(a: std.mem.Allocator, ak: []const u8, sk: []const u8, token: []cons
     });
     const signed = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token";
     const in: Input = .{ .method = "GET", .target = "/b/k", .headers = hdrs.items };
-    const creq = try canonicalRequest(a, in, signed, sv.empty_sha256_hex, false, false);
+    const creq = try canonicalRequest(a, in, signed, sv.empty_sha256_hex, false, false, false);
     const scope: sv.Scope = .{ .date = "20130524", .region = "us-east-1", .service = "s3" };
     var sts: Writer.Allocating = .init(a);
     try sv.writeStringToSign(&sts.writer, "20130524T000000Z", scope, creq);
