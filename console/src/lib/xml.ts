@@ -4,21 +4,25 @@ export function esc(s: string): string {
   return s.replace(/[<>&'"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[c]!);
 }
 
+function rootOf(el: Element | Document): Element | null {
+  return el.nodeType === 9 ? (el as Document).documentElement : (el as Element);
+}
+
 /** Direct children of `el` named `name` (namespace-agnostic). */
 export function children(el: Element | Document, name: string): Element[] {
-  const root = el instanceof Document ? el.documentElement : el;
+  const root = rootOf(el);
   if (!root) return [];
   return Array.from(root.children).filter((c) => c.localName === name);
 }
 
 /** All descendants named `name`. */
 export function all(el: Element | Document, name: string): Element[] {
-  return Array.from(el.getElementsByTagNameNS("*", name));
+  return Array.from(el.getElementsByTagName("*")).filter((e) => e.localName === name);
 }
 
 export function text(el: Element | Document | null | undefined, name: string): string {
   if (!el) return "";
-  const root = el instanceof Document ? el.documentElement : el;
+  const root = rootOf(el);
   const c = root ? Array.from(root.children).find((x) => x.localName === name) : undefined;
   return c?.textContent ?? "";
 }
