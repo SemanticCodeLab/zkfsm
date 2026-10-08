@@ -174,6 +174,8 @@ fn parseReplicate(a: Allocator, j: Node, now_ns: i128) Error!Replicate {
     // One side must be this deployment.
     if (!r.source.isLocal() and !r.target.isLocal()) return error.InvalidJob;
     if (r.source.isLocal() and r.target.isLocal() and std.mem.eql(u8, r.source.bucket, r.target.bucket)) return error.InvalidJob;
+    // Tags are not visible through a remote listing.
+    if (!r.source.isLocal() and r.filter.tags.len > 0) return error.InvalidJob;
     return r;
 }
 
@@ -300,10 +302,10 @@ pub fn size(s0: []const u8) Error!u64 {
     const n = std.fmt.parseInt(u64, s[0..i], 10) catch return error.InvalidJob;
     const u = std.mem.trim(u8, s[i..], " ");
     const units = .{
-        .{ "", 1 },                        .{ "B", 1 },
-        .{ "KB", 1000 },                   .{ "KiB", 1 << 10 },
-        .{ "MB", 1000 * 1000 },            .{ "MiB", 1 << 20 },
-        .{ "GB", 1000 * 1000 * 1000 },     .{ "GiB", 1 << 30 },
+        .{ "", 1 },                           .{ "B", 1 },
+        .{ "KB", 1000 },                      .{ "KiB", 1 << 10 },
+        .{ "MB", 1000 * 1000 },               .{ "MiB", 1 << 20 },
+        .{ "GB", 1000 * 1000 * 1000 },        .{ "GiB", 1 << 30 },
         .{ "TB", 1000 * 1000 * 1000 * 1000 }, .{ "TiB", 1 << 40 },
     };
     inline for (units) |x| if (std.ascii.eqlIgnoreCase(u, x[0])) return std.math.mul(u64, n, x[1]) catch error.InvalidJob;

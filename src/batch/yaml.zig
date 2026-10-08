@@ -327,11 +327,11 @@ test "hostile input is refused, never crashes" {
     defer arena.deinit();
     const a = arena.allocator();
     const bad = [_][]const u8{
-        "a: 1\n  b: 2",          "a:\n\tb: 1",           "a: \"unterminated",  "a: &anchor x",
-        "a: *alias",             "a: |\n  block",        "a: 1\na: 2",         "- a\nb: 1",
-        "a: [x, [y]]",           "a: {x: 1}",            "a: \"bad \\q\"",     ": v",
-        "a\n  b",                "a: 1\n---\nb: 2",      "\"k\"x: 1",          "a: [x,,y]",
-        "a: \"x\" trailing",     "k: \x01",
+        "a: 1\n  b: 2",      "a:\n\tb: 1",      "a: \"unterminated", "a: &anchor x",
+        "a: *alias",         "a: |\n  block",   "a: 1\na: 2",        "- a\nb: 1",
+        "a: [x, [y]]",       "a: {x: 1}",       "a: \"bad \\q\"",    ": v",
+        "a\n  b",            "a: 1\n---\nb: 2", "\"k\"x: 1",         "a: [x,,y]",
+        "a: \"x\" trailing", "k: \x01",
     };
     for (bad) |b| {
         if (parse(a, b)) |_| {

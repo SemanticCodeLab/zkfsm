@@ -16,6 +16,7 @@ const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
+const batch = @import("batch/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -406,7 +407,10 @@ pub fn run(opts: Options) u8 {
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var batch_mgr = batch.Manager.init(gpa, .{ .svc = &svc, .sse = &sse_route });
+    batch_mgr.start();
+    var batch_api: batch.Api = .{ .m = &batch_mgr, .prefix = admin_prefix, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ batch_api.extension(), bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -994,6 +998,7 @@ test {
     _ = replication;
     _ = events;
     _ = sse;
+    _ = batch;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
 }
