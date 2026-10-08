@@ -96,4 +96,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(operator);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = op_mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = kube_mod })).step);
+
+    // CSI driver for local drives (csi.zkfsm.io): node plugin and controller.
+    const csi_mod = b.createModule(.{ .root_source_file = b.path("k8s/csi/main.zig"), .target = target, .optimize = optimize });
+    b.installArtifact(b.addExecutable(.{ .name = "zkfsm-csi", .root_module = csi_mod }));
+    const csi_tests = b.addRunArtifact(b.addTest(.{ .root_module = csi_mod }));
+    test_step.dependOn(&csi_tests.step);
+    b.step("test-csi", "Run zkfsm-csi unit tests").dependOn(&csi_tests.step);
 }
