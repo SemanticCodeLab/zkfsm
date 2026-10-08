@@ -483,6 +483,26 @@ zkfsm --data /data --tls-cert cert.pem --tls-key key.pem \
 
 `zkfsm --help` lists every gateway flag.
 
+### Migrating from MinIO
+
+`zkfsm migrate` imports a MinIO deployment, keeping version ids, modification times,
+delete markers, user metadata, tags, retention and legal hold, and bucket configurations
+(versioning, Object Lock, policy, tagging, lifecycle, encryption, notification, quota):
+
+```sh
+# offline, from the drives of a stopped deployment (erasure-coded, checksums verified,
+# missing drives read through parity); also imports users, groups, and policies
+ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=secret123 \
+  zkfsm migrate --from-minio '/mnt/minio{1...4}' --to /data{1...4} --verify
+# online, from a running server
+ZKFSM_MIGRATE_ACCESS_KEY=... ZKFSM_MIGRATE_SECRET_KEY=... \
+  zkfsm migrate --from-s3 http://minio:9000 --to /data --verify
+```
+
+Progress is checkpointed in the destination, so an interrupted run resumes. Encrypted,
+compressed, and tiered objects are skipped offline (the online pull reads them through
+the server). `tests/migrate.sh` runs both paths against a real server.
+
 ## Compatibility
 
 `tests/s3/run.sh` drives each client against a single drive and against six
