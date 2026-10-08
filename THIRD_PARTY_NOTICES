@@ -1,9 +1,9 @@
-Third-party code included in this repository
+Third-party notices
 
 src/tls/client.zig
-  Origin: Zig standard library 0.15.2, lib/std/crypto/tls/Client.zig
-  Modified: client certificates (mutual TLS), minimum protocol version, CA options.
+  Origin:  Zig standard library 0.15.2, lib/std/crypto/tls/Client.zig
   License: MIT
+  Changes: client certificates, minimum version, ECDHE_ECDSA suites, bounds checks.
 
 The MIT License (Expat)
 

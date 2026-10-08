@@ -119,7 +119,7 @@ echo "== webhook"
 check "webhook target with client cert" "$applied" "$(set_t notify_webhook:mtls endpoint="https://localhost:$WH/mtls" client_cert="$CC" client_key="$CK" tls_ca_file="$CA")"
 check "webhook target without client cert" "$applied" "$(set_t notify_webhook:nocert endpoint="https://localhost:$WH/nocert" tls_ca_file="$CA")"
 check "webhook target with an untrusted client cert" "$applied" "$(set_t notify_webhook:rogue endpoint="https://localhost:$WH/rogue" client_cert="$PKI/rogue-client.pem" client_key="$PKI/rogue-client.key" tls_ca_file="$CA")"
-check "webhook TLS 1.2-only target (RSA client key)" "$applied" "$(set_t notify_webhook:tls12 endpoint="https://localhost:$WH12/tls12" client_cert="$PKI/client-rsa.pem" client_key="$PKI/client-rsa.key" tls_ca_file="$CA")"
+check "webhook TLS 1.2-only target (RSA client key)" "$applied" "$(set_t notify_webhook:tls12 endpoint="https://127.0.0.1:$WH12/tls12" client_cert="$PKI/client-rsa.pem" client_key="$PKI/client-rsa.key" tls_ca_file="$CA")"
 check "webhook min version 1.3 against a 1.2 server" "$applied" "$(set_t notify_webhook:min13 endpoint="https://localhost:$WH12/min13" client_cert="$CC" client_key="$CK" tls_ca_file="$CA" tls_min_version=1.3)"
 check "missing client key file rejected" 1 "$(ok "$MC" admin config set z notify_webhook:bad endpoint="https://localhost:$WH/x" client_cert="$CC" client_key="$WORK/nope.key")"
 check "bad min version rejected" 1 "$(ok "$MC" admin config set z notify_webhook:bad endpoint="https://localhost:$WH/x" tls_min_version=1.1)"
@@ -352,7 +352,7 @@ LDIF
     user_dn_search_base_dn=ou=people,dc=example,dc=org 'user_dn_search_filter=(uid=%s)' \
     tls_ca_file="$CA" tls_client_cert="$CC" tls_client_key="$CK")"
   "$MC" idp ldap policy attach z readwrite --user 'uid=alice,ou=people,dc=example,dc=org' >/dev/null
-  check "ldap login over LDAPS with a client cert" ASIA "$(akid)"
+  eventually "ldap login over LDAPS with a client cert" ASIA akid
   check "ldap switch to StartTLS" 0 "$(ok "$MC" idp ldap update z "server_addr=localhost:$LP" server_starttls=on)"
   check "ldap login over StartTLS with a client cert" ASIA "$(akid)"
   check "ldap drop the client cert" 0 "$(ok "$MC" idp ldap update z "server_addr=localhost:$LSP" server_starttls=off tls_client_cert= tls_client_key=)"

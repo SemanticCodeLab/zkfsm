@@ -1,6 +1,5 @@
-//! TLS 1.2/1.3 client with client certificates (mutual TLS) and a minimum version.
-// Modified copy of the Zig standard library 0.15.2 lib/std/crypto/tls/Client.zig:
-// added client certificates, a minimum version and CA options. Original notice:
+// Derived from the Zig standard library 0.15.2, lib/std/crypto/tls/Client.zig,
+// under the following license:
 //
 // The MIT License (Expat)
 //
@@ -23,6 +22,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
+//
+// Modified for zkfsm: client certificates (CertificateRequest answered in TLS 1.2
+// and 1.3), minimum version, ECDHE_ECDSA suites for TLS 1.2, bounds checks on
+// hostile records. Modifications are Apache-2.0; see THIRD_PARTY_NOTICES.
+
+//! TLS 1.2/1.3 client with client certificates (mutual TLS) and a minimum version.
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
@@ -693,7 +698,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 // Verify the host on the first certificate.
                                 switch (options.host) {
                                     .no_verification => {},
-                                    .explicit => try subject.verifyHostName(host),
+                                    .explicit => try verifyHost(subject, host),
                                 }
 
                                 // Keep track of the public key for the
@@ -1053,6 +1058,44 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
 }
 
 const max_empty_cert = 4 + 1 + max_ctx + 3;
+
+/// IP literals match only iPAddress SANs (RFC 6125 6.2.1); names go to std's check.
+fn verifyHost(subject: Certificate.Parsed, host: []const u8) Certificate.Parsed.VerifyHostNameError!void {
+    var ip_buf: [16]u8 = undefined;
+    const ip = ipBytes(host, &ip_buf) orelse return subject.verifyHostName(host);
+    const san = subject.subjectAltName();
+    if (san.len == 0) return error.CertificateHostMismatch;
+    const names = Certificate.der.Element.parse(san, 0) catch return error.CertificateFieldHasInvalidLength;
+    var i = names.slice.start;
+    while (i < names.slice.end) {
+        const gn = Certificate.der.Element.parse(san, i) catch return error.CertificateFieldHasInvalidLength;
+        if (gn.slice.end <= i or gn.slice.end > san.len) return error.CertificateFieldHasInvalidLength;
+        i = gn.slice.end;
+        const tag: Certificate.GeneralNameTag = @enumFromInt(@intFromEnum(gn.identifier.tag));
+        if (tag == .iPAddress and mem.eql(u8, san[gn.slice.start..gn.slice.end], ip)) return;
+    }
+    return error.CertificateHostMismatch;
+}
+
+fn ipBytes(host: []const u8, out: *[16]u8) ?[]const u8 {
+    if (std.net.Ip4Address.parse(host, 0)) |a| {
+        out[0..4].* = @bitCast(a.sa.addr);
+        return out[0..4];
+    } else |_| {}
+    const h = if (host.len > 2 and host[0] == '[' and host[host.len - 1] == ']') host[1 .. host.len - 1] else host;
+    if (std.net.Ip6Address.parse(h, 0)) |a| {
+        out.* = a.sa.addr;
+        return out[0..16];
+    } else |_| {}
+    return null;
+}
+
+test "ip literals parse to SAN bytes" {
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, ipBytes("127.0.0.1", &b).?);
+    try std.testing.expectEqual(@as(usize, 16), ipBytes("::1", &b).?.len);
+    try std.testing.expect(ipBytes("localhost", &b) == null);
+}
 
 /// Certificate message (RFC 8446 4.4.2 / RFC 5246 7.4.6); empty unless `send_chain`.
 fn certificateMsg(auth: ?*const ClientAuth, send_chain: bool, tls13: bool, ctx: []const u8, small: *[max_empty_cert]u8) error{OutOfMemory}![]u8 {

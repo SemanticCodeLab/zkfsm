@@ -115,6 +115,9 @@ test "mutual TLS 1.3 against our server with every client key type" {
     var other: [512]u8 = undefined;
     try testing.expectError(error.TlsFailed, roundTrip(&f, &ctx, .{ .ca_file = f.path(&other, "ca.pem"), .server_name = "localhost" }, &cn));
     try testing.expectError(error.TlsFailed, roundTrip(&f, &ctx, .{ .ca_file = ca, .server_name = "wrong.example" }, &cn));
+    // A host given as an IP matches the certificate's iPAddress SAN.
+    try testing.expectEqual(@as(usize, 0), try roundTrip(&f, &ctx, .{ .ca_file = ca }, &cn));
+    try testing.expectError(error.TlsFailed, roundTrip(&f, &ctx, .{ .ca_file = ca, .server_name = "127.0.0.2" }, &cn));
     // Skip-verify still presents the client certificate.
     var cb: [512]u8 = undefined;
     var kb: [512]u8 = undefined;
