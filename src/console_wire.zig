@@ -137,8 +137,8 @@ pub const Probe = struct {
                 }
                 try pools.append(a, .{ .index = pi, .drives = total, .online = online, .setSize = pool.set_size });
             }
-            // Capacity of local cluster drives comes from the node's own measurements.
-            for (n.local_eps) |eps| for (eps) |maybe| if (maybe) |le| for (drives.items) |*d| if (std.mem.eql(u8, d.path, le.path)) {
+            // Drives statfs could not size fall back to the node's own measurements.
+            for (n.local_eps) |eps| for (eps) |maybe| if (maybe) |le| for (drives.items) |*d| if (d.totalBytes == 0 and std.mem.eql(u8, d.path, le.path)) {
                 const t = le.total.load(.monotonic);
                 if (t > 0) {
                     d.totalBytes = t;

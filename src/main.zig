@@ -572,6 +572,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     active_server = &server;
     installStopSignals();
     var gateways: gateway.Running = .{};
+    var web: console_wire.Running = .{ .con = undefined, .probe = undefined };
+    var inner: InnerListener = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
         std.log.err("cannot start the listener", .{});
         return 1;
@@ -630,10 +632,14 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         }
         std.log.info("cluster: serving S3 on {f}", .{addr});
+        web.probe = .{ .svc = &svc, .started_s = bridge.started_s, .region = ev_opts.region, .node = node };
+        startConsole(gpa, arena, cfg, iam_ready, &web, &inner, &server, auth, admin_prefix, federation.env) catch break :blk 2;
         break :blk 0;
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    web.stop();
+    inner.stop();
     gateways.stop();
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
