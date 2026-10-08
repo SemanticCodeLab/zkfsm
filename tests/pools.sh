@@ -77,6 +77,7 @@ md5() { md5sum "$1" | cut -d' ' -f1; }
 aliases() { for i in 1 2 3 4; do "$MC" alias set "z$i" "$(ep "$i")" "$AK" "$SK" >/dev/null; done; }
 # Blob shard files under a pool's drives (records leave delete tombstones for a while).
 keyfiles() { find "$WORK"/n*/"$1"[0-9]* -path '*/data/*' -type f 2>/dev/null | wc -l; }
+recfiles() { find "$WORK"/n*/"$1"[0-9]* -path '*/record/*' -type f 2>/dev/null | wc -l; }
 jget() { python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for k in sys.argv[1].split("."):
@@ -176,6 +177,26 @@ traffic() { # node
     fi
   done
 }
+# Sequential overwrites of win0..7 through every node in turn; the last success wins.
+window_writer() { # seconds
+  local end=$((SECONDS + $1)) i=0 k f code
+  while ((SECONDS < end)); do
+    i=$((i + 1))
+    k="win$((i % 8))"
+    f="$WORK/win/$k.next"
+    head -c $((RANDOM + 1)) /dev/urandom >"$f"
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$f" "$(ep $((i % 4 + 1)))/plain/$k" || true)
+    if [[ "$code" == 200 ]]; then md5 "$f" >"$WORK/win/$k"; else echo "put $k $code" >>"$WORK/win/err"; fi
+  done
+}
+verify_window() { # node -> number of mismatches
+  local n="$1" bad=0 k
+  for k in win0 win1 win2 win3 win4 win5 win6 win7; do
+    curl -s -o "$WORK/got" "${sig[@]}" "$(ep "$n")/plain/$k"
+    [[ "$(md5 "$WORK/got")" == "$(cat "$WORK/win/$k")" ]] || bad=$((bad + 1))
+  done
+  echo "$bad"
+}
 verify_traffic() { # node -> number of mismatches
   local n="$1" bad=0 k sum code
   while read -r k sum; do
@@ -211,6 +232,13 @@ check "unknown pool refused" 1 "$("$MC" admin decommission start z1 "http://nowh
 # Cancel and restart before any move: canceled state is visible, then it runs.
 "$MC" admin decommission cancel z2 "$CMD_A" >/dev/null
 check "cancel shows canceled" true "$(decom 1 "$CMD_A" canceled)"
+# Overwrites through every node across the start: none may be lost while peers learn
+# that pool 1 drains.
+mkdir -p "$WORK/win"
+window_writer 2
+window_writer 4 &
+WPID=$!
+sleep 0.5
 "$MC" admin decommission start z2 "$CMD_A" >/dev/null
 check "restart after cancel" false "$(decom 1 "$CMD_A" canceled)"
 check "decommission started" yes "$([[ "$(decom 3 "$CMD_A" startTime)" != 0001* ]] && echo yes || echo no)"
@@ -247,6 +275,9 @@ start "$W"
 wait_ready "$W" 120
 r=$(wait_decom "$T" "$CMD_A" 400)
 check "decommission completes after kill -9 of node $W" complete "$r"
+wait "$WPID" || true
+check "overwrites during the start window kept" 0 "$(verify_window 2)"
+check "and no write failed" 0 "$(cat "$WORK/win/err" 2>/dev/null | wc -l)"
 touch "$WORK/tr/stop"
 wait "$TPID" || true
 TPID=0
@@ -310,7 +341,7 @@ check "appended pool starts empty" 0 "$(keyfiles e)"
 check "rebalance status before any run" 1 "$("$MC" admin rebalance status z1 >/dev/null 2>&1 && echo 0 || echo 1)"
 id=$("$MC" admin rebalance start --json z1 | jget id)
 check "rebalance started with an id" yes "$([[ ${#id} -ge 32 ]] && echo yes || echo no)"
-sleep 8
+for _ in $(seq 600); do [[ $(keyfiles e) -gt 0 ]] && break; sleep 0.1; done
 "$MC" admin rebalance stop z2 >/dev/null
 st=$("$MC" admin rebalance status --json z3)
 check "stopped rebalance reports Stopped" yes "$(echo "$st" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("yes" if any(p["status"]=="Stopped" for p in d["pools"]) else "no")')"
@@ -326,6 +357,7 @@ done
 check "rebalance completes" yes "$done_"
 echo "$st" | python3 -c 'import json,sys;[print("  pool",p["id"],"used %.6f"%p["used"],p["status"],p["progress"]["bytes"]) for p in json.load(sys.stdin)["pools"]]'
 check "rebalance moved data into the new pool" yes "$([[ $(keyfiles e) -gt 10 ]] && echo yes || echo no)"
+check "rebalance moved object records too" yes "$([[ $(recfiles e) -gt 0 ]] && echo yes || echo no)"
 check "rebalance reports moved bytes" yes "$(echo "$st" | python3 -c 'import json,sys;print("yes" if sum(p["progress"]["bytes"] for p in json.load(sys.stdin)["pools"])>0 else "no")')"
 check "pools within threshold" yes "$(echo "$st" | python3 -c 'import json,sys
 u=[p["used"] for p in json.load(sys.stdin)["pools"]]
@@ -346,6 +378,13 @@ check "mc admin info: four servers" 4 "$("$MC" admin info --json z2 | python3 -c
 check "mc admin info: 48 drives" 48 "$("$MC" admin info --json z3 | python3 -c 'import json,sys;print(sum(len(s.get("drives",[])) for s in json.load(sys.stdin)["info"]["servers"]))' 2>/dev/null || true)"
 check "mc admin heal status" 0 "$("$MC" admin heal --json z1 >/dev/null 2>&1; echo $?)"
 check "mc admin heal of a bucket" 0 "$("$MC" admin heal -r --json z1/plain >/dev/null 2>&1; echo $?)"
+check "heal covers noncurrent versions" yes "$("$MC" admin heal -r --json z1/ver 2>/dev/null | python3 -c 'import json,sys
+n=0
+for l in sys.stdin:
+    try: d=json.loads(l)
+    except ValueError: continue
+    n+=1 if d.get("type")=="object" and d.get("name")=="ver/doc" else 0
+print("yes" if n>=3 else "no")')"
 check "mc admin scanner status" 0 "$(timeout 60 "$MC" admin scanner status --json -n 1 z1 >/dev/null 2>&1; echo $?)"
 stop_all
 POOLS=(--data "${PC[@]}" --data "${PE[@]}")

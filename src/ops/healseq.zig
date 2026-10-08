@@ -254,22 +254,25 @@ fn walk(o: *Ops, s: *Seq, arena_state: *std.heap.ArenaAllocator) !void {
             if (s.prefix.len > 0) try healObject(o, s, a, bucket, s.prefix, set_count);
             continue;
         }
-        var after: []const u8 = "";
+        // Every version: noncurrent ones keep their own record and blob.
+        var km: []const u8 = "";
+        var vm: ?core.VersionId = null;
         while (true) {
             if (s.stop.load(.acquire)) return;
             var page_arena = std.heap.ArenaAllocator.init(o.gpa);
             defer page_arena.deinit();
             const pa = page_arena.allocator();
-            const res = o.svc.list(pa, bucket, .{ .prefix = s.prefix, .start_after = after, .max_keys = page_size }) catch |e| {
+            const res = object.versioning.listVersions(o.svc, pa, bucket, .{ .prefix = s.prefix, .key_marker = km, .version_id_marker = vm, .max_keys = page_size }) catch |e| {
                 if (e == error.NoSuchBucket) break;
                 return e;
             };
-            for (res.contents) |entry| {
+            for (res.entries) |v| {
                 if (s.stop.load(.acquire)) return;
-                try healObject(o, s, pa, bucket, entry.key, set_count);
+                if (v.is_latest) try healObject(o, s, pa, bucket, v.key, set_count) else try healVersion(o, s, pa, bucket, v, set_count);
             }
-            if (!res.is_truncated or res.contents.len == 0) break;
-            after = try a.dupe(u8, res.contents[res.contents.len - 1].key);
+            if (!res.is_truncated) break;
+            km = try a.dupe(u8, res.next_key_marker orelse break);
+            vm = res.next_version_id_marker;
         }
     }
 }
@@ -304,9 +307,25 @@ fn healObject(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, key: []const u
         else => return e,
     };
     const bid = try o.svc.bucketId(bucket);
-    const rkey = placement.recordKey(core.ids.nameId(bid, key));
-    // Tiered objects keep no local data; their record is what heal covers.
-    const dkey = if (info.remote(core.time.nowNs())) rkey else placement.dataKey(info.object_id);
+    try healOne(o, s, a, bucket, key, "", info, placement.recordKey(core.ids.nameId(bid, key)), set_count);
+}
+
+/// A noncurrent version (or delete marker): its version record and its blob.
+fn healVersion(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, v: object.versioning.VersionEntry, set_count: usize) !void {
+    const info = object.versioning.headVersion(o.svc, a, bucket, v.key, v.version) catch |e| switch (e) {
+        error.NoSuchKey, error.NoSuchVersion, error.NoSuchBucket => return,
+        else => return e,
+    };
+    const bid = try o.svc.bucketId(bucket);
+    const rkey = placement.versionRecordKey(core.ids.versionNameId(bid, v.key, v.version));
+    var vb: [32]u8 = undefined;
+    const vid = try a.dupe(u8, object.versioning.formatVersionId(v.version, &vb));
+    try healOne(o, s, a, bucket, v.key, vid, info, rkey, set_count);
+}
+
+fn healOne(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, key: []const u8, vid: []const u8, info: object.service.ObjectInfo, rkey: placement.PhysicalKey, set_count: usize) !void {
+    // Tiered objects and delete markers keep no local data; their record is what heal covers.
+    const dkey = if (info.delete_marker or info.remote(core.time.nowNs())) rkey else placement.dataKey(info.object_id);
     const set = try o.locate(a, dkey);
     if (!wanted(s, set)) return;
     const before = try states(o, a, set, dkey);
@@ -322,6 +341,7 @@ fn healObject(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, key: []const u
         .type = "object",
         .bucket = bucket,
         .object = key,
+        .versionId = vid,
         .parityBlocks = b.parity,
         .dataBlocks = b.data,
         .diskCount = set.drives.count(),

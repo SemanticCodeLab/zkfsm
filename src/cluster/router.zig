@@ -36,6 +36,9 @@ pub const Router = struct {
     guard: ?KeyGuard = null,
     /// Some pool is draining: writes take the key guard and lookups span all pools.
     moving: std.atomic.Value(bool) = .init(false),
+    /// Writes that saw `moving` false and run without the guard; a node confirms a
+    /// drain to the mover only once these finished (see `quiesce`).
+    unguarded: std.atomic.Value(u32) = .init(0),
 
     pub fn backend(self: *Router) iface.StorageBackend {
         return .{ .ctx = self, .capabilities = .{ .atomic_rename = true, .durable_sync = true, .range_read = true, .checksums = true }, .vtable = &vtable };
@@ -73,7 +76,30 @@ pub const Router = struct {
         self.pools[p].mode.store(m, .release);
         var any = false;
         for (self.pools) |*q| any = any or q.mode.load(.acquire) == .draining;
-        self.moving.store(any, .release);
+        self.moving.store(any, .seq_cst);
+    }
+
+    /// Enters an unguarded write; false when a drain began (take the guard instead).
+    fn enterUnguarded(self: *Router) bool {
+        _ = self.unguarded.fetchAdd(1, .seq_cst);
+        if (!self.moving.load(.seq_cst)) return true;
+        _ = self.unguarded.fetchSub(1, .seq_cst);
+        return false;
+    }
+
+    fn leaveUnguarded(self: *Router) void {
+        _ = self.unguarded.fetchSub(1, .seq_cst);
+    }
+
+    /// Waits until no write that started before the current modes is in flight;
+    /// false after `timeout_ms`.
+    pub fn quiesce(self: *Router, timeout_ms: i64) bool {
+        const until = std.time.milliTimestamp() + timeout_ms;
+        while (self.unguarded.load(.seq_cst) != 0) {
+            if (std.time.milliTimestamp() > until) return false;
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+        return true;
     }
 
     /// Pool indexes to search: active pools first, then draining, then retired.
@@ -112,6 +138,9 @@ pub const Router = struct {
 
     fn put(ctx: *anyopaque, key: PhysicalKey, source: *std.Io.Reader, opts: iface.PutOptions) Error!iface.ObjectMeta {
         const self = cast(ctx);
+        // Counted so a blob cannot land in a pool after it was confirmed draining.
+        const counted = self.pools.len > 1 and self.enterUnguarded();
+        defer if (counted) self.leaveUnguarded();
         return at(&self.pools[self.pickPool()], key).put(key, source, opts);
     }
 
@@ -164,6 +193,10 @@ pub const Router = struct {
 
     fn deleteRecord(ctx: *anyopaque, key: PhysicalKey) Error!void {
         const self = cast(ctx);
+        if (self.pools.len > 1 and self.enterUnguarded()) {
+            defer self.leaveUnguarded();
+            return self.deleteIn(key, true);
+        }
         const tok = try self.lockIfMoving(key);
         defer self.unlockToken(tok);
         return self.deleteIn(key, true);
@@ -186,7 +219,8 @@ pub const Router = struct {
     fn putRecord(ctx: *anyopaque, key: PhysicalKey, bytes: []const u8) Error!void {
         const self = cast(ctx);
         if (self.pools.len == 1) return at(&self.pools[0], key).putRecord(key, bytes);
-        if (self.moving.load(.acquire)) return self.putRecordMoving(key, bytes);
+        if (!self.enterUnguarded()) return self.putRecordMoving(key, bytes);
+        defer self.leaveUnguarded();
         // Overwrites stay in the pool that already holds the name, so one copy exists.
         for (self.pools) |*p| {
             if (p.mode.load(.acquire) == .retired) continue;

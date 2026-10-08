@@ -25,8 +25,8 @@ pub const Error = error{
 };
 
 const poll_ns = 2 * std.time.ns_per_s;
-/// Peers poll the state every `poll_ns`; moves wait until all of them have seen it.
-const grace_ns: i128 = 5 * std.time.ns_per_s;
+/// How long a node waits for writes that predate a drain before refusing to confirm.
+const quiesce_ms = 10_000;
 const persist_ns: i128 = 2 * std.time.ns_per_s;
 const max_idle_passes = 3;
 
@@ -42,9 +42,8 @@ pub const Manager = struct {
     thread: ?std.Thread = null,
     modes_thread: ?std.Thread = null,
     modes_ev: std.Thread.ResetEvent = .{},
-    /// Job seen by this node's worker and since when (for the grace period).
+    /// Job this node's worker has confirmed with every online peer.
     job: u64 = 0,
-    job_since: i128 = 0,
 
     pub fn init(gpa: std.mem.Allocator, node: *Node) Manager {
         const mbps = if (std.posix.getenv("ZKFSM_REBALANCE_MBPS")) |v| std.fmt.parseInt(u64, v, 10) catch 64 else 64;
@@ -107,6 +106,7 @@ pub const Manager = struct {
             defer arena.deinit();
             if (m.loadFresh(arena.allocator())) |meta| {
                 m.applyModes(meta);
+                m.node.pools_sync = .{ .ctx = m, .func = syncFn };
                 return;
             } else |_| {}
             const now = std.time.timestamp();
@@ -304,6 +304,18 @@ pub const Manager = struct {
         m.modes_thread = null;
     }
 
+    /// Peer request before a move: apply the latest state, then let unguarded
+    /// writes that started under the old modes finish.
+    fn syncFn(ctx: *anyopaque) ?u64 {
+        const m: *Manager = @ptrCast(@alignCast(ctx));
+        var arena = std.heap.ArenaAllocator.init(m.gpa);
+        defer arena.deinit();
+        const meta = m.loadFresh(arena.allocator()) catch return null;
+        m.applyModes(meta);
+        if (!m.router().quiesce(quiesce_ms)) return null;
+        return meta.epoch;
+    }
+
     fn wake(ctx: *anyopaque) void {
         const m: *Manager = @ptrCast(@alignCast(ctx));
         m.wake_ev.set();
@@ -340,12 +352,13 @@ pub const Manager = struct {
                 m.job = 0;
                 continue;
             };
-            const now = std.time.nanoTimestamp();
+            if (!m.node.ready()) continue;
+            // Moves start only once every online node applies the drain and finished
+            // the writes that began before it; those took no key guard.
             if (job != m.job) {
+                if (!m.router().quiesce(quiesce_ms) or !m.node.poolsSynced(meta.epoch)) continue;
                 m.job = job;
-                m.job_since = now;
             }
-            if (now - m.job_since < grace_ns or !m.node.ready()) continue;
             const tok = m.node.locks.lock("pools-worker") catch continue;
             defer m.node.locks.unlock(tok);
             m.runJob() catch |e| std.log.warn("pools: job interrupted: {t}", .{e});
@@ -604,7 +617,7 @@ pub const Manager = struct {
                 if (enough) break;
                 var arena = std.heap.ArenaAllocator.init(m.gpa);
                 defer arena.deinit();
-                const keys = keysOf(arena.allocator(), set, .data) catch |e| {
+                const keys = rebalanceKeys(arena.allocator(), set) catch |e| {
                     if (e == error.OutOfMemory) return e;
                     continue;
                 };
@@ -615,7 +628,7 @@ pub const Manager = struct {
                     }
                     if (m.stopping()) return;
                     if (mover.moveKey(r, m.gpa, key, p, buf)) |res| {
-                        if (res.outcome == .moved) {
+                        if (res.outcome == .moved and key.space == .data) {
                             s.objects += 1;
                             s.bytes += res.bytes;
                             moved_bytes += res.bytes;
@@ -652,6 +665,27 @@ pub const Manager = struct {
             try m.loadAndApply();
         }
         if (try m.persistRebal(id, srcs.items, .completed, goal) == .go) std.log.info("pools: rebalance complete", .{});
+    }
+
+    /// Data and object records of a set, interleaved in proportion so a partial
+    /// pass moves metadata along with the blobs instead of leaving it all behind.
+    fn rebalanceKeys(a: std.mem.Allocator, set: backend.StorageBackend) Error![]backend.PhysicalKey {
+        const data = try keysOf(a, set, .data);
+        const recs = try keysOf(a, set, .record);
+        const out = try a.alloc(backend.PhysicalKey, data.len + recs.len);
+        var i: usize = 0;
+        var j: usize = 0;
+        for (out) |*o| {
+            const take_rec = j < recs.len and (i == data.len or j * data.len <= i * recs.len);
+            if (take_rec) {
+                o.* = recs[j];
+                j += 1;
+            } else {
+                o.* = data[i];
+                i += 1;
+            }
+        }
+        return out;
     }
 
     fn loadAndApply(m: *Manager) Error!void {

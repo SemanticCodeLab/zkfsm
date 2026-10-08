@@ -110,6 +110,12 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
         const x = n.ext.load(.acquire) orelse return fail(req, .service_unavailable, "starting");
         return req.respond(try x.handle(x.ctx, arena, body), .{});
     }
+    if (std.mem.eql(u8, op, "pools_sync")) {
+        const ps = n.pools_sync orelse return fail(req, .service_unavailable, "starting");
+        const e = ps.func(ps.ctx) orelse return fail(req, .service_unavailable, "busy");
+        var b: [20]u8 = undefined;
+        return req.respond(std.fmt.bufPrint(&b, "{d}", .{e}) catch unreachable, .{});
+    }
     if (std.mem.eql(u8, op, "pread")) return pread(n, req, q);
     if (std.mem.eql(u8, op, "close")) {
         n.leases.close(q.int(u64, "h") orelse return fail(req, .bad_request, "h"));

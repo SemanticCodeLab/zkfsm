@@ -85,6 +85,8 @@ pub const Ext = struct {
     handle: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8,
 };
 pub const Hook = struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque) void };
+/// Applies the latest pool state and drains unguarded writes; returns its epoch.
+pub const SyncHook = struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque) ?u64 };
 
 pub const Node = struct {
     gpa: std.mem.Allocator,
@@ -141,6 +143,7 @@ pub const Node = struct {
     pool_count: u32 = 0,
     /// Called when a peer announces a pool state change.
     pools_hook: ?Hook = null,
+    pools_sync: ?SyncHook = null,
 
     /// Parses the topology and prepares RPC; nothing touches peers yet.
     pub fn create(gpa: std.mem.Allocator, cfg: Config) Error!*Node {
@@ -1131,6 +1134,34 @@ pub const Node = struct {
             k += 1;
         }
         n.broadcast(notes[0..k]);
+    }
+
+    /// Asks every online peer to apply the pool state; true when each reports
+    /// `epoch` or later and has no unguarded write in flight.
+    pub fn poolsSynced(n: *Node, epoch: u64) bool {
+        const Each = struct {
+            n: *Node,
+            epoch: u64,
+            ok: std.atomic.Value(bool) = .init(true),
+            fn f(c: *@This(), i: usize) void {
+                const node: u16 = @intCast(i);
+                if (node == c.n.topo.local or !c.n.rpc.isOnline(node)) return;
+                if (!c.ask(node)) c.ok.store(false, .release);
+            }
+            fn ask(c: *@This(), node: u16) bool {
+                var call = c.n.rpc.call(node, "pools_sync", "", .{ .bytes = "" }, .{ .timeout_ms = 20_000 }) catch return false;
+                defer call.deinit();
+                if (!call.ok() or call.body_left > 20) return false;
+                var b: [20]u8 = undefined;
+                const body = b[0..@intCast(call.body_left)];
+                call.readInto(body) catch return false;
+                const e = std.fmt.parseInt(u64, body, 10) catch return false;
+                return e >= c.epoch;
+            }
+        };
+        var each: Each = .{ .n = n, .epoch = epoch };
+        protection.fanout.run(n.topo.nodes.len, true, &each, Each.f);
+        return each.ok.load(.acquire);
     }
 
     /// Sends notes to every online peer at once.
