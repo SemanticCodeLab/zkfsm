@@ -105,6 +105,13 @@ pub const Controller = struct {
             }
         }
 
+        // The scheme is in every drive's endpoint fingerprint: never switch it live.
+        if (st.tls_mode.len > 0 and !std.mem.eql(u8, st.tls_mode, c.spec.tls.mode)) {
+            try st.setCond(a, "Degraded", "True", "TlsModeChanged", try std.fmt.allocPrint(a, "tls.mode was {s}; changing it would orphan every drive", .{st.tls_mode}));
+            return;
+        }
+        st.tls_mode = c.spec.tls.mode;
+
         const creds_data = try ctl.secretData(a, ns, c.spec.credsSecret) orelse {
             try st.setCond(a, "Available", "False", "MissingCredentials", c.spec.credsSecret);
             return;
@@ -420,12 +427,14 @@ pub const Status = struct {
     topology: []const u8 = "",
     observed_generation: i64 = 0,
     bootstrapped_generation: i64 = 0,
+    tls_mode: []const u8 = "",
 
     pub fn fromExisting(a: A, c: Cluster) !Status {
         var st: Status = .{};
         const old = c.status orelse Value.null;
         if (old == .object) {
             st.bootstrapped_generation = kube.int(old, &.{"bootstrappedGeneration"}) orelse 0;
+            st.tls_mode = kube.str(old, &.{"tlsMode"}) orelse "";
             if (old.object.get("conditions")) |cs| if (cs == .array) for (cs.array.items) |cd| {
                 try st.conditions.append(a, .{
                     .type = kube.str(cd, &.{"type"}) orelse continue,
@@ -499,6 +508,7 @@ pub const Status = struct {
             .readyServers = st.ready_servers,
             .currentImage = st.image,
             .topologyHash = st.topology,
+            .tlsMode = st.tls_mode,
             .pools = st.pools.items,
             .conditions = st.conditions.items,
         });

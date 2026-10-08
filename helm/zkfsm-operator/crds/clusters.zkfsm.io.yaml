@@ -31,6 +31,9 @@ spec:
             spec:
               type: object
               required: [pools, credsSecret]
+              x-kubernetes-validations:
+                - rule: "(has(self.tls) && has(self.tls.mode) ? self.tls.mode : 'none') == (has(oldSelf.tls) && has(oldSelf.tls.mode) ? oldSelf.tls.mode : 'none')"
+                  message: tls.mode is fixed at creation; the scheme is part of every drive's endpoint fingerprint
               properties:
                 image: {type: string, description: "zkfsm server image."}
                 imagePullPolicy: {type: string, enum: [Always, IfNotPresent, Never]}
@@ -84,9 +87,6 @@ spec:
                       affinity: {type: object, x-kubernetes-preserve-unknown-fields: true}
                 tls:
                   type: object
-                  x-kubernetes-validations:
-                    - rule: self.mode == oldSelf.mode
-                      message: tls.mode is fixed at creation; the scheme is part of every drive's endpoint fingerprint
                   properties:
                     mode: {type: string, enum: [none, selfSigned, certManager], default: none}
                     issuerRef:

@@ -176,6 +176,7 @@ for _ in $(seq 120); do
   [[ -n "$st" && "$st" != Started ]] && break
   sleep 2
 done
+check "decommission request answered" yes "$([[ -n "$st" ]] && echo yes)"
 echo "     decommission condition: $(k get zkc s3 -o jsonpath='{.status.conditions[?(@.type=="Decommissioning")]}')"
 pool1=$(k get zkc s3 -o jsonpath='{.status.pools[?(@.name=="pool-1")].state}')
 if [[ "$pool1" == decommissioned ]]; then
