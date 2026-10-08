@@ -18,6 +18,7 @@ tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Co
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
 tests/replication.sh       # bucket and site replication across three deployments (set MC)
+tests/observe.sh           # OTLP export, metrics v3, mc admin trace/logs, access logs (set MC)
 ```
 
 ## Run
@@ -407,6 +408,49 @@ mc watch z/photos --events put
   (sent, failed, dropped, queue length, online). In a cluster each node publishes the
   events of the requests it serves from its own queue.
 
+### Observability
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 zkfsm --data /data --otel-sample-ratio 0.1
+mc admin trace z --call s3 --call storage --errors       # live request tracing
+mc admin logs z --last 20                                # server log stream
+mc admin prometheus generate z --api-version v3          # scrape config with a bearer token
+```
+
+- OpenTelemetry over OTLP/HTTP (protobuf): a span per S3, admin, and gateway
+  (FTP, SFTP, WebDAV, Swift) request, with child spans for storage operations,
+  internode RPC (the `traceparent` travels with the call, so remote nodes continue
+  the trace), KMS, remote tiers, lifecycle passes, and replication (forwarded to the
+  target). Incoming W3C `traceparent` headers are honored; their sampled flag wins
+  over `--otel-sample-ratio` / `OTEL_TRACES_SAMPLER[_ARG]`. Logs (info and above, with
+  trace ids) and every v3 metric are exported too. Standard variables apply:
+  `OTEL_EXPORTER_OTLP_[<SIGNAL>_]ENDPOINT`, `_HEADERS`, `OTEL_SERVICE_NAME`,
+  `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_<SIGNAL>_EXPORTER=none`, `OTEL_BSP_*`,
+  `OTEL_METRIC_EXPORT_INTERVAL`; flags `--otel-endpoint`, `--otel-headers`,
+  `--otel-signals`, `--otel-service-name`.
+- Metrics v3 under `/minio/metrics/v3` with the MinIO hierarchy (`api/requests`,
+  `system/{drive,memory,cpu,process,network/internode}`, `debug/go`,
+  `cluster/{health,usage/objects,usage/buckets,erasure-set,iam,config}`, `ilm`,
+  `audit`, `logger/webhook`, `replication`, `notification`, `scanner`, and per bucket
+  `bucket/{api,replication}/<bucket>`); any path serves the groups below it. API
+  latency is both a MinIO `ttfb_seconds_distribution` and a Prometheus histogram.
+  Scrapes need the JWT from `mc admin prometheus generate` (a key allowed
+  `admin:Prometheus`) unless `MINIO_PROMETHEUS_AUTH_TYPE=public`. `/metrics` and
+  `/minio/v2/metrics/cluster` are unchanged.
+- `mc admin trace` streams S3/admin calls with HTTP detail and, by `--call`, storage,
+  internode, KMS, ILM (tier), replication, and gateway events, with `--errors` and
+  `--response-duration` filters; in a cluster any node streams every node's events.
+  `mc admin logs` replays recent server log lines and follows new ones.
+- Server access logs: PutBucketLogging now delivers records in the S3 server access
+  log format to the target bucket (`SimplePrefix` or `PartitionedPrefix` keys) every
+  `--access-log-interval` seconds (default 300). Records are journaled per node under
+  `<drive>/.zkfsm/accesslog` and fsynced each second, so a crash loses nothing that
+  was journaled; batch object names are deterministic, so redelivery after a crash
+  replaces rather than duplicates. The target must grant the
+  `logging.s3.amazonaws.com` service `s3:PutObject` (bucket policy) or LogDelivery
+  WRITE (ACL), or share the source bucket's owner and tenant; an explicit Deny drops
+  the records (`zkfsm_access_log_denied_total`).
+
 ### Server-side encryption and KMS
 
 SSE-S3, SSE-KMS and SSE-C work on PutObject, GetObject/HeadObject (with
@@ -545,5 +589,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: bucket
-notifications, bucket access log delivery, TLS termination
+notifications, TLS termination
 (run behind a proxy).

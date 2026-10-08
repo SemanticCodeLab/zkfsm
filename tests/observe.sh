@@ -46,6 +46,7 @@ wait_for 5 curl -s -o /dev/null "http://127.0.0.1:$RPORT/"
 OTLP="$WORK/otlp"
 
 PORT="$(freeport)"
+FPORT="$(freeport)"
 EP="http://127.0.0.1:$PORT"
 SPID=""
 start() { # extra args...
@@ -76,7 +77,7 @@ PY
 }
 has_spans() { [[ "$(spans "$1")" -ge "${2:-1}" ]]; }
 
-start
+start --kms-backend local --kms-dir "$WORK/kms" --ftp "127.0.0.1:$FPORT"
 "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null
 echo "hello observability" >"$WORK/f.txt"
 "$MC" mb z/obs z/logs z/denied z/granted >/dev/null
@@ -105,6 +106,22 @@ check "unsampled parent is not exported" 0 "$(spans "s['trace_id']=='$UTID'")"
 "$MC" admin info z >/dev/null 2>&1 || true
 wait_for 5 has_spans "s['name']=='admin.info'"
 check "admin calls are spans" yes "$(yes_no has_spans "s['name']=='admin.info'")"
+
+KTID=22222222222222222222222222222222
+check "SSE-KMS PUT with traceparent" 200 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -H "traceparent: 00-$KTID-$PSID-01" -H "x-amz-server-side-encryption: aws:kms" -T "$WORK/f.txt" "$EP/obs/enc.txt")"
+wait_for 5 has_spans "s['trace_id']=='$KTID' and s['name']=='s3.PutObject'"
+check "KMS span in the request trace" yes "$(yes_no has_spans "s['trace_id']=='$KTID' and s['name']=='kms.GenerateDataKey' and s['kind']==3 and s['attrs'].get('kms.backend')=='local'")"
+python3 - "$FPORT" "$AK" "$SK" <<'PY'
+import ftplib, sys
+f = ftplib.FTP()
+f.connect("127.0.0.1", int(sys.argv[1]), timeout=10)
+f.login(sys.argv[2], sys.argv[3])
+f.cwd("/obs")
+f.nlst()
+f.quit()
+PY
+wait_for 5 has_spans "s['name']=='ftp.NLST'"
+check "FTP gateway commands are root spans" yes "$(yes_no has_spans "s['name']=='ftp.CWD' and s['parent']=='' and s['kind']==2 and s['attrs'].get('path')=='/obs'")"
 
 echo "--- OTLP logs and metrics"
 logs_has() { grep -q "$1" "$OTLP/logs.jsonl" 2>/dev/null; }
@@ -161,7 +178,7 @@ check "v3 ttfb distribution" yes "$(yes_no grep -q 'minio_api_requests_ttfb_seco
 check "v3 per-bucket api" yes "$(yes_no grep -q 'minio_bucket_api_total{bucket="obs",name="GetObject"' <<<"$(v3 api --bucket obs)")"
 check "v3 system drive" yes "$(yes_no grep -q "minio_system_drive_total_bytes{drive=\"$WORK/d1\"" <<<"$(v3 system)")"
 check "v3 system memory/cpu/process" 3 "$(v3 system | grep -cE '^minio_system_(memory_total|cpu_load|process_resident_memory_bytes)\{')"
-check "v3 cluster usage" yes "$(yes_no grep -q 'minio_cluster_usage_buckets_objects_count{bucket="obs"} 1' <<<"$(v3 cluster)")"
+check "v3 cluster usage" yes "$(yes_no grep -q 'minio_cluster_usage_buckets_objects_count{bucket="obs"} 2' <<<"$(v3 cluster)")"
 check "v3 cluster health" yes "$(yes_no grep -q '^minio_cluster_health_drives_online_count 1' <<<"$(v3 cluster)")"
 for g in ilm replication notification scanner audit logger debug; do
   check "v3 group $g" 0 "$("$MC" admin prometheus metrics z "$g" --api-version v3 >/dev/null 2>&1; echo $?)"
@@ -188,12 +205,14 @@ TSP=$!
 TEP=$!
 "$MC" admin trace z >"$WORK/trace.txt" 2>&1 &
 TTP=$!
+"$MC" admin trace z --response-duration 1h --json >"$WORK/trace-slow.json" 2>&1 &
+TLP=$!
 sleep 1
 "$MC" cat z/obs/a.txt >/dev/null
 "$MC" cat z/obs/nothere >/dev/null 2>&1 || true
 sleep 1.5
-kill "$TP" "$TSP" "$TEP" "$TTP" 2>/dev/null || true
-wait "$TP" "$TSP" "$TEP" "$TTP" 2>/dev/null || true
+kill "$TP" "$TSP" "$TEP" "$TTP" "$TLP" 2>/dev/null || true
+wait "$TP" "$TSP" "$TEP" "$TTP" "$TLP" 2>/dev/null || true
 tq() { python3 - "$1" "$2" <<'PY'
 import json, sys
 n = 0
@@ -213,6 +232,7 @@ check "trace storage calls" yes "$([[ "$(tq "$WORK/trace-storage.json" "t.get('t
 check "storage-only stream has no S3 calls" 0 "$(tq "$WORK/trace-storage.json" "t.get('type')=='S3'")"
 check "errors filter" 0 "$(tq "$WORK/trace-errors.json" "t.get('statusCode',0) < 400")"
 check "errors filter keeps 404" yes "$([[ "$(tq "$WORK/trace-errors.json" "t.get('statusCode')==404")" -ge 1 ]] && echo yes || echo no)"
+check "threshold filter" 0 "$(tq "$WORK/trace-slow.json" "t.get('type')=='S3'")"
 check "text trace" yes "$(yes_no grep -q 's3.GetObject' "$WORK/trace.txt")"
 check "trace needs admin:ServerTrace" 1 "$(timeout 3 "$MC" admin trace p >/dev/null 2>&1; echo $?)"
 

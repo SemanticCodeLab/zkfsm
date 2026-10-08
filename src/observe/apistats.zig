@@ -78,9 +78,8 @@ pub const Stats = struct {
     inflight: Atomic(i64) = .init(0),
     rejected_auth: Atomic(u64) = .init(0),
     rejected_invalid: Atomic(u64) = .init(0),
-    mutex: std.Thread.Mutex = .{},
+    lock: std.Thread.RwLock = .{},
     buckets: std.StringArrayHashMapUnmanaged(*[n_names]Counters) = .empty,
-    bucket_inflight: std.StringArrayHashMapUnmanaged(i64) = .empty,
 
     pub fn deinit(s: *Stats) void {
         for (s.buckets.keys(), s.buckets.values()) |k, v| {
@@ -88,7 +87,6 @@ pub const Stats = struct {
             s.gpa.destroy(v);
         }
         s.buckets.deinit(s.gpa);
-        s.bucket_inflight.deinit(s.gpa);
     }
 
     pub const Done = struct {
@@ -113,8 +111,13 @@ pub const Stats = struct {
     }
 
     fn bucketCounters(s: *Stats, bucket: []const u8) ?*[n_names]Counters {
-        s.mutex.lock();
-        defer s.mutex.unlock();
+        {
+            s.lock.lockShared();
+            defer s.lock.unlockShared();
+            if (s.buckets.get(bucket)) |c| return c;
+        }
+        s.lock.lock();
+        defer s.lock.unlock();
         if (s.buckets.get(bucket)) |c| return c;
         if (s.buckets.count() >= max_buckets) return null;
         const c = s.gpa.create([n_names]Counters) catch return null;
@@ -132,17 +135,20 @@ pub const Stats = struct {
     }
 
     /// Forgets a deleted bucket's series.
+    /// Zeroes a deleted bucket's series; the slot stays, since requests in flight may hold it.
     pub fn dropBucket(s: *Stats, bucket: []const u8) void {
-        s.mutex.lock();
-        defer s.mutex.unlock();
-        const kv = s.buckets.fetchSwapRemove(bucket) orelse return;
-        s.gpa.free(kv.key);
-        s.gpa.destroy(kv.value);
+        s.lock.lockShared();
+        defer s.lock.unlockShared();
+        const per = s.buckets.get(bucket) orelse return;
+        for (per) |*c| {
+            inline for (.{ "total", "err4", "err5", "canceled", "rx", "tx", "dur_ns" }) |f| @field(c, f).store(0, .monotonic);
+            for (&c.hist) |*h| h.store(0, .monotonic);
+        }
     }
 
     pub fn bucketNames(s: *Stats, a: std.mem.Allocator) error{OutOfMemory}![]const []const u8 {
-        s.mutex.lock();
-        defer s.mutex.unlock();
+        s.lock.lockShared();
+        defer s.lock.unlockShared();
         const out = try a.alloc([]const u8, s.buckets.count());
         for (s.buckets.keys(), out) |k, *o| o.* = try a.dupe(u8, k);
         return out;
@@ -183,9 +189,9 @@ pub const Stats = struct {
 
     /// `/bucket/api/{bucket}` group.
     pub fn renderBucket(s: *Stats, w: *std.Io.Writer, bucket: []const u8, server: []const u8) std.Io.Writer.Error!void {
-        s.mutex.lock();
+        s.lock.lockShared();
         const per = s.buckets.get(bucket);
-        s.mutex.unlock();
+        s.lock.unlockShared();
         inline for (.{ .{ "minio_bucket_api_traffic_received_bytes", "rx" }, .{ "minio_bucket_api_traffic_sent_bytes", "tx" } }) |f| {
             var sum: u64 = 0;
             if (per) |p| for (p) |*c| {
