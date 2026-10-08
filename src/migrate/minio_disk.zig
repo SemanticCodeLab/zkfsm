@@ -30,8 +30,9 @@ pub const Source = struct {
 
     pub fn open(gpa: std.mem.Allocator, arena: std.mem.Allocator, paths: []const []const u8) Error!Source {
         const Fmt = struct { id: []const u8 = "", xl: struct { this: []const u8, sets: [][][]const u8 } };
-        var layout: ?[][][]const u8 = null;
-        var deployment: []const u8 = "";
+        // Each pool's drives list that pool's sets; the union covers every pool.
+        var layout: std.ArrayList([][]const u8) = .empty;
+        var deployment: ?[]const u8 = null;
         const thises = try arena.alloc(?[]const u8, paths.len);
         const dirs = try arena.alloc(?std.fs.Dir, paths.len);
         for (paths, thises, dirs) |p, *t, *d| {
@@ -40,16 +41,21 @@ pub const Source = struct {
             const dir = d.* orelse continue;
             const bytes = dir.readFileAlloc(arena, meta_bucket ++ "/format.json", 1 << 20) catch continue;
             const f = std.json.parseFromSliceLeaky(Fmt, arena, bytes, .{ .ignore_unknown_fields = true }) catch continue;
-            if (layout == null) {
-                layout = f.xl.sets;
-                deployment = f.id;
-            } else if (!std.mem.eql(u8, deployment, f.id)) {
+            if (deployment) |dep| if (!std.mem.eql(u8, dep, f.id)) {
                 std.log.err("{s}: drive belongs to another deployment ({s})", .{ p, f.id });
                 return error.NoFormat;
+            };
+            deployment = f.id;
+            for (f.xl.sets) |set| {
+                if (set.len == 0) return error.NoFormat;
+                const known = for (layout.items) |have| {
+                    if (std.mem.eql(u8, have[0], set[0])) break true;
+                } else false;
+                if (!known) try layout.append(arena, set);
             }
             t.* = f.xl.this;
         }
-        const sets_doc = layout orelse return error.NoFormat;
+        const sets_doc = layout.items;
         if (sets_doc.len == 0 or sets_doc.len > 1024) return error.NoFormat;
         const sets = try gpa.alloc([]?Drive, sets_doc.len);
         var missing: u64 = 0;
@@ -64,6 +70,14 @@ pub const Source = struct {
                 if (slot.* == null) missing += 1;
             }
         }
+        for (dirs, thises) |*d, t| if (d.*) |*x| {
+            const used = if (t) |tt| for (sets_doc) |ids| {
+                if (for (ids) |id| {
+                    if (std.mem.eql(u8, id, tt)) break true;
+                } else false) break true;
+            } else false else false;
+            if (!used) x.close();
+        };
         return .{ .gpa = gpa, .sets = sets, .stats = .{ .missing_drives = missing } };
     }
 
@@ -458,3 +472,41 @@ pub const ObjectReader = struct {
         r.part_left -= block_len;
     }
 };
+
+test "pools merge into sets; hostile metadata is skipped" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const ids = [_][]const u8{ "a1", "a2", "b1", "b2" };
+    for (ids, 0..) |id, i| {
+        var buf: [256]u8 = undefined;
+        const pool = if (i < 2) "[[\"a1\",\"a2\"]]" else "[[\"b1\",\"b2\"]]";
+        const doc = try std.fmt.bufPrint(&buf, "{{\"id\":\"dep\",\"xl\":{{\"this\":\"{s}\",\"sets\":{s}}}}}", .{ id, pool });
+        var d = try tmp.dir.makeOpenPath(id, .{});
+        defer d.close();
+        try d.makePath(meta_bucket);
+        try d.writeFile(.{ .sub_path = meta_bucket ++ "/format.json", .data = doc });
+        try d.makePath("bkt/obj");
+        try d.writeFile(.{ .sub_path = "bkt/obj/xl.meta", .data = "XL2 \x01\x00\x03\x00\xc6\xff\xff\xff\xff" });
+    }
+    var paths: [4][]const u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (ids, &paths) |id, *p| p.* = try tmp.dir.realpathAlloc(a, id);
+    var src = try Source.open(std.testing.allocator, a, &paths);
+    defer src.deinit();
+    try std.testing.expectEqual(@as(usize, 2), src.sets.len);
+    try std.testing.expectEqual(@as(u64, 0), src.stats.missing_drives);
+    const Ctx = struct { n: usize = 0 };
+    var ctx: Ctx = .{};
+    try src.walk("bkt", "", Error, &ctx, struct {
+        fn f(c: *Ctx, _: usize, key: []const u8) Error!void {
+            if (std.mem.eql(u8, key, "obj")) c.n += 1;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 2), ctx.n);
+    try std.testing.expectError(error.NotFound, src.loadObject(a, 0, "bkt", "obj"));
+    var kb: [64]u8 = undefined;
+    try std.testing.expect(diskKey(&kb, "a/../b") == null);
+    try std.testing.expectEqualStrings("d" ++ dir_suffix, diskKey(&kb, "d/").?);
+}
