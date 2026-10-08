@@ -457,6 +457,24 @@ functions (`SUBSTRING`, `TRIM`, `UPPER`, `LOWER`, `CHAR_LENGTH`, `EXTRACT`,
 as event-stream `Records`, `Progress`, `Stats` and `End` frames, CSV or JSON.
 `tests/select.sh` checks every case against DuckDB.
 
+### S3 Tables and Iceberg REST catalog
+
+A table bucket is an ordinary bucket enabled for catalog use. The S3 Tables
+API (signing name `s3tables`, e.g. the boto3 `s3tables` client) covers
+table buckets (create/get/list/delete, bucket policy), namespaces, tables,
+`GetTableMetadataLocation` and `UpdateTableMetadataLocation` with
+`versionToken` compare-and-swap, and `RenameTable`. The Iceberg REST catalog
+is served at `/iceberg/v1` (alias `/_iceberg/v1`); the warehouse (bucket name
+or table bucket ARN) becomes the URL prefix. It supports config, namespace
+CRUD and properties, table list/create (including staged create)/load/
+exists/register/rename/drop (with purge) and commits with all standard
+requirements and updates; a commit writes a new metadata file and swaps the
+table pointer atomically, answering `409 CommitFailedException` on conflict.
+Clients sign with SigV4 (`s3tables` or `s3`) and write data files with plain
+S3. Catalog state lives under the reserved `.zkfsm-tables/` prefix, which S3
+requests cannot reach. Format v2 only; no views or multi-table transactions.
+`tests/tables.sh` drives it with curl, PyIceberg and boto3.
+
 ### Protocol gateways
 
 FTP/FTPS, SFTP, WebDAV, and OpenStack Swift serve the same namespace as S3, each on
@@ -531,6 +549,7 @@ Pre-1.0. Working today and covered by tests:
   certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
   SSE-C with static, Vault, cloud KMS-API, and local key backends.
 - **S3 Select**: SQL over CSV, JSON and Parquet.
+- **S3 Tables**: table buckets and an Iceberg REST catalog (PyIceberg tested).
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and
