@@ -15,6 +15,8 @@ const cluster = @import("cluster/root.zig");
 const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
+const ops = @import("ops/root.zig");
+const pools = @import("pools/root.zig");
 const sse = @import("sse/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
@@ -402,7 +404,8 @@ pub fn run(opts: Options) u8 {
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     svc.events = ev_ext.sink();
     const observers = [_]s3.Observer{ev_ext.observer()};
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .endpoint = std.fmt.allocPrint(arena, "{s}:{d}", .{ cfg.host, cfg.port }) catch return 1, .local = .{ .drives = &drives, .strategy = strategy, .healer = &healer } };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .ops = &ops_ctx };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
@@ -449,6 +452,7 @@ pub fn run(opts: Options) u8 {
     defer gateways.stop();
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
+    ops_ctx.server = &server;
     installStopSignals();
     server.run(addr) catch |e| {
         std.log.err("server failed: {t}", .{e});
@@ -456,6 +460,7 @@ pub fn run(opts: Options) u8 {
     };
     svc.flush() catch |e| std.log.warn("key index not saved ({t}); it is rebuilt on next start", .{e});
     be.sync() catch |e| std.log.warn("final sync failed: {t}", .{e});
+    ops_ctx.finish();
     std.log.info("stopped", .{});
     return 0;
 }
@@ -489,10 +494,12 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .secret = secret,
         .root_fp = if (creds) |c| cluster.auth.rootFingerprint(secret, c.access_key, c.secret_key) else @splat(0),
         .ca_files = cas.items,
-        .scan_interval_s = if (cfg.scan_interval_s == 0) 600 else cfg.scan_interval_s,
+        .scan_interval_s = cfg.scan_interval_s,
         .refresh_s = cfg.cluster_refresh_s,
     }) catch return 2;
     defer node.destroy();
+    var pool_mgr = pools.Manager.init(gpa, node);
+    defer pool_mgr.stop();
 
     var svc: object.ObjectService = undefined;
     var svc_ready = false;
@@ -525,7 +532,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     defer if (notif_ready) notif.deinit();
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     const observers = [_]s3.Observer{ev_ext.observer()};
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .node = node, .pool_state = .{ .ctx = &pool_mgr, .func = pools.Manager.poolState } };
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .ops = &ops_ctx, .pools = &pool_mgr };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
@@ -544,7 +552,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    const routes = [_]s3.server.RawRoute{ ops_ctx.route(), cluster.server.route(node) };
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -561,6 +569,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
+    ops_ctx.server = &server;
     installStopSignals();
     var gateways: gateway.Running = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
@@ -572,6 +581,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (e != error.Stopped) std.log.err("cluster bootstrap failed: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
         };
+        // Pool modes must be set before the first catalog read.
+        pool_mgr.load();
         node.initService(&svc) catch |e| {
             if (e != error.Stopped) std.log.err("cannot open the object service: {t}", .{e});
             break :blk if (e == error.Stopped) 0 else 1;
@@ -615,6 +626,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             std.log.err("cannot start protocol gateways: {t}", .{e});
             break :blk 1;
         };
+        pool_mgr.start();
         if (std.Thread.spawn(.{}, sweepLoop, .{ &svc, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         startTierLoop(&svc, cfg.lifecycle_interval_s, node);
         if (cfg.lifecycle_interval_s > 0) {
@@ -626,8 +638,11 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     if (code != 0) _ = server.requestStop();
     serving.join();
     gateways.stop();
+    pool_mgr.stop();
+    if (svc_ready) svc.collectDeferred(true);
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
+    if (code == 0) ops_ctx.finish();
     std.log.info("stopped", .{});
     return code;
 }
@@ -993,6 +1008,8 @@ test {
     _ = gateway;
     _ = replication;
     _ = events;
+    _ = ops;
+    _ = pools;
     _ = sse;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");

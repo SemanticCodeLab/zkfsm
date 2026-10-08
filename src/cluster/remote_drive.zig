@@ -223,7 +223,7 @@ pub const RemoteDrive = struct {
         errdefer d.gpa.destroy(f);
         f.* = .{ .drive = d, .key = key };
         errdefer f.free();
-        try f.fetch(0, open_window);
+        try f.open();
         return .{ .ctx = f, .vtable = &file_vtable };
     }
 
@@ -300,11 +300,15 @@ const RemoteWrite = struct {
     }
 };
 
+/// A remote blob read by position. Blobs larger than the first window are read
+/// through a lease on the owner, so a concurrent delete cannot cut the read short.
 const RemoteFile = struct {
     drive: *RemoteDrive,
     key: PhysicalKey,
     size: u64 = 0,
     mtime_ns: i128 = 0,
+    /// Lease id on the owner; 0 when the first window held the whole blob.
+    lease: u64 = 0,
     win: []u8 = &.{},
     win_off: u64 = 0,
     win_len: usize = 0,
@@ -313,14 +317,21 @@ const RemoteFile = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// Loads [off, off+want) (clipped to the blob) into the window.
-    fn fetch(f: *RemoteFile, off: u64, want: usize) Error!void {
+    fn open(f: *RemoteFile) Error!void {
         const d = f.drive;
-        var eb: [64]u8 = undefined;
-        var c = try d.exchange("read", f.key, std.fmt.bufPrint(&eb, "off={d}&len={d}&clip=1", .{ off, want }) catch unreachable, "");
+        var eb: [32]u8 = undefined;
+        var c = try d.exchange("open", f.key, std.fmt.bufPrint(&eb, "len={d}", .{open_window}) catch unreachable, "");
         defer c.deinit();
         f.size = c.meta.size orelse return error.IoFailed;
         f.mtime_ns = c.meta.mtime_ns orelse 0;
+        f.lease = c.meta.handle;
+        if (f.lease == 0 and c.body_left != f.size) return error.IoFailed;
+        try f.load(&c, 0, open_window);
+    }
+
+    /// Reads the response body into the window at `off`.
+    fn load(f: *RemoteFile, c: *rpc_mod.Call, off: u64, want: usize) Error!void {
+        const d = f.drive;
         const n: usize = @intCast(c.body_left);
         if (n > want) return error.IoFailed;
         if (f.win.len < n) {
@@ -331,6 +342,19 @@ const RemoteFile = struct {
         c.readInto(f.win[0..n]) catch return error.IoFailed;
         f.win_off = off;
         f.win_len = n;
+    }
+
+    /// Loads [off, off+want) (clipped to the blob) into the window.
+    fn fetch(f: *RemoteFile, off: u64, want: usize) Error!void {
+        const d = f.drive;
+        var qb: [128]u8 = undefined;
+        // Without a lease the first window already held every byte.
+        if (f.lease == 0) return error.IoFailed;
+        const q = std.fmt.bufPrint(&qb, "h={d}&off={d}&len={d}", .{ f.lease, off, want }) catch unreachable;
+        var c = d.rpc.call(d.node, "pread", q, .{ .bytes = "" }, .{}) catch |e| return mapCall(e);
+        defer c.deinit();
+        if (!c.ok()) return if (c.status == 410) error.IoFailed else mapStatus(c.status);
+        try f.load(&c, off, want);
     }
 
     fn pread(ctx: *anyopaque, buf: []u8, off: u64) Error!usize {
@@ -352,6 +376,11 @@ const RemoteFile = struct {
 
     fn free(f: *RemoteFile) void {
         f.drive.gpa.free(f.win);
+        if (f.lease == 0) return;
+        const d = f.drive;
+        var qb: [32]u8 = undefined;
+        var c = d.rpc.call(d.node, "close", std.fmt.bufPrint(&qb, "h={d}", .{f.lease}) catch unreachable, .{ .bytes = "" }, .{ .timeout_ms = 2000 }) catch return;
+        c.deinit();
     }
 
     fn close(ctx: *anyopaque) void {

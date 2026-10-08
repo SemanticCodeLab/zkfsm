@@ -223,6 +223,13 @@ pub const ObjectService = struct {
     replication: ?replica.Sink = null,
     /// Bucket notifications; set right after init, before serving.
     events: ?events_mod.Sink = null,
+    /// Cluster mode: replaced blobs wait `gc_grace_ns` before deletion, so a read
+    /// that resolved the old record on another node can still open them.
+    deferred: std.ArrayList(Deferred) = .empty,
+    deferred_mutex: std.Thread.Mutex = .{},
+
+    pub const gc_grace_ns: i128 = 10 * std.time.ns_per_s;
+    const Deferred = struct { id: core.ObjectId, due_ns: i128 };
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -250,6 +257,37 @@ pub const ObjectService = struct {
         self.catalog.deinit();
         for (self.pending.items) |c| self.freeChange(c);
         self.pending.deinit(self.gpa);
+        self.deferred.deinit(self.gpa);
+    }
+
+    /// Deletes a data blob no record points at any more; deferred in cluster mode.
+    pub fn dropBlob(self: *ObjectService, id: core.ObjectId) void {
+        if (self.cluster != null) {
+            self.deferred_mutex.lock();
+            defer self.deferred_mutex.unlock();
+            if (self.deferred.append(self.gpa, .{ .id = id, .due_ns = core.time.nowNs() + gc_grace_ns })) return else |_| {}
+        }
+        self.store.delete(placement.dataKey(id)) catch {};
+    }
+
+    /// Deletes deferred blobs whose grace passed (all of them with `all`).
+    pub fn collectDeferred(self: *ObjectService, all: bool) void {
+        const now = core.time.nowNs();
+        while (true) {
+            var batch: [64]core.ObjectId = undefined;
+            var n: usize = 0;
+            {
+                self.deferred_mutex.lock();
+                defer self.deferred_mutex.unlock();
+                // Appended in due order: the due ones are a prefix.
+                while (n < batch.len and n < self.deferred.items.len and (all or self.deferred.items[n].due_ns <= now)) : (n += 1) {
+                    batch[n] = self.deferred.items[n].id;
+                }
+                self.deferred.replaceRangeAssumeCapacity(0, n, &.{});
+            }
+            for (batch[0..n]) |id| self.store.delete(placement.dataKey(id)) catch {};
+            if (n < batch.len) return;
+        }
     }
 
     /// Hands a committed change to the notification subsystem.

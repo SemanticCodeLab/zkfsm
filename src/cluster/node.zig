@@ -16,6 +16,7 @@ const wire = @import("wire.zig");
 const locks = @import("locks.zig");
 const router_mod = @import("router.zig");
 const remote_drive = @import("remote_drive.zig");
+const handles = @import("handles.zig");
 
 const layout = placement.layout;
 const FormatV2 = layout.FormatV2;
@@ -81,6 +82,7 @@ pub const Ext = struct {
     ctx: *anyopaque,
     handle: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8,
 };
+pub const Hook = struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque) void };
 
 pub const Node = struct {
     gpa: std.mem.Allocator,
@@ -94,6 +96,8 @@ pub const Node = struct {
     topo_fp: [16]u8,
     table: locks.Table,
     locks: locks.Manager = undefined,
+    /// Blobs peers are reading by lease.
+    leases: handles.Table,
     profile: Profile = .single,
     deployment: [16]u8 = @splat(0),
     local_eps: [][]?LocalEp,
@@ -115,6 +119,14 @@ pub const Node = struct {
     iam_persist: IamPersist = undefined,
     /// Handler for "ext" calls from peers (subsystems above the cluster layer).
     ext: std.atomic.Value(?*const Ext) = .init(null),
+    /// Per endpoint-list pool, its index in the deployment (kept when pools are removed).
+    orig: []u32 = &.{},
+    /// Deployment pools that finished decommissioning (bit per index).
+    retired: u64 = 0,
+    /// Deployment pools ever formatted; recorded in drive formats.
+    pool_count: u32 = 0,
+    /// Called when a peer announces a pool state change.
+    pools_hook: ?Hook = null,
 
     /// Parses the topology and prepares RPC; nothing touches peers yet.
     pub fn create(gpa: std.mem.Allocator, cfg: Config) Error!*Node {
@@ -131,6 +143,7 @@ pub const Node = struct {
             .root_fp = cfg.root_fp,
             .topo_fp = undefined,
             .table = .{ .gpa = gpa },
+            .leases = .{ .gpa = gpa },
             .local_eps = &.{},
             .remotes = &.{},
         };
@@ -141,6 +154,12 @@ pub const Node = struct {
             return error.BadTopology;
         };
         n.topo_fp = topoFingerprint(&n.topo);
+        if (n.topo.pools.len > router_mod.max_pools) {
+            std.log.err("cluster: at most {d} pools", .{router_mod.max_pools});
+            return error.BadTopology;
+        }
+        n.orig = try a.alloc(u32, n.topo.pools.len);
+        for (n.orig, 0..) |*o, p| o.* = @intCast(p);
         n.rpc = rpc_mod.Rpc.init(gpa, &n.topo, cfg.secret) catch return error.OutOfMemory;
         errdefer n.rpc.deinit();
         if (n.topo.tls) try n.loadCa();
@@ -183,6 +202,7 @@ pub const Node = struct {
         for (n.pools) |*p| for (p.sets) |*s| s.drives.deinit();
         n.locks.deinit();
         n.table.deinit();
+        n.leases.deinit();
         n.guard.deinit();
         n.rpc.deinit();
         n.threads.deinit(n.gpa);
@@ -263,6 +283,7 @@ pub const Node = struct {
             n.stop_ev.timedWait(500 * std.time.ns_per_ms) catch {};
         }
         try n.openSets(seen);
+        n.recordPoolCount(seen);
         n.drives_open.store(true, .release);
         n.refreshSpace();
         std.log.info("cluster: deployment {s}, protection {s}, {d} set(s)", .{ &std.fmt.bytesToHex(n.deployment, .lower), n.profile.name(), n.setCount() });
@@ -392,6 +413,7 @@ pub const Node = struct {
             }
             std.log.warn("cluster: remote drive {s} holds a foreign format", .{n.topo.pools[p].endpoints[i].url});
         };
+        if (dep != null and !try n.resolvePools(seen, dep.?)) return false;
         if (dep == null) {
             // Brand-new cluster: format once every drive can be reached.
             for (seen) |s| for (s) |e| if (e == .unknown) return false;
@@ -400,6 +422,7 @@ pub const Node = struct {
             std.crypto.random.bytes(&d);
             n.deployment = d;
             n.profile = n.cfg.profile orelse n.defaultProfile();
+            n.pool_count = @intCast(n.topo.pools.len);
             for (0..n.topo.pools.len) |p| try n.formatPool(p, seen[p]);
             return false;
         }
@@ -423,6 +446,115 @@ pub const Node = struct {
             if (reachable and n.formatter(p)) try n.formatPool(p, s);
         }
         return complete;
+    }
+
+    /// Maps endpoint-list pools to deployment pool indexes from their formats. A pool
+    /// may leave the list only once its formats record it as decommissioned.
+    fn resolvePools(n: *Node, seen: [][]Seen, dep: [16]u8) Error!bool {
+        var retired: u64 = 0;
+        var present: u64 = 0;
+        var count: u32 = 0;
+        var known = try n.gpa.alloc(bool, seen.len);
+        defer n.gpa.free(known);
+        for (seen, 0..) |s, p| {
+            known[p] = false;
+            for (s) |e| if (e == .fmt and std.mem.eql(u8, &e.fmt.deployment, &dep)) {
+                retired |= e.fmt.retired;
+                count = @max(count, e.fmt.pools);
+                if (e.fmt.pool >= router_mod.max_pools - 1) return error.LayoutMismatch;
+                if (known[p] and n.orig[p] != e.fmt.pool) {
+                    std.log.err("cluster: pool {d} mixes drives of deployment pools {d} and {d}", .{ p + 1, n.orig[p] + 1, e.fmt.pool + 1 });
+                    return error.LayoutMismatch;
+                }
+                n.orig[p] = e.fmt.pool;
+                known[p] = true;
+            };
+            if (known[p]) {
+                const bit = @as(u64, 1) << @intCast(n.orig[p]);
+                if (present & bit != 0) {
+                    std.log.err("cluster: deployment pool {d} appears twice in the endpoint list", .{n.orig[p] + 1});
+                    return error.LayoutMismatch;
+                }
+                present |= bit;
+            }
+        }
+        n.retired = retired;
+        // New pools take the next unused indexes, in endpoint-list order.
+        var next: u32 = @intCast(64 - @clz(present | retired));
+        var fresh = false;
+        for (seen, 0..) |s, p| if (!known[p]) {
+            for (s) |e| if (e != .none) return false;
+            n.orig[p] = next;
+            next += 1;
+            fresh = true;
+        };
+        // Judged once every pool is formatted (a peer may be formatting right now).
+        if (fresh) {
+            n.pool_count = next;
+            return true;
+        }
+        const hi: u32 = @max(count, @as(u32, @intCast(64 - @clz(present | retired))));
+        n.pool_count = @max(hi, next);
+        const missing = ~(present | retired) & ((@as(u64, 1) << @intCast(@min(hi, 63))) -% 1);
+        if (missing != 0) {
+            std.log.err("cluster: deployment pool {d} is missing from the endpoint list and was not decommissioned", .{@ctz(missing) + 1});
+            return error.LayoutMismatch;
+        }
+        return true;
+    }
+
+    /// Records pools as decommissioned in every reachable drive format; returns the
+    /// number of drives that could not be updated.
+    pub fn markRetired(n: *Node, mask: u64) usize {
+        n.retired |= mask;
+        var failed: usize = 0;
+        for (n.topo.pools, 0..) |pool, p| for (pool.endpoints, 0..) |_, i| {
+            const f = switch (n.readFormat(p, i)) {
+                .fmt => |f| f,
+                else => {
+                    failed += 1;
+                    continue;
+                },
+            };
+            var g = f;
+            g.retired |= n.retired;
+            var buf: [layout.format_max]u8 = undefined;
+            const bytes = g.encode(&buf) catch {
+                failed += 1;
+                continue;
+            };
+            n.writeFormat(p, i, bytes) catch {
+                failed += 1;
+            };
+        };
+        for (n.pools) |*ps| for (ps.sets) |*st| if (st.drives.cluster) |*c| {
+            c.format.retired = n.retired;
+        };
+        return failed;
+    }
+
+    /// Local drives learn how many pools the deployment has, so dropping one that
+    /// was never decommissioned is refused even when only older drives remain.
+    fn recordPoolCount(n: *Node, seen: [][]Seen) void {
+        for (seen, 0..) |s, p| for (s, 0..) |e, i| {
+            if (n.local_eps[p][i] == null) continue;
+            const f = switch (e) {
+                .fmt => |f| f,
+                else => continue,
+            };
+            if (f.pools >= n.pool_count and f.retired == n.retired) continue;
+            var g = f;
+            g.pools = @max(f.pools, n.pool_count);
+            g.retired |= n.retired;
+            var buf: [layout.format_max]u8 = undefined;
+            const bytes = g.encode(&buf) catch continue;
+            n.writeFormat(p, i, bytes) catch std.log.warn("cluster: cannot update the format of {s}", .{n.topo.pools[p].endpoints[i].url});
+        };
+    }
+
+    /// Deployment index of endpoint-list pool `p`.
+    pub fn poolIndex(n: *const Node, p: usize) u32 {
+        return n.orig[p];
     }
 
     fn defaultProfile(n: *const Node) Profile {
@@ -465,7 +597,7 @@ pub const Node = struct {
         std.log.info("cluster: formatting pool {d}: {d} set(s) of {d} drives, {s}", .{ p + 1, sets.len, size, n.profile.name() });
         for (sets, 0..) |members, si| for (members, 0..) |ep, idx| {
             if (s[ep] != .none) continue;
-            const f: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = @intCast(p), .set = @intCast(si), .index = @intCast(idx), .set_size = @intCast(size), .profile = n.profile };
+            const f: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = @intCast(idx), .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
             var buf: [layout.format_max]u8 = undefined;
             const bytes = f.encode(&buf) catch return error.BadLayout;
             n.writeFormat(p, ep, bytes) catch std.log.warn("cluster: cannot format {s}", .{n.topo.pools[p].endpoints[ep].url});
@@ -507,7 +639,7 @@ pub const Node = struct {
                     .fmt => |f| f,
                     else => continue,
                 };
-                const ok = std.mem.eql(u8, &f.layout, &fp) and f.pool == p and f.set == si and f.index == idx and f.set_size == size and f.profile.eql(n.profile);
+                const ok = std.mem.eql(u8, &f.layout, &fp) and f.pool == n.orig[p] and f.set == si and f.index == idx and f.set_size == size and f.profile.eql(n.profile);
                 if (!ok) {
                     std.log.err("cluster: drive {s} was formatted for a different layout (endpoint list, order, or protection changed)", .{pool.endpoints[ep].url});
                     return error.LayoutMismatch;
@@ -523,7 +655,7 @@ pub const Node = struct {
                     const e = pool.endpoints[ep];
                     m.* = .{ .path = if (n.local_eps[p][ep]) |le| le.path else e.url, .node = e.node, .remote = if (n.remotes[p][ep]) |*rd| rd.ext() else null };
                 }
-                const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = @intCast(p), .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile };
+                const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
                 st.drives = placement.DriveSet.openCluster(n.gpa, ms, tmpl, true) catch |e| {
                     std.log.err("cluster: pool {d} set {d}: {t}", .{ p + 1, si + 1, e });
                     return error.LayoutMismatch;
@@ -540,9 +672,10 @@ pub const Node = struct {
             }
             var seed: [8]u8 = undefined;
             @memcpy(&seed, n.deployment[0..8]);
-            n.router_pools[p] = .{ .sets = ps.backends, .seed = std.mem.readInt(u64, &seed, .little) +% p };
+            n.router_pools[p] = .{ .sets = ps.backends, .seed = std.mem.readInt(u64, &seed, .little) +% n.orig[p] };
+            if (n.retired & (@as(u64, 1) << @intCast(n.orig[p])) != 0) n.router_pools[p].mode = .init(.retired);
         }
-        n.router = .{ .gpa = n.gpa, .pools = n.router_pools };
+        n.router = .{ .gpa = n.gpa, .pools = n.router_pools, .guard = .{ .ctx = n, .lock = guardLock, .unlock = unlockFn } };
     }
 
     /// Sends `body` to peer `peer`'s "ext" handler; null when the peer is this node,
@@ -608,7 +741,7 @@ pub const Node = struct {
         n.iam_store.store(iam_store, .release);
         n.locks.start();
         for (n.pools) |*p| for (p.sets) |*s| {
-            s.healer.start(time_ns(@max(n.cfg.scan_interval_s, 1))) catch std.log.err("cluster: healer not started", .{});
+            s.healer.start(time_ns(n.cfg.scan_interval_s)) catch std.log.err("cluster: healer not started", .{});
         };
         n.spawn(refreshLoop);
         n.spawn(spaceLoop);
@@ -672,6 +805,16 @@ pub const Node = struct {
         };
     }
 
+    fn guardLock(ctx: *anyopaque, key: backend.PhysicalKey) backend.Error!u64 {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        var buf: [40]u8 = undefined;
+        const res = std.fmt.bufPrint(&buf, "pk/{c}{s}", .{ wire.spaceChar(key.space), &key.hex }) catch unreachable;
+        return n.locks.lock(res) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.WriteQuorum,
+        };
+    }
+
     fn unlockFn(ctx: *anyopaque, token: u64) void {
         const n: *Node = @ptrCast(@alignCast(ctx));
         n.locks.unlock(token);
@@ -704,6 +847,7 @@ pub const Node = struct {
     /// Applies a peer's note to this node's caches.
     pub fn applyNote(n: *Node, note: wire.Note) void {
         switch (note) {
+            .pools => if (n.pools_hook) |h| h.func(h.ctx),
             .iam => if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.warn("iam reload failed: {t}", .{e}),
             .change => |c| {
                 const svc = n.svc.load(.acquire) orelse {
@@ -726,6 +870,8 @@ pub const Node = struct {
                 // A peer still bootstrapping cannot serve drive I/O yet.
                 if (n.hello(node)) |h| n.rpc.setOnline(node, h.drives) else |_| n.rpc.setOnline(node, false);
             }
+            _ = n.leases.sweep(std.time.milliTimestamp());
+            if (n.svc.load(.acquire)) |svc| svc.collectDeferred(false);
             n.stop_ev.timedWait(heartbeat_ns) catch {};
         }
     }
@@ -754,20 +900,30 @@ pub const Node = struct {
     }
 
     /// Pool room: per drive, capacity minus what this deployment stores there.
-    fn refreshSpace(n: *Node) void {
+    pub fn refreshSpace(n: *Node) void {
         for (n.topo.pools, 0..) |pool, p| {
             var free: u64 = 0;
+            var total: u64 = 0;
             for (pool.endpoints, 0..) |_, i| {
                 if (n.local_eps[p][i]) |*le| {
                     measure(le);
                     free += le.total.load(.monotonic) -| le.used.load(.monotonic);
-                } else if (n.remoteSpace(p, i)) |f| free += f;
+                    total += le.total.load(.monotonic);
+                } else if (n.remoteSpace(p, i)) |sp| {
+                    free += sp.total -| sp.used;
+                    total += sp.total;
+                }
             }
-            if (p < n.router_pools.len) n.router_pools[p].free.store(free, .monotonic);
+            if (p < n.router_pools.len) {
+                n.router_pools[p].free.store(free, .monotonic);
+                n.router_pools[p].total.store(total, .monotonic);
+            }
         }
     }
 
-    fn remoteSpace(n: *Node, p: usize, i: usize) ?u64 {
+    pub const Space = struct { total: u64, used: u64 };
+
+    pub fn remoteSpace(n: *Node, p: usize, i: usize) ?Space {
         const rd = &n.remotes[p][i].?;
         if (!n.rpc.isOnline(rd.node)) return null;
         var qb: [32]u8 = undefined;
@@ -785,7 +941,7 @@ pub const Node = struct {
             if (std.mem.startsWith(u8, line, "total ")) total = std.fmt.parseInt(u64, line[6..], 10) catch 0;
             if (std.mem.startsWith(u8, line, "used ")) used = std.fmt.parseInt(u64, line[5..], 10) catch 0;
         }
-        return total -| used;
+        return .{ .total = total, .used = used };
     }
 };
 
