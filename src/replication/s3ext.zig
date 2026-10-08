@@ -33,7 +33,7 @@ fn route(ptr: *anyopaque, c: *Ctx) ConnError!bool {
     const r = self.r;
     if (c.route.bucket.len == 0) return false;
     if (header(c, deliver.hdr_request)) |v| if (std.ascii.eqlIgnoreCase(v, "true")) return receive(r, c);
-    if (c.route.key.len > 0) return false;
+    if (c.route.key.len > 0) return proxyRead(r, c);
     if (try handler.param(c, "replication") != null) {
         configOp(r, c) catch |e| return failObject(c, e);
         return true;
@@ -109,8 +109,95 @@ fn receive(r: *engine.Replicator, c: *Ctx) ConnError!bool {
     defer object.replica.origin = null;
     try handler.runBuiltin(c);
     const st = metrics.global.last_status;
-    if (is_put and st >= 200 and st < 300) r.stats.received(len);
+    if (is_put and st >= 200 and st < 300) {
+        r.stats.received(len);
+        r.wake.set();
+    }
     return true;
+}
+
+// ---- proxying reads ----
+
+pub const hdr_proxy = "x-minio-source-proxy-request";
+
+/// Plain object reads only: no subresources besides these.
+fn plainRead(query: []const u8) bool {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |kv| {
+        if (kv.len == 0) continue;
+        const name = kv[0 .. std.mem.indexOfScalar(u8, kv, '=') orelse kv.len];
+        if (std.mem.eql(u8, name, "versionId") or std.mem.eql(u8, name, "partNumber") or std.mem.startsWith(u8, name, "response-")) continue;
+        if (std.mem.startsWith(u8, name, "X-Amz-") or std.mem.eql(u8, name, "AWSAccessKeyId") or std.mem.eql(u8, name, "Signature") or std.mem.eql(u8, name, "Expires")) continue;
+        return false;
+    }
+    return true;
+}
+
+const ProxySink = struct {
+    c: *Ctx,
+    buf: []u8,
+    bw: ?std.http.BodyWriter = null,
+
+    fn begin(ctx: *anyopaque, status: u16, headers: []const client.Header, len: ?u64) ?*std.Io.Writer {
+        const self: *ProxySink = @ptrCast(@alignCast(ctx));
+        const c = self.c;
+        var hs: std.ArrayList(std.http.Header) = .empty;
+        hs.appendSlice(c.arena, headers) catch return null;
+        hs.append(c.arena, .{ .name = "x-amz-request-id", .value = &c.request_id }) catch return null;
+        const st: u10 = @intCast(status); // 2xx only
+        metrics.global.last_status = st;
+        self.bw = c.req.respondStreaming(self.buf, .{
+            .content_length = len,
+            .respond_options = .{ .status = @enumFromInt(st), .extra_headers = hs.items },
+        }) catch return null;
+        return &self.bw.?.writer;
+    }
+};
+
+/// Serves a GET/HEAD of an object missing here from a replication destination
+/// that has it (not yet replicated back); false lets the local answer stand.
+fn proxyRead(r: *engine.Replicator, c: *Ctx) ConnError!bool {
+    if (c.method != .GET and c.method != .HEAD) return false;
+    if (header(c, hdr_proxy) != null or !plainRead(c.route.query)) return false;
+    var version: ?core.VersionId = null;
+    const vparam = try handler.param(c, "versionId");
+    if (vparam) |v| version = ov.parseVersionId(v) catch return false;
+    if (ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, version)) |_| return false else |e| switch (e) {
+        error.NoSuchKey, error.NoSuchVersion => {},
+        else => return false,
+    }
+    const dests = r.proxyDests(c.arena, c.route.bucket) catch return false;
+    if (dests.len == 0) return false;
+    var hs: std.ArrayList(client.Header) = .empty;
+    try hs.append(c.arena, .{ .name = hdr_proxy, .value = "true" });
+    if (c.range) |rg| try hs.append(c.arena, .{ .name = "range", .value = rg });
+    var q: std.ArrayList(client.Param) = .empty;
+    if (vparam) |v| try q.append(c.arena, .{ .name = "versionId", .value = v });
+    if (try handler.param(c, "partNumber")) |v| try q.append(c.arena, .{ .name = "partNumber", .value = v });
+    var hc = client.newHttp(r.gpa);
+    defer hc.deinit();
+    var buf: [64 * 1024]u8 = undefined;
+    for (dests) |d| {
+        var sink: ProxySink = .{ .c = c, .buf = &buf };
+        const path = try std.fmt.allocPrint(c.arena, "/{s}/{s}", .{ d.target_bucket, c.route.key });
+        const res = client.send(&hc, c.arena, d.remote, .{
+            .method = c.method,
+            .path = path,
+            .query = q.items,
+            .headers = hs.items,
+            .sink = .{ .ctx = &sink, .begin = ProxySink.begin },
+        }) catch |e| {
+            if (sink.bw != null) return error.StreamAborted;
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            continue;
+        };
+        if (sink.bw) |*bw| {
+            if (c.method == .HEAD) try bw.flush() else try bw.end();
+            return true;
+        }
+        _ = res;
+    }
+    return false;
 }
 
 // ---- configuration ----
@@ -163,7 +250,7 @@ fn configOp(r: *engine.Replicator, c: *Ctx) OpError!void {
 fn checkOp(r: *engine.Replicator, c: *Ctx) OpError!void {
     const v = try r.view(c.arena, c.route.bucket);
     const cfg = v.cfg orelse return failCode(c, .not_found, "ReplicationConfigurationNotFoundError", "The replication configuration was not found");
-    var hc: std.http.Client = .{ .allocator = r.gpa };
+    var hc = client.newHttp(r.gpa);
     defer hc.deinit();
     for (cfg.rules) |rule| {
         const t = for (v.targets) |t| {

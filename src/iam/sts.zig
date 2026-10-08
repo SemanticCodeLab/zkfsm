@@ -60,6 +60,28 @@ pub const Claims = struct {
 
 pub const DecodeBuffer = [limits.max_payload + Hmac.mac_length]u8;
 
+/// Key shared by linked deployments (site replication); sessions minted under it carry
+/// `site_marker` at access key index 4 and validate on every site.
+pub const SiteKey = struct {
+    mutex: std.Thread.Mutex = .{},
+    key: ?[32]u8 = null,
+
+    pub fn set(k: *SiteKey, v: ?[32]u8) void {
+        k.mutex.lock();
+        defer k.mutex.unlock();
+        k.key = v;
+    }
+
+    pub fn get(k: *SiteKey) ?[32]u8 {
+        k.mutex.lock();
+        defer k.mutex.unlock();
+        return k.key;
+    }
+};
+
+pub var site_key: SiteKey = .{};
+pub const site_marker = '9';
+
 pub const Issuer = struct {
     key: [32]u8,
 
@@ -85,7 +107,11 @@ pub const Issuer = struct {
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
         @memcpy(creds.access_key[0..4], "ASIA");
         for (creds.access_key[4..]) |*c| c.* = alphabet[rand.int(u5)];
-        creds.secret_key = self.secretFor(&creds.access_key);
+        const key = if (site_key.get()) |k| blk: {
+            creds.access_key[4] = site_marker;
+            break :blk k;
+        } else self.key;
+        creds.secret_key = secretWith(&key, &creds.access_key);
 
         var raw: DecodeBuffer = undefined;
         var w: std.Io.Writer = .fixed(&raw);
@@ -106,7 +132,7 @@ pub const Issuer = struct {
         w.writeByte(@intCast(req.tenant.len)) catch unreachable;
         w.writeAll(req.tenant) catch unreachable;
         const payload_len = w.end;
-        self.mac(raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
+        macWith(&key, raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
         const signed = raw[0 .. payload_len + Hmac.mac_length];
         creds.session_token = try gpa.alloc(u8, b64.Encoder.calcSize(signed.len));
         _ = b64.Encoder.encode(creds.session_token, signed);
@@ -121,9 +147,13 @@ pub const Issuer = struct {
         b64.Decoder.decode(buf[0..n], token) catch return error.MalformedToken;
         const payload = buf[0 .. n - Hmac.mac_length];
         var want: [Hmac.mac_length]u8 = undefined;
-        self.mac(payload, &want);
-        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, buf[n - Hmac.mac_length ..][0..Hmac.mac_length].*))
-            return error.BadSignature;
+        const got = buf[n - Hmac.mac_length ..][0..Hmac.mac_length].*;
+        macWith(&self.key, payload, &want);
+        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, got)) {
+            const k = site_key.get() orelse return error.BadSignature;
+            macWith(&k, payload, &want);
+            if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, got)) return error.BadSignature;
+        }
         var r: std.Io.Reader = .fixed(payload);
         const m = r.takeArray(2) catch return error.MalformedToken;
         const v2 = std.mem.eql(u8, m, &magic);
@@ -164,7 +194,12 @@ pub const Issuer = struct {
 
     /// Temporary secrets are derived, so no server-side session state is needed.
     pub fn secretFor(self: *const Issuer, access_key: []const u8) [secret_key_len]u8 {
-        var h = Hmac.init(&self.key);
+        if (access_key.len > 4 and access_key[4] == site_marker) if (site_key.get()) |k| return secretWith(&k, access_key);
+        return secretWith(&self.key, access_key);
+    }
+
+    fn secretWith(key: *const [32]u8, access_key: []const u8) [secret_key_len]u8 {
+        var h = Hmac.init(key);
         h.update("zkfsm-sts-secret\x00");
         h.update(access_key);
         var d: [Hmac.mac_length]u8 = undefined;
@@ -174,8 +209,8 @@ pub const Issuer = struct {
         return enc[0..secret_key_len].*;
     }
 
-    fn mac(self: *const Issuer, payload: []const u8, out: *[Hmac.mac_length]u8) void {
-        var h = Hmac.init(&self.key);
+    fn macWith(key: *const [32]u8, payload: []const u8, out: *[Hmac.mac_length]u8) void {
+        var h = Hmac.init(key);
         h.update("zkfsm-sts-token\x00");
         h.update(payload);
         h.final(out);
@@ -255,4 +290,20 @@ test "federated session carries policies and tenant" {
     var l = try test_issuer.issue(a, .{ .parent = "bob" }, 0, prng.random());
     defer l.deinit(a);
     try std.testing.expect((try test_issuer.validate(l.session_token, 0, &buf)).federated_policies == null);
+}
+
+test "site key sessions validate on another issuer" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(3);
+    site_key.set(@splat(9));
+    defer site_key.set(null);
+    var c = try test_issuer.issue(a, .{ .parent = "alice" }, 1000, prng.random());
+    defer c.deinit(a);
+    try std.testing.expectEqual(site_marker, c.access_key[4]);
+    const other: Issuer = .{ .key = @splat(8) };
+    var buf: DecodeBuffer = undefined;
+    _ = try other.verify(&c.access_key, c.session_token, 1100, &buf);
+    try std.testing.expectEqualSlices(u8, &c.secret_key, &other.secretFor(&c.access_key));
+    site_key.set(null);
+    try std.testing.expectError(error.BadSignature, other.validate(c.session_token, 1100, &buf));
 }

@@ -73,6 +73,9 @@ pub fn handle(r: *engine.Replicator, a: Allocator, store: *iam.Store, req: Reque
         .{ "/site-replication/peer/remove", .PUT, "admin:SiteReplicationRemove", peerRemove },
         .{ "/site-replication/peer/metainfo", .GET, "admin:SiteReplicationInfo", peerMetaInfo },
         .{ "/site-replication/peer/iam-import", .PUT, "admin:SiteReplicationOperation", peerIamImport },
+        .{ "/site-replication/edit", .PUT, "admin:SiteReplicationAdd", siteEdit },
+        .{ "/site-replication/peer/edit", .PUT, "admin:SiteReplicationAdd", peerEdit },
+        .{ "/site-replication/resync/op", .PUT, "admin:SiteReplicationResync", siteResync },
     };
     inline for (routes) |rt| if (std.mem.eql(u8, req.target.op, rt[0])) {
         if (req.method != rt[1]) return try api.fail(a, .method_not_allowed, "MethodNotAllowed", "The specified method is not allowed against this resource.");
@@ -137,7 +140,7 @@ fn setRemoteTarget(c: Ctx) Error!Response {
 /// Target bucket must exist and be versioned; returns an error response otherwise.
 fn probeRemote(c: Ctx, t: targets.Target) Error!?Response {
     if (t.access_key.len == 0) return try bad(c.a, "XMinioAdminInvalidArgument", "Remote target credentials are required.");
-    var hc: std.http.Client = .{ .allocator = c.r.gpa };
+    var hc = client.newHttp(c.r.gpa);
     defer hc.deinit();
     const path = try std.fmt.allocPrint(c.a, "/{s}", .{t.target_bucket});
     const q = [_]client.Param{.{ .name = "versioning", .value = "" }};
@@ -215,7 +218,7 @@ fn siteAdd(c: Ctx) Error!Response {
     if (sites.len < 1) return bad(c.a, "XMinioAdminInvalidArgument", "At least two sites are needed.");
     const self_dep = site.deploymentId(c.r, c.a) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "deployment id unavailable");
     const cur = try c.r.siteState(c.a);
-    var hc: std.http.Client = .{ .allocator = c.r.gpa };
+    var hc = client.newHttp(c.r.gpa);
     defer hc.deinit();
 
     // Identify every site by deployment id, with the credentials given for it.
@@ -285,6 +288,135 @@ fn peerJoin(c: Ctx) Error!Response {
     return .{};
 }
 
+/// Body that may or may not be sealed with the caller's secret.
+fn maybeSealed(c: Ctx) Error!?[]const u8 {
+    if (!admin.sio.isEncrypted(c.req.body)) return c.req.body;
+    return try c.decrypted();
+}
+
+const PeerEditReq = struct { endpoint: []const u8 = "", name: []const u8 = "", deploymentID: []const u8 = "", sync: []const u8 = "" };
+
+/// Applies an edit to the peer list; null when the deployment is unknown.
+fn applyEdit(a: Allocator, st: site.State, req: PeerEditReq) Allocator.Error!?site.State {
+    var peers = try a.dupe(site.Peer, st.peers);
+    const i = for (peers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.deployment_id, req.deploymentID)) break i;
+    } else return null;
+    if (req.endpoint.len > 0) peers[i].endpoint = req.endpoint;
+    if (std.mem.eql(u8, req.sync, "enable")) peers[i].sync = true;
+    if (std.mem.eql(u8, req.sync, "disable")) peers[i].sync = false;
+    var next = st;
+    next.peers = peers;
+    next.updated_ns = @intCast(std.time.nanoTimestamp());
+    return next;
+}
+
+fn siteEdit(c: Ctx) Error!Response {
+    const body = try maybeSealed(c) orelse return bad(c.a, "XMinioAdminConfigBadJSON", "Request body could not be decrypted.");
+    const req = std.json.parseFromSliceLeaky(PeerEditReq, c.a, body, .{ .ignore_unknown_fields = true }) catch
+        return bad(c.a, "XMinioAdminConfigBadJSON", "Malformed site edit request.");
+    const st = try c.r.siteState(c.a) orelse return bad(c.a, "XMinioSiteReplicationNotEnabled", "Site replication is not enabled.");
+    const next = try applyEdit(c.a, st, req) orelse return bad(c.a, "XMinioAdminInvalidArgument", "No site with this deployment id takes part in site replication.");
+    var hc = client.newHttp(c.r.gpa);
+    defer hc.deinit();
+    if (req.endpoint.len > 0) {
+        const p = next.peer(req.deploymentID).?;
+        if (client.parseUrl(p.endpoint) == null) return bad(c.a, "XMinioAdminInvalidArgument", "Invalid endpoint.");
+        const res = client.send(&hc, c.a, site.remoteFor(next, p), .{ .method = .GET, .path = site.peer_prefix ++ "/peer/whoami" }) catch
+            return bad(c.a, "XMinioAdminSiteReplicationEdit", "The new endpoint is unreachable.");
+        const who = std.json.parseFromSliceLeaky(struct { deploymentID: []const u8 }, c.a, res.body, .{ .ignore_unknown_fields = true }) catch
+            return bad(c.a, "XMinioAdminSiteReplicationEdit", "The new endpoint did not identify itself.");
+        if (!std.mem.eql(u8, who.deploymentID, req.deploymentID))
+            return bad(c.a, "XMinioAdminSiteReplicationEdit", "The new endpoint belongs to another deployment.");
+    }
+    const doc = Stringify.valueAlloc(c.a, req, .{}) catch return error.OutOfMemory;
+    var detail: std.ArrayList(u8) = .empty;
+    for (next.peers) |p| {
+        if (std.mem.eql(u8, p.deployment_id, st.deployment_id)) continue;
+        const res = client.send(&hc, c.a, site.remoteFor(next, p), .{ .method = .PUT, .path = site.peer_prefix ++ "/peer/edit", .body = .{ .bytes = doc } }) catch {
+            try detail.print(c.a, "site {s} unreachable; ", .{p.name});
+            continue;
+        };
+        if (!res.ok()) try detail.print(c.a, "site {s}: {d} {s}; ", .{ p.name, res.status, res.code() });
+    }
+    site.save(c.r, next) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "cannot update site replication state");
+    if (detail.items.len > 0) return c.json(.{ .success = false, .status = "Site edited locally; some peers were not updated.", .errorDetail = detail.items });
+    return c.json(.{ .success = true, .status = "Requested site was edited successfully" });
+}
+
+fn peerEdit(c: Ctx) Error!Response {
+    const req = std.json.parseFromSliceLeaky(PeerEditReq, c.a, c.req.body, .{ .ignore_unknown_fields = true }) catch
+        return bad(c.a, "XMinioAdminConfigBadJSON", "Malformed site edit request.");
+    const st = try c.r.siteState(c.a) orelse return bad(c.a, "XMinioSiteReplicationNotEnabled", "Site replication is not enabled.");
+    const next = try applyEdit(c.a, st, req) orelse return bad(c.a, "XMinioAdminInvalidArgument", "Unknown deployment id.");
+    site.save(c.r, next) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "cannot update site replication state");
+    return .{};
+}
+
+/// One site-level resync: a reset id shared by per-bucket resyncs to one peer.
+const SiteResync = struct { id: []const u8, buckets: []const []const u8 = &.{}, canceled: bool = false };
+
+fn siteResyncKey(a: Allocator, dep: []const u8) Allocator.Error!@import("store.zig").PhysicalKey {
+    return @import("store.zig").key(.resync, try std.fmt.allocPrint(a, "site/{s}", .{dep}));
+}
+
+fn siteResync(c: Ctx) Error!Response {
+    const sstore = @import("store.zig");
+    const op = try c.param("operation") orelse "";
+    const body = try maybeSealed(c) orelse return bad(c.a, "XMinioAdminConfigBadJSON", "Request body could not be decrypted.");
+    const req = std.json.parseFromSliceLeaky(PeerEditReq, c.a, body, .{ .ignore_unknown_fields = true }) catch
+        return bad(c.a, "XMinioAdminConfigBadJSON", "Malformed resync request.");
+    const st = try c.r.siteState(c.a) orelse return bad(c.a, "XMinioSiteReplicationNotEnabled", "Site replication is not enabled.");
+    const p = st.peer(req.deploymentID) orelse return bad(c.a, "XMinioAdminInvalidArgument", "No site with this deployment id takes part in site replication.");
+    if (std.mem.eql(u8, p.deployment_id, st.deployment_id)) return bad(c.a, "XMinioAdminInvalidArgument", "A site cannot resync to itself.");
+    const k = try siteResyncKey(c.a, p.deployment_id);
+    const cur = sstore.getJson(SiteResync, c.r.svc.store, c.a, k) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "resync state unreadable");
+    const BucketStatus = struct { bucket: []const u8, status: []const u8, errorDetail: []const u8 = "" };
+    var out: std.ArrayList(BucketStatus) = .empty;
+    if (std.mem.eql(u8, op, "start")) {
+        var idb: [16]u8 = undefined;
+        std.crypto.random.bytes(&idb);
+        const id = try c.a.dupe(u8, &std.fmt.bytesToHex(idb, .lower));
+        const buckets = c.r.svc.listBuckets(c.a) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "bucket listing failed");
+        var names_: std.ArrayList([]const u8) = .empty;
+        for (buckets) |b| {
+            const arn = try site.peerArn(c.a, p.deployment_id, b.name);
+            c.r.updateResync(b.name, arn, id, .{ .start = true });
+            const now: i128 = std.time.nanoTimestamp();
+            c.r.startScan(b.name, arn, id, now) catch {
+                try out.append(c.a, .{ .bucket = b.name, .status = "Failed", .errorDetail = "cannot start scan" });
+                continue;
+            };
+            try names_.append(c.a, b.name);
+            try out.append(c.a, .{ .bucket = b.name, .status = "Ongoing" });
+        }
+        sstore.putJson(c.r.svc.store, c.r.gpa, k, SiteResync{ .id = id, .buckets = names_.items }) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "cannot save resync state");
+        return c.json(.{ .op = "start", .id = id, .status = "success", .buckets = out.items });
+    }
+    const rs = cur orelse return c.json(.{ .op = op, .id = "", .status = "not-found", .errorDetail = "no resync in progress or recorded for this site" });
+    if (std.mem.eql(u8, op, "cancel")) {
+        for (rs.buckets) |b| {
+            const arn = try site.peerArn(c.a, p.deployment_id, b);
+            c.r.cancelResync(b, arn, rs.id);
+            try out.append(c.a, .{ .bucket = b, .status = "Canceled" });
+        }
+        var n = rs;
+        n.canceled = true;
+        sstore.putJson(c.r.svc.store, c.r.gpa, k, n) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "cannot save resync state");
+        return c.json(.{ .op = "cancel", .id = rs.id, .status = "success", .buckets = out.items });
+    }
+    if (!std.mem.eql(u8, op, "status")) return bad(c.a, "XMinioAdminInvalidArgument", "operation must be start, status, or cancel");
+    for (rs.buckets) |b| {
+        const arn = try site.peerArn(c.a, p.deployment_id, b);
+        const list = c.r.resyncs(c.a, b) catch &.{};
+        const status = for (list) |t| {
+            if (std.mem.eql(u8, t.arn, arn) and std.mem.eql(u8, t.reset_id, rs.id)) break t.status;
+        } else "Unknown";
+        try out.append(c.a, .{ .bucket = b, .status = status });
+    }
+    return c.json(.{ .op = "status", .id = rs.id, .status = "success", .buckets = out.items });
+}
+
 fn siteInfo(c: Ctx) Error!Response {
     const st = try c.r.siteState(c.a) orelse return c.json(.{ .enabled = false, .apiVersion = "1" });
     var out: std.Io.Writer.Allocating = .init(c.a);
@@ -298,7 +430,7 @@ fn writePeer(w: *Stringify, p: site.Peer) std.Io.Writer.Error!void {
         .endpoint = p.endpoint,
         .name = p.name,
         .deploymentID = p.deployment_id,
-        .sync = "disable",
+        .sync = if (p.sync) "enable" else "disable",
         .defaultbandwidth = .{ .bandwidthLimitPerBucket = 0, .set = false },
         .@"replicate-ilm-expiry" = false,
         .apiVersion = "1",
@@ -329,7 +461,7 @@ fn siteRemove(c: Ctx) Error!Response {
     const req = std.json.parseFromSliceLeaky(RemoveReq, c.a, body, .{ .ignore_unknown_fields = true }) catch
         return bad(c.a, "XMinioAdminConfigBadJSON", "Malformed remove request.");
     const st = try c.r.siteState(c.a) orelse return bad(c.a, "XMinioSiteReplicationNotEnabled", "Site replication is not enabled.");
-    var hc: std.http.Client = .{ .allocator = c.r.gpa };
+    var hc = client.newHttp(c.r.gpa);
     defer hc.deinit();
     var detail: std.ArrayList(u8) = .empty;
     var removed: std.ArrayList([]const u8) = .empty;
@@ -381,7 +513,7 @@ const SiteView = struct { peer: site.Peer, info: ?site.MetaInfo };
 
 fn siteStatus(c: Ctx) Error!Response {
     const st = try c.r.siteState(c.a) orelse return c.json(.{ .Enabled = false, .apiVersion = "1" });
-    var hc: std.http.Client = .{ .allocator = c.r.gpa };
+    var hc = client.newHttp(c.r.gpa);
     defer hc.deinit();
     var views: std.ArrayList(SiteView) = .empty;
     for (st.peers) |p| {
