@@ -213,6 +213,8 @@ pub const Session = struct {
             (if (hs.containsU16(g, hs.group_x25519)) hs.group_x25519 else if (hs.containsU16(g, hs.group_secp256r1)) hs.group_secp256r1 else return error.HandshakeFailure)
         else
             hs.group_secp256r1;
+        // RFC 8422 5.1: supported_groups also limits the ECDSA certificate's curve.
+        if (ecdsa) if (ch.groups) |g| if (!hs.containsU16(g, hs.group_secp256r1)) return error.HandshakeFailure;
         if (ch.sni) |name| {
             @memcpy(s.sni_buf[0..name.len], name);
             s.sni_len = @intCast(name.len);
