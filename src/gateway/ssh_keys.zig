@@ -1,11 +1,14 @@
-//! SSH keys: server host keys (ed25519 in openssh-key-v1, RSA from PEM via the
-//! TLS key parser), public key blobs, signatures, and client signature checks.
+//! SSH keys: server host keys (ed25519 or ECDSA P-256 in openssh-key-v1, RSA or
+//! EC from PEM via the TLS key parser), public key blobs, signatures, and client
+//! signature checks.
 const std = @import("std");
 const wire = @import("ssh_wire.zig");
 const tls_keys = @import("../tls/keys.zig");
 const tls_rsa = @import("../tls/rsa.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
+const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const ecdsa_name = "ecdsa-sha2-nistp256";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const M = std.crypto.ff.Modulus(tls_rsa.max_bits);
@@ -20,12 +23,14 @@ pub const max_pub_blob = tls_rsa.max_bytes + 64;
 
 pub const SigAlg = enum {
     ssh_ed25519,
+    ecdsa_nistp256,
     rsa_sha2_512,
     rsa_sha2_256,
 
     pub fn name(a: SigAlg) []const u8 {
         return switch (a) {
             .ssh_ed25519 => "ssh-ed25519",
+            .ecdsa_nistp256 => ecdsa_name,
             .rsa_sha2_512 => "rsa-sha2-512",
             .rsa_sha2_256 => "rsa-sha2-256",
         };
@@ -41,15 +46,42 @@ pub const SigAlg = enum {
 };
 
 /// Signature algorithms accepted for user authentication (ext-info server-sig-algs).
-pub const user_sig_algs = "ssh-ed25519,rsa-sha2-512,rsa-sha2-256";
+pub const user_sig_algs = "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256";
+
+/// Which host key types a server holds.
+pub const HostAlgs = struct {
+    ed: bool = false,
+    ecdsa: bool = false,
+    rsa: bool = false,
+
+    pub fn allow(h: HostAlgs, a: SigAlg) bool {
+        return switch (a) {
+            .ssh_ed25519 => h.ed,
+            .ecdsa_nistp256 => h.ecdsa,
+            .rsa_sha2_512, .rsa_sha2_256 => h.rsa,
+        };
+    }
+
+    pub fn of(ks: []const HostKey) HostAlgs {
+        var h: HostAlgs = .{};
+        for (ks) |k| switch (k) {
+            .ed25519 => h.ed = true,
+            .ecdsa => h.ecdsa = true,
+            .rsa => h.rsa = true,
+        };
+        return h;
+    }
+};
 
 pub const HostKey = union(enum) {
     ed25519: Ed25519.KeyPair,
+    ecdsa: Ecdsa.KeyPair,
     rsa: tls_keys.PrivateKey,
 
     pub fn deinit(k: *HostKey, gpa: std.mem.Allocator) void {
         switch (k.*) {
             .ed25519 => |*kp| std.crypto.secureZero(u8, std.mem.asBytes(kp)),
+            .ecdsa => |*kp| std.crypto.secureZero(u8, std.mem.asBytes(kp)),
             .rsa => |*r| r.deinit(gpa),
         }
     }
@@ -57,7 +89,8 @@ pub const HostKey = union(enum) {
     pub fn supports(k: *const HostKey, alg: SigAlg) bool {
         return switch (k.*) {
             .ed25519 => alg == .ssh_ed25519,
-            .rsa => alg != .ssh_ed25519,
+            .ecdsa => alg == .ecdsa_nistp256,
+            .rsa => alg == .rsa_sha2_256 or alg == .rsa_sha2_512,
         };
     }
 
@@ -71,6 +104,11 @@ pub const HostKey = union(enum) {
             .ed25519 => |kp| {
                 try w.string("ssh-ed25519");
                 try w.string(&kp.public_key.toBytes());
+            },
+            .ecdsa => |kp| {
+                try w.string(ecdsa_name);
+                try w.string("nistp256");
+                try w.string(&kp.public_key.toUncompressedSec1());
             },
             .rsa => {
                 const r = k.rsaKey();
@@ -89,12 +127,20 @@ pub const HostKey = union(enum) {
                 try w.string("ssh-ed25519");
                 try w.string(&sig.toBytes());
             },
+            .ecdsa => |kp| {
+                const sig = kp.sign(msg, null) catch return error.SignFailed;
+                try w.string(ecdsa_name);
+                const inner = try w.beginString();
+                try w.mpint(&sig.r);
+                try w.mpint(&sig.s);
+                w.endString(inner);
+            },
             .rsa => {
                 var out: [tls_rsa.max_bytes]u8 = undefined;
                 const s = switch (alg) {
                     .rsa_sha2_256 => try rsaSign(k.rsaKey(), Sha256, msg, &out),
                     .rsa_sha2_512 => try rsaSign(k.rsaKey(), Sha512, msg, &out),
-                    .ssh_ed25519 => return error.SignFailed,
+                    .ssh_ed25519, .ecdsa_nistp256 => return error.SignFailed,
                 };
                 try w.string(alg.name());
                 try w.string(s);
@@ -115,10 +161,11 @@ pub const HostKey = union(enum) {
     }
 };
 
-/// Loads a host key file: openssh-key-v1 (unencrypted ed25519) or PEM RSA.
+/// Loads a host key file: openssh-key-v1 (unencrypted ed25519 or ECDSA P-256),
+/// or PEM RSA / EC P-256.
 pub fn loadHostKey(gpa: std.mem.Allocator, text: []const u8) LoadError!HostKey {
     if (std.mem.indexOf(u8, text, "-----BEGIN OPENSSH PRIVATE KEY-----") != null) {
-        return .{ .ed25519 = try parseOpenSsh(gpa, text) };
+        return parseOpenSsh(gpa, text);
     }
     var k = tls_keys.parsePem(gpa, text) catch |e| return switch (e) {
         error.BadKey => error.BadKey,
@@ -127,18 +174,20 @@ pub fn loadHostKey(gpa: std.mem.Allocator, text: []const u8) LoadError!HostKey {
         error.NoKey => error.NoKey,
         error.OutOfMemory => error.OutOfMemory,
     };
-    if (k.kind != .rsa) {
-        k.deinit(gpa);
-        return error.UnsupportedKey;
+    switch (k.kind) {
+        .rsa => return .{ .rsa = k },
+        .ecdsa_p256 => |kp| {
+            k.deinit(gpa);
+            return .{ .ecdsa = kp };
+        },
     }
-    return .{ .rsa = k };
 }
 
 const openssh_magic = "openssh-key-v1\x00";
 const openssh_begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
 const openssh_end = "-----END OPENSSH PRIVATE KEY-----";
 
-fn parseOpenSsh(gpa: std.mem.Allocator, text: []const u8) LoadError!Ed25519.KeyPair {
+fn parseOpenSsh(gpa: std.mem.Allocator, text: []const u8) LoadError!HostKey {
     const start = (std.mem.indexOf(u8, text, openssh_begin) orelse return error.NoKey) + openssh_begin.len;
     const end = std.mem.indexOfPos(u8, text, start, openssh_end) orelse return error.BadKey;
     const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
@@ -156,7 +205,7 @@ fn parseOpenSsh(gpa: std.mem.Allocator, text: []const u8) LoadError!Ed25519.KeyP
     };
 }
 
-fn parseOpenSshBytes(raw: []const u8) (LoadError || wire.DecodeError)!Ed25519.KeyPair {
+fn parseOpenSshBytes(raw: []const u8) (LoadError || wire.DecodeError)!HostKey {
     if (!std.mem.startsWith(u8, raw, openssh_magic)) return error.BadKey;
     var r = wire.Reader.init(raw[openssh_magic.len..]);
     const cipher = try r.string();
@@ -168,6 +217,7 @@ fn parseOpenSshBytes(raw: []const u8) (LoadError || wire.DecodeError)!Ed25519.Ke
     var p = wire.Reader.init(try r.string());
     if (try p.u32be() != try p.u32be()) return error.BadKey;
     const kt = try p.string();
+    if (std.mem.eql(u8, kt, ecdsa_name)) return .{ .ecdsa = try parseOpenSshEcdsa(&p) };
     if (!std.mem.eql(u8, kt, "ssh-ed25519")) return error.UnsupportedKey;
     const pub_bytes = try p.string();
     const priv = try p.string();
@@ -175,6 +225,19 @@ fn parseOpenSshBytes(raw: []const u8) (LoadError || wire.DecodeError)!Ed25519.Ke
     const sk = Ed25519.SecretKey.fromBytes(priv[0..64].*) catch return error.BadKey;
     const kp = Ed25519.KeyPair.fromSecretKey(sk) catch return error.BadKey;
     if (!std.mem.eql(u8, &kp.public_key.toBytes(), pub_bytes)) return error.BadKey;
+    return .{ .ed25519 = kp };
+}
+
+fn parseOpenSshEcdsa(p: *wire.Reader) (LoadError || wire.DecodeError)!Ecdsa.KeyPair {
+    if (!std.mem.eql(u8, try p.string(), "nistp256")) return error.UnsupportedKey;
+    const q = try p.string();
+    const d = try p.mpintUnsigned();
+    if (d.len > 32) return error.BadKey;
+    var sk: [32]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &sk);
+    @memcpy(sk[32 - d.len ..], d);
+    const kp = Ecdsa.KeyPair.fromSecretKey(Ecdsa.SecretKey.fromBytes(sk) catch return error.BadKey) catch return error.BadKey;
+    if (!std.mem.eql(u8, &kp.public_key.toUncompressedSec1(), q)) return error.BadKey;
     return kp;
 }
 
@@ -299,6 +362,22 @@ pub fn verify(alg_name: []const u8, blob: []const u8, sig_blob: []const u8, msg:
             Ed25519.Signature.fromBytes(sig[0..64].*).verify(msg, key) catch return false;
             return true;
         },
+        .ecdsa_nistp256 => {
+            if (!std.mem.eql(u8, kt, ecdsa_name)) return false;
+            const curve = kr.string() catch return false;
+            const q = kr.string() catch return false;
+            if (!kr.done() or !std.mem.eql(u8, curve, "nistp256")) return false;
+            const key = Ecdsa.PublicKey.fromSec1(q) catch return false;
+            var ir = wire.Reader.init(sig);
+            const r = ir.mpintUnsigned() catch return false;
+            const s = ir.mpintUnsigned() catch return false;
+            if (!ir.done() or r.len > 32 or s.len > 32) return false;
+            var rs: [64]u8 = @splat(0);
+            @memcpy(rs[32 - r.len .. 32], r);
+            @memcpy(rs[64 - s.len ..], s);
+            Ecdsa.Signature.fromBytes(rs).verify(msg, key) catch return false;
+            return true;
+        },
         .rsa_sha2_256, .rsa_sha2_512 => {
             if (!std.mem.eql(u8, kt, "ssh-rsa")) return false;
             const e = kr.mpintUnsigned() catch return false;
@@ -369,6 +448,25 @@ test "openssh-key-v1 ed25519 round trip and signatures" {
     try std.testing.expect(!verify("rsa-sha2-256", bw.written(), sw.written(), "exchange hash"));
     var fp: [64]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, hk.fingerprint(&fp), "SHA256:"));
+}
+
+test "ecdsa p256 host key signs and verifies" {
+    var hk: HostKey = .{ .ecdsa = Ecdsa.KeyPair.generate() };
+    try std.testing.expect(hk.supports(.ecdsa_nistp256));
+    try std.testing.expect(!hk.supports(.ssh_ed25519));
+    var bb: [max_pub_blob]u8 = undefined;
+    var bw = wire.Writer.init(&bb);
+    try hk.writeBlob(&bw);
+    try std.testing.expectEqualStrings(ecdsa_name, blobType(bw.written()).?);
+    var sb: [max_sig_blob]u8 = undefined;
+    var sw = wire.Writer.init(&sb);
+    try hk.sign(.ecdsa_nistp256, "H", &sw);
+    try std.testing.expect(verify(ecdsa_name, bw.written(), sw.written(), "H"));
+    try std.testing.expect(!verify(ecdsa_name, bw.written(), sw.written(), "h"));
+    try std.testing.expect(!verify("ssh-ed25519", bw.written(), sw.written(), "H"));
+    const h = HostAlgs.of(&.{hk});
+    try std.testing.expect(h.allow(.ecdsa_nistp256) and !h.allow(.rsa_sha2_256));
+    hk.deinit(std.testing.allocator);
 }
 
 test "openssh key rejects encrypted and garbage" {

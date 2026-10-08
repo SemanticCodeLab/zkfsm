@@ -42,6 +42,10 @@ ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/id"
 echo "$AK $(cut -d' ' -f1,2 "$WORK/id.pub") test" > "$WORK/authorized"
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/host_ed"
 ssh-keygen -q -t rsa -b 3072 -m PEM -N '' -C '' -f "$WORK/host_rsa"
+ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$WORK/host_ec"
+ssh-keygen -q -t ecdsa -b 256 -m PEM -N '' -C '' -f "$WORK/host_ec_pem"
+ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$WORK/id_ec"
+echo "$AK $(cut -d' ' -f1,2 "$WORK/id_ec.pub") ec" >> "$WORK/authorized"
 
 SSHOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o LogLevel=ERROR)
 if command -v sshpass >/dev/null; then
@@ -66,7 +70,9 @@ check "fingerprint matches client view" "$FP1" "$(ssh-keyscan -t ed25519 -p "$SP
 stop
 
 # Configured host keys plus a small rekey limit so server-started re-exchange runs too.
-start --sftp-host-key "$WORK/host_ed" --sftp-host-key "$WORK/host_rsa" --sftp-rekey-bytes 4194304
+start --sftp-host-key "$WORK/host_ed" --sftp-host-key "$WORK/host_rsa" --sftp-host-key "$WORK/host_ec" --sftp-rekey-bytes 4194304
+check "ecdsa host key offered" "$(ssh-keygen -lf "$WORK/host_ec.pub" | awk '{print $2}')" \
+  "$(ssh-keyscan -t ecdsa -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
 
 printf 'mkdir /sftpbkt\nmkdir /sftpbkt/dir\nls /\n' > "$WORK/b1"
 check "mkdir bucket and dir" 0 "$(sftpb "$WORK/b1"; echo $?)"
@@ -77,7 +83,7 @@ BIGMD5=$(md5 "$WORK/big")
 printf 'small file\n' > "$WORK/small"
 for cipher in chacha20-poly1305@openssh.com aes256-gcm@openssh.com aes128-gcm@openssh.com; do
   for kex in mlkem768x25519-sha256 curve25519-sha256 curve25519-sha256@libssh.org; do
-    for hk in ssh-ed25519 rsa-sha2-512 rsa-sha2-256; do
+    for hk in ssh-ed25519 ecdsa-sha2-nistp256 rsa-sha2-512 rsa-sha2-256; do
       printf 'put %s /sftpbkt/dir/s.txt\nget /sftpbkt/dir/s.txt %s\n' "$WORK/small" "$WORK/small.out" > "$WORK/b2"
       rm -f "$WORK/small.out"
       sftpb "$WORK/b2" -c "$cipher" -o KexAlgorithms="$kex" -o HostKeyAlgorithms="$hk" || true
@@ -93,6 +99,9 @@ for cipher in chacha20-poly1305@openssh.com aes256-gcm@openssh.com; do
   check "100MB md5 $cipher" "$BIGMD5" "$(md5 "$WORK/big.out" 2>/dev/null || echo none)"
 done
 check "100MB via s3" "$BIGMD5" "$(s3 "$EP/sftpbkt/dir/big" | md5sum | cut -d' ' -f1)"
+# Streaming: a large put is stored part by part (multipart ETag), not spooled whole.
+check "100MB streamed as parts" 1 "$(s3 -I "$EP/sftpbkt/dir/big" | tr -d '\r' | grep -ic '^etag: "[0-9a-f]*-[0-9]*"')"
+check "no spool files left" 0 "$(find "$DATA" -name 'zkfsm-sftp-*.spool' | wc -l)"
 
 # reget: resume a truncated local copy; reput: finish a truncated remote copy.
 head -c 30000000 "$WORK/big" > "$WORK/big.out"
@@ -116,6 +125,10 @@ check "rm and rmdir" 0 "$(sftpb "$WORK/b7"; echo $?)"
 check "dir gone via s3" 0 "$(s3 "$EP/sftpbkt?list-type=2" | grep -c '<Key>')"
 printf 'rmdir /sftpbkt/missing\n' > "$WORK/b8"
 check "rmdir missing fails" 1 "$(sftpb "$WORK/b8" >/dev/null 2>&1; echo $?)"
+
+# ECDSA P-256 user key.
+printf 'ls /sftpbkt\n' > "$WORK/bec"
+check "ecdsa user key login" 0 "$(timeout 30 sftp -i "$WORK/id_ec" "${SSHOPTS[@]}" -o PasswordAuthentication=no -o PubkeyAcceptedAlgorithms=ecdsa-sha2-nistp256 -P "$SPORT" -b "$WORK/bec" "$AK@127.0.0.1" >/dev/null 2>&1; echo $?)"
 
 # Publickey with a key that is not registered must not log in.
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/other"
@@ -146,6 +159,14 @@ else
   echo "skip quota checks (set MC to the MinIO client)"
 fi
 check "server still alive" 0 "$(kill -0 "$PID"; echo $?)"
+stop
+# PEM (SEC1) EC host key only.
+start --sftp-host-key "$WORK/host_ec_pem"
+check "pem ecdsa host key" "$(ssh-keygen -lf "$WORK/host_ec_pem.pub" | awk '{print $2}')" \
+  "$(ssh-keyscan -t ecdsa -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
+printf 'put %s /sftpbkt/ec.txt\nget /sftpbkt/ec.txt %s\n' "$WORK/small" "$WORK/ec.out" > "$WORK/bec2"
+sftpb "$WORK/bec2" -o HostKeyAlgorithms=ecdsa-sha2-nistp256 || true
+check "pem ecdsa round trip" "$(md5 "$WORK/small")" "$(md5 "$WORK/ec.out" 2>/dev/null || echo none)"
 
 echo "sftp: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

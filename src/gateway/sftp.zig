@@ -30,7 +30,7 @@ pub const Config = struct {
 
 pub const usage =
     \\  --sftp HOST:PORT SFTP gateway (SSH-2 with the sftp subsystem; password = secret key)
-    \\  --sftp-host-key FILE  host key: openssh ed25519 or PEM RSA; repeatable (default:
+    \\  --sftp-host-key FILE  host key: ed25519, ECDSA P-256 or RSA; repeatable (default:
     \\                   generated ed25519 kept in the first drive's .zkfsm)
     \\  --sftp-authorized-keys FILE  public keys, one per line: ACCESS-KEY TYPE BASE64 [COMMENT]
     \\  --sftp-rekey-bytes N  re-exchange keys after N bytes (default: 1 GiB)
@@ -117,7 +117,7 @@ pub const Server = struct {
                 gpa.free(text);
             }
             s.host_keys[s.host_key_count] = keys.loadHostKey(gpa, text) catch |e| {
-                std.log.err("sftp: unusable host key {s}: {t} (ed25519 in OpenSSH format or RSA in PEM)", .{ path, e });
+                std.log.err("sftp: unusable host key {s}: {t} (ed25519/ECDSA P-256 in OpenSSH format, RSA/EC P-256 in PEM)", .{ path, e });
                 return error.BadConfig;
             };
             s.host_key_count += 1;
@@ -361,7 +361,11 @@ const Conn = struct {
         const path = c.srv.cfg.authorized_keys orelse return .{ .failure = true };
         const alg = keys.SigAlg.parse(alg_name) orelse return .{ .failure = true };
         const kt = keys.blobType(blob) orelse return .{ .failure = true };
-        const want_kt = if (alg == .ssh_ed25519) "ssh-ed25519" else "ssh-rsa";
+        const want_kt = switch (alg) {
+            .ssh_ed25519 => "ssh-ed25519",
+            .ecdsa_nistp256 => "ecdsa-sha2-nistp256",
+            .rsa_sha2_256, .rsa_sha2_512 => "ssh-rsa",
+        };
         if (!std.mem.eql(u8, kt, want_kt)) return .{ .failure = true };
         const gpa = c.srv.gpa;
         const text = std.fs.cwd().readFileAlloc(gpa, path, keys.max_authorized_file) catch {
