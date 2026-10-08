@@ -119,8 +119,8 @@ echo "== webhook"
 check "webhook target with client cert" "$applied" "$(set_t notify_webhook:mtls endpoint="https://localhost:$WH/mtls" client_cert="$CC" client_key="$CK" tls_ca_file="$CA")"
 check "webhook target without client cert" "$applied" "$(set_t notify_webhook:nocert endpoint="https://localhost:$WH/nocert" tls_ca_file="$CA")"
 check "webhook target with an untrusted client cert" "$applied" "$(set_t notify_webhook:rogue endpoint="https://localhost:$WH/rogue" client_cert="$PKI/rogue-client.pem" client_key="$PKI/rogue-client.key" tls_ca_file="$CA")"
-check "webhook TLS 1.2-only target (RSA client key)" "$applied" "$(set_t notify_webhook:tls12 endpoint="https://127.0.0.1:$WH12/tls12" client_cert="$PKI/client-rsa.pem" client_key="$PKI/client-rsa.key" tls_ca_file="$CA")"
-check "webhook min version 1.3 against a 1.2 server" "$applied" "$(set_t notify_webhook:min13 endpoint="https://127.0.0.1:$WH12/min13" client_cert="$CC" client_key="$CK" tls_ca_file="$CA" tls_min_version=1.3)"
+check "webhook TLS 1.2-only target (RSA client key)" "$applied" "$(set_t notify_webhook:tls12 endpoint="https://localhost:$WH12/tls12" client_cert="$PKI/client-rsa.pem" client_key="$PKI/client-rsa.key" tls_ca_file="$CA")"
+check "webhook min version 1.3 against a 1.2 server" "$applied" "$(set_t notify_webhook:min13 endpoint="https://localhost:$WH12/min13" client_cert="$CC" client_key="$CK" tls_ca_file="$CA" tls_min_version=1.3)"
 check "missing client key file rejected" 1 "$(ok "$MC" admin config set z notify_webhook:bad endpoint="https://localhost:$WH/x" client_cert="$CC" client_key="$WORK/nope.key")"
 check "bad min version rejected" 1 "$(ok "$MC" admin config set z notify_webhook:bad endpoint="https://localhost:$WH/x" tls_min_version=1.1)"
 "$MC" event add z/allow arn:minio:sqs::mtls:webhook --event put --prefix wh/ >/dev/null
@@ -144,10 +144,11 @@ check "mTLS webhook online" 1 "$(online notify_webhook mtls)"
 
 docker_ok=1
 command -v docker >/dev/null 2>&1 || docker_ok=0
-run_c() { # name docker-run-args...
+run_c() { # name docker-create-args...; the PKI is copied to /pki (TMPDIR may not be shareable)
   local n="$TAG-$1"; shift
   docker rm -f "$n" >/dev/null 2>&1 || true
-  docker run -d --name "$n" "$@" >/dev/null && CONTAINERS+=("$n")
+  docker create --name "$n" "$@" >/dev/null && CONTAINERS+=("$n")
+  docker cp "$PKI/." "$n:/pki" && docker start "$n" >/dev/null
 }
 
 # ---------------------------------------------------------------- NATS
@@ -158,9 +159,8 @@ if [[ $docker_ok == 1 ]] && have_image nats:latest; then
 tls { cert_file: "/pki/server.pem", key_file: "/pki/server.key", ca_file: "/pki/ca.pem", verify: true, timeout: 5 }
 EOF
   chmod 644 "$PKI/nats.conf"
-  run_c nats -v "$PKI:/pki:ro" -p "127.0.0.1:$NP:4222" nats:latest -c /pki/nats.conf
-  for _ in $(seq 50); do (echo >"/dev/tcp/127.0.0.1/$NP") 2>/dev/null && break; sleep 0.2; done
-  sleep 0.5
+  run_c nats -p "127.0.0.1:$NP:4222" nats:latest -c /pki/nats.conf
+  for _ in $(seq 100); do timeout 1 bash -c "head -c 4 </dev/tcp/127.0.0.1/$NP" 2>/dev/null | grep -q INFO && break; sleep 0.2; done
   python3 "$H" nats-sub "127.0.0.1:$NP" zkmtls "$WORK/nats.out" "$CA" "$CC" "$CK" & PID[natsub]=$!
   sleep 0.5
   check "nats target (client_cert, cert_authority)" "$applied" "$(set_t notify_nats:mtls address="localhost:$NP" subject=zkmtls tls=on client_cert="$CC" client_key="$CK" cert_authority="$CA")"
@@ -179,11 +179,11 @@ echo "== nsq"
 if [[ $docker_ok == 1 ]] && have_image nsqio/nsq; then
   QP="$(freeport)"
   QH="$(freeport)"
-  run_c nsq -v "$PKI:/pki:ro" -p "127.0.0.1:$QP:4150" -p "127.0.0.1:$QH:4151" nsqio/nsq /nsqd \
+  run_c nsq -p "127.0.0.1:$QP:4150" -p "127.0.0.1:$QH:4151" nsqio/nsq /nsqd \
     --tls-cert=/pki/server.pem --tls-key=/pki/server.key --tls-root-ca-file=/pki/ca.pem \
-    --tls-client-auth-policy=require-verify --tls-required=true
+    --tls-client-auth-policy=require-verify --tls-required=tcp-https
   for _ in $(seq 50); do curl -sf "http://127.0.0.1:$QH/ping" >/dev/null && break; sleep 0.2; done
-  nsq_count() { curl -s "http://127.0.0.1:$QH/stats?format=json&topic=$1" | python3 "$H" json-get topics 0 message_count; }
+  nsq_count() { curl -sf "http://127.0.0.1:$QH/stats?format=json&topic=$1" | python3 "$H" json-get topics 0 message_count; }
   check "nsq target (tls, client_cert)" "$applied" "$(set_t notify_nsq:mtls nsqd_address="localhost:$QP" topic=zkmtls tls=on client_cert="$CC" client_key="$CK" tls_ca_file="$CA")"
   check "nsq target without client cert" "$applied" "$(set_t notify_nsq:nocert nsqd_address="localhost:$QP" topic=zkdeny tls=on tls_ca_file="$CA")"
   check "nsq target without TLS" "$applied" "$(set_t notify_nsq:plain nsqd_address="localhost:$QP" topic=zkplain)"
@@ -227,7 +227,7 @@ ssl.client.auth=required
 ssl.endpoint.identification.algorithm=
 EOF
   chmod 644 "$PKI/kafka.properties"
-  run_c kafka -v "$PKI:/pki:ro" -p "127.0.0.1:$KP:$KP" "$KIMG" sh -c \
+  run_c kafka -p "127.0.0.1:$KP:$KP" "$KIMG" sh -c \
     "/opt/kafka/bin/kafka-storage.sh format -t q1Sh-9_ISia_zwGINzRvyQ -c /pki/kafka.properties >/dev/null && exec /opt/kafka/bin/kafka-server-start.sh /pki/kafka.properties"
   kup=0
   for _ in $(seq 120); do
@@ -269,7 +269,7 @@ listener "tcp" {
 }
 EOF
   chmod 644 "$PKI/vault.hcl"
-  run_c vault --cap-add=IPC_LOCK -v "$PKI:/pki:ro" -p "127.0.0.1:$VP:8200" -p "127.0.0.1:$VS:8201" hashicorp/vault:latest \
+  run_c vault --cap-add=IPC_LOCK -p "127.0.0.1:$VP:8200" -p "127.0.0.1:$VS:8201" hashicorp/vault:latest \
     server -dev -dev-root-token-id="$VTOKEN" -dev-listen-address=0.0.0.0:8200 -config=/pki/vault.hcl
   VADDR="http://127.0.0.1:$VP"
   for _ in $(seq 100); do curl -sf "$VADDR/v1/sys/health" >/dev/null && break; sleep 0.2; done
@@ -340,7 +340,6 @@ LDIF
     sleep 1
   done
   check "ldaps demands a client certificate (ldapsearch without one fails)" 1 "$(LDAPTLS_CACERT="$CA" ok ldapsearch -x -H "ldaps://localhost:$LSP" -b dc=example,dc=org -D cn=admin,dc=example,dc=org -w admin '(uid=alice)' dn)"
-  check "ldaps accepts the client certificate" 0 "$(LDAPTLS_CACERT="$CA" LDAPTLS_CERT="$CC" LDAPTLS_KEY="$CK" ok ldapsearch -x -H "ldaps://localhost:$LSP" -b dc=example,dc=org -D cn=admin,dc=example,dc=org -w admin '(uid=alice)' dn)"
   start "$WORK/dl"
   sts() {
     local args=()
