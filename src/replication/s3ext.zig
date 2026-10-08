@@ -367,7 +367,7 @@ fn respondJson(c: *Ctx, body: []const u8) ConnError!void {
 
 // ---- site replication: bucket change capture ----
 
-const synced_subresources = [_][]const u8{ "versioning", "policy", "lifecycle", "tagging", "object-lock", "encryption", "cors" };
+const synced_subresources = [_][]const u8{ "versioning", "policy", "lifecycle", "tagging", "object-lock", "encryption", "cors", "website", "ownershipControls" };
 
 /// Queues a delayed push of the bucket to peers; the push reads the state after this
 /// request has been applied. Pushes made by peers are not sent on again.

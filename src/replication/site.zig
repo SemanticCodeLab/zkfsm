@@ -198,6 +198,8 @@ const subresources = [_]struct { name: []const u8, root: []const u8, deletable: 
     .{ .name = "tagging", .root = "<Tagging", .deletable = true },
     .{ .name = "encryption", .root = "<ServerSideEncryptionConfiguration", .deletable = true },
     .{ .name = "cors", .root = "<CORSConfiguration", .deletable = true },
+    .{ .name = "website", .root = "<WebsiteConfiguration", .deletable = true },
+    .{ .name = "ownershipControls", .root = "<OwnershipControls", .deletable = true },
 };
 
 fn pushBucket(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, st: State, remote: client.Remote, bucket: []const u8) client.Error!Outcome {
