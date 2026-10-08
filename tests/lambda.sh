@@ -128,6 +128,16 @@ check "configured target works" 200 "$(get "$A" "/docs/greet.txt?lambdaArn=$(arn
 check "configured target body" "uryyb ynzoqn jbeyq" "$(cat "$WORK/out")"
 check "unknown key rejected" 1 "$("$MC" admin config set z lambda_webhook:cfg nope=1 >/dev/null 2>&1 && echo 0 || echo 1)"
 check "bad endpoint rejected" 1 "$("$MC" admin config set z lambda_webhook:x endpoint=ftp://h >/dev/null 2>&1 && echo 0 || echo 1)"
+check "client cert rejected (no mTLS client)" 1 "$("$MC" admin config set z lambda_webhook:x endpoint="https://127.0.0.1:$WH/" client_cert=/c.pem client_key=/k.pem >/dev/null 2>&1 && echo 0 || echo 1)"
+P2="$(freeport)"
+set +e
+timeout 20 env ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" MINIO_LAMBDA_WEBHOOK_ENABLE_m=on \
+  MINIO_LAMBDA_WEBHOOK_ENDPOINT_m="https://127.0.0.1:$WH/" MINIO_LAMBDA_WEBHOOK_CLIENT_CERT_m=/c.pem MINIO_LAMBDA_WEBHOOK_CLIENT_KEY_m=/k.pem \
+  "$BIN" --data "$WORK/d2" --listen "127.0.0.1:$P2" >"$WORK/z2.log" 2>&1
+rc=$?
+set -e
+check "env client cert fails startup" 2 "$rc"
+check "startup error names the target" 1 "$(grep -c 'lambda_webhook:m' "$WORK/z2.log")"
 check "disable" "Successfully applied new settings." "$("$MC" admin config set z lambda_webhook:cfg enable=off 2>&1 | tail -n1)"
 check "disabled target not found" 404 "$(get "$A" "/docs/greet.txt?lambdaArn=$(arn cfg)")"
 "$MC" admin config set z lambda_webhook:cfg enable=on >/dev/null
