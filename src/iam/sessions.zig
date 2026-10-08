@@ -121,6 +121,7 @@ pub fn list(a: Allocator, st: *Store, provider: []const u8, users: []const []con
             .access_key = try a.dupe(u8, s.access_key),
             .parent = try a.dupe(u8, s.parent),
             .provider = try a.dupe(u8, s.provider),
+            .idp_config = try a.dupe(u8, s.idp_config),
             .token_type = try a.dupe(u8, s.token_type),
             .issued_ms = s.issued_ms,
             .expires_s = s.expires_s,

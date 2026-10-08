@@ -184,7 +184,7 @@ fn checkV2(arena: std.mem.Allocator, src: Source, in: Input, p: sigv2.Parsed, au
     };
     const secret: []const u8 = if (token) |t| blk: {
         const issuer = src.cfg.sts orelse return deny(.InvalidToken);
-        const claims = issuer.verify(p.access_key, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
+        const claims = iam.sessions.verify(&issuer, src.store, p.access_key, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
             error.Expired => .ExpiredToken,
             else => .InvalidToken,
         });
@@ -282,7 +282,7 @@ fn check(
     auth.access_key = ak;
     const secret: []const u8 = if (token) |t| blk: {
         const issuer = src.cfg.sts orelse return deny(.InvalidToken);
-        const claims = issuer.verify(ak, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
+        const claims = iam.sessions.verify(&issuer, src.store, ak, t, src.now_s, &dbuf) catch |e| return deny(switch (e) {
             error.Expired => .ExpiredToken,
             else => .InvalidToken,
         });

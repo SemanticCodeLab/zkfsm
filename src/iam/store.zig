@@ -78,6 +78,8 @@ pub const Session = struct {
     access_key: []const u8,
     parent: []const u8,
     provider: []const u8,
+    /// OpenID configuration name that issued it.
+    idp_config: []const u8 = "",
     token_type: []const u8 = "",
     issued_ms: i64,
     expires_s: i64,

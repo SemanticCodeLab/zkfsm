@@ -71,8 +71,11 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
     }
     const pol = try formParam(c.arena, body, "Policy");
     const session_policy = if (pol) |p| (if (p.len == 0) null else p) else null;
-    var req: iam.sts.Request = .{ .parent = "", .duration_s = duration orelse 3600, .session_policy = session_policy };
+    const issued_ms = std.time.milliTimestamp();
+    var req: iam.sts.Request = .{ .parent = "", .duration_s = duration orelse 3600, .session_policy = session_policy, .issued_ms = issued_ms };
+    req.token_type = try formParam(c.arena, body, "TokenRevokeType") orelse "";
     var extra: [3]Field = undefined;
+    var idp_config: []const u8 = "";
     var n_extra: usize = 0;
     switch (kind) {
         .AssumeRole => {
@@ -100,6 +103,8 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
                 return true;
             };
             req.parent = id.subject;
+            req.provider = .openid;
+            idp_config = id.provider;
             req.federated_policies = id.policies;
             req.tenant = id.tenant;
             if (duration == null) if (id.expires_s) |exp| {
@@ -119,6 +124,7 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
                 return true;
             };
             req.parent = id.user_dn;
+            req.provider = .ldap;
             req.federated_policies = id.policies;
             req.tenant = id.tenant;
         },
@@ -133,6 +139,7 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
                 return true;
             }
             req.parent = id.common_name;
+            req.provider = .tls;
             req.federated_policies = id.common_name;
             if (duration == null) req.duration_s = std.math.clamp(id.not_after_s - now_s, iam.sts.limits.min_duration_s, 3600);
         },
@@ -143,10 +150,21 @@ pub fn route(c: *Ctx, env: authz.Env, now_s: i64) ConnError!bool {
             error.InvalidDuration => try fail(c, .bad_request, "InvalidParameterValue", "DurationSeconds must be between 900 and 43200."),
             error.SessionPolicyTooLarge => try fail(c, .bad_request, "PackedPolicyTooLarge", "Session policy is too large."),
             error.InvalidSessionPolicy => try fail(c, .bad_request, "MalformedPolicyDocument", "Session policy is invalid."),
+            error.InvalidTokenType => try fail(c, .bad_request, "InvalidParameterValue", "TokenRevokeType is too long."),
             error.InvalidParent, error.InvalidRoles, error.InvalidTenant => try fail(c, .bad_request, "InvalidParameterValue", "Caller identity is not usable for a session."),
         }
         return true;
     };
+    // Listing only; revocation works from the token's own claims if this fails.
+    if (env.auth.iam) |st| iam.sessions.record(st, .{
+        .access_key = &creds.access_key,
+        .parent = req.parent,
+        .provider = @tagName(req.provider),
+        .idp_config = idp_config,
+        .token_type = req.token_type,
+        .issued_ms = issued_ms,
+        .expires_s = creds.expires_s,
+    }, now_s) catch {};
     var a: std.Io.Writer.Allocating = .init(c.arena);
     const w = &a.writer;
     var tb: [24]u8 = undefined;

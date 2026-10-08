@@ -31,7 +31,7 @@ pub const Provider = enum(u8) {
     builtin = 0,
     openid = 1,
     ldap = 2,
-    certificate = 3,
+    tls = 3,
 };
 
 pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant, InvalidTokenType };

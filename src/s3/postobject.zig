@@ -170,7 +170,7 @@ fn secretFor(c: *Ctx, store: *iam.Store, ak: []const u8, fields: []const postfor
     if (postform.fieldValue(fields, "x-amz-security-token")) |t| {
         const issuer = c.env.auth.sts orelse return null;
         var dbuf: iam.sts.DecodeBuffer = undefined;
-        const claims = issuer.verify(ak, t, now_s, &dbuf) catch return null;
+        const claims = iam.sessions.verify(&issuer, store, ak, t, now_s, &dbuf) catch return null;
         c.auth.principal = try c.arena.dupe(u8, claims.parent);
         c.auth.session_policy = if (claims.session_policy) |sp| try c.arena.dupe(u8, sp) else null;
         c.auth.federated_policies = if (claims.federated_policies) |fp| try c.arena.dupe(u8, fp) else null;
