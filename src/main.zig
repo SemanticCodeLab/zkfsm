@@ -16,8 +16,9 @@ const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
+const observe = @import("observe/root.zig");
 
-pub const std_options: std.Options = .{ .log_level = .info };
+pub const std_options: std.Options = .{ .log_level = .info, .logFn = observe.logs.logFn };
 
 const usage =
     \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
@@ -106,6 +107,7 @@ const Config = struct {
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
     kms: sse.setup.Flags = .{},
+    obs: observe.config.Flags = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -221,6 +223,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.metrics_path = args[i];
         } else if (sse.setup.Flags.isFlag(a)) {
             if (!cfg.kms.set(a, args[i])) return error.BadArgs;
+        } else if (observe.config.Flags.isFlag(a)) {
+            if (!cfg.obs.set(a, args[i])) return error.BadArgs;
         } else if (try gateway.parseFlag(&cfg.gateways, a, args[i])) {
             continue;
         } else if (opts.extra_flag) |f| {
@@ -278,7 +282,7 @@ pub fn run(opts: Options) u8 {
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
-        std.debug.print("{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, opts.extra_usage });
+        std.debug.print("{s}{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, observe.config.usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     applyEnv(arena, &cfg) catch {
@@ -401,13 +405,22 @@ pub fn run(opts: Options) u8 {
     startEvents(&notif, &svc, false);
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     svc.events = ev_ext.sink();
-    const observers = [_]s3.Observer{ev_ext.observer()};
+    var obs_hook: observe.Late = .{};
+    const obs = startObserve(gpa, arena, cfg, &svc, auth.iam, cfg.data[0], localNodeName(arena, cfg, addr), &std.fmt.bytesToHex(drives.set.bytes, .lower), admin_prefix) orelse return 2;
+    defer obs.destroy();
+    obs.sources.drives = cfg.data;
+    obs.sources.parity = parityOf(drives.profile);
+    obs.sources.repl = &repl;
+    obs.sources.notifier = &notif;
+    obs_hook.set(obs);
+    const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
+    const single_routes = [_]s3.server.RawRoute{obs_hook.rawRoute()};
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -436,6 +449,7 @@ pub fn run(opts: Options) u8 {
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+        .raw_routes = &single_routes,
     };
     var gateways = gateway.Running.start(.{
         .gpa = gpa,
@@ -524,12 +538,15 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var notif_ready = false;
     defer if (notif_ready) notif.deinit();
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
-    const observers = [_]s3.Observer{ev_ext.observer()};
+    var obs_hook: observe.Late = .{};
+    var obs: ?*observe.Observe = null;
+    defer if (obs) |o| o.destroy();
+    const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -544,7 +561,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{cluster.server.route(node)};
+    const routes = [_]s3.server.RawRoute{ cluster.server.route(node), obs_hook.rawRoute() };
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -601,6 +618,16 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         const ev_opts = eventOptions(arena, cfg, node.localPath() orelse ".", addr) catch break :blk 2;
         notif = events.Notifier.init(gpa, &svc, ev_opts);
         notif_ready = true;
+        const node_name = node.topo.nodes[node.topo.local].name;
+        obs = startObserve(gpa, arena, cfg, &svc, if (iam_ready) &iam_store else null, node.localPath() orelse ".", node_name, &std.fmt.bytesToHex(node.deployment, .lower), admin_prefix) orelse break :blk 2;
+        obs.?.sources.drives = localDrives(arena, node) catch &.{};
+        obs.?.sources.parity = parityOf(node.profile);
+        obs.?.sources.repl = &repl;
+        obs.?.sources.notifier = &notif;
+        obs.?.sources.nodes = .{ .ctx = node, .func = clusterNodes };
+        obs.?.peers = .{ .ctx = node, .count = node.nodeCount(), .call = eventsPeerCall };
+        obs_hook.set(obs.?);
+        peer_obs = &obs_hook;
         events_ext = .{ .ctx = &notif, .handle = eventsPeerHandle };
         startEvents(&notif, &svc, true);
         svc.events = ev_ext.sink();
@@ -682,7 +709,10 @@ fn eventsPeerCall(ctx: *anyopaque, peer: usize, a: std.mem.Allocator, body: []co
     return node.extCall(peer, a, body, 8 * 1024 * 1024);
 }
 
+var peer_obs: ?*observe.Late = null;
+
 fn eventsPeerHandle(ctx: *anyopaque, a: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8 {
+    if (peer_obs) |l| if (try l.peerHandle(a, body)) |res| return res;
     const n: *events.Notifier = @ptrCast(@alignCast(ctx));
     return n.handlePeer(a, body);
 }
@@ -706,6 +736,54 @@ fn startEvents(n: *events.Notifier, svc: *object.ObjectService, cluster_mode: bo
     };
     metrics.global.extra[1] = .{ .ctx = n, .func = events.Notifier.render };
     n.startWatcher(if (cluster_mode) 10 else 60) catch |e| std.log.warn("events: config watcher not started: {t}", .{e});
+}
+
+/// Observability for this node: OTLP export, metrics v3, live streams, access logs.
+fn startObserve(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService, store: ?*iam.Store, drive: []const u8, node_name: []const u8, deployment: []const u8, admin_prefix: []const u8) ?*observe.Observe {
+    var env = std.process.getEnvMap(arena) catch return null;
+    const settings = observe.config.resolve(arena, cfg.obs, &env, node_name) catch |e| {
+        std.log.err("invalid observability settings (OTEL_* / --otel-* / ZKFSM_ACCESS_LOG_INTERVAL): {t}", .{e});
+        return null;
+    };
+    const state_dir = std.fs.path.join(arena, &.{ drive, ".zkfsm" }) catch return null;
+    return observe.Observe.create(gpa, svc, .{
+        .settings = settings,
+        .node = arena.dupe(u8, node_name) catch return null,
+        .deployment_id = arena.dupe(u8, deployment) catch return null,
+        .admin_prefix = admin_prefix,
+        .store = store,
+        .state_dir = state_dir,
+    }) catch null;
+}
+
+/// host:port this node is reached at (the listen address with a wildcard host replaced).
+fn localNodeName(arena: std.mem.Allocator, cfg: Config, addr: std.net.Address) []const u8 {
+    if (cfg.node_address) |n| return n;
+    if (!std.mem.eql(u8, cfg.host, "0.0.0.0") and !std.mem.eql(u8, cfg.host, "::")) return std.fmt.allocPrint(arena, "{f}", .{addr}) catch cfg.host;
+    var hb: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const h = std.posix.gethostname(&hb) catch "localhost";
+    return std.fmt.allocPrint(arena, "{s}:{d}", .{ h, cfg.port }) catch "localhost";
+}
+
+fn parityOf(p: placement.Profile) u32 {
+    return switch (p) {
+        .single => 0,
+        .replica => |n| n - 1,
+        .erasure => |e| e.parity,
+    };
+}
+
+fn localDrives(arena: std.mem.Allocator, node: *cluster.Node) error{OutOfMemory}![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (node.local_eps) |pool| for (pool) |ep| if (ep) |e| try out.append(arena, e.path);
+    return out.items;
+}
+
+fn clusterNodes(ctx: *anyopaque) [2]usize {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    var online: usize = 0;
+    for (0..node.nodeCount()) |i| online += @intFromBool(i == node.topo.local or node.rpc.isOnline(@intCast(i)));
+    return .{ node.nodeCount(), online };
 }
 
 fn clusterReady(ctx: *anyopaque) bool {
@@ -778,6 +856,8 @@ fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.
     while (true) {
         std.Thread.sleep(interval_s * std.time.ns_per_s);
         if (leader) |l| if (!l.isLeader()) continue;
+        var sp = @import("core/root.zig").trace.root("ilm.lifecycle", .internal, .ilm, .{});
+        defer sp.end();
         const st = object.lifecycle.runOnce(svc, std.time.nanoTimestamp()) catch |e| {
             std.log.warn("lifecycle pass failed: {t}", .{e});
             continue;
@@ -994,6 +1074,7 @@ test {
     _ = replication;
     _ = events;
     _ = sse;
+    _ = observe;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
 }

@@ -2,6 +2,7 @@
 //! A backend owns master keys; callers only ever see per-object data keys
 //! (DEKs) in plaintext, plus an opaque sealed form to persist with the object.
 const std = @import("std");
+const core = @import("../core/root.zig");
 
 pub const dek_len = 32;
 
@@ -124,13 +125,31 @@ pub const Kms = struct {
         return k.vtable.kind;
     }
     pub fn createKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!KeyInfo {
-        return k.vtable.createKey(k.ptr, gpa, key_id);
+        var sp = k.span("kms.CreateKey", key_id);
+        defer sp.end();
+        return k.vtable.createKey(k.ptr, gpa, key_id) catch |e| failed(&sp, e);
     }
     pub fn generateDataKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, ctx: Context) Error!DataKey {
-        return k.vtable.generateDataKey(k.ptr, gpa, key_id, ctx);
+        var sp = k.span("kms.GenerateDataKey", key_id);
+        defer sp.end();
+        return k.vtable.generateDataKey(k.ptr, gpa, key_id, ctx) catch |e| failed(&sp, e);
     }
     pub fn decryptDataKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, sealed: []const u8, ctx: Context) Error![dek_len]u8 {
-        return k.vtable.decryptDataKey(k.ptr, gpa, key_id, sealed, ctx);
+        var sp = k.span("kms.Decrypt", key_id);
+        defer sp.end();
+        return k.vtable.decryptDataKey(k.ptr, gpa, key_id, sealed, ctx) catch |e| failed(&sp, e);
+    }
+
+    fn span(k: Kms, name: []const u8, key_id: []const u8) core.trace.Span {
+        var sp = core.trace.leaf(name, .client, .kms);
+        sp.str("path", key_id);
+        sp.str("kms.backend", @tagName(k.vtable.kind));
+        return sp;
+    }
+
+    fn failed(sp: *core.trace.Span, e: Error) Error {
+        sp.fail(@errorName(e));
+        return e;
     }
     pub fn listKeys(k: Kms, gpa: std.mem.Allocator) Error![]KeyInfo {
         return k.vtable.listKeys(k.ptr, gpa);

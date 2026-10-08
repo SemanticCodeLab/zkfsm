@@ -189,23 +189,49 @@ pub const Tier = struct {
     pub fn put(t: *Tier, id: [16]u8, src: *std.Io.Reader, size: u64) backend.Error!void {
         var nb: [name_max]u8 = undefined;
         const p = t.provider();
-        _ = p.vtable.put(p.ctx, t.objectName(id, &nb), src, .{ .size_hint = size }) catch |e| return switch (e) {
-            error.PreconditionFailed => error.IoFailed,
-            else => |x| x,
+        const name = t.objectName(id, &nb);
+        var sp = t.span("tier.put", name);
+        defer sp.end();
+        sp.int("bytes", @intCast(@min(size, std.math.maxInt(i63))));
+        _ = p.vtable.put(p.ctx, name, src, .{ .size_hint = size }) catch |e| {
+            sp.fail(@errorName(e));
+            return switch (e) {
+                error.PreconditionFailed => error.IoFailed,
+                else => |x| x,
+            };
         };
     }
 
     pub fn get(t: *Tier, id: [16]u8, range: ?core.Range, sink: *std.Io.Writer) backend.Error!void {
         var nb: [name_max]u8 = undefined;
         const p = t.provider();
-        _ = try p.vtable.get(p.ctx, t.objectName(id, &nb), range, sink);
+        const name = t.objectName(id, &nb);
+        var sp = t.span("tier.get", name);
+        defer sp.end();
+        _ = p.vtable.get(p.ctx, name, range, sink) catch |e| {
+            sp.fail(@errorName(e));
+            return e;
+        };
     }
 
     /// Missing objects count as deleted.
     pub fn delete(t: *Tier, id: [16]u8) backend.Error!void {
         var nb: [name_max]u8 = undefined;
         const p = t.provider();
-        p.vtable.delete(p.ctx, t.objectName(id, &nb)) catch |e| if (e != error.NotFound) return e;
+        const name = t.objectName(id, &nb);
+        var sp = t.span("tier.delete", name);
+        defer sp.end();
+        p.vtable.delete(p.ctx, name) catch |e| if (e != error.NotFound) {
+            sp.fail(@errorName(e));
+            return e;
+        };
+    }
+
+    fn span(t: *Tier, op: []const u8, name: []const u8) core.trace.Span {
+        var sp = core.trace.leaf(op, .client, .ilm);
+        sp.str("path", name);
+        sp.str("tier", t.cfg.name);
+        return sp;
     }
 
     /// Writes, reads back, and deletes a probe object.

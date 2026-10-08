@@ -2,6 +2,7 @@
 //! per call, small bodies in memory or streamed uploads, optional bandwidth cap.
 const std = @import("std");
 const sign = @import("../backend/s3/sign.zig");
+const core = @import("../core/root.zig");
 
 const Allocator = std.mem.Allocator;
 const http = std.http;
@@ -104,6 +105,8 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
         .{ .name = "x-amz-date", .value = &date },
     });
     try extra.appendSlice(a, req.headers);
+    var tpb: [core.trace.header_len]u8 = undefined;
+    if (core.trace.outgoing(&tpb)) |tp| try extra.append(a, .{ .name = "traceparent", .value = try a.dupe(u8, tp) });
     const uri: std.Uri = .{
         .scheme = if (r.secure) "https" else "http",
         .host = .{ .raw = hp.host },

@@ -1,6 +1,7 @@
 //! One FTP control connection: login, path state, passive data channels, and
 //! the command loop. Objects are reached only through the gateway Fs view.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const posix = std.posix;
 const tls = @import("../tls/root.zig");
 const root = @import("root.zig");
@@ -208,6 +209,11 @@ pub const Session = struct {
             s.replyFmt(500, "Unknown command '{s}'.", .{cmd.raw});
             return;
         };
+        var sp = core.trace.root(switch (verb) {
+            inline else => |v| "ftp." ++ @tagName(v),
+        }, .server, .gateway, .{});
+        defer sp.end();
+        if (verb != .PASS) sp.str("path", cmd.arg);
         switch (verb) {
             .USER, .PASS, .AUTH, .PBSZ, .PROT, .FEAT, .SYST, .QUIT, .NOOP, .HELP, .OPTS, .CCC, .ACCT => {},
             else => if (s.who == null) {

@@ -283,7 +283,8 @@ pub const Server = struct {
             in = &t.reader;
             out = &t.writer;
         }
-        var http = std.http.Server.init(in, out);
+        var counting: Counting = .{ .inner = out };
+        var http = std.http.Server.init(in, &counting.interface);
         var client_cert: ?authz.ClientCert = null;
         if (secure) |t| if (t.peerIdentity()) |p| {
             client_cert = .{ .common_name = p.common_name, .not_after_s = p.not_after_s };
@@ -321,6 +322,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
+                metrics.global.tx.reset();
                 const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .observers = self.observers, .routing = self.routing, .client_cert = client_cert }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
@@ -350,6 +352,32 @@ fn bodyDone(r: *std.http.Reader) bool {
     }
     return false;
 }
+
+/// Unbuffered pass-through feeding written bytes to `metrics.global.tx`.
+const Counting = struct {
+    inner: *std.Io.Writer,
+    interface: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain, .flush = flush } },
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Counting = @fieldParentPtr("interface", w);
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.inner.writeAll(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.inner.writeAll(last);
+        n += last.len * splat;
+        for (data[0 .. data.len - 1]) |d| metrics.global.tx.feed(d);
+        for (0..splat) |_| metrics.global.tx.feed(last);
+        return n;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *Counting = @fieldParentPtr("interface", w);
+        try self.inner.flush();
+    }
+};
 
 fn now() u64 {
     return @intCast(@max(0, std.time.nanoTimestamp()));

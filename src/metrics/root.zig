@@ -75,9 +75,55 @@ pub const global = struct {
     pub var counters: Counters = .{};
     /// Status of the response being written on this thread.
     pub threadlocal var last_status: u10 = 200;
+    /// Body bytes of the response being written on this thread.
+    pub threadlocal var tx: Tx = .{};
     /// Set once at startup, before serving.
     pub var extra: [4]?Renderer = .{ null, null, null, null };
 };
+
+/// Counts response body bytes from the raw output: everything after the head's
+/// blank line, skipping interim 1xx heads (100 Continue).
+pub const Tx = struct {
+    body: u64 = 0,
+    in_body: bool = false,
+    matched: u8 = 0,
+    pos: u32 = 0,
+    informational: bool = false,
+
+    pub fn reset(t: *Tx) void {
+        t.* = .{};
+    }
+
+    pub fn feed(t: *Tx, bytes: []const u8) void {
+        if (t.in_body) {
+            t.body +%= bytes.len;
+            return;
+        }
+        for (bytes, 0..) |ch, i| {
+            if (t.pos == 9) t.informational = ch == '1';
+            t.pos +|= 1;
+            const want: u8 = if (t.matched % 2 == 0) '\r' else '\n';
+            t.matched = if (ch == want) t.matched + 1 else if (ch == '\r') 1 else 0;
+            if (t.matched < 4) continue;
+            if (t.informational) {
+                t.* = .{ .body = t.body };
+                continue;
+            }
+            t.in_body = true;
+            t.body +%= bytes.len - i - 1;
+            return;
+        }
+    }
+};
+
+test "tx counts body bytes after the head" {
+    var t: Tx = .{};
+    t.feed("HTTP/1.1 100 Continue\r\n\r\n");
+    t.feed("HTTP/1.1 200 OK\r\ncontent-length: 5\r");
+    t.feed("\n\r\nhel");
+    t.feed("lo");
+    try std.testing.expectEqual(@as(u64, 5), t.body);
+}
 
 pub const Endpoint = enum { live, ready, metrics };
 

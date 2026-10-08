@@ -3,6 +3,7 @@
 //! notifications, and bootstrap queries.
 const std = @import("std");
 const backend = @import("../backend/root.zig");
+const core = @import("../core/root.zig");
 const placement = @import("../placement/root.zig");
 const protection = @import("../protection/root.zig");
 const s3 = @import("../s3/root.zig");
@@ -61,8 +62,10 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (req.head.method != .POST) return fail(req, .method_not_allowed, "method");
     var h: auth.Fields = .{ .method = "POST", .target = req.head.target, .node = "", .time = "", .nonce = "", .body = "" };
     var sig: []const u8 = "";
+    var traceparent: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |hd| {
+        if (std.ascii.eqlIgnoreCase(hd.name, "traceparent")) traceparent = hd.value;
         if (std.ascii.eqlIgnoreCase(hd.name, auth.header_node)) h.node = hd.value;
         if (std.ascii.eqlIgnoreCase(hd.name, auth.header_time)) h.time = hd.value;
         if (std.ascii.eqlIgnoreCase(hd.name, auth.header_nonce)) h.nonce = hd.value;
@@ -77,6 +80,10 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     const qpos = std.mem.indexOfScalar(u8, path, '?');
     const op = path[0 .. qpos orelse path.len];
     const q: Query = .{ .raw = if (qpos) |p| path[p + 1 ..] else "" };
+    // Only calls made under a caller's span join its trace (no new roots for heartbeats).
+    var sp = core.trace.root("internode.server", .server, .internal, .{ .traceparent = traceparent, .fresh = false });
+    defer sp.end();
+    sp.str("rpc.op", arena.dupe(u8, op) catch op);
 
     if (std.mem.eql(u8, op, "write")) {
         if (!std.mem.eql(u8, h.body, auth.body_stream)) return fail(req, .bad_request, "body");

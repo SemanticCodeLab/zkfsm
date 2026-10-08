@@ -1,6 +1,7 @@
 //! Swift v1 request handling: routing, authentication (tempauth, Keystone, temp
 //! URLs), account and container operations. Objects live in swift_object.zig.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const object = @import("../object/root.zig");
 const access_mod = @import("access.zig");
 const util = @import("swift_util.zig");
@@ -130,6 +131,15 @@ pub const Ctx = struct {
 /// Serves one request; errors mean the connection must close.
 pub fn handle(st: *State, req: *Request, a: std.mem.Allocator, peer: std.net.Address, secure: bool, is_copy: bool) ConnError!void {
     var c: Ctx = .{ .st = st, .req = req, .a = a, .peer = peer, .secure = secure, .method = req.head.method, .is_copy = is_copy };
+    var tp: ?[]const u8 = null;
+    var hit = req.iterateHeaders();
+    while (hit.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "traceparent")) {
+        tp = a.dupe(u8, h.value) catch null;
+    };
+    var sp = core.trace.root("swift.request", .server, .gateway, .{ .traceparent = tp });
+    defer sp.end();
+    sp.str("http.request.method", @tagName(req.head.method));
+    sp.str("path", a.dupe(u8, req.head.target) catch "");
     var rnd: [8]u8 = undefined;
     std.crypto.random.bytes(&rnd);
     _ = std.fmt.bufPrint(&c.trans, "tx{x}", .{&rnd}) catch {};

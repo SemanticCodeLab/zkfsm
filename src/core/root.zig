@@ -7,6 +7,7 @@ pub const errors = @import("errors.zig");
 pub const sigv4 = @import("sigv4.zig");
 pub const license = @import("license.zig");
 pub const checksum_algos = @import("checksum_algos.zig");
+pub const trace = @import("trace.zig");
 
 pub const ObjectId = ids.ObjectId;
 pub const BucketId = ids.BucketId;
@@ -27,4 +28,5 @@ test {
     _ = time;
     _ = sigv4;
     _ = checksum_algos;
+    _ = trace;
 }

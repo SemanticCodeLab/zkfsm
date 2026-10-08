@@ -4,6 +4,7 @@
 const std = @import("std");
 const posix = std.posix;
 const auth = @import("auth.zig");
+const core = @import("../core/root.zig");
 const topology = @import("topology.zig");
 
 pub const prefix = "/zkfsm/rpc/v1/";
@@ -204,6 +205,14 @@ pub const Rpc = struct {
     pub fn call(self: *Rpc, node: u16, op: []const u8, query: []const u8, body: Body, opts: Opts) Error!Call {
         const p = &self.peers[node];
         if (!opts.probe and !p.online.load(.acquire)) return error.NodeOffline;
+        var sp = core.trace.leaf("internode", .client, .internal);
+        sp.str("rpc.op", op);
+        sp.int("rpc.node", node);
+        var handed = false;
+        defer if (!handed) {
+            sp.fail("rpc failed");
+            sp.end();
+        };
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             var reused = true;
@@ -214,7 +223,7 @@ pub const Rpc = struct {
                     return e;
                 };
             };
-            var c: Call = .{ .rpc = self, .peer = p, .conn = conn };
+            var c: Call = .{ .rpc = self, .peer = p, .conn = conn, .span = sp };
             conn.setTimeout(opts.timeout_ms);
             c.sendHead(op, query, body) catch |e| {
                 c.abandon();
@@ -222,13 +231,17 @@ pub const Rpc = struct {
                 if (e == error.Transport) self.setOnline(node, false);
                 return e;
             };
-            if (body == .stream) return c;
+            if (body == .stream) {
+                handed = true;
+                return c;
+            }
             c.receiveHead() catch |e| {
                 c.abandon();
                 if (e == error.Transport and reused and attempt == 0) continue;
                 if (e == error.Transport) self.setOnline(node, false);
                 return e;
             };
+            handed = true;
             return c;
         }
     }
@@ -281,6 +294,8 @@ pub const Call = struct {
     body_left: u64 = 0,
     meta: Meta = .{},
     keep: bool = true,
+    /// Client span, ended by `deinit`; its context travels as `traceparent`.
+    span: core.trace.Span = .{},
 
     fn sendHead(c: *Call, op: []const u8, query: []const u8, body: Rpc.Body) Error!void {
         var tbuf: [1024]u8 = undefined;
@@ -302,6 +317,9 @@ pub const Call = struct {
             auth.header_body,  btag,
             auth.header_sig,   &sig,
         }) catch return error.Transport;
+        var tpb: [core.trace.header_len]u8 = undefined;
+        const tp: ?[]const u8 = if (c.span.recording) core.trace.format(c.span.ctx, &tpb) else core.trace.outgoing(&tpb);
+        if (tp) |v| w.print("traceparent: {s}\r\n", .{v}) catch return error.Transport;
         switch (body) {
             .bytes => |b| {
                 w.print("content-length: {d}\r\n\r\n", .{b.len}) catch return error.Transport;
@@ -408,6 +426,9 @@ pub const Call = struct {
 
     /// Returns the connection to the pool when the exchange ended cleanly.
     pub fn deinit(c: *Call) void {
+        c.span.int("http.response.status_code", c.status);
+        if (!c.ok()) c.span.fail("rpc failed");
+        c.span.end();
         if (c.keep and c.body_left > 0 and c.body_left <= 64 * 1024) {
             c.conn.reader().discardAll64(c.body_left) catch {
                 c.keep = false;

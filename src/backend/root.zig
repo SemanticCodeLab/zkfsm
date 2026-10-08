@@ -47,6 +47,21 @@ pub const PutOptions = struct {
     size_hint: ?u64 = null,
 };
 
+/// Storage spans are leaves under the request span; NotFound is not a failure.
+fn span(name: []const u8, key: *const PhysicalKey) core.trace.Span {
+    var sp = core.trace.leaf(name, .internal, .storage);
+    if (sp.recording) {
+        sp.str("key", &key.hex);
+        sp.str("space", @tagName(key.space));
+    }
+    return sp;
+}
+
+fn failed(sp: *core.trace.Span, e: Error) Error {
+    if (e != error.NotFound) sp.fail(@errorName(e));
+    return e;
+}
+
 pub const ListCallback = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, key: PhysicalKey) Error!void,
@@ -83,28 +98,45 @@ pub const StorageBackend = struct {
     };
 
     pub fn put(b: StorageBackend, key: PhysicalKey, source: *std.Io.Reader, opts: PutOptions) Error!ObjectMeta {
-        return b.vtable.put(b.ctx, key, source, opts);
+        var sp = span("storage.put", &key);
+        defer sp.end();
+        const m = b.vtable.put(b.ctx, key, source, opts) catch |e| return failed(&sp, e);
+        sp.int("bytes", @intCast(@min(m.size, std.math.maxInt(i63))));
+        return m;
     }
     pub fn get(b: StorageBackend, key: PhysicalKey, range: ?Range, sink: *std.Io.Writer) Error!ObjectMeta {
-        return b.vtable.get(b.ctx, key, range, sink);
+        var sp = span("storage.get", &key);
+        defer sp.end();
+        return b.vtable.get(b.ctx, key, range, sink) catch |e| failed(&sp, e);
     }
     pub fn stat(b: StorageBackend, key: PhysicalKey) Error!ObjectMeta {
-        return b.vtable.stat(b.ctx, key);
+        var sp = span("storage.stat", &key);
+        defer sp.end();
+        return b.vtable.stat(b.ctx, key) catch |e| failed(&sp, e);
     }
     pub fn delete(b: StorageBackend, key: PhysicalKey) Error!void {
-        return b.vtable.delete(b.ctx, key);
+        var sp = span("storage.delete", &key);
+        defer sp.end();
+        return b.vtable.delete(b.ctx, key) catch |e| failed(&sp, e);
     }
     pub fn list(b: StorageBackend, space: KeySpace, cb: ListCallback) Error!void {
         return b.vtable.list(b.ctx, space, cb);
     }
     pub fn putRecord(b: StorageBackend, key: PhysicalKey, bytes: []const u8) Error!void {
-        return b.vtable.putRecord(b.ctx, key, bytes);
+        var sp = span("storage.putRecord", &key);
+        defer sp.end();
+        sp.int("bytes", @intCast(bytes.len));
+        return b.vtable.putRecord(b.ctx, key, bytes) catch |e| failed(&sp, e);
     }
     pub fn getRecord(b: StorageBackend, key: PhysicalKey, gpa: std.mem.Allocator) Error![]u8 {
-        return b.vtable.getRecord(b.ctx, key, gpa);
+        var sp = span("storage.getRecord", &key);
+        defer sp.end();
+        return b.vtable.getRecord(b.ctx, key, gpa) catch |e| failed(&sp, e);
     }
     pub fn deleteRecord(b: StorageBackend, key: PhysicalKey) Error!void {
-        return b.vtable.deleteRecord(b.ctx, key);
+        var sp = span("storage.deleteRecord", &key);
+        defer sp.end();
+        return b.vtable.deleteRecord(b.ctx, key) catch |e| failed(&sp, e);
     }
     pub fn sync(b: StorageBackend) Error!void {
         return b.vtable.sync(b.ctx);

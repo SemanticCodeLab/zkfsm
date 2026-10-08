@@ -204,6 +204,10 @@ fn isCollection(k: fsm.Kind) bool {
 
 fn handle(ctx: *anyopaque, x: *http.Exchange) Error!void {
     const s: *Server = @ptrCast(@alignCast(ctx));
+    var sp = core.trace.root("webdav.request", .server, .gateway, .{});
+    defer sp.end();
+    sp.str("http.request.method", x.method);
+    sp.str("path", x.target);
     const enc = proto.stripPrefix(s.cfg.prefix, proto.uriPath(x.target)) orelse return send(x, .not_found, "", &.{});
     const path = resolve(x.arena, enc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

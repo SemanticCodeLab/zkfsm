@@ -72,6 +72,8 @@ pub const Ctx = struct {
     status_override: ?std.http.Status = null,
     /// Request headers, copied (valid after the body is read).
     headers: []const Header = &.{},
+    /// S3 error code of the response, if it was an error (access logs, traces).
+    err_code: []const u8 = "",
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -648,6 +650,7 @@ pub fn fail(c: *Ctx, code: Code) ConnError!void {
 
 pub fn failWith(c: *Ctx, code: Code, extra: []const Header) ConnError!void {
     metrics.global.last_status = @intFromEnum(code.status());
+    c.err_code = @tagName(code);
     // Refusing before reading the body: no `100 Continue` (the connection then closes).
     if (c.req.server.reader.state == .received_head) c.req.head.expect = null;
     var a: std.Io.Writer.Allocating = .init(c.arena);

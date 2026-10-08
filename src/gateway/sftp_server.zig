@@ -120,6 +120,9 @@ pub const Session = struct {
     const ReqError = wire.DecodeError || wire.EncodeError;
 
     fn dispatch(s: *Session, ty: u8, id: u32, r: *wire.Reader) ReqError![]const u8 {
+        var sp = core.trace.root("sftp.request", .server, .gateway, .{});
+        defer sp.end();
+        sp.int("sftp.type", ty);
         return switch (ty) {
             T.open => s.open(id, r),
             T.close => s.close(id, r),
