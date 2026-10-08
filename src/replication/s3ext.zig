@@ -118,7 +118,7 @@ fn receive(r: *engine.Replicator, c: *Ctx) ConnError!bool {
 
 // ---- proxying reads ----
 
-pub const hdr_proxy = "x-minio-source-proxy-request";
+pub const hdr_proxy = client.hdr_no_proxy;
 
 /// Plain object reads only: no subresources besides these.
 fn plainRead(query: []const u8) bool {
@@ -169,7 +169,6 @@ fn proxyRead(r: *engine.Replicator, c: *Ctx) ConnError!bool {
     const dests = r.proxyDests(c.arena, c.route.bucket) catch return false;
     if (dests.len == 0) return false;
     var hs: std.ArrayList(client.Header) = .empty;
-    try hs.append(c.arena, .{ .name = hdr_proxy, .value = "true" });
     if (c.range) |rg| try hs.append(c.arena, .{ .name = "range", .value = rg });
     var q: std.ArrayList(client.Param) = .empty;
     if (vparam) |v| try q.append(c.arena, .{ .name = "versionId", .value = v });

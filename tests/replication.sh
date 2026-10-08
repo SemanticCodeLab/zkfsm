@@ -122,7 +122,8 @@ echo "== two-way (active-active)"
 "$MC" replicate add b1/dst --remote-bucket "http://$AK:$SK@127.0.0.1:$PA/src" --replicate "delete-marker,metadata-sync" >/dev/null
 echo fromb | "$MC" pipe b4/dst/fromb.txt >/dev/null
 eventually "B write reaches A" fromb catobj a/src/fromb.txt
-check "A copy is a replica" REPLICA "$(rstatus cliA src fromb.txt)"
+# Reads of a not-yet-replicated object are proxied to B; the local copy follows.
+eventually "A copy is a replica" REPLICA rstatus cliA src fromb.txt
 echo froma | "$MC" pipe a/src/froma.txt >/dev/null
 eventually "A write reaches B" froma catobj b1/dst/froma.txt
 sleep 3
@@ -158,7 +159,8 @@ admin "remove-remote-target?bucket=src&arn=$ARN" -o /dev/null -X DELETE
 check "remote target removed" 0 "$(admin "list-remote-targets?bucket=src&type=replication" | grep -c "$ARN" || true)"
 echo after | "$MC" pipe a/src/after-rm.txt >/dev/null
 sleep 3
-check "nothing replicates after rule removal" 1 "$("$MC" stat b1/dst/after-rm.txt >/dev/null 2>&1 && echo 0 || echo 1)"
+# Listing, not stat: B's own rule back to A would proxy a read of the key.
+check "nothing replicates after rule removal" 0 "$("$MC" ls b1/dst/after-rm.txt 2>/dev/null | wc -l | tr -d ' ')"
 
 echo "== site replication A + B + C"
 "$MC" mb c/cbucket >/dev/null

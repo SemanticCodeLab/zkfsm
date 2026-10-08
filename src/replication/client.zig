@@ -18,6 +18,7 @@ pub const Remote = struct {
 };
 
 pub const Param = sign.Param;
+pub const hdr_no_proxy = "x-minio-source-proxy-request";
 pub const Header = http.Header;
 
 /// Writes exactly `len` bytes of an upload body.
@@ -137,6 +138,8 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
         .{ .name = "x-amz-date", .value = &date },
     });
     try extra.appendSlice(a, req.headers);
+    // Replication's own reads must see the peer's local state, never a proxied one.
+    if (req.method == .GET or req.method == .HEAD) try extra.append(a, .{ .name = hdr_no_proxy, .value = "true" });
     const uri: std.Uri = .{
         .scheme = if (r.secure) "https" else "http",
         .host = .{ .raw = hp.host },
