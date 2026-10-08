@@ -245,8 +245,30 @@ minute; restore expiry and the usage scan run every 10 minutes (both follow
 
 Federated STS actions turn an external identity into temporary credentials
 whose rights are a list of canned or stored policies (still narrowed by an
-optional session `Policy`). The session token carries the policy names and the
-tenant, so no per-session server state exists; every node accepts the tokens.
+optional session `Policy`). The session token carries the policy names, the
+tenant, the provider, its issue time, and an optional `TokenRevokeType`, so every
+node accepts it without a lookup; the IAM store keeps only session metadata (for
+listings) and revocation cut-offs.
+
+- **Console login** (authorization code with PKCE S256 and nonce), unauthenticated:
+  `GET /minio/admin/v3/oidc/providers`, `GET .../oidc/authorize/<name>[?redirect_after=/path]`
+  (302 to the IdP's `authorization_endpoint`; the PKCE verifier, nonce, and
+  redirect URI travel encrypted in `state`, bound to the browser by a cookie, valid
+  10 minutes), and `GET .../oidc/callback/<name>?code=..&state=..`, which exchanges
+  the code at the `token_endpoint` (client secret via HTTP Basic), validates the
+  id_token like `AssumeRoleWithWebIdentity` plus the nonce, and returns STS
+  credentials as JSON (or a 302 to `redirect_after` with them in the fragment).
+  The redirect URI is the provider's `redirect_uri` when set (a console that
+  forwards `code` and `state` to the callback), else the callback URL itself
+  (set `redirect_uri` behind TLS-terminating proxies without `X-Forwarded-Proto`).
+- **Revocation**: `POST /minio/admin/v3/revoke-tokens/<builtin|ldap|openid|tls>?user=U&fullRevoke=true`
+  or `&tokenRevokeType=T` (204) rejects every session of `U` from that provider
+  issued so far (all of them, or those requested with that `TokenRevokeType`).
+  Without `user` a caller revokes its own sessions; other users need
+  `admin:RemoveServiceAccount`.
+- **Listing**: `mc idp ldap accesskey ls ALIAS [--all] [DN...]` and
+  `mc idp openid accesskey ls ALIAS[:CFG] [--all] [USER...]` (admin
+  `idp/ldap|openid/list-access-keys-bulk`) list live STS keys per user.
 
 - **OpenID Connect** (`AssumeRoleWithWebIdentity`, `AssumeRoleWithClientGrants`):
   providers are added with `mc idp openid add ALIAS [NAME] config_url=...
@@ -303,6 +325,15 @@ cluster node sees the same value. An overwrite in an unversioned bucket only
 needs room for the difference. `get-bucket-quota` also reports `usage` and
 `objects`.
 
+Rate limits: `set-bucket-quota` also takes `requests` (requests per second) and
+`rate` (bytes per second, uploads and downloads); tenants get the same with
+`PUT /minio/admin/v3/tenant/set-quota?name=T&requests=N&rate=B` (0 clears),
+applied to every bucket the tenant owns and to its identities. Each node meters
+with a token bucket holding one second of burst; a request past the limit gets
+`SlowDown` (HTTP 503). Bytes may go into debt (a large transfer is let through,
+later requests wait). The body of `set-bucket-quota` replaces the whole quota
+configuration, so `mc quota set --size` clears rate limits.
+
 ### Multi-tenancy
 
 Users already isolate through policies; tenants add a hard boundary on top,
@@ -327,7 +358,9 @@ project-scoped buckets other servers get from Keystone).
   (only when it has no users or buckets), `GET .../tenant/list` (users,
   buckets, and usage per tenant), `PUT .../tenant/set-status?name=T&status=enabled|disabled`,
   `PUT .../tenant/assign-user?name=T&accessKey=U` (empty `name` makes the
-  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`.
+  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`,
+  `PUT .../tenant/set-quota?name=T&requests=N&rate=B`. The MinIO client has no
+  tenant commands, so these are native routes.
 
 ### Replication
 
