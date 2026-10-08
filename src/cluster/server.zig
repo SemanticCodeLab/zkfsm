@@ -11,6 +11,7 @@ const rpc = @import("rpc.zig");
 const wire = @import("wire.zig");
 const locks = @import("locks.zig");
 const node_mod = @import("node.zig");
+const journal = @import("journal.zig");
 
 const Node = node_mod.Node;
 const Request = std.http.Server.Request;
@@ -22,7 +23,7 @@ const max_small_body = 17 * 1024 * 1024;
 const max_read = 8 * 1024 * 1024;
 
 pub fn route(n: *Node) s3.server.RawRoute {
-    return .{ .prefix = rpc.prefix, .ctx = n, .serve = serve };
+    return .{ .prefix = rpc.prefix, .ctx = n, .serve = serve, .preamble = rpc.preamble };
 }
 
 const Query = struct {
@@ -93,11 +94,17 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     };
     if (!std.mem.eql(u8, &auth.bodyDigest(body), h.body)) return fail(req, .bad_request, "digest");
 
-    if (std.mem.eql(u8, op, "hello")) return hello(n, req, arena);
+    if (std.mem.eql(u8, op, "hello")) {
+        if (std.mem.eql(u8, q.get("drives") orelse "", "1")) {
+            if (std.fmt.parseInt(u16, h.node, 10)) |from| n.peerSaysUp(from) else |_| {}
+        }
+        return hello(n, req, arena);
+    }
     if (std.mem.eql(u8, op, "format")) return formatGet(n, req, q);
     if (std.mem.eql(u8, op, "format_put")) return formatPut(n, req, q, body);
     if (std.mem.eql(u8, op, "lock") or std.mem.eql(u8, op, "refresh") or std.mem.eql(u8, op, "unlock")) return lockOp(n, req, op, body);
-    if (std.mem.eql(u8, op, "notify")) return notify(n, req, body);
+    if (std.mem.eql(u8, op, "notify")) return notify(n, req, body, std.fmt.parseInt(u16, h.node, 10) catch std.math.maxInt(u16));
+    if (std.mem.eql(u8, op, "jread")) return jread(n, req, q, arena);
     if (std.mem.eql(u8, op, "diskinfo")) return diskInfo(n, req, q, arena);
     if (std.mem.eql(u8, op, "ext")) {
         const x = n.ext.load(.acquire) orelse return fail(req, .service_unavailable, "starting");
@@ -113,6 +120,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     const lb = d.set.acquire(d.slot) orelse return fail(req, .service_unavailable, "offline");
     defer d.set.release(d.slot);
     const l = lb.local;
+    if (std.mem.eql(u8, op, "fresh")) return req.respond(if (d.set.drives[d.slot].fresh.load(.acquire)) "1" else "0", .{});
     if (std.mem.eql(u8, op, "sync")) {
         l.backend().sync() catch |e| return fail(req, statusOf(e), @errorName(e));
         return req.respond("", .{});
@@ -164,8 +172,12 @@ fn respondMeta(req: *Request, body: []const u8, size: u64, mtime: i128) RawError
 fn hello(n: *Node, req: *Request, arena: std.mem.Allocator) RawError!void {
     const topo = std.fmt.bytesToHex(n.topo_fp, .lower);
     const root = std.fmt.bytesToHex(n.root_fp, .lower);
-    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\n", .{
-        n.topo.local, &topo, &root, @intFromBool(n.open.load(.acquire)), @intFromBool(n.drives_open.load(.acquire)),
+    const head = if (n.journal_ok.load(.acquire)) n.journal.head() else journal.Journal.Head{ .epoch = 0, .stable = 0 };
+    const open = n.open.load(.acquire);
+    var ob: [32]u8 = undefined;
+    const jopen = if (open) std.fmt.bufPrint(&ob, "jopen {d}\n", .{n.jopen.load(.acquire)}) catch unreachable else "";
+    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\njepoch {d}\njseq {d}\n{s}", .{
+        n.topo.local, &topo, &root, @intFromBool(open), @intFromBool(n.drives_open.load(.acquire)), head.epoch, head.stable, jopen,
     });
     try req.respond(body, .{});
 }
@@ -212,14 +224,28 @@ fn lockOp(n: *Node, req: *Request, op: []const u8, body: []const u8) RawError!vo
     try req.respond("", .{});
 }
 
-fn notify(n: *Node, req: *Request, body: []const u8) RawError!void {
+fn notify(n: *Node, req: *Request, body: []const u8, from: u16) RawError!void {
     if (body.len > wire.max_notify) return fail(req, .payload_too_large, "notify");
     var it: wire.NoteIter = .{ .bytes = body };
     // Validate everything before applying anything.
     while (it.next() catch return fail(req, .bad_request, "notify")) |_| {}
     it = .{ .bytes = body };
-    while (it.next() catch unreachable) |note| n.applyNote(note);
+    n.applyNotes(from, &it);
     try req.respond("", .{});
+}
+
+/// A page of this node's journal for a peer catching up; 409 when the peer must
+/// rebuild instead (another epoch, or entries no longer kept).
+fn jread(n: *Node, req: *Request, q: Query, arena: std.mem.Allocator) RawError!void {
+    if (!n.journal_ok.load(.acquire)) return fail(req, .service_unavailable, "starting");
+    const epoch = q.int(u64, "e") orelse return fail(req, .bad_request, "e");
+    const after = q.int(u64, "after") orelse return fail(req, .bad_request, "after");
+    const max = @min(q.int(usize, "max") orelse 0, max_read);
+    const page = n.journal.read(arena, epoch, after, max) catch |e| return switch (e) {
+        error.Gone => fail(req, .conflict, "gone"),
+        error.OutOfMemory => error.OutOfMemory,
+    };
+    try req.respond(page.bytes, .{ .extra_headers = &.{.{ .name = "x-zkfsm-more", .value = if (page.more) "1" else "0" }} });
 }
 
 fn diskInfo(n: *Node, req: *Request, q: Query, arena: std.mem.Allocator) RawError!void {

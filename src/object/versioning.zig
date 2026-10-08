@@ -69,7 +69,8 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
     defer svc.gpa.free(bytes);
     try svc.beginIndexChange();
     const version = if (isCurrentSlot(pk, rec.bucket_id, rec.key)) null else rec.versionId();
-    defer svc.emit(.{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } });
+    const change: service.Change = .{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } };
+    defer svc.emitSeq(change, svc.journal(change));
     svc.store.putRecord(pk, bytes) catch |e| {
         svc.indexResync(pk, rec.bucket_id, rec.key, version);
         return service.mapBackend(e);
@@ -81,7 +82,8 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
 fn dropRecord(svc: *Svc, bid: core.BucketId, key: []const u8, version: ?core.VersionId) Error!void {
     const pk = if (version) |v| slotKey(bid, key, v) else currentKey(bid, key);
     try svc.beginIndexChange();
-    defer svc.emit(.{ .record = .{ .pk = pk, .bid = bid, .key = key, .version = version } });
+    const change: service.Change = .{ .record = .{ .pk = pk, .bid = bid, .key = key, .version = version } };
+    defer svc.emitSeq(change, svc.journal(change));
     svc.store.deleteRecord(pk) catch |e| switch (e) {
         error.NotFound => {},
         else => {

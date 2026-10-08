@@ -130,6 +130,8 @@ pub const Ext = struct {
         online: *const fn (ctx: *anyopaque) bool,
         /// Deletes a stamped cluster record only if it still carries `stamp`.
         deleteRecordIf: *const fn (ctx: *anyopaque, key: PhysicalKey, stamp: u64) Error!void,
+        /// The owner formatted the drive empty and has not fully healed it yet.
+        fresh: *const fn (ctx: *anyopaque) Error!bool,
     };
 };
 

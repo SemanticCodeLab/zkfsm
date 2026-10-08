@@ -11,6 +11,8 @@ pub const remote_drive = @import("remote_drive.zig");
 pub const node = @import("node.zig");
 pub const server = @import("server.zig");
 pub const handles = @import("handles.zig");
+pub const journal = @import("journal.zig");
+pub const catchup = @import("catchup.zig");
 
 pub const Node = node.Node;
 pub const Config = node.Config;
@@ -27,4 +29,6 @@ test {
     _ = node;
     _ = server;
     _ = handles;
+    _ = journal;
+    _ = catchup;
 }

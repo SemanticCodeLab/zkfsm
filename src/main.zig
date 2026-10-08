@@ -553,6 +553,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     }
     defer if (tls_paths != null) tls_ctx.deinit();
     const routes = [_]s3.server.RawRoute{ ops_ctx.route(), cluster.server.route(node) };
+    var limits = cfg.limits;
+    limits.rpc_workers = cluster.rpc.Rpc.serverWorkers(node.topo.nodes.len);
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -560,7 +562,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .extensions = extensions,
         .observers = &observers,
         .tls = if (tls_paths != null) &tls_ctx else null,
-        .limits = cfg.limits,
+        .limits = limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
         .raw_routes = &routes,
@@ -639,7 +641,6 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     serving.join();
     gateways.stop();
     pool_mgr.stop();
-    if (svc_ready) svc.collectDeferred(true);
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
     if (code == 0) ops_ctx.finish();

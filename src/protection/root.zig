@@ -7,6 +7,7 @@ pub const shard = @import("shard.zig");
 pub const replica = @import("replica.zig");
 pub const erasure = @import("erasure.zig");
 pub const ec_store = @import("ec_store.zig");
+pub const fanout = @import("fanout.zig");
 
 pub const ReplicaStore = replica.ReplicaStore;
 pub const ErasureStore = ec_store.ErasureStore;
@@ -80,4 +81,5 @@ test {
     _ = shard;
     _ = replica;
     _ = ec_store;
+    _ = fanout;
 }

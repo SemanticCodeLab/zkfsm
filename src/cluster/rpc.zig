@@ -1,12 +1,16 @@
 //! Internal RPC client: HTTP/1.1 to peers on the S3 port under a reserved path, signed
 //! per request, with pooled keep-alive connections, per-call timeouts, and a circuit
 //! breaker that fails calls fast while a node is down (a heartbeat brings it back).
+//! Each connection opens with a preamble so the peer serves it from its RPC pool, and
+//! connections per peer are capped so that pool can always hold all of them.
 const std = @import("std");
 const posix = std.posix;
 const auth = @import("auth.zig");
 const topology = @import("topology.zig");
 
 pub const prefix = "/zkfsm/rpc/v1/";
+/// First bytes of every RPC connection, before TLS.
+pub const preamble = "ZKRPC/1\n";
 
 pub const Error = error{
     /// The breaker has the node marked down; the call was not attempted.
@@ -15,6 +19,8 @@ pub const Error = error{
     Transport,
     /// The peer answered with something that is not a valid response.
     BadResponse,
+    /// Every connection to the peer stayed in use past the wait.
+    Busy,
     OutOfMemory,
 };
 
@@ -25,11 +31,15 @@ pub const Opts = struct {
 };
 
 const max_idle_per_peer = 16;
+/// Longest wait for a free connection slot before a call fails with Busy.
+const slot_wait_ms = 5000;
 /// Pooled connections idle longer than this are dropped (servers close them at 30 s).
 const max_idle_ns: i128 = 15 * std.time.ns_per_s;
 const io_buf = 64 * 1024;
 const max_head = 16 * 1024;
 const connect_timeout_ms = 3000;
+/// Probes (heartbeats, bootstrap) may open this many connections past the cap.
+const probe_extra = 16;
 
 const Conn = struct {
     stream: std.net.Stream,
@@ -80,6 +90,9 @@ pub const Peer = struct {
     online: std.atomic.Value(bool) = .init(true),
     mutex: std.Thread.Mutex = .{},
     idle: std.ArrayList(*Conn) = .empty,
+    /// Open connections, idle or in use; at most `Rpc.peer_cap` (probes may exceed it).
+    conns: usize = 0,
+    freed: std.Thread.Condition = .{},
 };
 
 /// Called on every online/offline transition of a peer.
@@ -97,11 +110,23 @@ pub const Rpc = struct {
     ca: ?std.crypto.Certificate.Bundle = null,
     peers: []Peer,
     on_change: ?OnChange = null,
+    /// Connection cap per peer; the peer's RPC pool is sized from it.
+    peer_cap: usize,
 
     pub fn init(gpa: std.mem.Allocator, topo: *const topology.Topology, secret: auth.Secret) Error!Rpc {
         const peers = try gpa.alloc(Peer, topo.nodes.len);
         for (topo.nodes, peers, 0..) |n, *p, i| p.* = .{ .node = @intCast(i), .host = n.host, .port = n.port, .name = n.name };
-        return .{ .gpa = gpa, .secret = secret, .self_node = topo.local, .tls = topo.tls, .peers = peers };
+        return .{ .gpa = gpa, .secret = secret, .self_node = topo.local, .tls = topo.tls, .peers = peers, .peer_cap = peerCap(topo.nodes.len) };
+    }
+
+    /// Connections per peer: the whole cluster's inbound total stays near 2048.
+    pub fn peerCap(nodes: usize) usize {
+        return std.math.clamp(2048 / @max(1, nodes -| 1), 16, 128);
+    }
+
+    /// RPC workers a node needs so every peer connection is served at once.
+    pub fn serverWorkers(nodes: usize) u32 {
+        return @intCast((nodes -| 1) * (peerCap(nodes) + probe_extra) + 16);
     }
 
     pub fn deinit(self: *Rpc) void {
@@ -128,8 +153,46 @@ pub const Rpc = struct {
     fn dropIdle(self: *Rpc, p: *Peer) void {
         p.mutex.lock();
         defer p.mutex.unlock();
-        for (p.idle.items) |c| c.destroy(self.gpa);
+        for (p.idle.items) |c| self.discardLocked(p, c);
         p.idle.clearRetainingCapacity();
+    }
+
+    /// Closes a connection and frees its slot. Caller holds `p.mutex`.
+    fn discardLocked(self: *Rpc, p: *Peer, c: *Conn) void {
+        c.destroy(self.gpa);
+        p.conns -= 1;
+        p.freed.signal();
+    }
+
+    fn discard(self: *Rpc, p: *Peer, c: *Conn) void {
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        self.discardLocked(p, c);
+    }
+
+    /// Reserves a slot for a new connection; probes may go past the cap.
+    fn reserve(self: *Rpc, p: *Peer, probe: bool) Error!void {
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        const cap = if (probe) self.peer_cap + probe_extra else self.peer_cap;
+        var timer = std.time.Timer.start() catch unreachable;
+        while (p.conns >= cap) {
+            // Probes measure liveness: never queue them behind busy connections.
+            if (probe) return error.Busy;
+            const spent = timer.read();
+            const limit = slot_wait_ms * std.time.ns_per_ms;
+            if (spent >= limit) return error.Busy;
+            p.freed.timedWait(&p.mutex, limit - spent) catch {};
+        }
+        p.conns += 1;
+    }
+
+    fn unreserve(self: *Rpc, p: *Peer) void {
+        _ = self;
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        p.conns -= 1;
+        p.freed.signal();
     }
 
     fn takeIdle(self: *Rpc, p: *Peer) ?*Conn {
@@ -138,7 +201,7 @@ pub const Rpc = struct {
         const now = std.time.nanoTimestamp();
         while (p.idle.pop()) |c| {
             if (now - c.idle_since < max_idle_ns and quiet(c)) return c;
-            c.destroy(self.gpa);
+            self.discardLocked(p, c);
         }
         return null;
     }
@@ -146,9 +209,9 @@ pub const Rpc = struct {
     fn putIdle(self: *Rpc, p: *Peer, c: *Conn) void {
         p.mutex.lock();
         defer p.mutex.unlock();
-        if (p.idle.items.len >= max_idle_per_peer) return c.destroy(self.gpa);
+        if (p.idle.items.len >= max_idle_per_peer) return self.discardLocked(p, c);
         c.idle_since = std.time.nanoTimestamp();
-        p.idle.append(self.gpa, c) catch c.destroy(self.gpa);
+        p.idle.append(self.gpa, c) catch self.discardLocked(p, c);
     }
 
     fn connect(self: *Rpc, p: *Peer) Error!*Conn {
@@ -175,6 +238,7 @@ pub const Rpc = struct {
         c.wbuf = try self.gpa.alloc(u8, if (self.tls) tls_len else io_buf);
         c.sr = s.reader(c.rbuf);
         c.sw = s.writer(c.wbuf);
+        s.writeAll(preamble) catch return error.Transport;
         if (self.tls) {
             c.tls_rbuf = try self.gpa.alloc(u8, tls_len + io_buf);
             c.tls_wbuf = try self.gpa.alloc(u8, tls_len);
@@ -209,7 +273,9 @@ pub const Rpc = struct {
             var reused = true;
             const conn = self.takeIdle(p) orelse blk: {
                 reused = false;
+                try self.reserve(p, opts.probe);
                 break :blk self.connect(p) catch |e| {
+                    self.unreserve(p);
                     if (e == error.Transport) self.setOnline(node, false);
                     return e;
                 };
@@ -418,11 +484,11 @@ pub const Call = struct {
             };
             c.body_left = 0;
         }
-        if (c.keep and c.body_left == 0 and c.status != 0) c.rpc.putIdle(c.peer, c.conn) else c.conn.destroy(c.rpc.gpa);
+        if (c.keep and c.body_left == 0 and c.status != 0) c.rpc.putIdle(c.peer, c.conn) else c.rpc.discard(c.peer, c.conn);
     }
 
     fn abandon(c: *Call) void {
-        c.conn.destroy(c.rpc.gpa);
+        c.rpc.discard(c.peer, c.conn);
     }
 
     pub fn ok(c: *const Call) bool {

@@ -57,11 +57,32 @@ pub const Healer = struct {
         var report: Report = .{ .entries_scanned = scan.entries };
         var ex: executor.HealExecutor = .{ .drives = self.drives, .strategy = self.strategy, .throttle = &throttle };
         try ex.run(&plan, &report);
-        if (report.fullyRedundant() and cfg.walk_keys) {
+        if (report.fullyRedundant() and cfg.walk_keys and !scan.incomplete) {
             for (self.drives.drives) |*d| d.fresh.store(false, .release);
         }
         self.stats.end(report.entries_scanned, report.keys_checked, report.replicas_repaired, report.replicas_unrepaired);
         return report;
+    }
+
+    /// Repairs keys written while a drive was away, once every drive is reachable.
+    /// Keys still short afterwards go back on the list; an overflowed list asks for
+    /// a full pass instead.
+    pub fn healDegraded(self: *Healer) void {
+        if (!self.drives.hasDegraded() or self.drives.onlineCount() < self.drives.count()) return;
+        const got = self.drives.takeDegraded();
+        defer self.gpa.free(got.keys);
+        if (got.overflow) self.wake();
+        var fixed: u64 = 0;
+        for (got.keys) |k| {
+            if (self.stop_ev.isSet()) {
+                self.drives.noteDegraded(k);
+                continue;
+            }
+            const r = self.strategy.healKey(k);
+            fixed += r.repaired;
+            if (r.unrepaired > 0) self.drives.noteDegraded(k);
+        }
+        if (got.keys.len > 0) std.log.info("heal: {d} key(s) written degraded, {d} replica(s) repaired", .{ got.keys.len, fixed });
     }
 
     fn hasFresh(self: *Healer) bool {
@@ -99,6 +120,7 @@ pub const Healer = struct {
                 const limit: u64 = if (interval_ns > 0) interval_ns else if (fresh) fresh_retry_ns else std.math.maxInt(u64);
                 var waited: u64 = 0;
                 while (waited < limit and !self.wake_flag.load(.acquire)) : (waited += wake_step_ns) {
+                    self.healDegraded();
                     self.stop_ev.timedWait(@min(wake_step_ns, limit - waited)) catch {};
                     if (self.stop_ev.isSet()) return;
                 }
@@ -120,8 +142,8 @@ const fresh_retry_ns = 30 * std.time.ns_per_s;
 
 pub fn logReport(r: Report) void {
     std.log.info(
-        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
-        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
+        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} purged={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
+        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.keys_purged, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
     );
 }
 

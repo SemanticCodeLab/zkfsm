@@ -105,7 +105,13 @@ pub const Note = union(enum) {
     iam,
     /// Pool decommission/rebalance state changed: reload it.
     pools,
+    /// The next change is entry `seq` of the sender's journal epoch `epoch`.
+    mark: Mark,
+    /// A blob the sender will delete after its grace; delete it later if it cannot.
+    garbage: [16]u8,
 };
+
+pub const Mark = struct { epoch: u64, seq: u64 };
 
 pub fn encodeNotes(gpa: std.mem.Allocator, notes: []const Note) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -121,10 +127,19 @@ pub fn encodeNotes(gpa: std.mem.Allocator, notes: []const Note) error{OutOfMemor
     return out.toOwnedSlice();
 }
 
-fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
+pub fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
     switch (n) {
         .iam => try w.writeByte('i'),
         .pools => try w.writeByte('p'),
+        .garbage => |id| {
+            try w.writeByte('g');
+            try w.writeAll(&id);
+        },
+        .mark => |m| {
+            try w.writeByte('j');
+            try w.writeInt(u64, m.epoch, .little);
+            try w.writeInt(u64, m.seq, .little);
+        },
         .change => |c| switch (c) {
             .catalog => try w.writeByte('c'),
             .resync => try w.writeByte('x'),
@@ -164,10 +179,19 @@ pub const NoteIter = struct {
     }
 };
 
-fn decodeNote(e: []const u8) error{BadNote}!Note {
+pub fn decodeNote(e: []const u8) error{BadNote}!Note {
+    if (e.len == 0) return error.BadNote;
     switch (e[0]) {
         'i' => return .iam,
         'p' => return .pools,
+        'g' => {
+            if (e.len != 17) return error.BadNote;
+            return .{ .garbage = e[1..17].* };
+        },
+        'j' => {
+            if (e.len != 17) return error.BadNote;
+            return .{ .mark = .{ .epoch = std.mem.readInt(u64, e[1..9], .little), .seq = std.mem.readInt(u64, e[9..17], .little) } };
+        },
         'c' => return .{ .change = .catalog },
         'x' => return .{ .change = .resync },
         'u' => {

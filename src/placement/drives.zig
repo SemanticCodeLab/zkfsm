@@ -117,6 +117,17 @@ pub const Member = struct {
     remote: ?backend.drive.Ext = null,
 };
 
+/// Keys stored below full width (a drive was unreachable), for the healer to repair
+/// as soon as every drive is back instead of at the next full pass.
+pub const Degraded = struct {
+    mutex: std.Thread.Mutex = .{},
+    keys: std.ArrayListUnmanaged(backend.PhysicalKey) = .empty,
+    /// More keys than the cap arrived: only a full pass finds them all.
+    overflow: bool = false,
+
+    pub const cap = 65536;
+};
+
 pub const DriveSet = struct {
     gpa: std.mem.Allocator,
     drives: []Drive,
@@ -124,6 +135,7 @@ pub const DriveSet = struct {
     profile: Profile,
     ids: [max_drives]DriveId,
     cluster: ?ClusterInfo = null,
+    degraded: Degraded = .{},
 
     /// Opens and verifies every drive; formats a brand-new set or empty replacement drives.
     pub fn open(gpa: std.mem.Allocator, paths: []const []const u8, want: ?Profile) OpenError!DriveSet {
@@ -236,7 +248,43 @@ pub const DriveSet = struct {
         return set;
     }
 
+    /// Remembers a key that was written without every placed drive.
+    pub fn noteDegraded(self: *DriveSet, key: backend.PhysicalKey) void {
+        const g = &self.degraded;
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        if (g.keys.items.len >= Degraded.cap) {
+            g.overflow = true;
+            return;
+        }
+        g.keys.append(self.gpa, key) catch {
+            g.overflow = true;
+        };
+    }
+
+    /// Hands the remembered keys to the caller (who frees them with `self.gpa`).
+    pub fn takeDegraded(self: *DriveSet) struct { keys: []backend.PhysicalKey, overflow: bool } {
+        const g = &self.degraded;
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        const out: []backend.PhysicalKey = g.keys.toOwnedSlice(self.gpa) catch blk: {
+            g.keys.clearRetainingCapacity();
+            g.overflow = true;
+            break :blk &.{};
+        };
+        defer g.overflow = false;
+        return .{ .keys = out, .overflow = g.overflow };
+    }
+
+    pub fn hasDegraded(self: *DriveSet) bool {
+        const g = &self.degraded;
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        return g.keys.items.len > 0 or g.overflow;
+    }
+
     pub fn deinit(self: *DriveSet) void {
+        self.degraded.keys.deinit(self.gpa);
         for (self.drives) |*d| {
             if (d.kind == .local) d.kind.local.close();
             self.gpa.free(d.path);
@@ -347,6 +395,20 @@ pub const DriveSet = struct {
         return if (f.sameSlot(want)) .ok else .foreign;
     }
 
+    /// True when one of drives `idx` was formatted empty and is not fully healed yet;
+    /// remote drives are asked (unreachable ones count as fresh, to stay safe).
+    pub fn anyFresh(self: *DriveSet, idx: []const u8) bool {
+        for (idx) |i| {
+            const d = &self.drives[i];
+            const fresh = switch (d.kind) {
+                .local => d.fresh.load(.acquire),
+                .remote => |x| x.vtable.fresh(x.ctx) catch true,
+            };
+            if (fresh) return true;
+        }
+        return false;
+    }
+
     pub fn isLocal(self: *const DriveSet, i: usize) bool {
         return self.drives[i].kind == .local;
     }
@@ -358,7 +420,10 @@ pub const DriveSet = struct {
         d.lock.lock();
         defer d.lock.unlock();
         d.online.store(false, .release);
-        const lb = LocalBackend.open(d.path) catch return error.DriveUnavailable;
+        var lb = LocalBackend.open(d.path) catch return error.DriveUnavailable;
+        // The drive came back empty: its usage restarts from zero.
+        lb.usage = d.kind.local.usage;
+        if (lb.usage) |u| u.store(0, .monotonic);
         d.kind.local.close();
         d.kind.local = lb;
         self.writeFormat(i) catch return error.DriveUnavailable;
