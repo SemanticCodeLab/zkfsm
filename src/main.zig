@@ -17,6 +17,7 @@ const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
 const tables = @import("tables/root.zig");
+const lambda = @import("lambda/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -71,6 +72,8 @@ const usage =
     \\             / ZKFSM_NOTIFY_... env (ENABLE=on); audit via audit_webhook / audit_kafka, or
     \\             ZKFSM_AUDIT_CONSOLE=on and ZKFSM_AUDIT_FILE=path; region from ZKFSM_REGION / MINIO_REGION;
     \\             queues under ZKFSM_EVENTS_DIR (default: <first drive>/.zkfsm/events)
+    \\lambda: GET ?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook via MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on and
+    \\             ..._ENDPOINT_<id> / _AUTH_TOKEN_<id> (or ZKFSM_LAMBDA_WEBHOOK_...), or mc admin config set lambda_webhook:<id>
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -403,12 +406,13 @@ pub fn run(opts: Options) u8 {
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     svc.events = ev_ext.sink();
     const observers = [_]s3.Observer{ev_ext.observer()};
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
     var tables_route = tables.Tables.init(&svc, auth);
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), lambda_reg.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -528,12 +532,13 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     defer if (notif_ready) notif.deinit();
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     const observers = [_]s3.Observer{ev_ext.observer()};
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg };
     var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
     var tables_route = tables.Tables.init(&svc, auth);
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
+    const builtin_ext = [_]s3.Extension{ bridge.extension(), lambda_reg.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -677,6 +682,20 @@ fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: 
         .endpoint = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, host }),
         .env_targets = targets,
     };
+}
+
+/// Object Lambda targets from the environment; invalid ones stop startup.
+fn lambdaRegistry(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService) error{ BadArgs, OutOfMemory }!lambda.Registry {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    const targets = try lambda.config.fromEnv(arena, &env);
+    for (targets) |t| _ = lambda.config.endpoint(arena, t) catch {
+        std.log.err("lambda_webhook:{s} from the environment: need an http(s) endpoint (client certificates unsupported)", .{t.id});
+        return error.BadArgs;
+    };
+    var reg = lambda.Registry.init(gpa, svc, targets);
+    reg.region = env.get("ZKFSM_REGION") orelse env.get("MINIO_REGION") orelse env.get("MINIO_SITE_REGION") orelse "";
+    if ((tlsPaths(arena, cfg) catch null) != null) reg.scheme = "https";
+    return reg;
 }
 
 var events_ext: cluster.node.Ext = undefined;
@@ -999,6 +1018,7 @@ test {
     _ = events;
     _ = sse;
     _ = tables;
+    _ = lambda;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
 }

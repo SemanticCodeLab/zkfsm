@@ -8,6 +8,7 @@ const object = @import("object/root.zig");
 const metrics = @import("metrics/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
+const lambda = @import("lambda/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -21,6 +22,8 @@ pub const Bridge = struct {
     repl: ?*replication.Replicator = null,
     /// Event and audit target configuration (config-kv for notify_*/audit_*).
     events: ?*events.Notifier = null,
+    /// Object Lambda targets (config-kv for lambda_webhook).
+    lambda: ?*lambda.Registry = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -64,6 +67,10 @@ pub const Bridge = struct {
             .now_s = now_s,
         };
         if (self.events) |n| if (try events.admin.handle(n, c.arena, store, req)) |res| {
+            try respond(c, res);
+            return true;
+        };
+        if (self.lambda) |l| if (try lambda.admin.handle(l, c.arena, store, req)) |res| {
             try respond(c, res);
             return true;
         };
