@@ -9,11 +9,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    _ = b.addModule("zkfsm", .{
+    // Prebuilt console bundle; rebuild with `npm run build` in console/.
+    const console_assets = b.createModule(.{ .root_source_file = b.path("console/assets.zig") });
+    mod.addImport("console_assets", console_assets);
+
+    const lib_mod = b.addModule("zkfsm", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addImport("console_assets", console_assets);
 
     const exe = b.addExecutable(.{ .name = "zkfsm", .root_module = mod });
     b.installArtifact(exe);

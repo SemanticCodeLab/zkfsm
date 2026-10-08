@@ -27,6 +27,33 @@ pub const Healer = struct {
     /// Cluster sets: whether this node verifies keys now (the set's heal leader, or
     /// it holds a fresh drive). Null: always.
     leader: ?Leader = null,
+    /// Last finished pass, for status pages.
+    stats_lock: std.Thread.Mutex = .{},
+    stats: Status = .{},
+
+    pub const Status = struct {
+        running: bool = false,
+        passes: u64 = 0,
+        last_end_s: i64 = 0,
+        last: Report = .{},
+    };
+
+    pub fn status(self: *Healer) Status {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        return self.stats;
+    }
+
+    fn setRunning(self: *Healer, on: bool, r: ?Report) void {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        self.stats.running = on;
+        if (r) |x| {
+            self.stats.last = x;
+            self.stats.passes += 1;
+            self.stats.last_end_s = std.time.timestamp();
+        }
+    }
 
     pub const Leader = struct {
         ctx: *anyopaque,
@@ -41,6 +68,9 @@ pub const Healer = struct {
     pub fn runOnce(self: *Healer) Error!Report {
         self.pass_lock.lock();
         defer self.pass_lock.unlock();
+        self.setRunning(true, null);
+        var done: ?Report = null;
+        defer self.setRunning(false, done);
         var throttle: scanner.Throttle = .{ .per_sec = self.cfg.rate_per_sec, .stop = &self.stop_ev };
         var cfg = self.cfg;
         if (self.leader) |l| cfg.walk_keys = self.hasFresh() or l.func(l.ctx, self.drives);
@@ -55,6 +85,7 @@ pub const Healer = struct {
         if (report.fullyRedundant() and cfg.walk_keys) {
             for (self.drives.drives) |*d| d.fresh.store(false, .release);
         }
+        done = report;
         return report;
     }
 

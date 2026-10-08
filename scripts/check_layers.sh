@@ -13,7 +13,7 @@ rank() {
     protection) echo 4 ;;
     heal | object) echo 5 ;;
     metrics | iam) echo 6 ;;
-    s3 | admin | gateway) echo 7 ;;
+    s3 | admin | gateway | console) echo 7 ;;
     cluster | replication | events | sse) echo 8 ;;
     *) echo -1 ;;
   esac
@@ -25,6 +25,7 @@ forbidden() {
     s3:backend | s3:placement | s3:metadata | s3:device) return 0 ;;
     admin:backend | admin:device) return 0 ;;
     gateway:backend | gateway:placement | gateway:metadata | gateway:device | gateway:protection) return 0 ;;
+    console:backend | console:placement | console:metadata | console:device | console:protection | console:object) return 0 ;;
     *) return 1 ;;
   esac
 }
