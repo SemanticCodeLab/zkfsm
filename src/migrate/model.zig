@@ -48,8 +48,10 @@ pub const BucketConfigs = struct {
     replication: ?[]const u8 = null,
 };
 
-/// Versions of one key, oldest first.
+/// Versions of one key, oldest first. Input is newest first (listing order), so
+/// reversing before the stable sort keeps that order for equal times.
 pub fn sortOldestFirst(vs: []VersionInfo) void {
+    std.mem.reverse(VersionInfo, vs);
     std.mem.sort(VersionInfo, vs, {}, struct {
         fn lt(_: void, a: VersionInfo, b: VersionInfo) bool {
             return a.mtime_ns < b.mtime_ns;
@@ -87,7 +89,7 @@ pub fn applyMeta(arena: std.mem.Allocator, v: *VersionInfo, pairs: []const Heade
         } else if (std.ascii.eqlIgnoreCase(n, "x-amz-object-lock-mode")) {
             v.mode = parseMode(p.value);
         } else if (std.ascii.eqlIgnoreCase(n, "x-amz-object-lock-retain-until-date")) {
-            v.until_ns = core.time.parseIso8601(p.value) catch 0;
+            v.until_ns = parseTime(p.value) orelse 0;
         } else if (std.ascii.eqlIgnoreCase(n, "x-amz-object-lock-legal-hold")) {
             v.legal_hold = std.ascii.eqlIgnoreCase(p.value, "ON");
         } else if (std.ascii.startsWithIgnoreCase(n, "x-amz-server-side-encryption") or
@@ -102,6 +104,26 @@ pub fn applyMeta(arena: std.mem.Allocator, v: *VersionInfo, pairs: []const Heade
         }
     }
     v.user = user.items;
+}
+
+/// ISO-8601 UTC time keeping up to nanosecond fractions (the core parser drops them).
+pub fn parseTime(s: []const u8) ?i128 {
+    const dot = std.mem.indexOfScalar(u8, s, '.') orelse return core.time.parseIso8601(s) catch null;
+    if (s.len < dot + 2 or s[s.len - 1] != 'Z') return null;
+    const frac = s[dot + 1 .. s.len - 1];
+    if (frac.len == 0 or frac.len > 9) return null;
+    var whole: [20]u8 = undefined;
+    if (dot + 1 > whole.len) return null;
+    @memcpy(whole[0..dot], s[0..dot]);
+    whole[dot] = 'Z';
+    const base = core.time.parseIso8601(whole[0 .. dot + 1]) catch return null;
+    var ns: i128 = 0;
+    for (0..9) |i| {
+        const d: u8 = if (i < frac.len) frac[i] else '0';
+        if (!std.ascii.isDigit(d)) return null;
+        ns = ns * 10 + (d - '0');
+    }
+    return base + ns;
 }
 
 pub fn parseMode(s: []const u8) Mode {
@@ -161,5 +183,9 @@ test "metadata pairs map to fields" {
     try std.testing.expectEqualStrings("c d", v.tags[1].value);
     try std.testing.expectEqual(Mode.governance, v.mode);
     try std.testing.expect(v.until_ns > 0 and v.legal_hold);
+    try std.testing.expectEqual(@as(i128, 123 * std.time.ns_per_ms), @mod(v.until_ns, std.time.ns_per_s));
+    try std.testing.expect(parseTime("2030-01-02T03:04:05.1234567891Z") == null);
+    try std.testing.expect(parseTime("2030-01-02T03:04:05.Z") == null);
+    try std.testing.expect(parseTime("x") == null);
     try std.testing.expect(v.skip_reason == null);
 }

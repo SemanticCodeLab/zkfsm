@@ -259,7 +259,7 @@ pub const Source = struct {
         v.until_ns = 0;
         for (r.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "x-amz-object-lock-mode")) v.mode = model.parseMode(h.value);
-            if (std.ascii.eqlIgnoreCase(h.name, "x-amz-object-lock-retain-until-date")) v.until_ns = core.time.parseIso8601(h.value) catch 0;
+            if (std.ascii.eqlIgnoreCase(h.name, "x-amz-object-lock-retain-until-date")) v.until_ns = model.parseTime(h.value) orelse 0;
         }
         var count: u32 = 0;
         for (r.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-amz-tagging-count")) {
@@ -319,7 +319,7 @@ fn parseEntry(arena: std.mem.Allocator, e: Entry) Error!model.VersionInfo {
     var v: model.VersionInfo = .{ .delete_marker = e.marker, .src_id = try arena.dupe(u8, vid) };
     v.id = versionBytes(vid);
     const lm = xml.find(e.body, "LastModified") orelse return error.BadResponse;
-    v.mtime_ns = core.time.parseIso8601(std.mem.trim(u8, lm, " ")) catch return error.BadResponse;
+    v.mtime_ns = model.parseTime(std.mem.trim(u8, lm, " ")) orelse return error.BadResponse;
     if (!e.marker) {
         const etag = try unescape(arena, xml.find(e.body, "ETag") orelse "");
         v.etag = std.mem.trim(u8, etag, "\" ");
