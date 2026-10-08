@@ -1,3 +1,6 @@
 .zig-cache/
 zig-out/
 data/
+console/node_modules/
+console/test-results/
+console/playwright-report/
