@@ -196,10 +196,11 @@ pub const Sink = struct {
         const src = body orelse return null;
         var want: [32]u8 = undefined;
         sha256Of(src, &want) catch return "source unreadable";
-        var hw: HashWriter = .{};
+        var hw: HashWriter = undefined;
+        hw.init();
         s.svc.read(info, null, &hw.writer) catch return "stored data unreadable";
         var got: [32]u8 = undefined;
-        hw.h.final(&got);
+        hw.final(&got);
         if (!std.mem.eql(u8, &want, &got)) return "content differs";
         return null;
     }
@@ -207,10 +208,18 @@ pub const Sink = struct {
 
 const HashWriter = struct {
     h: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    buf: [64 * 1024]u8 = undefined,
     writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn init(self: *HashWriter) void {
+        self.* = .{};
+        self.writer.buffer = &self.buf;
+    }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *HashWriter = @alignCast(@fieldParentPtr("writer", w));
+        self.h.update(w.buffer[0..w.end]);
+        w.end = 0;
         var n: usize = 0;
         for (data[0 .. data.len - 1]) |d| {
             self.h.update(d);
@@ -220,15 +229,22 @@ const HashWriter = struct {
         for (0..splat) |_| self.h.update(last);
         return n + last.len * splat;
     }
+
+    fn final(self: *HashWriter, out: *[32]u8) void {
+        self.h.update(self.writer.buffer[0..self.writer.end]);
+        self.writer.end = 0;
+        self.h.final(out);
+    }
 };
 
 fn sha256Of(r: *std.Io.Reader, out: *[32]u8) std.Io.Reader.StreamError!void {
-    var hw: HashWriter = .{};
+    var hw: HashWriter = undefined;
+    hw.init();
     _ = r.streamRemaining(&hw.writer) catch |e| switch (e) {
         error.ReadFailed => return error.ReadFailed,
         error.WriteFailed => return error.WriteFailed,
     };
-    hw.h.final(out);
+    hw.final(out);
 }
 
 pub fn versioningState(doc: ?[]const u8) ov.Versioning {
