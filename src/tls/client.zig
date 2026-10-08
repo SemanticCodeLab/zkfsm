@@ -164,6 +164,8 @@ pub const Options = struct {
 
 /// Handshake transcript kept for the TLS 1.2 CertificateVerify signature.
 const max_transcript12 = 1 << 18;
+const ext_extended_master_secret: u16 = 23;
+const ext_renegotiation_info: u16 = 0xff01;
 const max_ctx = 255;
 
 pub const InitError = error{
@@ -267,7 +269,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .secp256r1,
         .secp384r1,
         .x25519,
-    })) ++ tls.extension(.psk_key_exchange_modes, array(u8, tls.PskKeyExchangeMode, .{
+    })) ++ int(u16, ext_extended_master_secret) ++ int(u16, 0) ++
+        int(u16, ext_renegotiation_info) ++ int(u16, 1) ++ .{0} ++ tls.extension(.psk_key_exchange_modes, array(u8, tls.PskKeyExchangeMode, .{
         .psk_dhe_ke,
     })) ++ tls.extension(.key_share, array(
         u16,
@@ -331,6 +334,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         try t12.appendSlice(ca.gpa, host);
     }
     var cert_requested = false;
+    var ems = false;
     var client_scheme: ?tls.SignatureScheme = null;
     var cr_ctx_buf: [max_ctx]u8 = undefined;
     var cr_ctx_len: u8 = 0;
@@ -537,7 +541,10 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try extd.ensure(key_size);
                                         try key_share.exchange(named_group, extd.slice(key_size));
                                     },
-                                    else => {},
+                                    else => if (@intFromEnum(et) == ext_extended_master_secret) {
+                                        if (ems or ext_size != 0) return error.TlsIllegalParameter;
+                                        ems = true;
+                                    },
                                 }
                             }
                         }
@@ -832,6 +839,8 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 }
                                 p.transcript_hash.update(client_key_exchange_prefix[tls.record_header_len..]);
                                 p.transcript_hash.update(public_key_bytes);
+                                // RFC 7627: the session hash covers messages through ClientKeyExchange.
+                                const session_hash = p.transcript_hash.peek();
                                 if (client_scheme) |scheme| {
                                     const ca = options.client_auth.?;
                                     if (t12.items.len + cert_msg.len + 128 > max_transcript12) return error.TlsHandshakeTooLong;
@@ -841,11 +850,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     verify_msg = try certificateVerifyMsg(ca, scheme, t12.items, &verify_msg_buf);
                                     p.transcript_hash.update(verify_msg);
                                 }
-                                const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
-                                    "master secret",
-                                    &client_hello_rand,
-                                    &server_hello_rand,
-                                }, 48);
+                                var master_secret = if (ems)
+                                    hmacExpandLabel(P.Hmac, pre_master_secret, &.{ "extended master secret", &session_hash }, 48)
+                                else
+                                    hmacExpandLabel(P.Hmac, pre_master_secret, &.{ "master secret", &client_hello_rand, &server_hello_rand }, 48);
+                                defer crypto.secureZero(u8, &master_secret);
                                 if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
                                     .client_random = &client_hello_rand,
                                 }, .{
