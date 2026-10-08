@@ -108,8 +108,7 @@ pub const Observe = struct {
             d.deinit();
         }
         if (o.exporter) |e| {
-            e.stop();
-            o.gpa.destroy(e);
+            if (e.stop()) o.gpa.destroy(e);
         }
         o.logs.deinit();
         o.stats.deinit();

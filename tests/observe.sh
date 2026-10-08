@@ -169,6 +169,30 @@ start --otel-sample-ratio 1
 check "bad sample ratio refused" 2 "$("$BIN" --otel-sample-ratio 1.5 >/dev/null 2>&1; echo $?)"
 check "bad endpoint refused" 2 "$(OTEL_EXPORTER_OTLP_ENDPOINT=nope ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/x" --listen 127.0.0.1:1 >/dev/null 2>&1; echo $?)"
 
+echo "--- unresponsive collector"
+stop
+BPORT="$(freeport)"
+python3 - "$BPORT" <<'PY' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(64)
+held = []
+while True:
+    held.append(s.accept())
+PY
+PIDS+=($!)
+OTEL_EP="http://127.0.0.1:$BPORT" OTEL_EXPORTER_OTLP_TIMEOUT=1000 start
+T0=$(date +%s%N)
+for _ in 1 2 3 4 5; do curl -s -o /dev/null "${sig[@]}" "$EP/obs/a.txt"; done
+check "requests are not slowed by a hung collector" yes "$([[ $(( ($(date +%s%N) - T0) / 1000000 )) -lt 2000 ]] && echo yes || echo no)"
+sleep 1
+T0=$(date +%s)
+stop
+check "shutdown does not wait on a hung collector" yes "$([[ $(( $(date +%s) - T0 )) -lt 10 ]] && echo yes || echo no)"
+start --otel-sample-ratio 1
+
 echo "--- metrics v3"
 "$MC" cat z/obs/a.txt >/dev/null
 v3() { "$MC" admin prometheus metrics z "$@" --api-version v3 2>&1; }

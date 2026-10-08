@@ -431,6 +431,7 @@ pub const Exporter = struct {
     metrics: ?Renderer = null,
     stats: Stats = .{},
     started_ns: u64 = 0,
+    done: std.Thread.ResetEvent = .{},
 
     pub fn init(gpa: Allocator, cfg: Config) Exporter {
         return .{ .gpa = gpa, .cfg = cfg, .started_ns = nanos(std.time.nanoTimestamp()) };
@@ -440,20 +441,29 @@ pub const Exporter = struct {
         e.thread = try std.Thread.spawn(.{}, loop, .{e});
     }
 
-    /// Flushes what is queued, then joins the worker.
-    pub fn stop(e: *Exporter) void {
+    /// Flushes what is queued, then joins the worker. Returns false (and leaves the
+    /// exporter allocated) when a hung collector keeps the worker past the timeout.
+    pub fn stop(e: *Exporter) bool {
         {
             e.mutex.lock();
             defer e.mutex.unlock();
             e.stopping = true;
             e.cond.signal();
         }
-        if (e.thread) |t| t.join();
+        if (e.thread) |t| {
+            e.done.timedWait(@as(u64, e.cfg.timeout_ms) * std.time.ns_per_ms + 2 * std.time.ns_per_s) catch {
+                std.log.scoped(.otlp).warn("otel: exporter still busy at shutdown; abandoning queued data", .{});
+                t.detach();
+                return false;
+            };
+            t.join();
+        }
         e.thread = null;
         for (e.spans.items) |s| s.destroy(e.gpa);
         e.spans.deinit(e.gpa);
         for (e.logs.items) |l| e.gpa.free(l.msg);
         e.logs.deinit(e.gpa);
+        return true;
     }
 
     pub fn pushSpan(e: *Exporter, s: *const trace.Span) void {
@@ -492,6 +502,7 @@ pub const Exporter = struct {
     }
 
     fn loop(e: *Exporter) void {
+        defer e.done.set();
         var client: std.http.Client = .{ .allocator = e.gpa };
         defer client.deinit();
         var next_metrics: i128 = std.time.nanoTimestamp() + @as(i128, e.cfg.metrics_interval_ms) * std.time.ns_per_ms;
