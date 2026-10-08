@@ -40,10 +40,10 @@ forward() {
   PORT="$(free_port)"
   k port-forward svc/s3 "$PORT:9000" >"$WORK/pf.log" 2>&1 &
   PF=$!
-  for _ in $(seq 50); do curl -s "${CURL_TLS[@]}" -o /dev/null "$SCHEME://127.0.0.1:$PORT/health/live" && return 0; sleep 0.2; done
+  for _ in $(seq 50); do curl -s --max-time 2 "${CURL_TLS[@]}" -o /dev/null "$SCHEME://127.0.0.1:$PORT/health/live" && return 0; sleep 0.2; done
   echo "port-forward failed"; cat "$WORK/pf.log"; return 1
 }
-s3() { curl -sS "${CURL_TLS[@]}" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$1" "${@:2}"; }
+s3() { curl -sS --max-time 20 "${CURL_TLS[@]}" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$1" "${@:2}"; }
 APP=appuser:app-secret-123
 put() { s3 "$APP" -o /dev/null -w '%{http_code}' -T "$2" "$SCHEME://127.0.0.1:$PORT/app/$1"; }
 get() { s3 "$APP" -o "$2" -w '%{http_code}' "$SCHEME://127.0.0.1:$PORT/app/$1"; }
