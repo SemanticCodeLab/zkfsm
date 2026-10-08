@@ -45,6 +45,7 @@ const usage =
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
+    \\  --tls-min-version V   lowest TLS version accepted: 1.2 (default) or 1.3
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -105,6 +106,7 @@ const Config = struct {
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
+    tls_min_version: tls.Version = .tls12,
     kms: sse.setup.Flags = .{},
 };
 
@@ -177,6 +179,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.identity_openid = args[i];
         } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
             cfg.tls_client_ca = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-min-version")) {
+            cfg.tls_min_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -420,6 +424,7 @@ pub fn run(opts: Options) u8 {
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -541,6 +546,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
