@@ -93,14 +93,23 @@ fn sub(o: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     return if (v == .object) v.object else null;
 }
 
-/// GCS credentials: base64 of a JSON document holding an HMAC interoperability key pair.
-fn gcsHmac(a: Allocator, b64: []const u8) ?[2][]const u8 {
+/// GCS credentials file (base64 JSON): a service-account key or an HMAC key pair.
+const GcsCreds = union(enum) {
+    hmac: [2][]const u8,
+    /// client_email, private_key (PEM), token_uri.
+    service_account: [3][]const u8,
+};
+
+fn gcsCreds(a: Allocator, b64: []const u8) ?GcsCreds {
     const dec = std.base64.standard.Decoder;
     const n = dec.calcSizeForSlice(b64) catch return null;
     const raw = a.alloc(u8, n) catch return null;
     dec.decode(raw, b64) catch return null;
     const v = std.json.parseFromSliceLeaky(Value, a, raw, .{}) catch return null;
     if (v != .object) return null;
+    const email = str(v.object, "client_email");
+    const pem = str(v.object, "private_key");
+    if (email.len > 0 and pem.len > 0) return .{ .service_account = .{ email, pem, str(v.object, "token_uri") } };
     const pairs = [_][2][]const u8{
         .{ "access_key", "secret_key" },           .{ "accessKey", "secretKey" },
         .{ "access_key_id", "secret_access_key" }, .{ "hmac_access_id", "hmac_secret" },
@@ -108,12 +117,34 @@ fn gcsHmac(a: Allocator, b64: []const u8) ?[2][]const u8 {
     for (pairs) |p| {
         const ak = str(v.object, p[0]);
         const sk = str(v.object, p[1]);
-        if (ak.len > 0 and sk.len > 0) return .{ ak, sk };
+        if (ak.len > 0 and sk.len > 0) return .{ .hmac = .{ ak, sk } };
     }
     return null;
 }
 
-const gcs_creds_msg = "GCS tiers use an HMAC interoperability key: a credentials file with access_key and secret_key";
+fn applyGcs(cfg: anytype, g: GcsCreds) void {
+    switch (g) {
+        .hmac => |p| {
+            cfg.auth = .keys;
+            cfg.access_key = p[0];
+            cfg.secret_key = p[1];
+        },
+        .service_account => |p| {
+            cfg.auth = .service_account;
+            cfg.access_key = p[0];
+            cfg.secret_key = p[1];
+            cfg.token_uri = p[2];
+        },
+    }
+}
+
+fn isTrue(o: ?std.json.ObjectMap, key: []const u8) bool {
+    const m = o orelse return false;
+    const v = m.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+const gcs_creds_msg = "GCS tiers need a service-account key file or an HMAC key pair (access_key, secret_key)";
 
 fn add(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry, force: bool) Error!Response {
     if (!can(a, env, req, .set_tier)) return denied(a);
@@ -138,22 +169,29 @@ fn add(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry,
     };
     switch (kind) {
         .s3, .minio => {
-            if (s.get("AWSRole")) |v| if (v == .bool and v.bool) return api.fail(a, .not_implemented, "NotImplemented", "Role-based tier credentials are not supported.");
             cfg.access_key = str(s, "AccessKey");
             cfg.secret_key = str(s, "SecretKey");
+            if (isTrue(s, "AWSRole")) {
+                cfg.auth = .role;
+                cfg.role_arn = str(s, "AWSRoleARN");
+                cfg.token_file = str(s, "AWSRoleWebIdentityTokenFile");
+            }
         },
         .azure => {
-            if (str(sub(s, "SPAuth"), "ClientID").len > 0) return api.fail(a, .not_implemented, "NotImplemented", "Azure service principal credentials are not supported.");
             cfg.access_key = str(s, "AccountName");
             cfg.secret_key = str(s, "AccountKey");
+            const sp = sub(s, "SPAuth");
+            if (str(sp, "ClientID").len > 0) {
+                cfg.auth = .service_principal;
+                cfg.tenant_id = str(sp, "TenantID");
+                cfg.client_id = str(sp, "ClientID");
+                cfg.secret_key = str(sp, "ClientSecret");
+                if (cfg.tenant_id.len == 0 or cfg.secret_key.len == 0) return badRequest(a, "XMinioAdminTierMissingCredentials", "Service principal needs a tenant id, client id and client secret");
+            }
         },
-        .gcs => {
-            const pair = gcsHmac(a, str(s, "Creds")) orelse return badRequest(a, "XMinioAdminTierInvalidCredentials", gcs_creds_msg);
-            cfg.access_key = pair[0];
-            cfg.secret_key = pair[1];
-        },
+        .gcs => applyGcs(&cfg, gcsCreds(a, str(s, "Creds")) orelse return badRequest(a, "XMinioAdminTierInvalidCredentials", gcs_creds_msg)),
     }
-    if (cfg.access_key.len == 0 or cfg.secret_key.len == 0) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
+    if (cfg.auth == .keys and (cfg.access_key.len == 0 or cfg.secret_key.len == 0)) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
     reg.add(cfg, .{ .force = force }) catch |e| return tierFail(a, e);
     return .{ .status = .no_content };
 }
@@ -183,13 +221,25 @@ fn writeList(js: *std.json.Stringify, cfgs: []const Config) std.Io.Writer.Error!
         try js.beginObject();
         try optField(js, "Endpoint", c.endpoint);
         switch (c.kind) {
-            .s3, .minio => {
+            .s3, .minio => if (c.auth == .role) {
+                try js.objectField("AWSRole");
+                try js.write(true);
+                try optField(js, "AWSRoleARN", c.role_arn);
+                try optField(js, "AWSRoleWebIdentityTokenFile", c.token_file);
+            } else {
                 try optField(js, "AccessKey", c.access_key);
                 try field(js, "SecretKey", redacted);
             },
             .azure => {
                 try optField(js, "AccountName", c.access_key);
-                try field(js, "AccountKey", redacted);
+                if (c.auth == .service_principal) {
+                    try js.objectField("SPAuth");
+                    try js.beginObject();
+                    try field(js, "TenantID", c.tenant_id);
+                    try field(js, "ClientID", c.client_id);
+                    try field(js, "ClientSecret", redacted);
+                    try js.endObject();
+                } else try field(js, "AccountKey", redacted);
             },
             .gcs => try field(js, "Creds", redacted),
         }
@@ -221,20 +271,26 @@ fn verify(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Regist
 fn edit(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry, name: []const u8) Error!Response {
     if (!can(a, env, req, .set_tier)) return denied(a);
     const body = decryptJson(a, req) orelse return badRequest(a, "XMinioAdminConfigBadJSON", "Request body could not be decrypted or parsed.");
-    if (body.get("awsrole")) |v| if (v == .bool and v.bool) return api.fail(a, .not_implemented, "NotImplemented", "Role-based tier credentials are not supported.");
-    if (str(sub(body, "azSP"), "ClientID").len > 0) return api.fail(a, .not_implemented, "NotImplemented", "Azure service principal credentials are not supported.");
     var creds: object.tier.Registry.Creds = .{};
     const ak = str(body, "access");
     const sk = str(body, "secret");
     if (ak.len > 0) creds.access_key = ak;
     if (sk.len > 0) creds.secret_key = sk;
+    if (isTrue(body, "awsrole")) creds = .{ .auth = .role, .role_arn = str(body, "awsroleARN"), .token_file = str(body, "awsroleWebIdentity") };
+    const sp = sub(body, "azSP");
+    if (str(sp, "ClientID").len > 0) creds = .{
+        .auth = .service_principal,
+        .secret_key = str(sp, "ClientSecret"),
+        .tenant_id = str(sp, "TenantID"),
+        .client_id = str(sp, "ClientID"),
+    };
     // GCS: `creds` is the credentials file as base64 (Go []byte).
     const gcs = str(body, "creds");
-    if (gcs.len > 0) {
-        const pair = gcsHmac(a, gcs) orelse return badRequest(a, "XMinioAdminTierInvalidCredentials", gcs_creds_msg);
-        creds = .{ .access_key = pair[0], .secret_key = pair[1] };
-    }
-    if (creds.access_key == null and creds.secret_key == null) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
+    if (gcs.len > 0) switch (gcsCreds(a, gcs) orelse return badRequest(a, "XMinioAdminTierInvalidCredentials", gcs_creds_msg)) {
+        .hmac => |p| creds = .{ .access_key = p[0], .secret_key = p[1], .auth = .keys },
+        .service_account => |p| creds = .{ .access_key = p[0], .secret_key = p[1], .auth = .service_account, .token_uri = p[2] },
+    };
+    if (creds.access_key == null and creds.secret_key == null and creds.auth == null) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
     reg.edit(name, creds) catch |e| return tierFail(a, e);
     return .{ .status = .no_content };
 }
@@ -278,9 +334,28 @@ test "gcs hmac credentials file" {
     const doc = "{\"access_key\":\"GOOG1\",\"secret_key\":\"s3cr3t\"}";
     const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(doc.len));
     _ = std.base64.standard.Encoder.encode(b64, doc);
-    const p = gcsHmac(a, b64).?;
+    const p = gcsCreds(a, b64).?.hmac;
     try std.testing.expectEqualStrings("GOOG1", p[0]);
-    try std.testing.expect(gcsHmac(a, "!!") == null);
+    try std.testing.expect(gcsCreds(a, "!!") == null);
+    const sa = "{\"type\":\"service_account\",\"client_email\":\"t@p.iam\",\"private_key\":\"-----BEGIN PRIVATE KEY-----\\nAA\\n-----END PRIVATE KEY-----\\n\",\"token_uri\":\"http://x/token\"}";
+    const b2 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(sa.len));
+    _ = std.base64.standard.Encoder.encode(b2, sa);
+    const g = gcsCreds(a, b2).?.service_account;
+    try std.testing.expectEqualStrings("t@p.iam", g[0]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, g[1], '\n') != null);
+}
+
+test "tier list json for role and service principal" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer };
+    try writeList(&js, &.{
+        .{ .name = "R", .kind = .s3, .bucket = "b", .auth = .role, .role_arn = "arn:x" },
+        .{ .name = "Z", .kind = .azure, .bucket = "c", .access_key = "acct", .secret_key = "cs", .auth = .service_principal, .tenant_id = "t", .client_id = "c" },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"AWSRole\":true,\"AWSRoleARN\":\"arn:x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"SPAuth\":{\"TenantID\":\"t\",\"ClientID\":\"c\",\"ClientSecret\":\"REDACTED\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "cs\"") == null);
 }
 
 test "tier list json redacts secrets" {

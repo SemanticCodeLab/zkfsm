@@ -78,6 +78,7 @@ pub const Source = struct {
     pub fn init(self: *Source, gpa: Allocator, kind: Kind) InitError!void {
         self.* = .{ .gpa = gpa, .kind = kind, .http = .{ .allocator = gpa } };
         rhttp.applyCaFile(&self.http);
+        errdefer self.http.deinit();
         if (kind == .service_account) {
             self.rsa = RsaKey.fromPem(gpa, kind.service_account.private_key_pem) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
