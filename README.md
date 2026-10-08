@@ -407,6 +407,17 @@ mc watch z/photos --events put
   (sent, failed, dropped, queue length, online). In a cluster each node publishes the
   events of the requests it serves from its own queue.
 
+### Object Lambda
+
+`GET /bucket/key?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook` runs the object
+through a webhook function, as MinIO does. Functions come from
+`MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on` plus `..._ENDPOINT_<id>` / `..._AUTH_TOKEN_<id>`
+(or `ZKFSM_LAMBDA_WEBHOOK_...`), or `mc admin config set lambda_webhook:<id> endpoint=...`.
+The caller needs `s3:GetObject`; the webhook gets the MinIO event JSON with a presigned
+`inputS3Url` (signed with the caller's key) and its reply is streamed back, with
+`x-amz-fwd-header-*` and `x-amz-fwd-status` / `-error-code` / `-error-message` mapped.
+Client certificates for the webhook are not supported. Tested by `tests/lambda.sh`.
+
 ### Server-side encryption and KMS
 
 SSE-S3, SSE-KMS and SSE-C work on PutObject, GetObject/HeadObject (with
