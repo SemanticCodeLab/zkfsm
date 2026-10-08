@@ -17,7 +17,7 @@ const HelloOpts = struct {
 fn clientHello(buf: []u8, o: HelloOpts) []u8 {
     var exts: [64]u8 = undefined;
     var e: usize = 0;
-    const fixed = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 0x1d, 0, 13, 0, 4, 0, 2, 4, 3 };
+    const fixed = [_]u8{ 0, 10, 0, 6, 0, 4, 0, 0x1d, 0, 0x17, 0, 13, 0, 4, 0, 2, 4, 3 };
     @memcpy(exts[0..fixed.len], &fixed);
     e = fixed.len;
     if (o.ems) {
