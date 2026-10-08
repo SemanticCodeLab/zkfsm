@@ -11,6 +11,8 @@ pub const Mode = object.lock.Mode;
 pub const VersionInfo = struct {
     /// All zeros is the null version.
     id: [16]u8 = @splat(0),
+    /// Version id as the source spells it (online sources address versions by it).
+    src_id: []const u8 = "",
     mtime_ns: i128 = 0,
     delete_marker: bool = false,
     size: u64 = 0,

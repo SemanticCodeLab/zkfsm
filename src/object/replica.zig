@@ -37,6 +37,8 @@ pub const Origin = struct {
     version: ?core.VersionId = null,
     created_ns: ?i128 = null,
     delete_marker: bool = false,
+    /// Imported by the migrator: keep the identity but record no replica status.
+    migrated: bool = false,
 };
 
 pub threadlocal var origin: ?Origin = null;

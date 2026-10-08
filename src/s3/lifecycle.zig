@@ -78,7 +78,7 @@ pub fn parse(arena: std.mem.Allocator, doc: []const u8) ParseError![]Rule {
 }
 
 /// One '1'/'0' per rule: whether it used the legacy rule-level Prefix (echoed back as such).
-fn legacyMarks(arena: std.mem.Allocator, doc: []const u8, n: usize) error{OutOfMemory}!?[]const u8 {
+pub fn legacyMarks(arena: std.mem.Allocator, doc: []const u8, n: usize) error{OutOfMemory}!?[]const u8 {
     var top: xml_read.Scanner = .{ .s = doc };
     const root = (top.next("LifecycleConfiguration") catch return null) orelse return null;
     const out = try arena.alloc(u8, n);

@@ -31,7 +31,13 @@ pub fn formatVersionId(v: core.VersionId, buf: *[32]u8) []const u8 {
 
 pub fn parseVersionId(s: []const u8) error{InvalidVersionId}!core.VersionId {
     if (std.mem.eql(u8, s, "null")) return null_version_id;
-    const v = core.VersionId.parseHex(s) catch return error.InvalidVersionId;
+    // Dashed UUID form, as ids imported from other servers were spelled there.
+    var hex: [32]u8 = undefined;
+    const plain = if (s.len == 36 and s[8] == '-' and s[13] == '-' and s[18] == '-' and s[23] == '-' and std.mem.count(u8, s, "-") == 4) blk: {
+        _ = std.mem.replace(u8, s, "-", "", &hex);
+        break :blk hex[0..];
+    } else s;
+    const v = core.VersionId.parseHex(plain) catch return error.InvalidVersionId;
     if (v.eql(null_version_id)) return error.InvalidVersionId;
     return v;
 }
@@ -273,7 +279,7 @@ fn commitPutLocked(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutI
     const origin = replica.origin;
     if (origin) |o| {
         if (o.created_ns) |t| rec.created_ns = t;
-        rec.internal_meta = try statusMeta(a, rec.internal_meta, .replica);
+        if (!o.migrated) rec.internal_meta = try statusMeta(a, rec.internal_meta, .replica);
     } else if (cfg.versioning == .enabled) if (svc.replication) |s| if (s.vtable.wants(s.ctx, bid, bucket, rec.key, rec.tags)) {
         rec.internal_meta = try statusMeta(a, rec.internal_meta, .pending);
         notify.* = true;
@@ -306,6 +312,7 @@ fn commitPutLocked(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutI
         .enabled => {
             if (origin) |o| if (o.version) |v| {
                 rec.version = v;
+                rec.flags.null_version = v.eql(null_version_id);
                 if (try placeReplica(svc, a, bid, cur, rec.*, &g)) return g;
             };
             if (origin == null or origin.?.version == null) rec.version = core.ids.newVersionId(rec.created_ns);
@@ -460,8 +467,8 @@ fn replicaMarker(svc: *Svc, a: std.mem.Allocator, bid: core.BucketId, key: []con
         .checksum = .{},
         .created_ns = o.created_ns orelse core.time.nowNs(),
         .key = key,
-        .flags = .{ .delete_marker = true },
-        .internal_meta = try statusMeta(a, "", .replica),
+        .flags = .{ .delete_marker = true, .null_version = v.eql(null_version_id) },
+        .internal_meta = if (o.migrated) "" else try statusMeta(a, "", .replica),
     };
     if (cur) |c| {
         if (c.created_ns > marker.created_ns) {
@@ -752,6 +759,9 @@ test "version id format and parse" {
     try std.testing.expect((try parseVersionId("null")).eql(null_version_id));
     try std.testing.expectError(error.InvalidVersionId, parseVersionId("xyz"));
     try std.testing.expectError(error.InvalidVersionId, parseVersionId(&([_]u8{'0'} ** 32)));
+    const dashed = try parseVersionId("6053e2b9-7941-4a38-b48f-d5262f2d75e8");
+    try std.testing.expect(dashed.eql(try parseVersionId("6053e2b979414a38b48fd5262f2d75e8")));
+    try std.testing.expectError(error.InvalidVersionId, parseVersionId("6053e2b9-7941-4a38-b48f-d5262f2d75-8"));
 }
 
 test "version listing order and pagination" {
