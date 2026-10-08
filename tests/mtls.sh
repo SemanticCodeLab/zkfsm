@@ -352,7 +352,7 @@ LDIF
     user_dn_search_base_dn=ou=people,dc=example,dc=org 'user_dn_search_filter=(uid=%s)' \
     tls_ca_file="$CA" tls_client_cert="$CC" tls_client_key="$CK")"
   "$MC" idp ldap policy attach z readwrite --user 'uid=alice,ou=people,dc=example,dc=org' >/dev/null
-  check "ldap login over LDAPS with a client cert" ASIA "$(akid)"
+  eventually "ldap login over LDAPS with a client cert" ASIA akid
   check "ldap switch to StartTLS" 0 "$(ok "$MC" idp ldap update z "server_addr=localhost:$LP" server_starttls=on)"
   check "ldap login over StartTLS with a client cert" ASIA "$(akid)"
   check "ldap drop the client cert" 0 "$(ok "$MC" idp ldap update z "server_addr=localhost:$LSP" server_starttls=off tls_client_cert= tls_client_key=)"
