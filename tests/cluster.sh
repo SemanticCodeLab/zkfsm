@@ -10,7 +10,7 @@ MC="${MC:-$(command -v mc || true)}"
 PIDS=(0 0 0 0 0)
 cleanup() {
   for p in "${PIDS[@]}"; do [[ "$p" != 0 ]] && kill -9 "$p" 2>/dev/null || true; done
-  rm -rf "$WORK"
+  [[ -n "${KEEP:-}" ]] || rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -69,6 +69,8 @@ redundant() { # expected blob count
 }
 wait_redundant() { # expected blob count, seconds
   for _ in $(seq "$2"); do redundant "$1" && return 0; sleep 1; done
+  echo "     want 6:$1; shards per blob (count:blobs):" \
+    "$(find "$WORK"/n*/[dp]* -path '*/data/*' -type f -printf '%f\n' | sort | uniq -c | awk '{print $1}' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
   return 1
 }
 

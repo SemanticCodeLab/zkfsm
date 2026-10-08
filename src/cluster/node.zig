@@ -859,7 +859,10 @@ pub const Node = struct {
     fn resumeFrom(n: *Node, svc: *object.ObjectService, marks: []const catchup.Origins.Want) bool {
         // Our own changes after the snapshot, then every peer's.
         const own = marks[n.topo.local];
-        if (own.epoch != n.journal.head().epoch) return false;
+        if (own.epoch != n.journal.head().epoch) {
+            std.log.info("cluster: own journal epoch changed since the snapshot; rebuilding", .{});
+            return false;
+        }
         n.applyOwn(svc, own) catch return false;
         for (0..n.topo.nodes.len) |i| {
             const node: u16 = @intCast(i);
@@ -868,7 +871,10 @@ pub const Node = struct {
                 std.log.info("cluster: node {s} is down; its changes need a rebuild", .{n.topo.nodes[i].name});
                 return false;
             }
-            n.pull(svc, node) catch return false;
+            n.pull(svc, node) catch |e| {
+                std.log.info("cluster: journal of {s} not usable ({t}); rebuilding", .{ n.topo.nodes[i].name, e });
+                return false;
+            };
             if (n.origins.want(node) != null) return false;
         }
         return true;
@@ -930,6 +936,8 @@ pub const Node = struct {
             defer svc.mutex.unlock();
             if (svc.index.stale) return;
             n.origins.marks(marks);
+            // A peer without a watermark makes the snapshot unusable; keep the older one.
+            for (marks, 0..) |m, i| if (i != n.topo.local and m.epoch == 0) return;
             const h = n.journal.lastAppended();
             marks[n.topo.local] = .{ .epoch = h.epoch, .seq = h.stable };
             break :blk catchup.encode(n.gpa, svc, n.deployment, marks) catch return;
