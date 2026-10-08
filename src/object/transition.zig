@@ -166,8 +166,15 @@ pub const RestoreResult = enum {
     extended,
 };
 
+pub const RestoreMode = enum {
+    /// Copy before returning.
+    wait,
+    /// Return once the copy is started; `x-amz-restore` shows it ongoing until done.
+    background,
+};
+
 /// RestoreObject: copies tiered data back locally for `days`.
-pub fn restore(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, days: u32) Error!RestoreResult {
+pub fn restore(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.VersionId, days: u32, mode: RestoreMode) Error!RestoreResult {
     if (days == 0) return error.InvalidRequest;
     var arena = std.heap.ArenaAllocator.init(svc.gpa);
     defer arena.deinit();
@@ -176,16 +183,77 @@ pub fn restore(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.Ve
     if (info.tier.len == 0) return error.InvalidObjectState;
     const reg = svc.tiers orelse return error.TierUnavailable;
     const now = core.time.nowNs();
-    const expiry = dueAt(now, days);
     if (info.restore_expiry_ns > now) {
-        try setExpiry(svc, bucket, info, expiry, null);
+        try setExpiry(svc, bucket, info, dueAt(now, days), null);
         return .extended;
     }
+    if (!reg.exists(info.tier)) return error.TierUnavailable;
     reg.beginRestore(info.object_id.bytes) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.RestoreInProgress => error.RestoreInProgress,
     };
-    defer reg.endRestore(info.object_id.bytes);
+    if (mode == .wait) {
+        defer reg.endRestore(info.object_id.bytes);
+        try copyBack(svc, reg, bucket, info, days);
+        return .accepted;
+    }
+    errdefer reg.endRestore(info.object_id.bytes);
+    const task = try RestoreTask.create(svc, bucket, info, days);
+    _ = reg.workers.fetchAdd(1, .acq_rel);
+    const th = std.Thread.spawn(.{}, RestoreTask.run, .{task}) catch {
+        _ = reg.workers.fetchSub(1, .acq_rel);
+        task.destroy();
+        return error.OutOfMemory;
+    };
+    th.detach();
+    return .accepted;
+}
+
+/// A background restore owning copies of everything it needs.
+const RestoreTask = struct {
+    arena: std.heap.ArenaAllocator,
+    svc: *Svc,
+    bucket: []const u8,
+    info: service.ObjectInfo,
+    days: u32,
+
+    fn create(svc: *Svc, bucket: []const u8, info: service.ObjectInfo, days: u32) error{OutOfMemory}!*RestoreTask {
+        const t = try svc.gpa.create(RestoreTask);
+        t.* = .{ .arena = .init(svc.gpa), .svc = svc, .bucket = "", .info = info, .days = days };
+        errdefer t.destroy();
+        const a = t.arena.allocator();
+        t.bucket = try a.dupe(u8, bucket);
+        var c = info;
+        c.key = try a.dupe(u8, info.key);
+        c.tier = try a.dupe(u8, info.tier);
+        c.content_type = try a.dupe(u8, info.content_type);
+        c.tags = "";
+        c.metadata = &.{};
+        c.internal = &.{};
+        c.system = .{};
+        c.part_sizes = "";
+        t.info = c;
+        return t;
+    }
+
+    fn destroy(t: *RestoreTask) void {
+        const gpa = t.svc.gpa;
+        t.arena.deinit();
+        gpa.destroy(t);
+    }
+
+    fn run(t: *RestoreTask) void {
+        const reg = t.svc.tiers.?;
+        copyBack(t.svc, reg, t.bucket, t.info, t.days) catch |e|
+            log.warn("restore of {s}/{s} failed: {t}", .{ t.bucket, t.info.key, e });
+        reg.endRestore(t.info.object_id.bytes);
+        t.destroy();
+        _ = reg.workers.fetchSub(1, .acq_rel);
+    }
+};
+
+/// Copies the tiered data of `info` into local storage and sets its expiry.
+fn copyBack(svc: *Svc, reg: *tier.Registry, bucket: []const u8, info: service.ObjectInfo, days: u32) Error!void {
     const t = reg.acquire(info.tier) orelse return error.TierUnavailable;
     defer t.release();
     const chunk = try svc.gpa.alloc(u8, @intCast(@max(1, @min(tier.chunk_len, info.blob_size))));
@@ -204,11 +272,10 @@ pub fn restore(svc: *Svc, bucket: []const u8, key: []const u8, version: ?core.Ve
         tier.Counters.inc(&reg.counters.restore_failures, 1);
         return error.StorageFailed;
     }
-    try setExpiry(svc, bucket, info, expiry, null);
+    try setExpiry(svc, bucket, info, dueAt(core.time.nowNs(), days), null);
     keep = true;
     tier.Counters.inc(&reg.counters.restores, 1);
-    svc.emitEvent(.{ .bucket = bucket, .key = key, .version = info.version_id, .kind = .restore_completed, .size = info.size, .content_type = info.content_type });
-    return .accepted;
+    svc.emitEvent(.{ .bucket = bucket, .key = info.key, .version = info.version_id, .kind = .restore_completed, .size = info.size, .content_type = info.content_type });
 }
 
 /// Sets the restore expiry of `info`'s version if it still holds the same data
@@ -512,10 +579,10 @@ test "transition, read-through, restore, outage, and cleanup" {
 
     e.mem.down = true;
     try std.testing.expectError(error.TierUnavailable, e.body("k", null, null));
-    try std.testing.expectError(error.TierUnavailable, restore(svc, "tbk", "k", null, 1));
+    try std.testing.expectError(error.TierUnavailable, restore(svc, "tbk", "k", null, 1, .wait));
     e.mem.down = false;
 
-    try std.testing.expectEqual(RestoreResult.accepted, try restore(svc, "tbk", "k", null, 1));
+    try std.testing.expectEqual(RestoreResult.accepted, try restore(svc, "tbk", "k", null, 1, .wait));
     try std.testing.expect(e.localBlob(v.object_id));
     const r = try svc.head(a, "tbk", "k");
     try std.testing.expect(r.restore_expiry_ns > core.time.nowNs());
@@ -523,10 +590,10 @@ test "transition, read-through, restore, outage, and cleanup" {
     e.mem.down = true; // served from the restored copy
     try std.testing.expectEqualStrings("hello tiered world", try e.body("k", null, null));
     e.mem.down = false;
-    try std.testing.expectEqual(RestoreResult.extended, try restore(svc, "tbk", "k", null, 2));
+    try std.testing.expectEqual(RestoreResult.extended, try restore(svc, "tbk", "k", null, 2, .wait));
     try std.testing.expectError(error.InvalidObjectState, blk: {
         _ = try e.put("local", "x");
-        break :blk restore(svc, "tbk", "local", null, 1);
+        break :blk restore(svc, "tbk", "local", null, 1, .wait);
     });
 
     // The restored copy expires; data is read from the tier again.
@@ -597,4 +664,22 @@ test "chained transitions move data tier to tier" {
     const w = try e.put("late", "skip ahead");
     try std.testing.expectEqual(@as(usize, 1), (try lifecycle.runOnce(svc, dueAt(w.created_ns, 5))).transitioned);
     try std.testing.expectEqualStrings("COLD", (try svc.head(e.arena.allocator(), "tbk", "late")).tier);
+}
+
+test "background restore reports ongoing until the copy lands" {
+    var e: TierEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const svc = &e.svc;
+    const a = e.arena.allocator();
+    const v = try e.put("k", "restore me later");
+    try lifecycle.set(svc, "tbk", &.{.{ .transition_days = 1, .transition_tier = "WARM" }});
+    _ = try lifecycle.runOnce(svc, dueAt(v.created_ns, 1));
+    try std.testing.expectEqual(RestoreResult.accepted, try restore(svc, "tbk", "k", null, 1, .background));
+    var tries: usize = 0;
+    while (e.reg.isRestoring(v.object_id.bytes) and tries < 500) : (tries += 1) std.Thread.sleep(10 * std.time.ns_per_ms);
+    const h = try svc.head(a, "tbk", "k");
+    try std.testing.expect(h.restore_expiry_ns > core.time.nowNs());
+    try std.testing.expect(std.mem.startsWith(u8, (try restoreHeader(svc, a, h)).?, "ongoing-request=\"false\""));
+    try std.testing.expect(e.localBlob(v.object_id));
 }

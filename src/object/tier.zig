@@ -331,6 +331,8 @@ pub const Registry = struct {
     stats_ns: i128 = 0,
     /// Object ids with a restore in flight.
     restoring: std.AutoHashMapUnmanaged([16]u8, void) = .empty,
+    /// Background restores still running; deinit waits for them.
+    workers: std.atomic.Value(u32) = .init(0),
     /// Per-tier transition activity; keys owned by gpa.
     daily: std.StringHashMapUnmanaged(Daily) = .empty,
 
@@ -339,6 +341,7 @@ pub const Registry = struct {
     }
 
     pub fn deinit(r: *Registry) void {
+        while (r.workers.load(.acquire) > 0) std.Thread.sleep(10 * std.time.ns_per_ms);
         for (r.tiers.items) |t| t.release();
         r.tiers.deinit(r.gpa);
         for (r.pinned.items) |t| t.release();

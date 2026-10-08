@@ -1,5 +1,6 @@
 //! RestoreObject (POST /bucket/key?restore): brings a temporary local copy of tiered
-//! data back for `Days`. 202 when a copy was made, 200 when an existing copy's expiry moved.
+//! data back for `Days`. 202 when a copy was started (it runs in the background), 200
+//! when an existing copy's expiry moved; 409 while a restore is in progress.
 const std = @import("std");
 const object = @import("../object/root.zig");
 const handler = @import("handler.zig");
@@ -22,7 +23,7 @@ pub fn route(c: *Ctx) DispatchError!bool {
         });
         return true;
     };
-    const res = try object.transition.restore(c.svc, c.route.bucket, c.route.key, version, days);
+    const res = try object.transition.restore(c.svc, c.route.bucket, c.route.key, version, days, .background);
     try handler.respondEmpty(c, if (res == .accepted) .accepted else .ok, &.{});
     return true;
 }
