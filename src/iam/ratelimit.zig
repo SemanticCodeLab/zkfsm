@@ -51,7 +51,7 @@ fn matches(r: RateLimit, kind: Kind, name: []const u8) bool {
     return std.mem.eql(u8, r.kind, @tagName(kind)) and std.mem.eql(u8, r.name, name);
 }
 
-const Bucket = struct { reqs: f64, bytes: f64, last_ns: i128 };
+const Bucket = struct { reqs: f64, bytes: f64, last_ns: i128, limits: Limits };
 
 /// Per-node token buckets keyed by kind and name.
 pub const Meter = struct {
@@ -94,15 +94,16 @@ pub const Meter = struct {
         const reqs: f64 = @floatFromInt(l.requests);
         const rate: f64 = @floatFromInt(l.rate);
         const gop = m.map.getOrPut(m.gpa, key) catch return null;
-        if (!gop.found_existing) {
-            gop.key_ptr.* = m.gpa.dupe(u8, key) catch {
-                m.map.removeByPtr(gop.key_ptr);
-                return null;
-            };
-            gop.value_ptr.* = .{ .reqs = reqs, .bytes = rate, .last_ns = now_ns };
-            return gop.value_ptr;
-        }
+        if (!gop.found_existing) gop.key_ptr.* = m.gpa.dupe(u8, key) catch {
+            m.map.removeByPtr(gop.key_ptr);
+            return null;
+        };
         const b = gop.value_ptr;
+        // New or changed limits start with a full burst.
+        if (!gop.found_existing or !std.meta.eql(b.limits, l)) {
+            b.* = .{ .reqs = reqs, .bytes = rate, .last_ns = now_ns, .limits = l };
+            return b;
+        }
         const dt: f64 = @as(f64, @floatFromInt(@max(now_ns - b.last_ns, 0))) / std.time.ns_per_s;
         b.last_ns = now_ns;
         b.reqs = @min(reqs, b.reqs + dt * reqs);

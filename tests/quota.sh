@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Bucket quotas: mc quota set/info/clear, hard limits on PUT, multipart complete, and
+# Bucket quotas: mc quota set/info/clear, request-rate/bandwidth limits (bucket and
+# tenant, 503 SlowDown), hard limits on PUT, multipart complete, and
 # copy (QuotaExceeded), usage from the key index through overwrites, deletes,
 # versioning, and restarts, and the same limit seen through every node of a cluster.
 set -euo pipefail
@@ -113,10 +114,53 @@ check "cleared quota info fails" 1 "$(ok "$MC" quota info z/vqb)"
 "$MC" admin policy attach z readwrite --user quser >/dev/null
 check "non-admin cannot set quota" 403 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --aws-sigv4 aws:amz:us-east-1:s3 --user quser:quser-secret1 -d '{"size":1}' "$EP/minio/admin/v3/set-bucket-quota?bucket=qbk")"
 "$MC" quota set z/qbk --size 1MiB >/dev/null
+# Request-rate and bandwidth limits (bucket and tenant): 503 SlowDown past the limit.
+adm() { curl -s -o "$WORK/adm.out" -w '%{http_code}' -X "$1" --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" ${3:+-d "$3"} "$EP/minio/admin/v3$2"; }
+burst() { # url n -> count of 503 SlowDown answers among n quick GETs
+  local n503=0
+  for _ in $(seq "$2"); do
+    st="$(curl -s -o "$WORK/burst.out" -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$1")"
+    [[ "$st" == 503 ]] && grep -q '<Code>SlowDown</Code>' "$WORK/burst.out" && n503=$((n503 + 1))
+  done
+  echo "$n503"
+}
+"$MC" mb z/rbk z/tbk >/dev/null
+rawput "$EP/rbk/k" "$WORK/400k" >/dev/null
+check "set request-rate quota" 200 "$(adm PUT '/set-bucket-quota?bucket=rbk' '{"requests":3}')"
+check "quota info shows requests" 3 "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/minio/admin/v3/get-bucket-quota?bucket=rbk" | jfield '["requests"]')"
+check "request burst throttled" 1 "$(( $(burst "$EP/rbk?list-type=2" 10) > 0 ? 1 : 0 ))"
+check "other bucket not throttled" 0 "$(burst "$EP/free?list-type=2" 10)"
+sleep 1.2
+check "rate refills" 200 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/rbk?list-type=2")"
+check "set bandwidth quota" 200 "$(adm PUT '/set-bucket-quota?bucket=rbk' '{"rate":300000}')"
+check "first download within burst" 200 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/rbk/k")"
+check "download debt throttles next request" 503 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/rbk/k")"
+sleep 1.5
+check "upload within burst after refill" 200 "$(rawput "$EP/rbk/u" "$WORK/400k")"
+check "upload debt throttles" 503 "$(rawput "$EP/rbk/u2" "$WORK/400k")"
+check "SlowDown code on upload" 1 "$(grep -c '<Code>SlowDown</Code>' "$WORK/put.out")"
+check "clear rate quota" 200 "$(adm PUT '/set-bucket-quota?bucket=rbk' '{}')"
+check "cleared rate quota info fails" 1 "$(ok "$MC" quota info z/rbk)"
+check "unthrottled after clear" 0 "$(burst "$EP/rbk?list-type=2" 6)"
+check "tenant add" 200 "$(adm PUT '/tenant/add?name=rt')"
+check "tenant owns bucket" 200 "$(adm PUT '/tenant/assign-bucket?bucket=tbk&name=rt')"
+check "tenant rate quota" 200 "$(adm PUT '/tenant/set-quota?name=rt&requests=3')"
+check "tenant rate quota on unknown tenant" 404 "$(adm PUT '/tenant/set-quota?name=nope&requests=3')"
+check "tenant rate quota bad value" 400 "$(adm PUT '/tenant/set-quota?name=rt&requests=-1')"
+adm GET '/tenant/list' >/dev/null
+check "tenant list shows requests" 3 "$(python3 -c 'import json; print([t for t in json.load(open("'"$WORK"'/adm.out")) if t["name"]=="rt"][0]["requests"])')"
+check "tenant burst throttled" 1 "$(( $(burst "$EP/tbk?list-type=2" 10) > 0 ? 1 : 0 ))"
+check "non-tenant bucket not throttled" 0 "$(burst "$EP/free?list-type=2" 6)"
+adm PUT '/tenant/set-quota?name=rt&requests=0' >/dev/null
+sleep 1.1
+check "tenant limit cleared" 0 "$(burst "$EP/tbk?list-type=2" 6)"
+adm PUT '/set-bucket-quota?bucket=rbk' '{"requests":2}' >/dev/null
+
 stop
 start
 check "quota persists across restart" 1048576 "$("$MC" quota info z/qbk --json | jfield '["quota"]')"
 check "usage rebuilt after restart" 400 "$(rawput "$EP/qbk/z" "$WORK/400k")"
+check "rate quota persists across restart" 2 "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$EP/minio/admin/v3/get-bucket-quota?bucket=rbk" | jfield '["requests"]')"
 stop
 
 # ---------------------------------------------------------------- cluster

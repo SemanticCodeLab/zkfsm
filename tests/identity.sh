@@ -106,6 +106,48 @@ INFO="$("$MC" idp openid info z corp --json)"
 check "openid info client_id" zkfsm "$(echo "$INFO" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([i["value"] for i in d["info"] if i["key"]=="client_id"][0])')"
 check "openid info redirect_uri" "http://127.0.0.1:9001/oauth_callback" "$(echo "$INFO" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([i["value"] for i in d["info"] if i["key"]=="redirect_uri"][0])')"
 
+# --- Console login: authorization code + PKCE + nonce, state sealed and cookie-bound.
+JAR="$WORK/oidc.jar"
+qget() { python3 -c "import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).query).get(sys.argv[2],[''])[0])" "$1" "$2"; }
+oidc_start() { # -> IdP authorize URL (cookie stored in $JAR)
+  curl -s -c "$JAR" -o /dev/null -w '%{redirect_url}' "$EP/minio/admin/v3/oidc/authorize/corp$1"
+}
+idp_code() { # authorize URL -> callback URL from the IdP redirect
+  curl -s -o /dev/null -w '%{redirect_url}' "$1"
+}
+check "oidc providers listed" corp "$(curl -s "$EP/minio/admin/v3/oidc/providers" | jfield '["providers"][0]')"
+AU="$(oidc_start)"
+check "authorize redirects to IdP" "$IDP/auth" "${AU%%\?*}"
+check "authorize sends PKCE S256" S256 "$(qget "$AU" code_challenge_method)"
+check "authorize sends nonce" 1 "$([[ -n "$(qget "$AU" nonce)" ]] && echo 1 || echo 0)"
+check "authorize uses configured redirect_uri" "http://127.0.0.1:9001/oauth_callback" "$(qget "$AU" redirect_uri)"
+check "authorize scopes" "openid email" "$(qget "$AU" scope)"
+curl -s "$IDP/login?sub=coder&policy=teamb-rw" >/dev/null
+CB="$(idp_code "$AU")"
+CODE="$(qget "$CB" code)"; STATE="$(qget "$CB" state)"
+check "callback without browser cookie refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/callback/corp?code=$CODE&state=$STATE")"
+check "callback with tampered state refused" 403 "$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/callback/corp?code=$CODE&state=${STATE:0:20}x${STATE:21}")"
+LOGIN="$(curl -s -b "$JAR" "$EP/minio/admin/v3/oidc/callback/corp?code=$CODE&state=$STATE")"
+OC="$(echo "$LOGIN" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["accessKey"], d["secretKey"], d["sessionToken"])' 2>/dev/null || true)"
+check "code login issues STS key" ASIA "$(echo "$OC" | cut -c1-4)"
+check "code login subject" coder "$(echo "$LOGIN" | jfield '["subject"]' 2>/dev/null || true)"
+check "code login session writes via policy claim" 0 "$(ok s3as "$OC" s3 cp "$WORK/f.txt" s3://teamb/code.txt)"
+check "code login session denied elsewhere" 1 "$(ok s3as "$OC" s3 cp "$WORK/f.txt" s3://other/code.txt)"
+check "code replay refused" 502 "$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/callback/corp?code=$CODE&state=$STATE")"
+check "IdP saw the token exchange" 1 "$(curl -s "$IDP/stats" | jfield '["token_post"]' | awk '{print ($1>=1)}')"
+AU="$(oidc_start)"
+curl -s "$IDP/login?sub=coder&policy=teamb-rw&nonce=forged" >/dev/null
+CB="$(idp_code "$AU")"
+check "nonce mismatch refused" 403 "$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/callback/corp?code=$(qget "$CB" code)&state=$(qget "$CB" state)")"
+AU="$(oidc_start '?redirect_after=/browser/teamb')"
+curl -s "$IDP/login?sub=coder&policy=teamb-rw" >/dev/null
+CB="$(idp_code "$AU")"
+LOC="$(curl -s -b "$JAR" -o /dev/null -w '%{redirect_url}' "$EP/minio/admin/v3/oidc/callback/corp?code=$(qget "$CB" code)&state=$(qget "$CB" state)")"
+check "redirect_after gets credentials in fragment" "/browser/teamb#accessKey=ASIA" "$(echo "$LOC" | sed -E 's|^https?://[^/]*||' | cut -c1-33)"
+check "open redirect refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/authorize/corp?redirect_after=//evil.example")"
+check "unknown provider" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$EP/minio/admin/v3/oidc/authorize/nope")"
+curl -s "$IDP/login?sub=code-user" >/dev/null
+
 # --- AssumeRoleWithWebIdentity: claim -> policy, RS256 and ES256.
 X="$(sts Action=AssumeRoleWithWebIdentity "WebIdentityToken=$(token 'sub=user-1&policy=teamb-rw')" DurationSeconds=900)"
 C="$(echo "$X" | creds)"
@@ -121,6 +163,35 @@ check "ES256 token with policy array" hello "$(s3as "$C2" s3 cp s3://other/seed.
 check "ES256 session writes via teamb-rw" 0 "$(ok s3as "$C2" s3 cp "$WORK/f.txt" s3://teamb/es.txt)"
 check "ES256 session readonly elsewhere" 1 "$(ok s3as "$C2" s3 cp "$WORK/f.txt" s3://other/es.txt)"
 check "query-string form accepted" ASIA "$(curl -s -X POST "$EP/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&WebIdentityToken=$(token 'sub=q&policy=readonly')" | xmlget AccessKeyId | cut -c1-4)"
+
+# --- Access-key listing and token revocation (MinIO revoke-tokens).
+admin_as() { # admin_as "AK SK TOKEN" METHOD PATH -> HTTP status
+  local c=($1)
+  curl -s -o "$WORK/admin.out" -w '%{http_code}' -X "$2" --aws-sigv4 aws:amz:us-east-1:s3 --user "${c[0]}:${c[1]}" -H "x-amz-security-token: ${c[2]}" "$EP/minio/admin/v3$3"
+}
+check "openid accesskey ls shows session" 1 "$("$MC" idp openid accesskey ls z --all --json | grep -c "$C_AK" || true)"
+check "openid accesskey ls by user" 1 "$("$MC" idp openid accesskey ls z user-1 --json | grep -c "$C_AK" || true)"
+check "openid accesskey ls other user" 0 "$("$MC" idp openid accesskey ls z nobody --json | grep -c "$C_AK" || true)"
+check "admin bulk listing shows openid key" 200 "$(admin GET '/idp/openid/list-access-keys-bulk?all=true&listType=sts-only')"
+check "session cannot list others" 403 "$(admin_as "$C" GET '/idp/openid/list-access-keys-bulk?all=true')"
+check "session works before revoke" hello "$(s3as "$C" s3 cp s3://teamb/a.txt -)"
+check "revoke needs type or full with user" 400 "$(admin POST '/revoke-tokens/openid?user=user-1')"
+check "revoke unknown provider" 400 "$(admin POST '/revoke-tokens/saml?user=user-1&fullRevoke=true')"
+CT="$(sts Action=AssumeRoleWithWebIdentity TokenRevokeType=ci "WebIdentityToken=$(token 'sub=user-9&policy=readonly')" | creds)"
+CU="$(sts Action=AssumeRoleWithWebIdentity "WebIdentityToken=$(token 'sub=user-9&policy=readonly')" | creds)"
+check "revoke by token type" 204 "$(admin POST '/revoke-tokens/openid?user=user-9&tokenRevokeType=ci')"
+check "typed session revoked" 1 "$(ok s3as "$CT" s3 cp s3://other/seed.txt -)"
+check "other-type session survives" hello "$(s3as "$CU" s3 cp s3://other/seed.txt -)"
+check "self revoke from a session" 204 "$(admin_as "$CU" POST '/revoke-tokens/openid')"
+check "self-revoked session rejected" 1 "$(ok s3as "$CU" s3 cp s3://other/seed.txt -)"
+check "session cannot revoke another user" 403 "$(admin_as "$C2" POST '/revoke-tokens/openid?user=user-1&fullRevoke=true')"
+check "full revoke" 204 "$(admin POST '/revoke-tokens/openid?user=user-1&fullRevoke=true')"
+check "revoked session rejected" 1 "$(ok s3as "$C" s3 cp s3://teamb/a.txt -)"
+check "revoked session gone from listing" 0 "$("$MC" idp openid accesskey ls z --all --json | grep -c "$C_AK" || true)"
+check "other user unaffected" hello "$(s3as "$C2" s3 cp s3://other/seed.txt -)"
+sleep 0.01
+C="$(sts Action=AssumeRoleWithWebIdentity "WebIdentityToken=$(token 'sub=user-1&policy=teamb-rw')" | creds)"
+check "new session after revoke works" hello "$(s3as "$C" s3 cp s3://teamb/a.txt -)"
 
 # --- Rejections.
 check "expired token" ExpiredTokenException "$(sts Action=AssumeRoleWithWebIdentity "WebIdentityToken=$(token 'sub=u&policy=readonly&ttl=-120')" | xmlget Code)"
@@ -361,6 +432,12 @@ LDIF
   check "ldap policy detach" 0 "$(ok "$MC" idp ldap policy detach z readonly --user 'uid=bob,ou=people,dc=example,dc=org')"
   check "detached mapping denies" AccessDenied "$(sts Action=AssumeRoleWithLDAPIdentity LDAPUsername=bob LDAPPassword=bob-ldap-pw | xmlget Code)"
 
+  read -r L_AK _ <<<"$LC"
+  check "ldap accesskey ls shows session" 1 "$("$MC" idp ldap accesskey ls z --all --json | grep -c "$L_AK" || true)"
+  check "ldap accesskey ls by DN" 1 "$("$MC" idp ldap accesskey ls z 'uid=alice,ou=people,dc=example,dc=org' --json | grep -c "$L_AK" || true)"
+  check "ldap revoke tokens" 204 "$(admin POST '/revoke-tokens/ldap?user=uid%3Dalice%2Cou%3Dpeople%2Cdc%3Dexample%2Cdc%3Dorg&fullRevoke=true')"
+  check "revoked ldap session rejected" 1 "$(ok s3as "$LC" s3 cp "$WORK/f.txt" s3://teamb/ldap2.txt)"
+  check "ldap session of other user unaffected" hello "$(s3as "$BC" s3 cp s3://other/seed.txt -)"
   check "ldap switch to StartTLS" 0 "$(ok "$MC" idp ldap update z server_insecure=off server_starttls=on tls_skip_verify=on)"
   check "ldap login (StartTLS)" ASIA "$(sts Action=AssumeRoleWithLDAPIdentity LDAPUsername=alice LDAPPassword=alice-ldap-pw | xmlget AccessKeyId | cut -c1-4)"
   check "ldap switch to LDAPS" 0 "$(ok "$MC" idp ldap update z "server_addr=127.0.0.1:$LDAPS_PORT" server_starttls=off tls_skip_verify=on)"
