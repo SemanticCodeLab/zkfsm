@@ -403,10 +403,12 @@ pub fn run(opts: Options) u8 {
     svc.events = ev_ext.sink();
     const observers = [_]s3.Observer{ev_ext.observer()};
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(&kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -462,7 +464,7 @@ pub fn run(opts: Options) u8 {
 
 /// Cluster mode: the RPC route is served before bootstrap so peers can negotiate
 /// the layout; S3 requests wait behind the gate until storage and IAM are up.
-fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *const sse.setup.Holder) u8 {
+fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *sse.setup.Holder) u8 {
     if (cfg.heal_only) {
         std.log.err("heal runs continuously on cluster nodes; the one-shot heal command is for local drives", .{});
         return 2;
@@ -526,10 +528,12 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     const observers = [_]s3.Observer{ev_ext.observer()};
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
