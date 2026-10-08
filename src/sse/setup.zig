@@ -3,6 +3,7 @@
 //! encryption and KMS" for the variables each backend reads.
 const std = @import("std");
 const kms = @import("../kms/root.zig");
+const tls = @import("../tls/root.zig");
 
 pub const Backend = enum {
     none,
@@ -119,11 +120,23 @@ pub const Holder = struct {
             },
             .vault => {
                 const addr = env(gpa, "VAULT_ADDR") orelse return error.MissingConfig;
-                const auth: kms.vault.Auth = if (env(gpa, "VAULT_TOKEN")) |t| .{ .token = t } else .{ .approle = .{
-                    .role_id = env(gpa, "VAULT_ROLE_ID") orelse return error.MissingConfig,
+                const tls_opts: tls.TlsOptions = .{
+                    .ca_file = env(gpa, "VAULT_CACERT") orelse env(gpa, "KMS_VAULT_CAPATH") orelse "",
+                    .client_cert_file = env(gpa, "VAULT_CLIENT_CERT") orelse "",
+                    .client_key_file = env(gpa, "VAULT_CLIENT_KEY") orelse "",
+                    .server_name = env(gpa, "VAULT_TLS_SERVER_NAME") orelse "",
+                    .skip_verify = if (env(gpa, "VAULT_SKIP_VERIFY")) |v| std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") else false,
+                };
+                tls_opts.check(gpa) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.MissingConfig;
+                // Token, then AppRole, then TLS certificate auth.
+                const auth: kms.vault.Auth = if (env(gpa, "VAULT_TOKEN")) |t| .{ .token = t } else if (env(gpa, "VAULT_ROLE_ID")) |rid| .{ .approle = .{
+                    .role_id = rid,
                     .secret_id = env(gpa, "VAULT_SECRET_ID") orelse return error.MissingConfig,
-                } };
-                self.vault_client = kms.vault.Client.init(gpa, .{ .addr = addr, .auth = auth, .namespace = env(gpa, "VAULT_NAMESPACE") });
+                } } else if (tls_opts.hasClientCert()) .{ .cert = .{
+                    .mount = env(gpa, "VAULT_CERT_AUTH_MOUNT") orelse "cert",
+                    .role = env(gpa, "VAULT_CERT_ROLE") orelse "",
+                } } else return error.MissingConfig;
+                self.vault_client = kms.vault.Client.init(gpa, .{ .addr = addr, .auth = auth, .namespace = env(gpa, "VAULT_NAMESPACE"), .http = .{ .tls = tls_opts } });
                 const engine = env(gpa, "ZKFSM_KMS_VAULT_ENGINE") orelse "transit";
                 if (std.mem.eql(u8, engine, "kv2")) {
                     self.kv2.init(&self.vault_client);

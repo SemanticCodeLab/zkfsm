@@ -8,9 +8,9 @@ const dial = @import("dial.zig");
 const testing = std.testing;
 
 const files = [_][]const u8{
-    "mtls_ca.pem",             "mtls_server.pem",        "mtls_server.key",
-    "mtls_client_p256.pem",    "mtls_client_p256.key",   "mtls_client_p384.pem",
-    "mtls_client_p384.key",    "mtls_client_rsa.pem",    "mtls_client_rsa.key",
+    "mtls_ca.pem",             "mtls_server.pem",         "mtls_server.key",
+    "mtls_client_p256.pem",    "mtls_client_p256.key",    "mtls_client_p384.pem",
+    "mtls_client_p384.key",    "mtls_client_rsa.pem",     "mtls_client_rsa.key",
     "mtls_client_ed25519.pem", "mtls_client_ed25519.key", "ca.pem",
 };
 

@@ -5,11 +5,11 @@ const target = @import("target.zig");
 const net = @import("net.zig");
 
 pub const keys = [_][]const u8{
-    "address",     "subject",              "username",        "password",
-    "token",       "tls",                  "tls_skip_verify", "cert_authority",
-    "client_cert", "client_key",           "ping_interval",   "jetstream",
-    "streaming",   "streaming_cluster_id", "streaming_async", "streaming_max_pub_acks_in_flight",
-    "queue_dir",   "queue_limit",          "comment",         "tls_server_name",
+    "address",         "subject",              "username",        "password",
+    "token",           "tls",                  "tls_skip_verify", "cert_authority",
+    "client_cert",     "client_key",           "ping_interval",   "jetstream",
+    "streaming",       "streaming_cluster_id", "streaming_async", "streaming_max_pub_acks_in_flight",
+    "queue_dir",       "queue_limit",          "comment",         "tls_server_name",
     "tls_min_version",
 };
 

@@ -1,17 +1,20 @@
 //! Small HTTP(S) helper for KMS backends: per-socket I/O timeouts plus
 //! retries with exponential backoff on transport errors, 429 and 5xx.
 const std = @import("std");
+const tls = @import("../tls/root.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{ OutOfMemory, InvalidArgument, BackendUnavailable, InvalidResponse };
 
 pub const Options = struct {
-    /// Applied as SO_RCVTIMEO/SO_SNDTIMEO; connect uses the OS default.
+    /// Connect deadline and SO_RCVTIMEO/SO_SNDTIMEO.
     timeout_ms: u32 = 10_000,
     max_attempts: u8 = 4,
     backoff_ms: u32 = 100,
     max_body: usize = 4 << 20,
+    /// CA file, client certificate and key for https:// URLs.
+    tls: tls.TlsOptions = .{},
 };
 
 pub const Response = struct {
@@ -24,29 +27,25 @@ pub const Response = struct {
 };
 
 pub const Client = struct {
-    http: std.http.Client,
     opts: Options,
 
     pub fn init(gpa: Allocator, opts: Options) Client {
-        return .{ .http = .{ .allocator = gpa }, .opts = opts };
+        _ = gpa;
+        return .{ .opts = opts };
     }
 
     pub fn deinit(c: *Client) void {
-        c.http.deinit();
+        c.* = undefined;
     }
 
     /// Sends a request; retries idempotent failures. Caller owns the body.
     /// Header values must not contain CR/LF.
     pub fn send(c: *Client, gpa: Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, payload: ?[]const u8) Error!Response {
-        const uri = std.Uri.parse(url) catch return error.InvalidArgument;
-        for (headers) |h| {
-            if (std.mem.indexOfAny(u8, h.value, "\r\n") != null) return error.InvalidArgument;
-        }
         var attempt: u8 = 1;
         var delay: u64 = c.opts.backoff_ms;
         while (true) : (attempt += 1) {
             const last = attempt >= c.opts.max_attempts;
-            if (c.once(gpa, method, uri, headers, payload)) |resp| {
+            if (c.once(gpa, method, url, headers, payload)) |resp| {
                 const retry = resp.status == 429 or (resp.status >= 500 and resp.status != 501);
                 if (!retry or last) return resp;
                 var r = resp;
@@ -61,64 +60,26 @@ pub const Client = struct {
         }
     }
 
-    fn once(c: *Client, gpa: Allocator, method: std.http.Method, uri: std.Uri, headers: []const std.http.Header, payload: ?[]const u8) Error!Response {
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidArgument;
-        var host_buf: [std.Uri.host_name_max]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return error.InvalidArgument;
-        const port: u16 = uri.port orelse switch (protocol) {
-            .plain => 80,
-            .tls => 443,
-        };
-        const conn = c.http.connect(host, port, protocol) catch |e| return mapErr(e);
-        setTimeouts(conn.stream_reader.getStream().handle, c.opts.timeout_ms);
-
-        var req = c.http.request(method, uri, .{
-            .connection = conn,
-            .redirect_behavior = .not_allowed,
-            .keep_alive = false,
-            .extra_headers = headers,
-            .headers = .{ .accept_encoding = .{ .override = "identity" }, .user_agent = .{ .override = "zkfsm-kms" } },
-        }) catch |e| {
-            c.http.connection_pool.release(conn);
-            return mapErr(e);
-        };
-        defer req.deinit();
-        if (payload) |p| {
-            req.transfer_encoding = .{ .content_length = p.len };
-            var body = req.sendBodyUnflushed(&.{}) catch |e| return mapErr(e);
-            body.writer.writeAll(p) catch return error.BackendUnavailable;
-            body.end() catch return error.BackendUnavailable;
-            req.connection.?.flush() catch return error.BackendUnavailable;
-        } else {
-            req.sendBodiless() catch |e| return mapErr(e);
-        }
-        var resp = req.receiveHead(&.{}) catch |e| return mapErr(e);
-        var tbuf: [64]u8 = undefined;
-        const rd = resp.reader(&tbuf);
-        const body = rd.allocRemaining(gpa, .limited(c.opts.max_body)) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.StreamTooLong => return error.InvalidResponse,
-            error.ReadFailed => return error.BackendUnavailable,
-        };
-        return .{ .status = @intFromEnum(resp.head.status), .body = body };
-    }
-
-    fn mapErr(e: anyerror) Error {
-        return switch (e) {
+    fn once(c: *Client, gpa: Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, payload: ?[]const u8) Error!Response {
+        const r = tls.https.send(gpa, .{
+            .method = method,
+            .url = url,
+            .headers = headers,
+            .body = payload,
+            .tls = c.opts.tls,
+            .connect_timeout_ms = c.opts.timeout_ms,
+            .io_timeout_ms = c.opts.timeout_ms,
+            .max_body = c.opts.max_body,
+            .user_agent = "zkfsm-kms",
+        }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            error.UnsupportedUriScheme, error.UriMissingHost, error.UriHostTooLong => error.InvalidArgument,
-            error.HttpHeadersInvalid, error.HttpHeadersOversize, error.HttpChunkInvalid, error.HttpContentEncodingUnsupported, error.TooManyHttpRedirects, error.HttpRedirectLocationMissing, error.HttpRedirectLocationOversize, error.HttpRedirectLocationInvalid => error.InvalidResponse,
-            else => error.BackendUnavailable,
+            error.InvalidArgument => error.InvalidArgument,
+            error.InvalidResponse, error.ResponseTooLarge => error.InvalidResponse,
+            error.ConnectFailed, error.TlsFailed => error.BackendUnavailable,
         };
+        return .{ .status = r.status, .body = r.body };
     }
 };
-
-fn setTimeouts(fd: std.posix.socket_t, ms: u32) void {
-    const tv: std.posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-    const bytes = std.mem.asBytes(&tv);
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
-}
 
 /// Percent-encodes a path segment (RFC 3986 unreserved kept).
 pub fn escapeSegment(gpa: Allocator, s: []const u8) Error![]u8 {
