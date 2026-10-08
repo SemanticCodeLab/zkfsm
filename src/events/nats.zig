@@ -9,7 +9,8 @@ pub const keys = [_][]const u8{
     "token",       "tls",                  "tls_skip_verify", "cert_authority",
     "client_cert", "client_key",           "ping_interval",   "jetstream",
     "streaming",   "streaming_cluster_id", "streaming_async", "streaming_max_pub_acks_in_flight",
-    "queue_dir",   "queue_limit",          "comment",
+    "queue_dir",   "queue_limit",          "comment",         "tls_server_name",
+    "tls_min_version",
 };
 
 /// Largest inbound message payload accepted from the server.
@@ -53,9 +54,8 @@ const Nats = struct {
         n.pass = try a.dupe(u8, s.get("password"));
         n.token = try a.dupe(u8, s.get("token"));
         if (s.flag("tls")) n.tls = true;
-        n.tls_opts = .{ .skip_verify = s.flag("tls_skip_verify"), .ca_file = try a.dupe(u8, s.get("cert_authority")) };
-        // std TLS has no client certificates; NATS Streaming (STAN) is retired.
-        if (s.get("client_cert").len > 0 or s.get("client_key").len > 0) return error.InvalidConfig;
+        n.tls_opts = try net.tlsOptions(a, s, .{ .ca = "cert_authority" });
+        // NATS Streaming (STAN) is retired.
         if (s.flag("streaming")) return error.InvalidConfig;
         _ = try s.durationMs("ping_interval", 0);
         _ = try s.int(u64, "queue_limit", 0);
