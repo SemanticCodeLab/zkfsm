@@ -3,6 +3,7 @@
 //! encryption and KMS" for the variables each backend reads.
 const std = @import("std");
 const kms = @import("../kms/root.zig");
+const tls = @import("../tls/root.zig");
 
 pub const Backend = enum {
     none,
@@ -93,6 +94,13 @@ pub const VaultSpec = struct {
     role_id: ?[]const u8 = null,
     secret_id: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
+    ca_file: ?[]const u8 = null,
+    client_cert: ?[]const u8 = null,
+    client_key: ?[]const u8 = null,
+    tls_server_name: ?[]const u8 = null,
+    skip_verify: ?[]const u8 = null,
+    cert_mount: ?[]const u8 = null,
+    cert_role: ?[]const u8 = null,
     engine: []const u8 = "transit",
 };
 
@@ -124,6 +132,13 @@ pub const Spec = struct {
                 .role_id = env(gpa, "VAULT_ROLE_ID"),
                 .secret_id = env(gpa, "VAULT_SECRET_ID"),
                 .namespace = env(gpa, "VAULT_NAMESPACE"),
+                .ca_file = env(gpa, "VAULT_CACERT") orelse env(gpa, "KMS_VAULT_CAPATH"),
+                .client_cert = env(gpa, "VAULT_CLIENT_CERT"),
+                .client_key = env(gpa, "VAULT_CLIENT_KEY"),
+                .tls_server_name = env(gpa, "VAULT_TLS_SERVER_NAME"),
+                .skip_verify = env(gpa, "VAULT_SKIP_VERIFY"),
+                .cert_mount = env(gpa, "VAULT_CERT_AUTH_MOUNT"),
+                .cert_role = env(gpa, "VAULT_CERT_ROLE"),
                 .engine = env(gpa, "ZKFSM_KMS_VAULT_ENGINE") orelse "transit",
             },
             .kms_api => s.kms_api = .{
@@ -236,12 +251,24 @@ pub const Holder = struct {
             .vault => {
                 const v = spec.vault;
                 const addr = v.addr orelse return error.MissingConfig;
-                const auth: kms.vault.Auth = if (v.token) |t| .{ .token = t } else .{ .approle = .{
-                    .role_id = v.role_id orelse return error.MissingConfig,
+                const tls_opts: tls.TlsOptions = .{
+                    .ca_file = v.ca_file orelse "",
+                    .client_cert_file = v.client_cert orelse "",
+                    .client_key_file = v.client_key orelse "",
+                    .server_name = v.tls_server_name orelse "",
+                    .skip_verify = if (v.skip_verify) |x| std.mem.eql(u8, x, "true") or std.mem.eql(u8, x, "1") else false,
+                };
+                tls_opts.check(gpa) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.MissingConfig;
+                // Token, then AppRole, then TLS certificate auth.
+                const auth: kms.vault.Auth = if (v.token) |t| .{ .token = t } else if (v.role_id) |rid| .{ .approle = .{
+                    .role_id = rid,
                     .secret_id = v.secret_id orelse return error.MissingConfig,
-                } };
+                } } else if (tls_opts.hasClientCert()) .{ .cert = .{
+                    .mount = v.cert_mount orelse "cert",
+                    .role = v.cert_role orelse "",
+                } } else return error.MissingConfig;
                 if (!std.mem.eql(u8, v.engine, "kv2") and !std.mem.eql(u8, v.engine, "transit")) return error.MissingConfig;
-                self.vault_client = kms.vault.Client.init(gpa, .{ .addr = addr, .auth = auth, .namespace = v.namespace });
+                self.vault_client = kms.vault.Client.init(gpa, .{ .addr = addr, .auth = auth, .namespace = v.namespace, .http = .{ .tls = tls_opts } });
                 if (std.mem.eql(u8, v.engine, "kv2")) {
                     self.kv2.init(&self.vault_client);
                     self.handle = self.kv2.kms();

@@ -2,7 +2,7 @@
 //! user, bind as the user, collect group DNs. Plain, StartTLS, or LDAPS. Every server
 //! response is treated as hostile: message size, entry count, and nesting are bounded.
 const std = @import("std");
-const tls = std.crypto.tls;
+const tls = @import("../tls/root.zig");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -24,6 +24,9 @@ pub const Config = struct {
     tls_skip_verify: bool = false,
     /// PEM CA bundle file; null = system roots.
     ca_file: ?[]const u8 = null,
+    /// PEM client certificate and key for servers that demand one.
+    client_cert_file: []const u8 = "",
+    client_key_file: []const u8 = "",
     lookup_bind_dn: []const u8,
     lookup_bind_password: []const u8,
     user_dn_search_base: []const u8,
@@ -339,29 +342,27 @@ const Conn = struct {
     stream: std.net.Stream,
     sr: std.net.Stream.Reader,
     sw: std.net.Stream.Writer,
-    tc: ?tls.Client = null,
-    tls_read: []u8,
-    tls_write: []u8,
+    sec: ?*tls.dial.Secure = null,
     msg_id: i32 = 0,
     buf: []u8 = &.{},
 
     fn reader(c: *Conn) *std.Io.Reader {
-        return if (c.tc) |*t| &t.reader else c.sr.interface();
+        return if (c.sec) |t| &t.client.reader else c.sr.interface();
     }
 
     fn writer(c: *Conn) *std.Io.Writer {
-        return if (c.tc) |*t| &t.writer else &c.sw.interface;
+        return if (c.sec) |t| &t.client.writer else &c.sw.interface;
     }
 
     fn readErr(c: *Conn, e: std.Io.Reader.Error) Error {
         if (e == error.EndOfStream) return error.ProtocolError;
         if (c.sr.getError()) |se| return if (se == error.WouldBlock) error.Timeout else error.ConnectFailed;
-        return if (c.tc != null) error.TlsFailed else error.ConnectFailed;
+        return if (c.sec != null) error.TlsFailed else error.ConnectFailed;
     }
 
     fn writeErr(c: *Conn) Error {
         if (c.sw.err) |se| return if (se == error.WouldBlock) error.Timeout else error.ConnectFailed;
-        return if (c.tc != null) error.TlsFailed else error.ConnectFailed;
+        return if (c.sec != null) error.TlsFailed else error.ConnectFailed;
     }
 
     fn send(c: *Conn, op: []const u8) Error!void {
@@ -374,7 +375,7 @@ const Conn = struct {
         const w = c.writer();
         w.writeAll(e.list.items) catch return c.writeErr();
         w.flush() catch return c.writeErr();
-        if (c.tc != null) c.sw.interface.flush() catch return c.writeErr();
+        if (c.sec != null) c.sw.interface.flush() catch return c.writeErr();
     }
 
     /// Returned slices are valid until the next `recv`.
@@ -449,22 +450,18 @@ const Conn = struct {
     }
 
     fn startTls(c: *Conn, cfg: Config, host: []const u8) Error!void {
-        var bundle: std.crypto.Certificate.Bundle = .{};
-        if (!cfg.tls_skip_verify) {
-            if (cfg.ca_file) |path| {
-                bundle.addCertsFromFilePath(c.arena, std.fs.cwd(), path) catch return error.TlsFailed;
-            } else bundle.rescan(c.arena) catch return error.TlsFailed;
-        }
-        const opts: tls.Client.Options = .{
-            .host = if (cfg.tls_skip_verify) .no_verification else .{ .explicit = host },
-            .ca = if (cfg.tls_skip_verify) .no_verification else .{ .bundle = bundle },
-            .read_buffer = c.tls_read,
-            .write_buffer = c.tls_write,
-        };
-        c.tc = tls.Client.init(c.sr.interface(), &c.sw.interface, opts) catch {
+        const s = try c.arena.create(tls.dial.Secure);
+        s.start(c.arena, c.sr.interface(), &c.sw.interface, host, .{
+            .skip_verify = cfg.tls_skip_verify,
+            .ca_file = cfg.ca_file orelse "",
+            .client_cert_file = cfg.client_cert_file,
+            .client_key_file = cfg.client_key_file,
+        }) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
             if (c.sr.getError()) |se| if (se == error.WouldBlock) return error.Timeout;
             return error.TlsFailed;
         };
+        c.sec = s;
     }
 
     fn extendedStartTls(c: *Conn) Error!void {
@@ -491,7 +488,10 @@ const Conn = struct {
             w.writeAll(e.list.items) catch {};
             w.flush() catch {};
         } else |_| {}
-        if (c.tc) |*t| t.end() catch {};
+        if (c.sec) |t| {
+            t.end();
+            t.release(c.arena);
+        }
         c.sw.interface.flush() catch {};
         c.stream.close();
     }
@@ -544,15 +544,13 @@ fn connect(arena: Allocator, cfg: Config) Error!*Conn {
     errdefer stream.close();
 
     const n = tls.Client.min_buffer_len;
-    const bufs = try arena.alloc(u8, 4 * n);
+    const bufs = try arena.alloc(u8, 2 * n);
     const c = try arena.create(Conn);
     c.* = .{
         .arena = arena,
         .stream = stream,
         .sr = stream.reader(bufs[0..n]),
         .sw = stream.writer(bufs[n .. 2 * n]),
-        .tls_read = bufs[2 * n .. 3 * n],
-        .tls_write = bufs[3 * n .. 4 * n],
     };
     switch (cfg.tls) {
         .none => {},
