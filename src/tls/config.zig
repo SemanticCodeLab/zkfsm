@@ -4,6 +4,17 @@ const pem = @import("pem.zig");
 const keys = @import("keys.zig");
 const peer = @import("peer.zig");
 
+pub const Version = enum {
+    tls12,
+    tls13,
+
+    pub fn parse(text: []const u8) ?Version {
+        if (std.mem.eql(u8, text, "1.2")) return .tls12;
+        if (std.mem.eql(u8, text, "1.3")) return .tls13;
+        return null;
+    }
+};
+
 pub const LoadError = error{ CannotRead, NoCertificate, BadCertificate, KeyMismatch, BadKey, UnsupportedKey, EncryptedKey, NoKey, OutOfMemory };
 
 const max_file = 1 << 20;
@@ -121,6 +132,8 @@ pub const Context = struct {
     current: *Credentials,
     /// Trusted roots for client certificates (DER); empty means no mutual TLS.
     client_cas: [][]u8 = &.{},
+    /// Lowest protocol version accepted; 1.3 is always preferred when offered.
+    min_version: Version = .tls12,
 
     pub fn init(gpa: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) LoadError!Context {
         return .{ .gpa = gpa, .cert_path = cert_path, .key_path = key_path, .current = try Credentials.fromFiles(gpa, cert_path, key_path) };

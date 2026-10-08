@@ -1,5 +1,6 @@
-//! Server side of one TLS 1.3 connection: handshake, then std.Io.Reader/Writer
-//! over protected records. No PSK, no 0-RTT; optional client certificates.
+//! Server side of one TLS 1.3 or 1.2 connection: handshake, then std.Io.Reader/Writer
+//! over protected records. No PSK, 0-RTT, resumption or renegotiation; optional
+//! client certificates.
 const std = @import("std");
 const tls = std.crypto.tls;
 const hs = @import("handshake.zig");
@@ -7,6 +8,7 @@ const sched = @import("schedule.zig");
 const config = @import("config.zig");
 const keys = @import("keys.zig");
 const peer_cert = @import("peer.zig");
+const t12 = @import("tls12.zig");
 
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -30,6 +32,7 @@ pub const Error = error{
     BadCertificate,
     CertificateExpired,
     UnknownCa,
+    InappropriateFallback,
     InternalError,
     OutOfMemory,
 };
@@ -50,12 +53,19 @@ const Keys = union(enum) {
     aes128: Pair(sched.Aes128),
     aes256: Pair(sched.Aes256),
     chacha: Pair(sched.Chacha),
+    gcm128_12: Pair(t12.Gcm128),
+    gcm256_12: Pair(t12.Gcm256),
+    chacha_12: Pair(t12.Chacha),
 };
 
 /// Verified client certificate subject; `common_name` lives inside the Session.
 pub const PeerIdentity = struct { common_name: []const u8, not_before_s: i64, not_after_s: i64 };
 
 const suite_fields = .{ .{ sched.Aes128, "aes128" }, .{ sched.Aes256, "aes256" }, .{ sched.Chacha, "chacha" } };
+const suite_fields12 = .{ .{ t12.Gcm128, "gcm128_12" }, .{ t12.Gcm256, "gcm256_12" }, .{ t12.Chacha, "chacha_12" } };
+/// Bound on the raw 1.2 transcript kept for client CertificateVerify.
+const max_transcript12 = 4 * max_handshake_msg;
+const no_renegotiation: tls.Alert.Description = @enumFromInt(100);
 
 pub const Session = struct {
     gpa: std.mem.Allocator,
@@ -70,6 +80,9 @@ pub const Session = struct {
     sent_close: bool = false,
     failed: ?Error = null,
     ccs_seen: u8 = 0,
+    v12: bool = false,
+    /// TLS 1.2: a ChangeCipherSpec is due before the client Finished.
+    ccs12_armed: bool = false,
     early_skip: usize = 0,
     sni_buf: [255]u8 = undefined,
     sni_len: u8 = 0,
@@ -104,7 +117,7 @@ pub const Session = struct {
         s.writer.buffer = &s.wbuf;
         const creds = ctx.acquire();
         defer creds.release();
-        s.handshake(creds, ctx.client_cas) catch |e| {
+        s.handshake(creds, ctx.client_cas, ctx.min_version) catch |e| {
             s.sendAlertFor(e);
             s.destroy();
             return e;
@@ -160,7 +173,7 @@ pub const Session = struct {
 
     // ---- handshake ----
 
-    fn handshake(s: *Session, creds: *config.Credentials, cas: []const []const u8) Error!void {
+    fn handshake(s: *Session, creds: *config.Credentials, cas: []const []const u8, min: config.Version) Error!void {
         s.hs_buf = try s.gpa.alloc(u8, max_handshake_msg + 4);
         defer s.freeHandshake();
         const flight = try s.gpa.alloc(u8, max_flight);
@@ -171,10 +184,179 @@ pub const Session = struct {
         const msg = try s.readHandshake();
         if (msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch = try parseHello(msg);
-        inline for (suite_fields) |sf| {
-            if (ch.offersSuite(sf[0].suite_id)) return s.run(sf[0], sf[1], creds, cas, msg, ch, flight);
+        if (ch.tls13) {
+            inline for (suite_fields) |sf| {
+                if (ch.offersSuite(sf[0].suite_id)) return s.run(sf[0], sf[1], creds, cas, msg, ch, flight);
+            }
+            return error.HandshakeFailure;
+        }
+        if (!ch.tls12 or min != .tls12) return error.ProtocolVersion;
+        // RFC 7507: a fallback retry means a 1.3 attempt failed in between.
+        if (ch.offersSuite(t12.scsv_fallback)) return error.InappropriateFallback;
+        const ecdsa = creds.key.kind == .ecdsa_p256;
+        inline for (suite_fields12) |sf| {
+            if (ch.offersSuite(if (ecdsa) sf[0].ecdsa_id else sf[0].rsa_id)) return s.run12(sf[0], sf[1], ecdsa, creds, cas, msg, ch, flight);
         }
         return error.HandshakeFailure;
+    }
+
+    fn run12(s: *Session, comptime S: type, comptime field: []const u8, ecdsa: bool, creds: *config.Credentials, cas: []const []const u8, msg: []const u8, ch: hs.ClientHello, flight: []u8) Error!void {
+        // RFC 7627 5.3: without EMS the master secret is not bound to the handshake.
+        if (!ch.ems) return error.HandshakeFailure;
+        if (ch.reneg) |r| if (r.len != 0) return error.HandshakeFailure;
+        const secure_reneg = ch.reneg != null or ch.offersSuite(t12.scsv_renegotiation);
+        const algs = ch.sig_algs orelse return error.HandshakeFailure;
+        const scheme = creds.key.chooseScheme(algs) orelse return error.HandshakeFailure;
+        if (ch.alpn != null and !ch.offersAlpn(alpn_http11)) return error.NoApplicationProtocol;
+        s.alpn = ch.alpn != null;
+        const group: u16 = if (ch.groups) |g|
+            (if (hs.containsU16(g, hs.group_x25519)) hs.group_x25519 else if (hs.containsU16(g, hs.group_secp256r1)) hs.group_secp256r1 else return error.HandshakeFailure)
+        else
+            hs.group_secp256r1;
+        if (ch.sni) |name| {
+            @memcpy(s.sni_buf[0..name.len], name);
+            s.sni_len = @intCast(name.len);
+        }
+        s.v12 = true;
+        const client_random = ch.random;
+
+        var transcript = S.Hash.init(.{});
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(s.gpa);
+        const keep_raw = cas.len > 0;
+        try record12(S, &transcript, &raw, keep_raw, s.gpa, msg);
+
+        var server_random: [32]u8 = undefined;
+        std.crypto.random.bytes(server_random[0..24]);
+        server_random[24..].* = t12.downgrade_sentinel;
+
+        var x_kp: X25519.KeyPair = undefined;
+        var p_kp: P256.KeyPair = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&x_kp));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&p_kp));
+        var pub_buf: [65]u8 = undefined;
+        const our_pub: []const u8 = if (group == hs.group_x25519) blk: {
+            x_kp = X25519.KeyPair.generate();
+            pub_buf[0..32].* = x_kp.public_key;
+            break :blk pub_buf[0..32];
+        } else blk: {
+            p_kp = P256.KeyPair.generate();
+            pub_buf = p_kp.public_key.toUncompressedSec1();
+            break :blk &pub_buf;
+        };
+
+        // ServerHello, Certificate, ServerKeyExchange, [CertificateRequest], ServerHelloDone.
+        var b: hs.Builder = .{ .buf = flight };
+        hs.serverHello12(&b, .{
+            .random = server_random,
+            .suite = if (ecdsa) S.ecdsa_id else S.rsa_id,
+            .alpn = if (s.alpn) alpn_http11 else null,
+            .ack_sni = ch.sni != null,
+            .secure_reneg = secure_reneg,
+        }) catch return error.InternalError;
+        hs.certificate12(&b, creds.chain) catch return error.InternalError;
+        {
+            const ske = b.len;
+            b.bytes(&.{ @intFromEnum(tls.HandshakeType.server_key_exchange), 0, 0, 0 }) catch return error.InternalError;
+            const params = b.len;
+            hs.ecdheParams(&b, group, our_pub) catch return error.InternalError;
+            var content: [64 + 4 + 65]u8 = undefined;
+            content[0..32].* = client_random;
+            content[32..64].* = server_random;
+            const plen = b.len - params;
+            @memcpy(content[64..][0..plen], b.buf[params..b.len]);
+            var sig_buf: [keys.max_signature_len]u8 = undefined;
+            const sig = creds.key.sign(scheme, content[0 .. 64 + plen], &sig_buf) catch return error.InternalError;
+            b.int(u16, @intFromEnum(scheme)) catch return error.InternalError;
+            const sl = b.begin(u16) catch return error.InternalError;
+            b.bytes(sig) catch return error.InternalError;
+            b.end(u16, sl) catch return error.InternalError;
+            b.end(u24, ske + 1) catch return error.InternalError;
+        }
+        if (keep_raw) hs.certificateRequest12(&b, &peer_cert.schemes) catch return error.InternalError;
+        hs.serverHelloDone(&b) catch return error.InternalError;
+        try record12(S, &transcript, &raw, keep_raw, s.gpa, b.written());
+        try s.sendPlain(.handshake, b.written());
+        s.output.flush() catch return error.ConnectionClosed;
+
+        // [Certificate], ClientKeyExchange, [CertificateVerify], ChangeCipherSpec, Finished.
+        var chain_msg: []u8 = &.{};
+        defer if (chain_msg.len > 0) s.gpa.free(chain_msg);
+        var leaf: ?std.crypto.Certificate.Parsed = null;
+        if (keep_raw) {
+            const m = try s.readHandshake();
+            if (m[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+            // Later reads compact hs_buf, so keep our own copy of the chain.
+            chain_msg = try s.gpa.dupe(u8, m);
+            try record12(S, &transcript, &raw, keep_raw, s.gpa, chain_msg);
+            var list: [hs.max_peer_chain][]const u8 = undefined;
+            const chain = try hs.parseCertificate12(chain_msg[4..], &list);
+            if (chain.len > 0) leaf = try peer_cert.verifyChain(chain, cas, std.time.timestamp());
+        }
+
+        const cke = try s.readHandshake();
+        if (cke[0] != @intFromEnum(tls.HandshakeType.client_key_exchange)) return error.UnexpectedMessage;
+        const point = try hs.parseClientKeyExchange(cke[4..]);
+        var shared: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &shared);
+        if (group == hs.group_x25519) {
+            if (point.len != X25519.public_length) return error.IllegalParameter;
+            shared = X25519.scalarmult(x_kp.secret_key, point[0..32].*) catch return error.IllegalParameter;
+        } else {
+            if (point.len != 65 or point[0] != 4) return error.IllegalParameter;
+            const pk = P256.PublicKey.fromSec1(point) catch return error.IllegalParameter;
+            const q = pk.p.mul(p_kp.secret_key.bytes, .big) catch return error.IllegalParameter;
+            shared = q.affineCoordinates().x.toBytes(.big);
+        }
+        try record12(S, &transcript, &raw, keep_raw, s.gpa, cke);
+        var master = S.masterSecret(&shared, &peek(S, transcript));
+        defer std.crypto.secureZero(u8, &master);
+
+        if (leaf) |l| {
+            const cv = try s.readHandshake();
+            if (cv[0] != @intFromEnum(tls.HandshakeType.certificate_verify)) return error.UnexpectedMessage;
+            var c: hs.Cursor = .{ .b = cv[4..] };
+            const cv_scheme = try c.int(u16);
+            const sig = try c.vec(u16);
+            if (c.left() != 0) return error.DecodeError;
+            try peer_cert.verifySignature(l, cv_scheme, sig, raw.items);
+            try record12(S, &transcript, &raw, false, s.gpa, cv);
+            if (peer_cert.commonName(l)) |cn| {
+                @memcpy(s.peer_cn_buf[0..cn.len], cn);
+                s.peer_cn_len = @intCast(cn.len);
+                s.peer_not_before = @intCast(l.validity.not_before);
+                s.peer_not_after = @intCast(l.validity.not_after);
+            }
+        }
+
+        const dirs = S.trafficKeys(&master, client_random, server_random);
+        s.keys = @unionInit(Keys, field, .{ .read = dirs.client, .write = dirs.server });
+        var expected = S.verifyData(&master, "client finished", &peek(S, transcript));
+        defer std.crypto.secureZero(u8, &expected);
+        s.ccs12_armed = true;
+        const fin = try s.readHandshake();
+        if (!s.read_protected) return error.UnexpectedMessage;
+        if (fin[0] != @intFromEnum(tls.HandshakeType.finished)) return error.UnexpectedMessage;
+        if (fin.len != 4 + t12.verify_len) return error.DecodeError;
+        if (!std.crypto.timing_safe.eql([t12.verify_len]u8, fin[4..][0..t12.verify_len].*, expected)) return error.DecryptError;
+        if (s.hs_end != s.hs_start) return error.UnexpectedMessage;
+        transcript.update(fin);
+
+        const ours = S.verifyData(&master, "server finished", &peek(S, transcript));
+        try s.sendPlain(.change_cipher_spec, &.{1});
+        s.write_protected = true;
+        b = .{ .buf = flight };
+        hs.finished(&b, &ours) catch return error.InternalError;
+        try s.sendProtected(.handshake, b.written());
+        s.output.flush() catch return error.ConnectionClosed;
+    }
+
+    /// Hashes a 1.2 handshake message; keeps raw bytes too when a CertificateVerify may follow.
+    fn record12(comptime S: type, t: *S.Hash, raw: *std.ArrayList(u8), keep: bool, gpa: std.mem.Allocator, m: []const u8) Error!void {
+        t.update(m);
+        if (!keep) return;
+        if (raw.items.len + m.len > max_transcript12) return error.HandshakeFailure;
+        try raw.appendSlice(gpa, m);
     }
 
     const Negotiated = struct { scheme: keys.SignatureScheme, alpn: bool };
@@ -231,7 +413,7 @@ pub const Session = struct {
             msg = try s.readHandshake();
             if (msg[0] != @intFromEnum(tls.HandshakeType.client_hello)) return error.UnexpectedMessage;
             ch = try parseHello(msg);
-            if (!std.mem.eql(u8, ch.session_id, sid) or !ch.offersSuite(S.suite_id) or ch.early_data or
+            if (!ch.tls13 or !std.mem.eql(u8, ch.session_id, sid) or !ch.offersSuite(S.suite_id) or ch.early_data or
                 ch.keyShareCount() != 1 or ch.keyShare(group) == null) return error.IllegalParameter;
             neg = try negotiate(ch, creds);
             s.early_skip = 0;
@@ -408,6 +590,12 @@ pub const Session = struct {
                     s.hs_end += rec.data.len;
                 },
                 .change_cipher_spec => {
+                    if (s.v12) {
+                        if (!s.ccs12_armed or s.hs_end != s.hs_start or rec.data.len != 1 or rec.data[0] != 1) return error.UnexpectedMessage;
+                        s.ccs12_armed = false;
+                        s.read_protected = true;
+                        continue;
+                    }
                     s.ccs_seen += 1;
                     if (rec.data.len != 1 or rec.data[0] != 1 or s.ccs_seen > 1) return error.UnexpectedMessage;
                 },
@@ -434,13 +622,15 @@ pub const Session = struct {
             s.input.readSliceAll(body) catch return error.Truncated;
             switch (ct) {
                 .change_cipher_spec => return .{ .ct = ct, .data = body },
-                .handshake, .alert => {
-                    if (s.read_protected) return error.UnexpectedMessage;
+                .handshake, .alert => if (!s.read_protected) {
                     if (len > sched.max_plaintext) return error.RecordOverflow;
                     return .{ .ct = ct, .data = body };
-                },
+                } else if (s.v12) {
+                    return s.open12(hdr, body);
+                } else return error.UnexpectedMessage,
                 .application_data => {
                     if (!s.read_protected) return error.UnexpectedMessage;
+                    if (s.v12) return s.open12(hdr, body);
                     const opened = switch (s.keys) {
                         .none => return error.InternalError,
                         inline else => |*p| p.read.open(hdr, body, &s.plain),
@@ -460,6 +650,14 @@ pub const Session = struct {
                 else => return error.UnexpectedMessage,
             }
         }
+    }
+
+    fn open12(s: *Session, hdr: *const [sched.header_len]u8, body: []const u8) Error!Record {
+        const opened = try switch (s.keys) {
+            inline .gcm128_12, .gcm256_12, .chacha_12 => |*p| p.read.open(hdr, body, &s.plain),
+            else => error.InternalError,
+        };
+        return .{ .ct = opened[0], .data = opened[1] };
     }
 
     fn peerAlert(data: []const u8) Error {
@@ -504,6 +702,11 @@ pub const Session = struct {
         s.sent_close = true;
     }
 
+    fn sendWarning(s: *Session, desc: tls.Alert.Description) Error!void {
+        try s.sendProtected(.alert, &.{ 1, @intFromEnum(desc) });
+        s.output.flush() catch return error.ConnectionClosed;
+    }
+
     fn sendAlertFor(s: *Session, e: Error) void {
         const desc: tls.Alert.Description = switch (e) {
             error.PeerAlert, error.ConnectionClosed, error.Truncated => return,
@@ -520,6 +723,7 @@ pub const Session = struct {
             error.BadCertificate => .bad_certificate,
             error.CertificateExpired => .certificate_expired,
             error.UnknownCa => .unknown_ca,
+            error.InappropriateFallback => .inappropriate_fallback,
             error.InternalError, error.OutOfMemory => .internal_error,
         };
         s.sendAlert(desc);
@@ -585,6 +789,11 @@ pub const Session = struct {
 
     /// Post-handshake messages must arrive whole; only KeyUpdate is accepted.
     fn postHandshake(s: *Session, data: []const u8) Error!void {
+        if (s.v12) {
+            // RFC 5746: refuse renegotiation with a warning and keep the connection.
+            if (data.len > 0 and data[0] == @intFromEnum(tls.HandshakeType.client_hello)) return s.sendWarning(no_renegotiation);
+            return error.UnexpectedMessage;
+        }
         var c: hs.Cursor = .{ .b = data };
         while (c.left() > 0) {
             const typ = c.int(u8) catch return error.DecodeError;
@@ -599,7 +808,7 @@ pub const Session = struct {
             };
             switch (s.keys) {
                 .none => return error.InternalError,
-                inline else => |*p| p.read.update(),
+                inline else => |*p| if (@hasDecl(@TypeOf(p.read), "update")) p.read.update() else return error.UnexpectedMessage,
             }
             if (requested and !s.sent_close) try s.sendKeyUpdate();
         }
@@ -610,7 +819,7 @@ pub const Session = struct {
         try s.sendProtected(.handshake, &msg);
         switch (s.keys) {
             .none => return error.InternalError,
-            inline else => |*p| p.write.update(),
+            inline else => |*p| if (@hasDecl(@TypeOf(p.write), "update")) p.write.update() else return error.InternalError,
         }
     }
 
@@ -619,7 +828,7 @@ pub const Session = struct {
             .none => return error.WriteFailed,
             inline else => |*p| p.write.seq,
         };
-        if (seq >= rekey_after) s.sendKeyUpdate() catch return error.WriteFailed;
+        if (!s.v12 and seq >= rekey_after) s.sendKeyUpdate() catch return error.WriteFailed;
         s.sendProtected(.application_data, data) catch return error.WriteFailed;
     }
 
