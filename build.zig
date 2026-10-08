@@ -82,4 +82,18 @@ pub fn build(b: *std.Build) void {
     const live_run = b.addRunArtifact(live);
     live_run.has_side_effects = true;
     b.step("test-remote", "Run live remote backend tests").dependOn(&live_run.step);
+
+    // Kubernetes operator (zkfsm.io/v1 Cluster); shares the admin-payload cipher with the server.
+    const kube_mod = b.createModule(.{ .root_source_file = b.path("k8s/kube.zig"), .target = target, .optimize = optimize });
+    const sio_mod = b.createModule(.{ .root_source_file = b.path("src/admin/sio.zig"), .target = target, .optimize = optimize });
+    const op_mod = b.createModule(.{
+        .root_source_file = b.path("k8s/operator/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "kube", .module = kube_mod }, .{ .name = "sio", .module = sio_mod } },
+    });
+    const operator = b.addExecutable(.{ .name = "zkfsm-operator", .root_module = op_mod });
+    b.installArtifact(operator);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = op_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = kube_mod })).step);
 }
