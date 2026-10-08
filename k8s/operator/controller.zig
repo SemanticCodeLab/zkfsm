@@ -271,7 +271,9 @@ pub const Controller = struct {
         if (outdated.items.len > 0) {
             try st.setCond(a, "Progressing", "True", "RollingUpdate", try std.fmt.allocPrint(a, "{d} pods outdated", .{outdated.items.len}));
             // Gate: every pod reports ready (quorum) before the next one goes down.
-            if (ready_n == total and try ctl.allPodsReady(a, c, ac, live)) {
+            // Kubelet's readiness probe is /health/ready (quorum); dialing pods by DNS
+            // can hit a stale address and stall in connect, so the service is asked instead.
+            if (ready_n == total and cluster_ready) {
                 try ctl.deletePod(a, c, pickLast(outdated.items));
             }
             try st.setCond(a, "Available", if (cluster_ready) "True" else "False", if (cluster_ready) "Ready" else "Updating", "rolling update in progress");
@@ -285,15 +287,6 @@ pub const Controller = struct {
         }
         try st.setCond(a, "Available", "False", "Initializing", try std.fmt.allocPrint(a, "{d}/{d} servers ready", .{ ready_n, total }));
         return false;
-    }
-
-    fn allPodsReady(ctl: *Controller, a: A, c: Cluster, ac: *admin.Client, live: []const spec.Pool) !bool {
-        _ = ctl;
-        for (live) |p| for (0..p.servers) |i| {
-            const host = try c.podHost(a, p.name, @intCast(i));
-            if (!ac.ready(a, try std.fmt.allocPrint(a, "{s}://{s}:{d}", .{ c.scheme(), host, spec.port }))) return false;
-        };
-        return true;
     }
 
     fn deletePod(ctl: *Controller, a: A, c: Cluster, pod: Value) !void {
