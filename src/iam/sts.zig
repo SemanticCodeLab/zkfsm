@@ -13,7 +13,8 @@ pub const limits = struct {
     pub const max_parent_bytes = 512;
     pub const max_roles_bytes = 1024;
     pub const max_tenant_bytes = 64;
-    pub const max_payload = 2 + 1 + access_key_len + 2 + max_parent_bytes + 8 + 2 + max_policy_bytes + 2 + max_roles_bytes + 1 + max_tenant_bytes;
+    pub const max_token_type_bytes = 64;
+    pub const max_payload = 2 + 1 + access_key_len + 2 + max_parent_bytes + 8 + 2 + max_policy_bytes + 2 + max_roles_bytes + 1 + max_tenant_bytes + 8 + 1 + 1 + max_token_type_bytes;
     pub const max_token_bytes = b64.Encoder.calcSize(max_payload + Hmac.mac_length);
 };
 
@@ -21,9 +22,19 @@ pub const access_key_len = 20;
 pub const secret_key_len = 40;
 const magic_v1 = [2]u8{ 'Z', '1' };
 /// v2 adds federated policy names and a tenant, and widens the parent length.
-const magic = [2]u8{ 'Z', '2' };
+const magic_v2 = [2]u8{ 'Z', '2' };
+/// v3 adds issue time, identity provider, and token revoke type (for revocation).
+const magic = [2]u8{ 'Z', '3' };
 
-pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant };
+/// Identity provider that vouched for the session; names match MinIO's userProvider.
+pub const Provider = enum(u8) {
+    builtin = 0,
+    openid = 1,
+    ldap = 2,
+    certificate = 3,
+};
+
+pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant, InvalidTokenType };
 pub const ValidateError = error{ MalformedToken, BadSignature, Expired, AccessKeyMismatch };
 
 pub const Request = struct {
@@ -35,6 +46,11 @@ pub const Request = struct {
     /// Federated sessions: comma-separated policy names that replace the parent lookup.
     federated_policies: ?[]const u8 = null,
     tenant: []const u8 = "",
+    provider: Provider = .builtin,
+    /// Free-form label a later revocation can target (MinIO `TokenRevokeType`).
+    token_type: []const u8 = "",
+    /// Issue time in ms; 0 takes `now_s`.
+    issued_ms: i64 = 0,
 };
 
 pub const Credentials = struct {
@@ -56,6 +72,10 @@ pub const Claims = struct {
     session_policy: ?[]const u8,
     federated_policies: ?[]const u8 = null,
     tenant: []const u8 = "",
+    /// 0 for tokens older than v3, so any revocation covers them.
+    issued_ms: i64 = 0,
+    provider: Provider = .builtin,
+    token_type: []const u8 = "",
 };
 
 pub const DecodeBuffer = [limits.max_payload + Hmac.mac_length]u8;
@@ -76,6 +96,7 @@ pub const Issuer = struct {
         }
         if (req.federated_policies) |r| if (r.len > limits.max_roles_bytes) return error.InvalidRoles;
         if (req.tenant.len > limits.max_tenant_bytes) return error.InvalidTenant;
+        if (req.token_type.len > limits.max_token_type_bytes) return error.InvalidTokenType;
         var creds: Credentials = .{
             .access_key = undefined,
             .secret_key = undefined,
@@ -105,6 +126,10 @@ pub const Issuer = struct {
         } else w.writeInt(u16, 0xffff, .little) catch unreachable;
         w.writeByte(@intCast(req.tenant.len)) catch unreachable;
         w.writeAll(req.tenant) catch unreachable;
+        w.writeInt(i64, if (req.issued_ms != 0) req.issued_ms else now_s * 1000, .little) catch unreachable;
+        w.writeByte(@intFromEnum(req.provider)) catch unreachable;
+        w.writeByte(@intCast(req.token_type.len)) catch unreachable;
+        w.writeAll(req.token_type) catch unreachable;
         const payload_len = w.end;
         self.mac(raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
         const signed = raw[0 .. payload_len + Hmac.mac_length];
@@ -126,7 +151,8 @@ pub const Issuer = struct {
             return error.BadSignature;
         var r: std.Io.Reader = .fixed(payload);
         const m = r.takeArray(2) catch return error.MalformedToken;
-        const v2 = std.mem.eql(u8, m, &magic);
+        const v3 = std.mem.eql(u8, m, &magic);
+        const v2 = v3 or std.mem.eql(u8, m, &magic_v2);
         if (!v2 and !std.mem.eql(u8, m, &magic_v1)) return error.MalformedToken;
         const ak_len = r.takeByte() catch return error.MalformedToken;
         const ak = r.take(ak_len) catch return error.MalformedToken;
@@ -143,6 +169,16 @@ pub const Issuer = struct {
             const tenant_len = r.takeByte() catch return error.MalformedToken;
             tenant = r.take(tenant_len) catch return error.MalformedToken;
         }
+        var issued_ms: i64 = 0;
+        var provider: Provider = .builtin;
+        var token_type: []const u8 = "";
+        if (v3) {
+            issued_ms = r.takeInt(i64, .little) catch return error.MalformedToken;
+            const pb = r.takeByte() catch return error.MalformedToken;
+            provider = std.meta.intToEnum(Provider, pb) catch return error.MalformedToken;
+            const tl = r.takeByte() catch return error.MalformedToken;
+            token_type = r.take(tl) catch return error.MalformedToken;
+        }
         if (r.seek != payload.len) return error.MalformedToken;
         if (now_s >= exp) return error.Expired;
         return .{
@@ -152,6 +188,9 @@ pub const Issuer = struct {
             .session_policy = if (pol.len == 0) null else pol,
             .federated_policies = roles,
             .tenant = tenant,
+            .issued_ms = issued_ms,
+            .provider = provider,
+            .token_type = token_type,
         };
     }
 
@@ -249,6 +288,13 @@ test "federated session carries policies and tenant" {
     try std.testing.expectEqualStrings(dn, cl.parent);
     try std.testing.expectEqualStrings("readwrite,diag", cl.federated_policies.?);
     try std.testing.expectEqualStrings("acme", cl.tenant);
+    var t = try test_issuer.issue(a, .{ .parent = "carol", .provider = .ldap, .token_type = "batch", .issued_ms = 1234 }, 0, prng.random());
+    defer t.deinit(a);
+    const tc = try test_issuer.validate(t.session_token, 0, &buf);
+    try std.testing.expectEqual(Provider.ldap, tc.provider);
+    try std.testing.expectEqualStrings("batch", tc.token_type);
+    try std.testing.expectEqual(@as(i64, 1234), tc.issued_ms);
+    try std.testing.expectError(error.InvalidTokenType, test_issuer.issue(a, .{ .parent = "x", .token_type = "t" ** 65 }, 0, prng.random()));
     var e = try test_issuer.issue(a, .{ .parent = "bob", .federated_policies = "" }, 0, prng.random());
     defer e.deinit(a);
     try std.testing.expectEqualStrings("", (try test_issuer.validate(e.session_token, 0, &buf)).federated_policies.?);

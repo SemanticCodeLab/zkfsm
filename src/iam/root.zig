@@ -12,6 +12,9 @@ pub const ldap = @import("ldap.zig");
 pub const idp = @import("idp.zig");
 pub const federation = @import("federation.zig");
 pub const tenants = @import("tenants.zig");
+pub const sessions = @import("sessions.zig");
+pub const ratelimit = @import("ratelimit.zig");
+pub const oidc_login = @import("oidc_login.zig");
 
 pub const Policy = policy.Policy;
 pub const Context = context.Context;
@@ -66,4 +69,7 @@ test {
     _ = idp;
     _ = federation;
     _ = tenants;
+    _ = sessions;
+    _ = ratelimit;
+    _ = oidc_login;
 }

@@ -73,6 +73,32 @@ pub const Tenant = struct {
     enabled: bool = true,
 };
 
+/// STS session metadata (never the token), kept for access-key listings.
+pub const Session = struct {
+    access_key: []const u8,
+    parent: []const u8,
+    provider: []const u8,
+    token_type: []const u8 = "",
+    issued_ms: i64,
+    expires_s: i64,
+};
+
+/// Sessions of `user` issued at or before `before_ms` are rejected (see sessions.zig).
+pub const Revocation = struct {
+    user: []const u8,
+    provider: []const u8 = "",
+    token_type: []const u8 = "",
+    before_ms: i64,
+};
+
+/// Request-rate and bandwidth limits of a bucket or tenant (see ratelimit.zig).
+pub const RateLimit = struct {
+    kind: []const u8,
+    name: []const u8,
+    requests: u64 = 0,
+    rate: u64 = 0,
+};
+
 pub const Snapshot = struct {
     format: u32 = format_version,
     users: []const User = &.{},
@@ -82,6 +108,9 @@ pub const Snapshot = struct {
     idp: []const IdpConfig = &.{},
     ldap_mappings: []const LdapMapping = &.{},
     tenants: []const Tenant = &.{},
+    sessions: []const Session = &.{},
+    revocations: []const Revocation = &.{},
+    rate_limits: []const RateLimit = &.{},
 };
 
 // ---------------------------------------------------------------- persistence
