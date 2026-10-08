@@ -9,7 +9,7 @@ const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
 pub const Tag = store_mod.Tag;
 
-pub const reserved_prefix = ".zkfsm-tables/";
+pub const reserved_prefix = @import("../object/root.zig").list.reserved_prefix;
 const marker_key = reserved_prefix ++ "bucket";
 pub const policy_key = reserved_prefix ++ "policy";
 const ns_prefix = reserved_prefix ++ "ns/";

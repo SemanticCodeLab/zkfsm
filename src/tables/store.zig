@@ -58,7 +58,7 @@ pub const Store = struct {
 
     /// Keys under `prefix` after `after`, in order.
     pub fn list(self: *Store, arena: std.mem.Allocator, bucket: []const u8, prefix: []const u8, after: []const u8, max: usize) Error!Page {
-        const res = self.svc.list(arena, bucket, .{ .prefix = prefix, .start_after = after, .max_keys = max }) catch |e| return mapErr(e);
+        const res = self.svc.list(arena, bucket, .{ .include_reserved = true, .prefix = prefix, .start_after = after, .max_keys = max }) catch |e| return mapErr(e);
         const keys = try arena.alloc([]const u8, res.contents.len);
         for (res.contents, keys) |c, *k| k.* = c.key;
         return .{ .keys = keys, .truncated = res.is_truncated };

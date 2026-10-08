@@ -174,10 +174,33 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     return control.handle(self, &r);
 }
 
+/// Denies reserved keys as targets (objects, multipart) and as copy sources.
 fn guardRoute(_: *anyopaque, c: *s3.handler.Ctx) s3.handler.ConnError!bool {
-    if (!std.mem.startsWith(u8, c.route.key, catalog.reserved_prefix)) return false;
+    var hit = object.list.isReserved(c.route.key);
+    for (c.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-amz-copy-source")) {
+        hit = hit or copySourceReserved(c.arena, h.value);
+    };
+    if (!hit) return false;
     try s3.handler.fail(c, .AccessDenied);
     return true;
+}
+
+/// `[/]bucket/key[?versionId=..]`, percent-encoded; undecodable counts as reserved.
+fn copySourceReserved(arena: std.mem.Allocator, raw: []const u8) bool {
+    const path = raw[0 .. std.mem.indexOfScalar(u8, raw, '?') orelse raw.len];
+    const dec = s3.router.percentDecode(arena, path, false) catch return true;
+    const p = std.mem.trimLeft(u8, dec, "/");
+    const slash = std.mem.indexOfScalar(u8, p, '/') orelse return false;
+    return object.list.isReserved(p[slash + 1 ..]);
+}
+
+test "copy source guard" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expect(copySourceReserved(a.allocator(), "/b/.zkfsm-tables/bucket"));
+    try std.testing.expect(copySourceReserved(a.allocator(), "b/%2Ezkfsm-tables%2Fns%2Fx?versionId=1"));
+    try std.testing.expect(!copySourceReserved(a.allocator(), "/b/data/x"));
+    try std.testing.expect(copySourceReserved(a.allocator(), "/b/%zz"));
 }
 
 test "route matching" {

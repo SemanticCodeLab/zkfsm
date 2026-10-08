@@ -136,6 +136,40 @@ check "commit failed type" CommitFailedException "$(jget 'd["error"]["type"]')"
 check "reserved key read denied" 403 "$(icurl -o /dev/null -w '%{http_code}' "$EP/tb1/.zkfsm-tables/bucket")"
 check "reserved key write denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -d x "$EP/tb1/.zkfsm-tables/bucket")"
 check "reserved key delete denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X DELETE "$EP/tb1/.zkfsm-tables/bucket")"
+icurl -X PUT -d x "$EP/tb1/-early" -o /dev/null
+icurl -X PUT -d y "$EP/tb1/zz/late" -o /dev/null
+DEL='<Delete><Object><Key>.zkfsm-tables/bucket</Key></Object><Object><Key>-early</Key></Object></Delete>'
+MD5="$(printf '%s' "$DEL" | openssl md5 -binary | base64)"
+icurl -X POST -H "Content-MD5: $MD5" -d "$DEL" "$EP/tb1?delete" >"$WORK/del.xml"
+check "DeleteObjects reserved key denied" 1 "$(grep -c '<Error><Key>.zkfsm-tables/bucket</Key><Code>AccessDenied</Code>' "$WORK/del.xml")"
+check "DeleteObjects other key deleted" 1 "$(grep -c '<Deleted><Key>-early</Key>' "$WORK/del.xml")"
+check "catalog intact after DeleteObjects" 200 "$(code "$EP/buckets/$A")"
+icurl -X PUT -d x "$EP/tb1/-early" -o /dev/null
+check "copy from reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -H 'x-amz-copy-source: /tb1/.zkfsm-tables/bucket' "$EP/tb1/stolen")"
+check "copy from reserved (encoded) denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -H 'x-amz-copy-source: tb1/%2Ezkfsm-tables%2Fbucket' "$EP/tb1/stolen")"
+check "copy onto reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -H 'x-amz-copy-source: /tb1/-early' "$EP/tb1/.zkfsm-tables/bucket")"
+check "multipart create on reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X POST "$EP/tb1/.zkfsm-tables/x?uploads")"
+check "multipart part on reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -d x "$EP/tb1/.zkfsm-tables/x?partNumber=1&uploadId=abc")"
+check "multipart complete on reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X POST -d '<CompleteMultipartUpload/>' "$EP/tb1/.zkfsm-tables/x?uploadId=abc")"
+UPID="$(icurl -X POST "$EP/tb1/upl?uploads" | sed -n 's:.*<UploadId>\(.*\)</UploadId>.*:\1:p')"
+check "UploadPartCopy from reserved denied" 403 "$(icurl -o /dev/null -w '%{http_code}' -X PUT -H 'x-amz-copy-source: /tb1/.zkfsm-tables/bucket' "$EP/tb1/upl?partNumber=1&uploadId=$UPID")"
+check "ListObjects V1 hides reserved" 0 "$(icurl "$EP/tb1" | grep -c zkfsm-tables)"
+check "ListObjects V2 hides reserved" 0 "$(icurl "$EP/tb1?list-type=2" | grep -c zkfsm-tables)"
+check "ListObjects V2 delimiter hides reserved" 0 "$(icurl "$EP/tb1?list-type=2&delimiter=/" | grep -c zkfsm-tables)"
+check "ListObjectVersions hides reserved" 0 "$(icurl "$EP/tb1?versions" | grep -c zkfsm-tables)"
+check "ListMultipartUploads hides reserved" 0 "$(icurl "$EP/tb1?uploads" | grep -c zkfsm-tables)"
+ALL="$(icurl "$EP/tb1?list-type=2" | grep -o '<Key>[^<]*</Key>' | tr '\n' ' ')"
+walk=""; tok=""
+for _ in $(seq 50); do
+  pg="$(icurl "$EP/tb1?list-type=2&max-keys=1${tok:+&continuation-token=$(enc "$tok")}")"
+  walk+="$(grep -o '<Key>[^<]*</Key>' <<<"$pg" | tr '\n' ' ')"
+  grep -q '<IsTruncated>true</IsTruncated>' <<<"$pg" || break
+  tok="$(sed -n 's:.*<NextContinuationToken>\([^<]*\)</NextContinuationToken>.*:\1:p' <<<"$pg")"
+done
+check "paged V2 walk equals full listing" "$ALL" "$walk"
+check "paged walk spans reserved range" True "$([[ "$walk" == *"-early"* && "$walk" == *"zz/late"* ]] && echo True || echo False)"
+VER="$(icurl "$EP/tb1?versions&max-keys=1")"
+check "versions page truncates past reserved" 1 "$(grep -c '<IsTruncated>true</IsTruncated>' <<<"$VER")"
 check "metadata file readable via S3" 200 "$(icurl -o /dev/null -w '%{http_code}' "$EP/tb1/$KEY0")"
 if [[ -n "$MC" ]]; then
   "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null

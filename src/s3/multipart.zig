@@ -649,6 +649,10 @@ fn deleteObjects(c: *Ctx) OpError!void {
         const key = try xml_read.unescape(c.arena, (try ks.next("Key")) orelse return error.MalformedXML);
         ks.pos = 0;
         const version_s: ?[]const u8 = if (try ks.next("VersionId")) |vs| std.mem.trim(u8, vs, " \t\r\n") else null;
+        if (object.list.isReserved(key)) {
+            try deleteError(w, key, version_s, .AccessDenied);
+            continue;
+        }
         var version: ?core.VersionId = null;
         if (version_s) |vs| version = ov.parseVersionId(vs) catch {
             try deleteError(w, key, vs, .InvalidArgument);

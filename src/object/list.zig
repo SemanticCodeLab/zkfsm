@@ -10,7 +10,16 @@ pub const Entry = struct {
     tiered: bool = false,
 };
 
+/// Catalog keys (S3 Tables) that listings never show.
+pub const reserved_prefix = ".zkfsm-tables/";
+
+pub fn isReserved(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, reserved_prefix);
+}
+
 pub const Params = struct {
+    /// Show reserved keys too (the catalog's own listings).
+    include_reserved: bool = false,
     prefix: []const u8 = "",
     delimiter: []const u8 = "",
     start_after: []const u8 = "",

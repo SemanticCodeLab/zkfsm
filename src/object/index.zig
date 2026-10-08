@@ -404,6 +404,10 @@ pub const Index = struct {
         while (out.items.len <= p.max_keys) {
             const n = b.at(pos) orelse break;
             if (!std.mem.startsWith(u8, n.key, p.prefix)) break;
+            if (!p.include_reserved and list.isReserved(n.key)) {
+                pos = b.seekPast(pos, list.reserved_prefix);
+                continue;
+            }
             const cur = n.current orelse {
                 pos = b.next(pos);
                 continue;
@@ -437,6 +441,10 @@ pub const Index = struct {
         while (units <= q.max_keys) {
             const n = b.at(pos) orelse break;
             if (!std.mem.startsWith(u8, n.key, q.prefix)) break;
+            if (list.isReserved(n.key)) {
+                pos = b.seekPast(pos, list.reserved_prefix);
+                continue;
+            }
             if (commonPrefix(n.key, q.prefix, q.delimiter)) |cp| {
                 if (std.mem.lessThan(u8, q.key_marker, cp)) {
                     const v = n.current orelse n.noncurrent.items[0];
