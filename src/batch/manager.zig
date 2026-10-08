@@ -191,7 +191,7 @@ pub const Manager = struct {
         m.mutex.lock();
         defer m.mutex.unlock();
         for (m.jobs.items) |j| if (std.mem.eql(u8, &j.id, id)) {
-            if (j.done.load(.acquire)) return .finished;
+            if (j.done.load(.acquire) or !j.getState().active()) return .finished;
             j.cancel.store(true, .release);
             return .canceled;
         };
