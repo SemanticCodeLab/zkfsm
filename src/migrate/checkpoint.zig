@@ -81,11 +81,11 @@ pub const Checkpoint = struct {
     fn mark(c: *Checkpoint, kind: u8, bucket: []const u8, key: ?[]const u8) Error!void {
         // Keys with newlines cannot be recorded; they are simply redone on resume.
         if (key) |k| if (std.mem.indexOfScalar(u8, k, '\n') != null) return;
-        var buf: [2048]u8 = undefined;
-        const line = format(&buf, kind, bucket, key) orelse return;
+        var buf: [2049]u8 = undefined;
+        const line = format(buf[0..2048], kind, bucket, key) orelse return;
         try c.add(line);
-        var w = c.file.writer(&.{});
-        w.interface.print("{s}\n", .{line}) catch return error.CheckpointFailed;
+        buf[line.len] = '\n';
+        c.file.writeAll(buf[0 .. line.len + 1]) catch return error.CheckpointFailed;
         c.pending += 1;
         if (kind == 'B' or c.pending >= sync_every) {
             c.file.sync() catch return error.CheckpointFailed;
