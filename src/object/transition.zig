@@ -71,10 +71,11 @@ fn decodeEntry(bytes: []const u8) ?JournalEntry {
 
 pub const Outcome = enum { done, skipped, failed };
 
-/// Moves the data of version `rec` of `bucket` to `tier_name`; the record keeps its
-/// metadata plus the remote pointer. Losing a race with a writer is `skipped`.
+/// Moves the data of version `rec` of `bucket` to `tier_name` (from local storage or,
+/// for chained rules, from its current tier); the record keeps its metadata plus the
+/// remote pointer. Losing a race with a writer is `skipped`.
 pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const u8) Error!Outcome {
-    if (rec.tier.len > 0 or rec.flags.delete_marker) return .skipped;
+    if (rec.flags.delete_marker or std.mem.eql(u8, rec.tier, tier_name)) return .skipped;
     const reg = svc.tiers orelse return .skipped;
     const t = reg.acquire(tier_name) orelse {
         log.warn("transition of {s}/{s}: tier {s} is not configured", .{ bucket, rec.key, tier_name });
@@ -84,23 +85,30 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
     defer t.release();
     var id: [16]u8 = undefined;
     std.crypto.random.bytes(&id);
-    const segs = [_]blob.Segment{.{ .blob = rec.object_id, .offset = 0, .length = rec.size }};
     var buf: [64 * 1024]u8 = undefined;
-    var br = blob.BlobReader.init(svc.store, &segs, &buf);
-    t.put(id, &br.reader, rec.size) catch |e| {
-        if (br.err) |be| if (be == error.NotFound) return .skipped; // replaced meanwhile
-        log.warn("transition of {s}/{s} to {s} failed: {t}", .{ bucket, rec.key, tier_name, e });
+    const ok = if (rec.tier.len == 0) blk: {
+        const segs = [_]blob.Segment{.{ .blob = rec.object_id, .offset = 0, .length = rec.size }};
+        var br = blob.BlobReader.init(svc.store, &segs, &buf);
+        t.put(id, &br.reader, rec.size) catch |e| {
+            if (br.err) |be| if (be == error.NotFound) return .skipped; // replaced meanwhile
+            log.warn("transition of {s}/{s} to {s} failed: {t}", .{ bucket, rec.key, tier_name, e });
+            break :blk false;
+        };
+        break :blk true;
+    } else try retierCopy(svc, reg, rec, t, id, &buf);
+    if (!ok) {
         tier.Counters.inc(&reg.counters.transition_failures, 1);
         svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .transition_failed, .size = rec.size });
         return .failed;
-    };
-    const Ctx = struct { oid: core.ObjectId, tier: []const u8, id: [16]u8 };
-    _ = versioning.mutate(svc, bucket, rec.key, rec.versionId(), Ctx{ .oid = rec.object_id, .tier = t.cfg.name, .id = id }, struct {
+    }
+    const Ctx = struct { oid: core.ObjectId, from: []const u8, from_id: [16]u8, tier: []const u8, id: [16]u8 };
+    _ = versioning.mutate(svc, bucket, rec.key, rec.versionId(), Ctx{ .oid = rec.object_id, .from = rec.tier, .from_id = rec.tier_object, .tier = t.cfg.name, .id = id }, struct {
         fn f(c: Ctx, _: versioning.BucketConfig, r: *Record) Error!void {
-            if (!r.object_id.eql(c.oid) or r.tier.len > 0) return error.PreconditionFailed;
+            if (!r.object_id.eql(c.oid) or !std.mem.eql(u8, r.tier, c.from)) return error.PreconditionFailed;
+            if (c.from.len > 0 and !std.mem.eql(u8, &r.tier_object, &c.from_id)) return error.PreconditionFailed;
             r.tier = c.tier;
             r.tier_object = c.id;
-            r.restore_expiry_ns = 0;
+            if (c.from.len == 0) r.restore_expiry_ns = 0;
         }
     }.f) catch |e| {
         t.delete(id) catch enqueueCleanup(svc, t.cfg.name, id);
@@ -114,12 +122,39 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
             },
         };
     };
-    svc.store.delete(placement.dataKey(rec.object_id)) catch {};
+    if (rec.tier.len == 0) {
+        svc.store.delete(placement.dataKey(rec.object_id)) catch {};
+    } else {
+        dropRemote(svc, reg, rec.tier, rec.tier_object);
+    }
     tier.Counters.inc(&reg.counters.transitions, 1);
     tier.Counters.inc(&reg.counters.transitioned_bytes, rec.size);
     reg.recordTransition(t.cfg.name, rec.size);
     svc.emitEvent(.{ .bucket = bucket, .key = rec.key, .version = rec.versionId(), .kind = .transitioned, .size = rec.size });
     return .done;
+}
+
+/// Copies tiered data of `rec` from its tier to `dst` (chained transition).
+fn retierCopy(svc: *Svc, reg: *tier.Registry, rec: Record, dst: *tier.Tier, id: [16]u8, buf: []u8) Error!bool {
+    const src = reg.acquire(rec.tier) orelse {
+        log.warn("transition of {s}: source tier {s} is not configured", .{ rec.key, rec.tier });
+        return false;
+    };
+    defer src.release();
+    const chunk = try svc.gpa.alloc(u8, @intCast(@max(1, @min(tier.chunk_len, rec.size))));
+    defer svc.gpa.free(chunk);
+    var rd = tier.Reader.init(src, rec.tier_object, 0, rec.size, chunk, buf);
+    dst.put(id, &rd.interface, rec.size) catch |e| {
+        log.warn("transition of {s} from {s} to {s} failed: {t}", .{ rec.key, rec.tier, dst.cfg.name, e });
+        return false;
+    };
+    return true;
+}
+
+fn dropRemote(svc: *Svc, reg: *tier.Registry, tier_name: []const u8, id: [16]u8) void {
+    const t = reg.acquire(tier_name) orelse return enqueueCleanup(svc, tier_name, id);
+    defer t.release();
+    t.delete(id) catch enqueueCleanup(svc, tier_name, id);
 }
 
 // ---- restore ----
@@ -537,4 +572,29 @@ test "noncurrent transition, copy of tiered data, and version delete cleanup" {
     _ = try versioning.deleteObject(svc, "tbk", "k", .{ .version = v1.version_id });
     try std.testing.expectEqual(@as(usize, 1), (try housekeeping(svc, core.time.nowNs(), true)).cleaned);
     try std.testing.expectEqual(@as(u32, 0), e.mem.objects.count());
+}
+
+test "chained transitions move data tier to tier" {
+    var e: TierEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const svc = &e.svc;
+    var cold: MemTier = .{ .gpa = std.testing.allocator };
+    defer cold.deinit();
+    try e.reg.pin("COLD", cold.provider());
+    const v = try e.put("k", "chained data");
+    try std.testing.expectError(error.InvalidRequest, lifecycle.set(svc, "tbk", &.{.{ .transition_days = 2, .transition_tier = "WARM", .more_transitions = &.{.{ .days = 1, .tier = "COLD" }} }}));
+    try lifecycle.set(svc, "tbk", &.{.{ .transition_days = 1, .transition_tier = "WARM", .more_transitions = &.{.{ .days = 3, .tier = "COLD" }} }});
+    try std.testing.expectEqual(@as(usize, 1), (try lifecycle.runOnce(svc, dueAt(v.created_ns, 1))).transitioned);
+    try std.testing.expectEqualStrings("WARM", (try svc.head(e.arena.allocator(), "tbk", "k")).tier);
+    try std.testing.expectEqual(@as(usize, 0), (try lifecycle.runOnce(svc, dueAt(v.created_ns, 2))).transitioned);
+    try std.testing.expectEqual(@as(usize, 1), (try lifecycle.runOnce(svc, dueAt(v.created_ns, 3))).transitioned);
+    try std.testing.expectEqualStrings("COLD", (try svc.head(e.arena.allocator(), "tbk", "k")).tier);
+    try std.testing.expectEqual(@as(u32, 0), e.mem.objects.count());
+    try std.testing.expectEqual(@as(u32, 1), cold.objects.count());
+    try std.testing.expectEqualStrings("chained data", try e.body("k", null, null));
+    // A local object past every step goes straight to the last tier.
+    const w = try e.put("late", "skip ahead");
+    try std.testing.expectEqual(@as(usize, 1), (try lifecycle.runOnce(svc, dueAt(w.created_ns, 5))).transitioned);
+    try std.testing.expectEqualStrings("COLD", (try svc.head(e.arena.allocator(), "tbk", "late")).tier);
 }
