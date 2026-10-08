@@ -330,7 +330,8 @@ if command -v initdb >/dev/null && command -v postgres >/dev/null && command -v 
   echo zkpass >"$WORK/pgpw"
   initdb -D "$WORK/pg" -U postgres --auth=scram-sha-256 --pwfile="$WORK/pgpw" >"$WORK/initdb.log" 2>&1
   pg_up() {
-    postgres -D "$WORK/pg" -p "$PGP" -k "$WORK" -c listen_addresses=127.0.0.1 >>"$WORK/pg.log" 2>&1 &
+    # TCP only: a socket under a long $TMPDIR exceeds the 107-byte sun_path limit.
+    postgres -D "$WORK/pg" -p "$PGP" -k "" -c listen_addresses=127.0.0.1 >>"$WORK/pg.log" 2>&1 &
     PID[pg]=$!
     for _ in $(seq 100); do PGPASSWORD=zkpass psql -h 127.0.0.1 -p "$PGP" -U postgres -tAc 'select 1' >/dev/null 2>&1 && return 0; sleep 0.2; done
     echo "postgres did not start"; tail -n 20 "$WORK/pg.log" "$WORK/initdb.log"; exit 1
