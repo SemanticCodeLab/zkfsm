@@ -602,14 +602,13 @@ test "hostile updates are rejected, not crashed on" {
     const ar = a.allocator();
     var d: Diag = .{};
     const cases = [_][]const u8{
-        "[1]",                                                             "[{}]",
-        "[{\"action\":7}]",                                                "[{\"action\":\"nope\"}]",
-        "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"list\"}}]",    "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"fields\":[1]}}]",
-        "[{\"action\":\"set-current-schema\",\"schema-id\":-1}]",          "[{\"action\":\"set-current-schema\",\"schema-id\":42}]",
-        "[{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":1}]",
-        "[{\"action\":\"set-properties\",\"updates\":{\"a\":1}}]",
-        "[{\"action\":\"remove-snapshots\",\"snapshot-ids\":[\"x\"]}]",     "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1}}]",
-        "[{\"action\":\"remove-schemas\",\"schema-ids\":[0]}]",            "[{\"action\":\"add-spec\",\"spec\":{\"fields\":[{\"source-id\":1}]}}]",
+        "[1]",                                                                                             "[{}]",
+        "[{\"action\":7}]",                                                                                "[{\"action\":\"nope\"}]",
+        "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"list\"}}]",                                    "[{\"action\":\"add-schema\",\"schema\":{\"type\":\"struct\",\"fields\":[1]}}]",
+        "[{\"action\":\"set-current-schema\",\"schema-id\":-1}]",                                          "[{\"action\":\"set-current-schema\",\"schema-id\":42}]",
+        "[{\"action\":\"set-snapshot-ref\",\"ref-name\":\"main\",\"type\":\"branch\",\"snapshot-id\":1}]", "[{\"action\":\"set-properties\",\"updates\":{\"a\":1}}]",
+        "[{\"action\":\"remove-snapshots\",\"snapshot-ids\":[\"x\"]}]",                                    "[{\"action\":\"add-snapshot\",\"snapshot\":{\"snapshot-id\":1}}]",
+        "[{\"action\":\"remove-schemas\",\"schema-ids\":[0]}]",                                            "[{\"action\":\"add-spec\",\"spec\":{\"fields\":[{\"source-id\":1}]}}]",
         "[{\"action\":\"set-default-sort-order\",\"sort-order-id\":99}]",
     };
     for (cases) |c| {
