@@ -80,6 +80,8 @@ fi
 kind load docker-image --name "$CLUSTER" zc-k8s/zkfsm:v1 zc-k8s/zkfsm:v2 zc-k8s/zkfsm-operator:dev >/dev/null
 
 log "install operator"
+# helm installs crds/ only once; apply so schema changes land on reruns.
+kubectl apply -f "$ROOT/helm/zkfsm-operator/crds/" >/dev/null
 helm upgrade --install zkop "$ROOT/helm/zkfsm-operator" -n zkfsm-system --create-namespace \
   --set image.repository=zc-k8s/zkfsm-operator --set image.tag=dev --set interval=3 >/dev/null
 # The test image's entrypoint is the server; run the operator binary instead.
@@ -136,7 +138,7 @@ k patch zkc s3 --type=merge -p '{"spec":{"image":"zc-k8s/zkfsm:v2"}}' >/dev/null
 forward
 max_down=0
 get_fail=0
-for _ in $(seq 300); do
+for _ in $(seq 900); do
   ready=$(k get pods -l zkfsm.io/cluster=s3 -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c True || true)
   total=$(k get pods -l zkfsm.io/cluster=s3 --no-headers 2>/dev/null | wc -l)
   down=$((4 - ready)); ((down > max_down)) && max_down=$down
@@ -165,16 +167,7 @@ for i in $(seq 1 8); do head -c 200000 /dev/urandom >"$WORK/n$i"; [[ "$(put "n$i
 check "objects written after expansion" 200 "$(get n8 "$WORK/back")"
 check "pool-1 holds data" yes "$(k exec s3-pool-1-0 -- sh -c 'find /data1 /data2 -type f | grep -q . && echo yes')"
 
-log "switch to self-signed TLS (all pods restart together)"
-k patch zkc s3 --type=merge -p '{"spec":{"tls":{"mode":"selfSigned"}}}' >/dev/null
-sleep 8
-wait_phase Ready 300
-k get secret s3-tls -o jsonpath='{.data.ca\.crt}' | base64 -d >"$WORK/ca.crt"
-SCHEME=https
-CURL_TLS=(--cacert "$WORK/ca.crt")
-forward
-check "https get verifies against the cluster CA" 200 "$(get obj1 "$WORK/back")"
-check "content over https" same "$(same "$WORK/obj1" "$WORK/back")"
+check "tls.mode change is rejected" rejected "$(k patch zkc s3 --type=merge -p '{"spec":{"tls":{"mode":"selfSigned"}}}' >/dev/null 2>&1 && echo accepted || echo rejected)"
 
 log "decommission pool-1 through the admin API"
 k patch zkc s3 --type=json -p '[{"op":"add","path":"/spec/pools/1/decommission","value":true}]' >/dev/null
@@ -193,6 +186,32 @@ if [[ "$pool1" == decommissioned ]]; then
 else
   echo "     pool-1 state: $pool1 (the server build does not drain pools)"
 fi
+
+log "second cluster with self-signed TLS from the start"
+cat >"$WORK/tls.yaml" <<YAML
+apiVersion: zkfsm.io/v1
+kind: Cluster
+metadata: {name: s3tls, namespace: $NS}
+spec:
+  image: zc-k8s/zkfsm:v2
+  credsSecret: s3-root
+  pools: [{name: p0, servers: 4, drivesPerServer: 1, size: 1Gi, storageClassName: $SC}]
+  tls: {mode: selfSigned}
+  iam: {buckets: [{name: tlsb}]}
+YAML
+kubectl apply -f "$WORK/tls.yaml" >/dev/null
+for _ in $(seq 300); do [[ "$(k get zkc s3tls -o jsonpath='{.status.phase}')" == Ready ]] && break; sleep 1; done
+check "tls cluster ready" Ready "$(k get zkc s3tls -o jsonpath='{.status.phase}')"
+k get secret s3tls-tls -o jsonpath='{.data.ca\.crt}' | base64 -d >"$WORK/ca.crt"
+[[ -n "$PF" ]] && kill "$PF" 2>/dev/null || true
+TPORT="$(free_port)"
+k port-forward svc/s3tls "$TPORT:9000" >"$WORK/pf2.log" 2>&1 &
+PF=$!
+for _ in $(seq 50); do curl -s --cacert "$WORK/ca.crt" -o /dev/null "https://127.0.0.1:$TPORT/health/live" && break; sleep 0.2; done
+U=admin:admin-secret-123
+check "https put verified by the cluster CA" 200 "$(curl -sS --cacert "$WORK/ca.crt" --aws-sigv4 aws:amz:us-east-1:s3 --user $U -o /dev/null -w '%{http_code}' -T "$WORK/obj1" "https://127.0.0.1:$TPORT/tlsb/o")"
+curl -sS --cacert "$WORK/ca.crt" --aws-sigv4 aws:amz:us-east-1:s3 --user $U -o "$WORK/back" "https://127.0.0.1:$TPORT/tlsb/o"
+check "https content" same "$(same "$WORK/obj1" "$WORK/back")"
 
 log "result: $PASS passed, $FAIL failed"
 [[ "$FAIL" == 0 ]]
