@@ -1,7 +1,7 @@
 //! Minimal Kubernetes API client: HTTPS with the service-account token and CA,
 //! or a plain base URL (kubectl proxy) for development. JSON in, JSON out.
 const std = @import("std");
-const TlsClient = @import("tls_client.zig");
+const dial = @import("tls_dial");
 
 pub const sa_dir = "/var/run/secrets/kubernetes.io/serviceaccount";
 
@@ -18,9 +18,9 @@ pub const Client = struct {
     gpa: std.mem.Allocator,
     http: std.http.Client,
     base: []const u8,
-    /// Set for https: the API server's CA. Requests then go through `tls_client`,
-    /// which tolerates the server's request for an (optional) client certificate.
-    ca: ?std.crypto.Certificate.Bundle = null,
+    /// Set for https: the API server's CA file. Requests then go through zkfsm's
+    /// TLS client, which answers the server's (optional) client-certificate request.
+    ca: ?[]const u8 = null,
     token_path: ?[]const u8 = null,
     field_manager: []const u8 = "zkfsm-operator",
     mutex: std.Thread.Mutex = .{},
@@ -37,8 +37,7 @@ pub const Client = struct {
     pub fn withCa(gpa: std.mem.Allocator, base: []const u8, ca_file: []const u8, token_file: ?[]const u8) !*Client {
         const c = try gpa.create(Client);
         errdefer gpa.destroy(c);
-        c.* = .{ .gpa = gpa, .http = .{ .allocator = gpa }, .base = base, .ca = .{}, .token_path = token_file };
-        try c.ca.?.addCertsFromFilePathAbsolute(gpa, ca_file);
+        c.* = .{ .gpa = gpa, .http = .{ .allocator = gpa }, .base = base, .ca = ca_file, .token_path = token_file };
         return c;
     }
 
@@ -59,7 +58,6 @@ pub const Client = struct {
     }
 
     pub fn deinit(c: *Client) void {
-        if (c.ca) |*b| b.deinit(c.gpa);
         c.http.deinit();
         c.gpa.destroy(c);
     }
@@ -124,34 +122,39 @@ pub const Client = struct {
     }
 };
 
-/// One HTTP/1.1 request per TLS connection (Connection: close).
-fn httpsRequest(arena: std.mem.Allocator, ca: std.crypto.Certificate.Bundle, url: []const u8, method: std.http.Method, headers: []const std.http.Header, body: ?[]const u8) !Response {
+/// One HTTP/1.1 request per TLS connection (Connection: close); the response is
+/// complete once its framing (Content-Length or chunked) is satisfied.
+fn httpsRequest(arena: std.mem.Allocator, ca_file: []const u8, url: []const u8, method: std.http.Method, headers: []const std.http.Header, body: ?[]const u8) !Response {
     const uri = try std.Uri.parse(url);
     const host = uri.host.?.percent_encoded;
-    const port = uri.port orelse 443;
-    const stream = try std.net.tcpConnectToHost(arena, host, port);
-    defer stream.close();
-    const bufs = try arena.alloc(u8, 4 * TlsClient.min_buffer_len);
-    var sr = stream.reader(bufs[0..TlsClient.min_buffer_len]);
-    var sw = stream.writer(bufs[TlsClient.min_buffer_len .. 2 * TlsClient.min_buffer_len]);
-    var tls = try TlsClient.init(sr.interface(), &sw.interface, .{
-        .host = .{ .explicit = host },
-        .ca = .{ .bundle = ca },
-        .read_buffer = bufs[2 * TlsClient.min_buffer_len .. 3 * TlsClient.min_buffer_len],
-        .write_buffer = bufs[3 * TlsClient.min_buffer_len ..],
-        // Message framing is checked below (Content-Length / chunked).
-        .allow_truncation_attacks = true,
-    });
-    const w = &tls.writer;
+    const conn = try dial.dial(arena, host, uri.port orelse 443, .{ .io_timeout_ms = 30000, .tls = .{ .ca_file = ca_file } });
+    defer conn.close();
+    const w = conn.writer();
     try w.print("{s} {s}{s}{s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\nUser-Agent: zkfsm-operator\r\n", .{
         @tagName(method), uri.path.percent_encoded, if (uri.query != null) "?" else "", if (uri.query) |q| q.percent_encoded else "", host,
     });
     for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     if (body) |b| try w.print("Content-Length: {d}\r\n\r\n{s}", .{ b.len, b }) else try w.writeAll("\r\n");
-    try w.flush();
-    try sw.interface.flush();
-    const raw = try tls.reader.allocRemaining(arena, .limited(256 << 20));
-    return parseResponse(arena, raw);
+    try conn.flush();
+    var raw: std.ArrayList(u8) = .empty;
+    var buf: [16384]u8 = undefined;
+    const r = conn.reader();
+    while (true) {
+        const n = r.readSliceShort(&buf) catch 0;
+        if (n > 0) try raw.appendSlice(arena, buf[0..n]);
+        if (parseResponse(arena, raw.items)) |resp| {
+            if (n == 0 or !closeDelimited(raw.items)) return resp;
+        } else |e| if (e != error.Truncated and e != error.BadResponse) return e;
+        if (n == 0) return parseResponse(arena, raw.items);
+        if (raw.items.len > 256 << 20) return error.ResponseTooLarge;
+    }
+}
+
+/// True when the body runs to connection close (no length, not chunked).
+fn closeDelimited(raw: []const u8) bool {
+    const end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return false;
+    const head = raw[0..end];
+    return std.ascii.indexOfIgnoreCase(head, "content-length:") == null and std.ascii.indexOfIgnoreCase(head, "transfer-encoding:") == null;
 }
 
 fn parseResponse(arena: std.mem.Allocator, raw: []const u8) !Response {

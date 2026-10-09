@@ -30,7 +30,7 @@ COPY k8s ./k8s
 RUN set -eu; \
     case "$TARGETARCH" in amd64) t=x86_64-linux-musl ;; arm64) t=aarch64-linux-musl ;; esac; \
     zig build-exe -target "$t" -O ReleaseSafe --dep kube --dep sio -Mroot=k8s/operator/main.zig \
-      -Mkube=k8s/kube.zig -Msio=src/admin/sio.zig --name zkfsm-operator; \
+      --dep tls_dial -Mkube=k8s/kube.zig -Mtls_dial=src/tls/dial.zig -Msio=src/admin/sio.zig --name zkfsm-operator; \
     mkdir -p /rootfs/tmp && chmod 1777 /rootfs/tmp
 
 FROM scratch

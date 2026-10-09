@@ -84,7 +84,13 @@ pub fn build(b: *std.Build) void {
     b.step("test-remote", "Run live remote backend tests").dependOn(&live_run.step);
 
     // Kubernetes operator (zkfsm.io/v1 Cluster); shares the admin-payload cipher with the server.
-    const kube_mod = b.createModule(.{ .root_source_file = b.path("k8s/kube.zig"), .target = target, .optimize = optimize });
+    const dial_mod = b.createModule(.{ .root_source_file = b.path("src/tls/dial.zig"), .target = target, .optimize = optimize });
+    const kube_mod = b.createModule(.{
+        .root_source_file = b.path("k8s/kube.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "tls_dial", .module = dial_mod }},
+    });
     const sio_mod = b.createModule(.{ .root_source_file = b.path("src/admin/sio.zig"), .target = target, .optimize = optimize });
     const op_mod = b.createModule(.{
         .root_source_file = b.path("k8s/operator/main.zig"),
