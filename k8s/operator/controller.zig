@@ -245,6 +245,7 @@ pub const Controller = struct {
         var topo_changed = false;
         var total: u32 = 0;
         var ready_n: u32 = 0;
+        var settled_n: u32 = 0;
         for (live) |p| {
             total += p.servers;
             const sts = try ctl.kc.getJson(a, try kube.resPath(a, "apps/v1", c.namespace, "statefulsets", try c.stsName(a, p.name))) orelse continue;
@@ -254,6 +255,7 @@ pub const Controller = struct {
             var pool_ready: u32 = 0;
             for (kube.items(pods)) |pod| {
                 if (podReady(pod)) pool_ready += 1;
+                if (podSettled(pod, std.time.timestamp())) settled_n += 1;
                 const prev = kube.str(pod, &.{ "metadata", "labels", "controller-revision-hash" }) orelse "";
                 if (rev.len > 0 and !std.mem.eql(u8, prev, rev) and kube.lookup(pod, &.{ "metadata", "deletionTimestamp" }) == null) {
                     try outdated.append(a, pod);
@@ -280,7 +282,7 @@ pub const Controller = struct {
             // Gate: every pod reports ready (quorum) before the next one goes down.
             // Kubelet's readiness probe is /health/ready (quorum); dialing pods by DNS
             // can hit a stale address and stall in connect, so the service is asked instead.
-            if (ready_n == total and cluster_ready) {
+            if (settled_n == total and cluster_ready) {
                 try ctl.deletePod(a, c, pickLast(outdated.items));
             }
             try st.setCond(a, "Available", if (cluster_ready) "True" else "False", if (cluster_ready) "Ready" else "Updating", "rolling update in progress");
@@ -384,6 +386,49 @@ fn podReady(pod: Value) bool {
         if (std.mem.eql(u8, t, "Ready")) return std.mem.eql(u8, kube.str(cd, &.{"status"}) orelse "", "True");
     }
     return false;
+}
+
+/// Ready for a while and not terminating: readiness lags a peer going down by
+/// a few probe periods, so a fresh Ready says little about quorum.
+pub const settle_s = 20;
+
+fn podSettled(pod: Value, now: i64) bool {
+    if (kube.lookup(pod, &.{ "metadata", "deletionTimestamp" }) != null) return false;
+    const conds = kube.lookup(pod, &.{ "status", "conditions" }) orelse return false;
+    if (conds != .array) return false;
+    for (conds.array.items) |cd| {
+        const t = kube.str(cd, &.{"type"}) orelse continue;
+        if (!std.mem.eql(u8, t, "Ready")) continue;
+        if (!std.mem.eql(u8, kube.str(cd, &.{"status"}) orelse "", "True")) return false;
+        const since = parseTime(kube.str(cd, &.{"lastTransitionTime"}) orelse return false) orelse return false;
+        return now - since >= settle_s;
+    }
+    return false;
+}
+
+/// RFC 3339 UTC ("2026-10-09T03:52:39Z") to epoch seconds.
+fn parseTime(t: []const u8) ?i64 {
+    if (t.len < 20 or t[4] != '-' or t[10] != 'T') return null;
+    const f = struct {
+        fn n(s: []const u8) ?i64 {
+            return std.fmt.parseInt(i64, s, 10) catch null;
+        }
+    };
+    const y = f.n(t[0..4]) orelse return null;
+    const mo = f.n(t[5..7]) orelse return null;
+    const d = f.n(t[8..10]) orelse return null;
+    const h = f.n(t[11..13]) orelse return null;
+    const mi = f.n(t[14..16]) orelse return null;
+    const se = f.n(t[17..19]) orelse return null;
+    // Days from civil (proleptic Gregorian).
+    const yy = if (mo <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(mo + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400 + h * 3600 + mi * 60 + se;
 }
 
 /// Highest ordinal first, like a StatefulSet rolling update.
@@ -554,4 +599,8 @@ test "rolling order and readiness" {
     try std.testing.expectEqualStrings("s3-p0-10", kube.str(pickLast(pods.array.items), &.{ "metadata", "name" }).?);
     const pod = try std.json.parseFromSliceLeaky(Value, a, "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\"}]}}", .{});
     try std.testing.expect(podReady(pod));
+    try std.testing.expectEqual(@as(?i64, 1790000000), parseTime("2026-09-21T14:13:20Z"));
+    const fresh = try std.json.parseFromSliceLeaky(Value, a, "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"lastTransitionTime\":\"2026-09-21T14:13:20Z\"}]}}", .{});
+    try std.testing.expect(!podSettled(fresh, 1790000000 + 5));
+    try std.testing.expect(podSettled(fresh, 1790000000 + 30));
 }
