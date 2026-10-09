@@ -56,9 +56,9 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("s3load", "Build the HTTP load generator").dependOn(&b.addInstallArtifact(s3load, .{}).step);
 
-    // IAM is not wired into main.zig yet; test it as its own root.
+    // IAM tests as their own root (src/ so iam can import the tls layer).
     const iam_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/iam/root.zig"),
+        .root_source_file = b.path("src/iam_tests.zig"),
         .target = target,
         .optimize = optimize,
     }) });

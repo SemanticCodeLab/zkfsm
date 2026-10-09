@@ -43,7 +43,7 @@ pub const StaticKms = struct {
     fn store(p: *anyopaque, gpa: Allocator, rec: keyring.KeyRecord, mode: keyring.KeyStore.Mode) Error!void {
         const s: *StaticKms = @ptrCast(@alignCast(p));
         _ = gpa;
-        _ = mode;
+        if (mode == .replace) return error.Unsupported;
         return if (std.mem.eql(u8, rec.id, s.name)) error.KeyExists else error.Unsupported;
     }
 

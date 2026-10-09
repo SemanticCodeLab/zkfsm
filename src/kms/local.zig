@@ -25,7 +25,7 @@ pub const LocalFileStore = struct {
     }
 
     pub fn keyStore(s: *LocalFileStore) keyring.KeyStore {
-        return .{ .ptr = s, .vtable = &.{ .load = load, .store = store, .list = list } };
+        return .{ .ptr = s, .vtable = &.{ .load = load, .store = store, .list = list, .remove = remove } };
     }
 
     fn fileName(buf: []u8, id: []const u8, suffix: []const u8) Error![]const u8 {
@@ -75,6 +75,16 @@ pub const LocalFileStore = struct {
             f.sync() catch return error.StorageFailed;
         }
         s.dir.rename(tmp, name) catch return error.StorageFailed;
+    }
+
+    fn remove(p: *anyopaque, _: Allocator, id: []const u8) Error!void {
+        const s: *LocalFileStore = @ptrCast(@alignCast(p));
+        var nb: [160]u8 = undefined;
+        const name = try fileName(&nb, id, "");
+        s.dir.deleteFile(name) catch |e| return switch (e) {
+            error.FileNotFound => error.KeyNotFound,
+            else => error.StorageFailed,
+        };
     }
 
     fn list(p: *anyopaque, gpa: Allocator) Error![][]u8 {

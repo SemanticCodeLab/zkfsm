@@ -22,10 +22,12 @@ pub const KeyRecord = struct {
     created_unix: i64,
     current: u32,
     versions: []Version,
+    tags: []types.Tag = &.{},
 
     pub fn deinit(r: *KeyRecord, gpa: Allocator) void {
         for (r.versions) |*v| std.crypto.secureZero(u8, &v.key);
         gpa.free(r.versions);
+        types.freeTags(gpa, r.tags);
         gpa.free(r.id);
         r.* = undefined;
     }
@@ -97,6 +99,19 @@ pub const KeyRecord = struct {
             try js.endObject();
         }
         try js.endArray();
+        if (r.tags.len > 0) {
+            try js.objectField("tags");
+            try js.beginArray();
+            for (r.tags) |t| {
+                try js.beginObject();
+                try js.objectField("k");
+                try js.write(t.key);
+                try js.objectField("v");
+                try js.write(t.value);
+                try js.endObject();
+            }
+            try js.endArray();
+        }
         try js.endObject();
     }
 
@@ -108,6 +123,7 @@ pub const KeyRecord = struct {
             created: i64,
             current: u32,
             versions: []const struct { v: u32, key: []const u8 },
+            tags: []const struct { k: []const u8, v: []const u8 } = &.{},
         };
         const parsed = std.json.parseFromSlice(Wire, gpa, bytes, .{ .allocate = .alloc_always }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -119,6 +135,8 @@ pub const KeyRecord = struct {
         }
         const w = parsed.value;
         if (w.format != format_version or !types.validKeyName(w.id) or w.versions.len == 0) return error.InvalidResponse;
+        if (w.tags.len > types.max_tags) return error.InvalidResponse;
+        for (w.tags) |t| if (!types.validTag(t.k, t.v)) return error.InvalidResponse;
         const vs = try gpa.alloc(Version, w.versions.len);
         errdefer {
             for (vs) |*v| std.crypto.secureZero(u8, &v.key);
@@ -130,7 +148,21 @@ pub const KeyRecord = struct {
             if (n != 32) return error.InvalidResponse;
             b64.Decoder.decode(&dst.key, src.key) catch return error.InvalidResponse;
         }
-        var rec: KeyRecord = .{ .id = try gpa.dupe(u8, w.id), .state = types.KeyState.parse(w.state), .created_unix = w.created, .current = w.current, .versions = vs };
+        const id = try gpa.dupe(u8, w.id);
+        errdefer gpa.free(id);
+        const tags = try gpa.alloc(types.Tag, w.tags.len);
+        var nt: usize = 0;
+        errdefer types.freeTags(gpa, tags[0..nt]);
+        for (w.tags) |t| {
+            const k = try gpa.dupe(u8, t.k);
+            const v = gpa.dupe(u8, t.v) catch |e| {
+                gpa.free(k);
+                return e;
+            };
+            tags[nt] = .{ .key = k, .value = v };
+            nt += 1;
+        }
+        var rec: KeyRecord = .{ .id = id, .state = types.KeyState.parse(w.state), .created_unix = w.created, .current = w.current, .versions = vs, .tags = tags };
         if (rec.find(rec.current) == null) {
             rec.deinit(gpa);
             return error.InvalidResponse;
@@ -181,6 +213,8 @@ pub const KeyStore = struct {
         load: *const fn (*anyopaque, Allocator, []const u8) Error!KeyRecord,
         store: *const fn (*anyopaque, Allocator, KeyRecord, Mode) Error!void,
         list: *const fn (*anyopaque, Allocator) Error![][]u8,
+        /// Null when the store cannot delete records.
+        remove: ?*const fn (*anyopaque, Allocator, []const u8) Error!void = null,
     };
 
     pub fn load(s: KeyStore, gpa: Allocator, id: []const u8) Error!KeyRecord {
@@ -191,6 +225,10 @@ pub const KeyStore = struct {
     }
     pub fn list(s: KeyStore, gpa: Allocator) Error![][]u8 {
         return s.vtable.list(s.ptr, gpa);
+    }
+    pub fn remove(s: KeyStore, gpa: Allocator, id: []const u8) Error!void {
+        const f = s.vtable.remove orelse return error.Unsupported;
+        return f(s.ptr, gpa, id);
     }
 };
 
@@ -215,7 +253,20 @@ pub const KeyringKms = struct {
     const vt_kv2 = makeVTable(.vault_kv2);
 
     fn makeVTable(comptime k: types.BackendKind) types.Kms.VTable {
-        return .{ .kind = k, .createKey = createKey, .generateDataKey = generateDataKey, .decryptDataKey = decryptDataKey, .listKeys = listKeys, .keyStatus = keyStatus, .rotateKey = rotateKey };
+        return .{
+            .kind = k,
+            .createKey = createKey,
+            .generateDataKey = generateDataKey,
+            .decryptDataKey = decryptDataKey,
+            .listKeys = listKeys,
+            .keyStatus = keyStatus,
+            .rotateKey = rotateKey,
+            .setKeyState = setKeyState,
+            .deleteKey = deleteKey,
+            .keyTags = keyTags,
+            .setKeyTags = setKeyTags,
+            .sealDataKey = sealDataKey,
+        };
     }
 
     fn cast(p: *anyopaque) *KeyringKms {
@@ -250,10 +301,55 @@ pub const KeyringKms = struct {
         return dk;
     }
 
+    /// A disabled key still opens existing objects; only new use is refused.
     fn decryptDataKey(p: *anyopaque, gpa: Allocator, id: []const u8, sealed: []const u8, ctx: types.Context) Error![types.dek_len]u8 {
+        if (!types.validKeyName(id)) return error.InvalidArgument;
+        var rec = try cast(p).store.load(gpa, id);
+        defer rec.deinit(gpa);
+        if (rec.state != .enabled and rec.state != .disabled) return error.KeyDisabled;
+        return unseal(gpa, rec, sealed, ctx);
+    }
+
+    fn sealDataKey(p: *anyopaque, gpa: Allocator, id: []const u8, dek: *const [types.dek_len]u8, ctx: types.Context) Error!types.DataKey {
         var rec = try cast(p).loadEnabled(gpa, id);
         defer rec.deinit(gpa);
-        return unseal(gpa, rec, sealed, ctx);
+        var dk: types.DataKey = .{ .plaintext = dek.*, .sealed = &.{}, .key_version = rec.current };
+        errdefer std.crypto.secureZero(u8, &dk.plaintext);
+        dk.sealed = try seal(gpa, rec, dek, ctx);
+        return dk;
+    }
+
+    fn setKeyState(p: *anyopaque, gpa: Allocator, id: []const u8, state: types.KeyState) Error!void {
+        const self = cast(p);
+        if (!types.validKeyName(id)) return error.InvalidArgument;
+        var rec = try self.store.load(gpa, id);
+        defer rec.deinit(gpa);
+        if (rec.state == state) return;
+        rec.state = state;
+        try self.store.store(gpa, rec, .replace);
+    }
+
+    fn deleteKey(p: *anyopaque, gpa: Allocator, id: []const u8) Error!void {
+        if (!types.validKeyName(id)) return error.InvalidArgument;
+        return cast(p).store.remove(gpa, id);
+    }
+
+    fn keyTags(p: *anyopaque, gpa: Allocator, id: []const u8) Error![]types.Tag {
+        if (!types.validKeyName(id)) return error.InvalidArgument;
+        var rec = try cast(p).store.load(gpa, id);
+        defer rec.deinit(gpa);
+        return types.dupeTags(gpa, rec.tags);
+    }
+
+    fn setKeyTags(p: *anyopaque, gpa: Allocator, id: []const u8, tags: []const types.Tag) Error!void {
+        const self = cast(p);
+        if (!types.validKeyName(id)) return error.InvalidArgument;
+        var rec = try self.store.load(gpa, id);
+        defer rec.deinit(gpa);
+        const fresh = try types.dupeTags(gpa, tags);
+        types.freeTags(gpa, rec.tags);
+        rec.tags = fresh;
+        try self.store.store(gpa, rec, .replace);
     }
 
     fn listKeys(p: *anyopaque, gpa: Allocator) Error![]types.KeyInfo {
@@ -312,7 +408,15 @@ pub const MemoryStore = struct {
     }
 
     pub fn keyStore(m: *MemoryStore) KeyStore {
-        return .{ .ptr = m, .vtable = &.{ .load = load, .store = store, .list = list } };
+        return .{ .ptr = m, .vtable = &.{ .load = load, .store = store, .list = list, .remove = remove } };
+    }
+
+    fn remove(p: *anyopaque, _: Allocator, id: []const u8) Error!void {
+        const m: *MemoryStore = @ptrCast(@alignCast(p));
+        const kv = m.map.fetchSwapRemove(id) orelse return error.KeyNotFound;
+        std.crypto.secureZero(u8, kv.value);
+        m.gpa.free(kv.key);
+        m.gpa.free(kv.value);
     }
 
     fn load(p: *anyopaque, gpa: Allocator, id: []const u8) Error!KeyRecord {
@@ -406,4 +510,25 @@ test "keyring kms full lifecycle" {
     defer types.freeKeyInfos(gpa, list);
     try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expectError(error.KeyNotFound, k.keyStatus(gpa, "nope"));
+
+    // Disabled: no new data keys, existing ones still open; tags persist.
+    try k.setKeyState(gpa, "master", .disabled);
+    try std.testing.expectError(error.KeyDisabled, k.generateDataKey(gpa, "master", ctx));
+    try std.testing.expectError(error.KeyDisabled, k.sealDataKey(gpa, "master", &dk.plaintext, ctx));
+    _ = try k.decryptDataKey(gpa, "master", dk.sealed, ctx);
+    try k.setKeyState(gpa, "master", .enabled);
+    var ka = "env".*;
+    var va = "prod".*;
+    try k.setKeyTags(gpa, "master", &.{.{ .key = &ka, .value = &va }});
+    const tags = try k.keyTags(gpa, "master");
+    defer types.freeTags(gpa, tags);
+    try std.testing.expectEqualStrings("prod", tags[0].value);
+    try std.testing.expectError(error.InvalidArgument, k.setKeyTags(gpa, "master", &.{ .{ .key = &ka, .value = &va }, .{ .key = &ka, .value = &va } }));
+    var resealed = try k.sealDataKey(gpa, "master", &dk.plaintext, other);
+    defer resealed.deinit(gpa);
+    const again = try k.decryptDataKey(gpa, "master", resealed.sealed, other);
+    try std.testing.expectEqualSlices(u8, &dk.plaintext, &again);
+    try k.deleteKey(gpa, "master");
+    try std.testing.expectError(error.KeyNotFound, k.keyStatus(gpa, "master"));
+    try std.testing.expectError(error.KeyNotFound, k.deleteKey(gpa, "master"));
 }

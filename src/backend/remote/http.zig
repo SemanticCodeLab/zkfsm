@@ -53,6 +53,15 @@ fn componentStr(c: std.Uri.Component) []const u8 {
     };
 }
 
+/// Trusts `ca_file` (else $SSL_CERT_FILE) instead of the system roots when one is set.
+pub fn useCaFile(client: *http.Client, gpa: std.mem.Allocator, ca_file: []const u8) error{ InvalidConfig, OutOfMemory }!void {
+    const path = if (ca_file.len > 0) ca_file else std.posix.getenv("SSL_CERT_FILE") orelse return;
+    if (path.len == 0) return;
+    client.ca_bundle.addCertsFromFilePath(gpa, std.fs.cwd(), path) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidConfig;
+    if (client.ca_bundle.map.count() == 0) return error.InvalidConfig;
+    @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
+}
+
 /// Exponential backoff with full jitter.
 pub const RetryPolicy = struct {
     max_attempts: u32 = 5,

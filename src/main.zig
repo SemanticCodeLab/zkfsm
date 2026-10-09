@@ -45,6 +45,7 @@ const usage =
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
+    \\  --tls-min-version V   lowest TLS version accepted: 1.2 (default) or 1.3
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -105,6 +106,7 @@ const Config = struct {
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
+    tls_min_version: tls.Version = .tls12,
     kms: sse.setup.Flags = .{},
 };
 
@@ -177,6 +179,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.identity_openid = args[i];
         } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
             cfg.tls_client_ca = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-min-version")) {
+            cfg.tls_min_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -403,10 +407,12 @@ pub fn run(opts: Options) u8 {
     svc.events = ev_ext.sink();
     const observers = [_]s3.Observer{ev_ext.observer()};
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(&kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
@@ -418,6 +424,7 @@ pub fn run(opts: Options) u8 {
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -462,7 +469,7 @@ pub fn run(opts: Options) u8 {
 
 /// Cluster mode: the RPC route is served before bootstrap so peers can negotiate
 /// the layout; S3 requests wait behind the gate until storage and IAM are up.
-fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *const sse.setup.Holder) u8 {
+fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *sse.setup.Holder) u8 {
     if (cfg.heal_only) {
         std.log.err("heal runs continuously on cluster nodes; the one-shot heal command is for local drives", .{});
         return 2;
@@ -526,10 +533,12 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     const observers = [_]s3.Observer{ev_ext.observer()};
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -537,6 +546,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });

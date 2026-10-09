@@ -435,6 +435,21 @@ key/create,key/rotate,key/list,key/status}`, gated by `kms:*` policy actions.
 KV2 backends) sealed under that key. `POST /minio/kms/v1/restore[?dry-run=true]`
 takes the same document back and never overwrites existing keys.
 
+Key lifecycle (local and KV2 backends; also under `/minio/admin/v3/kms/`):
+`POST key/enable|key/disable?key-id=` (a disabled key seals no new data keys;
+existing objects stay readable), `GET|PUT|DELETE key/tags?key-id=` (body
+`{"tags":{"k":"v"}}`), `DELETE key/delete?key-id=[&force=true]` (refused with 409
+while the key is the default, a bucket default, or seals any object version),
+`GET key/list?state=`. `POST key/rekey?bucket=&prefix=&key-id=&from-key-id=&marker=&max-keys=`
+re-seals object data keys under another key without touching data, one page per
+call (follow `next-marker`). `GET|POST config` reads or swaps the backend at
+runtime (`{"backend":"local|static|vault|kms-api","default_key":..,"dir":..,
+"secret_key":..,"vault":{"addr","token"|"role_id"+"secret_id","engine","namespace"},
+"kms_api":{"region","endpoint","access_key","secret_key"}}`); the new backend must
+pass a data key round trip before it replaces the old one. `GET metrics` and the
+`zkfsm_kms_*` Prometheus families report per-operation requests, errors and
+latency, key counts, reconfigurations and rekeyed objects.
+
 Storage: the blob is DARE ciphertext (64 KiB AES-256-GCM packages bound to the
 object path and part number); the sealed data key lives in internal record
 headers that are never sent to clients. HEAD and listings report the plaintext
