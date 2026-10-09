@@ -46,7 +46,7 @@ forward() {
 s3() { curl -sS --max-time 20 "${CURL_TLS[@]}" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$1" "${@:2}"; }
 APP=appuser:app-secret-123
 put() { s3 "$APP" -o /dev/null -w '%{http_code}' -T "$2" "$SCHEME://127.0.0.1:$PORT/app/$1"; }
-get() { s3 "$APP" -o "$2" -w '%{http_code}' "$SCHEME://127.0.0.1:$PORT/app/$1"; }
+get() { rm -f "$2"; s3 "$APP" -o "$2" -w '%{http_code}' "$SCHEME://127.0.0.1:$PORT/app/$1"; }
 same() { cmp -s "$1" "$2" && echo same || echo differ; }
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -127,6 +127,8 @@ check "user policy denies other buckets" 403 "$(s3 "$APP" -o /dev/null -w '%{htt
 
 log "kill a pod"
 k delete pod s3-pool-0-2 --grace-period=0 --force >/dev/null 2>&1
+# port-forward pins one pod; reconnect so the client is not on the dead one.
+forward
 check "get while a server is down" 200 "$(get obj1 "$WORK/back")"
 check "content while degraded" same "$(same "$WORK/obj1" "$WORK/back")"
 sleep 5
