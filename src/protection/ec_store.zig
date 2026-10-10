@@ -34,6 +34,26 @@ const Header = struct {
     index: u8,
     block_size: u32,
     size: u64,
+    /// The last block's shards hold ceil(len/k) bytes instead of a padded full block.
+    compact: bool = false,
+
+    /// Shard bytes of block `b` (stride between blocks is the full-block length).
+    fn shardLen(h: Header, b: u64) u32 {
+        const lay = Layout.init(h.size, h.block_size, h.k) catch unreachable;
+        if (!h.compact) return lay.shardLen();
+        return std.math.divCeil(u32, lay.blockLen(b), h.k) catch unreachable;
+    }
+
+    /// Largest shard block of the object: buffers need no more.
+    fn maxShardLen(h: Header) u32 {
+        const full = std.math.divCeil(u32, h.block_size, h.k) catch unreachable;
+        if (!h.compact) return full;
+        return std.math.divCeil(u32, @intCast(@min(h.block_size, @max(1, h.size))), h.k) catch unreachable;
+    }
+
+    fn stride(h: Header) u64 {
+        return 4 + @as(u64, std.math.divCeil(u32, h.block_size, h.k) catch unreachable);
+    }
 
     fn encode(h: Header) [header_len]u8 {
         var b: [header_len]u8 = @splat(0);
@@ -41,6 +61,7 @@ const Header = struct {
         b[4] = h.k;
         b[5] = h.m;
         b[6] = h.index;
+        b[7] = @intFromBool(h.compact);
         std.mem.writeInt(u32, b[8..12], h.block_size, .little);
         std.mem.writeInt(u64, b[12..20], h.size, .little);
         std.mem.writeInt(u32, b[20..24], core.checksum.Crc32c.hash(b[0..20]), .little);
@@ -50,7 +71,9 @@ const Header = struct {
     fn decode(b: []const u8) ?Header {
         if (b.len != header_len or !std.mem.eql(u8, b[0..4], header_magic)) return null;
         if (std.mem.readInt(u32, b[20..24], .little) != core.checksum.Crc32c.hash(b[0..20])) return null;
+        if (b[7] > 1 or b[4] == 0 or std.mem.readInt(u32, b[8..12], .little) == 0) return null;
         return .{
+            .compact = b[7] == 1,
             .k = b[4],
             .m = b[5],
             .index = b[6],
@@ -163,21 +186,23 @@ pub const ErasureStore = struct {
         }
         if (live < self.writeQuorum()) return self.meta.short(&holds, self.writeQuorum(), worst, error.WriteQuorum);
 
-        const lay0 = Layout.init(0, block_size, k) catch return error.IoFailed;
-        const sl = lay0.shardLen();
-        const blk = try self.gpa.alloc(u8, block_size);
+        // Buffers sized to the object when its size is known: small objects stay small.
+        const cap: u32 = if (opts.size_hint) |h| @intCast(@max(1, @min(block_size, h))) else block_size;
+        const sl = std.math.divCeil(u32, cap, k) catch unreachable;
+        const blk = try self.gpa.alloc(u8, cap);
         defer self.gpa.free(blk);
         const sbuf = try self.gpa.alloc(u8, n * sl);
         defer self.gpa.free(sbuf);
         var slices: [max_n][]u8 = undefined;
-        for (0..n) |i| slices[i] = sbuf[i * sl ..][0..sl];
 
         var total: u64 = 0;
         while (true) {
-            const want: usize = if (opts.size_hint) |h| @intCast(@min(block_size, h -| total)) else block_size;
+            const want: usize = if (opts.size_hint) |h| @intCast(@min(cap, h -| total)) else cap;
             if (want == 0) break;
             const got = try ReplicaStore.fill(source, blk[0..want]);
             if (got == 0) break;
+            const bsl = std.math.divCeil(usize, got, k) catch unreachable;
+            for (0..n) |i| slices[i] = sbuf[i * sl ..][0..bsl];
             erasure.stripe.split(blk[0..got], slices[0..k]);
             self.codec.encode(constSlices(slices[0..k]), slices[k..n]) catch return error.IoFailed;
             for (0..n) |i| if (pend[i]) |*w| {
@@ -194,7 +219,7 @@ pub const ErasureStore = struct {
         }
 
         for (0..n) |i| if (pend[i]) |*w| {
-            const h = (Header{ .k = k, .m = self.codec.m, .index = @intCast(i), .block_size = block_size, .size = total }).encode();
+            const h = (Header{ .k = k, .m = self.codec.m, .index = @intCast(i), .block_size = block_size, .size = total, .compact = true }).encode();
             w.pwrite(&h, 0) catch dropWriter(&pend[i], &live, &worst, error.IoFailed);
         };
         if (live < self.writeQuorum()) return if (self.clustered()) error.WriteQuorum else worst;
@@ -288,7 +313,7 @@ pub const ErasureStore = struct {
         for (0..n) |i| if (headers[i]) |h| {
             var votes: usize = 0;
             for (0..n) |j| if (headers[j]) |o| {
-                if (o.size == h.size and o.block_size == h.block_size) votes += 1;
+                if (o.size == h.size and o.block_size == h.block_size and o.compact == h.compact) votes += 1;
             };
             if (votes > best) {
                 best = votes;
@@ -297,7 +322,7 @@ pub const ErasureStore = struct {
         };
         const h = s.header orelse return s;
         for (0..n) |i| if (headers[i]) |o| {
-            if (o.size != h.size or o.block_size != h.block_size or o.index != i or o.k != self.codec.k or o.m != self.codec.m) {
+            if (o.size != h.size or o.block_size != h.block_size or o.compact != h.compact or o.index != i or o.k != self.codec.k or o.m != self.codec.m) {
                 s.drop(i);
             } else if (s.mtime == 0) {
                 if (s.files[i].?.stat()) |st| {
@@ -308,9 +333,9 @@ pub const ErasureStore = struct {
         return s;
     }
 
-    fn readBlock(file: *ShardFile, b: u64, out: []u8, scratch: []u8) bool {
+    fn readBlock(file: *ShardFile, h: Header, b: u64, out: []u8, scratch: []u8) bool {
         const want = 4 + out.len;
-        const got = file.preadAll(scratch[0..want], header_len + b * want) catch return false;
+        const got = file.preadAll(scratch[0..want], header_len + b * h.stride()) catch return false;
         if (got != want) return false;
         const data = shard.verifyChunk(scratch[0..want]) orelse return false;
         @memcpy(out, data);
@@ -318,15 +343,19 @@ pub const ErasureStore = struct {
     }
 
     /// Fills all k+m slices of block `b`, reconstructing what is missing; false if < k survive.
-    fn loadBlock(self: *ErasureStore, s: *Shards, b: u64, slices: []const []u8, scratch: []u8, all: bool) bool {
+    fn loadBlock(self: *ErasureStore, s: *Shards, b: u64, full: []const []u8, scratch: []u8, all: bool) bool {
         const n = self.width();
         const k = self.codec.k;
+        const h = s.header.?;
+        var buf: [max_n][]u8 = undefined;
+        for (0..n) |i| buf[i] = full[i][0..h.shardLen(b)];
+        const slices = buf[0..n];
         var present: [max_n]bool = @splat(false);
         var have: usize = 0;
         for (0..n) |i| {
             if (!all and i >= k and have == k) break;
             const f = if (s.files[i]) |*f| f else continue;
-            if (readBlock(f, b, slices[i], scratch)) {
+            if (readBlock(f, h, b, slices[i], scratch)) {
                 present[i] = true;
                 have += 1;
             } else s.drop(i);
@@ -376,13 +405,14 @@ pub const ErasureStore = struct {
         const n = self.width();
         const k = self.codec.k;
         const lay = Layout.init(h.size, h.block_size, k) catch return error.IoFailed;
-        const sl = lay.shardLen();
-        const sbuf = try self.gpa.alloc(u8, n * sl + 4 + sl + h.block_size);
+        const sl = h.maxShardLen();
+        const jl: usize = @intCast(@min(h.block_size, h.size));
+        const sbuf = try self.gpa.alloc(u8, n * sl + 4 + sl + jl);
         defer self.gpa.free(sbuf);
         var slices: [max_n][]u8 = undefined;
         for (0..n) |i| slices[i] = sbuf[i * sl ..][0..sl];
         const scratch = sbuf[n * sl ..][0 .. 4 + sl];
-        const joined = sbuf[n * sl + 4 + sl ..][0..h.block_size];
+        const joined = sbuf[n * sl + 4 + sl ..][0..jl];
         const end = r.offset + r.length;
         var b = r.offset / h.block_size;
         while (b * h.block_size < end) : (b += 1) {
@@ -391,7 +421,9 @@ pub const ErasureStore = struct {
                 return error.IoFailed;
             }
             const blen = lay.blockLen(b);
-            erasure.stripe.join(constSlices(slices[0..k]), joined[0..blen]);
+            var used: [max_n][]const u8 = undefined;
+            for (0..k) |i| used[i] = slices[i][0..h.shardLen(b)];
+            erasure.stripe.join(used[0..k], joined[0..blen]);
             const bstart = b * h.block_size;
             const lo: usize = @intCast(@max(r.offset, bstart) - bstart);
             const hi: usize = @intCast(@min(end, bstart + blen) - bstart);
@@ -420,7 +452,7 @@ pub const ErasureStore = struct {
             return rep;
         };
         const lay = Layout.init(h.size, h.block_size, k) catch return .{ .lost = true };
-        const sl = lay.shardLen();
+        const sl = h.maxShardLen();
         const sbuf = self.gpa.alloc(u8, n * sl + 4 + sl) catch return .{ .unrepaired = 1 };
         defer self.gpa.free(sbuf);
         var slices: [max_n][]u8 = undefined;
@@ -431,7 +463,7 @@ pub const ErasureStore = struct {
         var b: u64 = 0;
         while (b < lay.blockCount()) : (b += 1) {
             for (0..n) |i| if (s.files[i]) |*f| {
-                if (!readBlock(f, b, slices[i], scratch)) {
+                if (!readBlock(f, h, b, slices[i][0..h.shardLen(b)], scratch)) {
                     std.log.warn("drive {s}: corrupt shard {d} of {s}", .{ self.drives.drives[placed[i]].path, i, &key.hex });
                     s.drop(i);
                 }
@@ -452,7 +484,7 @@ pub const ErasureStore = struct {
                 rep.unrepaired += 1;
                 continue;
             };
-            const hdr = (Header{ .k = k, .m = self.codec.m, .index = @intCast(i), .block_size = h.block_size, .size = h.size }).encode();
+            const hdr = (Header{ .k = k, .m = self.codec.m, .index = @intCast(i), .block_size = h.block_size, .size = h.size, .compact = h.compact }).encode();
             w.writeAll(&hdr) catch {
                 w.abort();
                 rep.unrepaired += 1;
@@ -482,15 +514,16 @@ pub const ErasureStore = struct {
                 rep.lost = true;
                 return rep;
             }
+            const bsl = h.shardLen(b);
             for (0..n) |i| if (pend[i]) |*w| {
-                const crc = shard.chunkCrc(slices[i]);
+                const crc = shard.chunkCrc(slices[i][0..bsl]);
                 w.writeAll(&crc) catch {
                     w.abort();
                     pend[i] = null;
                     rep.unrepaired += 1;
                     continue;
                 };
-                w.writeAll(slices[i]) catch {
+                w.writeAll(slices[i][0..bsl]) catch {
                     w.abort();
                     pend[i] = null;
                     rep.unrepaired += 1;
@@ -637,4 +670,67 @@ test "EC:4+2 survives two lost shards and heals them" {
     try testing.expectEqual(@as(u64, 0), (try be.get(ek, null, &out.writer)).size);
     try be.delete(ek);
     try testing.expectError(error.NotFound, be.stat(ek));
+}
+
+test "small objects get compact shards; sizes round-trip" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [4][]const u8 = undefined;
+    var nb: [4]u8 = undefined;
+    for (0..4) |i| {
+        const name = try std.fmt.bufPrint(&nb, "d{d}", .{i});
+        try tmp.dir.makePath(name);
+        paths[i] = try tmp.dir.realpath(name, &bufs[i]);
+    }
+    var set = try placement.DriveSet.open(gpa, &paths, .{ .erasure = .{ .data = 2, .parity = 2 } });
+    defer set.deinit();
+    var store = ErasureStore.init(gpa, &set, .ec2_2);
+    const be = store.backend();
+    const data = try gpa.alloc(u8, 2 * block_size + 3);
+    defer gpa.free(data);
+    var prng = std.Random.DefaultPrng.init(11);
+    prng.random().bytes(data);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for ([_]usize{ 1, 4096, 4097, block_size, block_size + 1, 2 * block_size + 3 }, 0..) |len, j| {
+        var key: PhysicalKey = .{ .space = .data, .hex = "aaaabbbbccccddddeeeeffff00002220".* };
+        key.hex[31] = "0123456789"[j];
+        for ([_]bool{ true, false }) |hint| {
+            var src: std.Io.Reader = .fixed(data[0..len]);
+            _ = try be.put(key, &src, .{ .size_hint = if (hint) len else null });
+            out.clearRetainingCapacity();
+            _ = try be.get(key, null, &out.writer);
+            try testing.expectEqualSlices(u8, data[0..len], out.written());
+            out.clearRetainingCapacity();
+            _ = try be.get(key, .{ .offset = len - 1, .length = 1 }, &out.writer);
+            try testing.expectEqualSlices(u8, data[len - 1 ..][0..1], out.written());
+            try testing.expectEqual(KeyReport{ .healthy = 4 }, store.healKey(key));
+        }
+        // Shard file: header, then (crc + ceil(len/k)) per block, the tail unpadded.
+        var pbuf: [max_drives]u8 = undefined;
+        const placed = set.placed(key, &pbuf);
+        var kb: [64]u8 = undefined;
+        const rel = try iface.local.keyPath(key, @ptrCast(&kb));
+        var pb: [128]u8 = undefined;
+        const st = try tmp.dir.statFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ placed[0], rel }));
+        const full = len / block_size;
+        const tail = len % block_size;
+        const want = header_len + full * (4 + block_size / 2) + (if (tail == 0) 0 else 4 + (tail + 1) / 2);
+        try testing.expectEqual(@as(u64, want), st.size);
+        // A lost shard is rebuilt with the same compact layout.
+        try tmp.dir.deleteFile(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ placed[3], rel }));
+        try testing.expectEqual(@as(u64, 1), store.healKey(key).repaired);
+        try testing.expectEqual(KeyReport{ .healthy = 4 }, store.healKey(key));
+    }
+}
+
+test "padded shards of older objects stay readable" {
+    const h: Header = .{ .k = 4, .m = 2, .index = 0, .block_size = block_size, .size = 10 };
+    const d = Header.decode(&h.encode()).?;
+    try testing.expect(!d.compact);
+    try testing.expectEqual(@as(u32, block_size / 4), d.shardLen(0));
+    const c: Header = .{ .k = 4, .m = 2, .index = 0, .block_size = block_size, .size = 10, .compact = true };
+    try testing.expectEqual(@as(u32, 3), Header.decode(&c.encode()).?.shardLen(0));
 }
