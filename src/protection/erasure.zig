@@ -6,12 +6,14 @@ const gf = @import("erasure_gf.zig");
 pub const stripe = @import("erasure_stripe.zig");
 
 pub const Profile = enum {
+    ec2_2,
     ec4_2,
     ec8_4,
     ec12_4,
 
     pub fn dataShards(p: Profile) u8 {
         return switch (p) {
+            .ec2_2 => 2,
             .ec4_2 => 4,
             .ec8_4 => 8,
             .ec12_4 => 12,
@@ -20,7 +22,7 @@ pub const Profile = enum {
 
     pub fn parityShards(p: Profile) u8 {
         return switch (p) {
-            .ec4_2 => 2,
+            .ec2_2, .ec4_2 => 2,
             .ec8_4, .ec12_4 => 4,
         };
     }
@@ -31,6 +33,7 @@ pub const Profile = enum {
 
     pub fn name(p: Profile) []const u8 {
         return switch (p) {
+            .ec2_2 => "EC:2+2",
             .ec4_2 => "EC:4+2",
             .ec8_4 => "EC:8+4",
             .ec12_4 => "EC:12+4",

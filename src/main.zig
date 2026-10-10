@@ -28,7 +28,7 @@ const usage =
     \\  heal             run one scan/heal pass over the drives and exit
     \\  --data           one or more drives; /data{1...4} expands (default: $ZKFSM_DATA, else ./data)
     \\  --listen         listen address (default: 0.0.0.0:9000)
-    \\  --protection     single | replica:2 | replica:3 | EC:4+2 | EC:8+4 | EC:12+4
+    \\  --protection     single | replica:2 | replica:3 | EC:2+2 | EC:4+2 | EC:8+4 | EC:12+4
     \\                   default: stored in the drive format, else replica:2 with 2+ drives
     \\  --scan-interval  seconds between background heal passes, 0 disables them (default: 600);
     \\                   a cluster still heals when a node returns or a drive is replaced

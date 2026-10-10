@@ -68,7 +68,7 @@ zkfsm heal --data /mnt/disk{1...4}     # one scan/heal pass, exit 0 when fully r
   or a changed profile are refused at startup. An empty drive in a known set is
   formatted as a replacement and healed.
 - Protection profiles are a closed set: `single`, `replica:2`, `replica:3`,
-  `EC:4+2`, `EC:8+4`, `EC:12+4`. The default is `replica:2` with 2+ drives.
+  `EC:2+2`, `EC:4+2`, `EC:8+4`, `EC:12+4`. The default is `replica:2` with 2+ drives.
 - Placement is rendezvous hashing on the object id over drive ids.
 - Replicas: writes need a quorum of N/2+1; every 64 KiB chunk carries a CRC32C
   that is checked on read; a missing or corrupt replica is served from another

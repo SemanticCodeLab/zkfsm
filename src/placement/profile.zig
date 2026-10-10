@@ -15,6 +15,7 @@ pub const Profile = union(enum) {
         .{ .name = "single", .p = .single },
         .{ .name = "replica:2", .p = .{ .replica = 2 } },
         .{ .name = "replica:3", .p = .{ .replica = 3 } },
+        .{ .name = "EC:2+2", .p = .{ .erasure = .{ .data = 2, .parity = 2 } } },
         .{ .name = "EC:4+2", .p = .{ .erasure = .{ .data = 4, .parity = 2 } } },
         .{ .name = "EC:8+4", .p = .{ .erasure = .{ .data = 8, .parity = 4 } } },
         .{ .name = "EC:12+4", .p = .{ .erasure = .{ .data = 12, .parity = 4 } } },

@@ -8,7 +8,7 @@
 #      SINGLE_MEM (8g), SINGLE_DRIVE (1536m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
 #      ZKFSM_BIN / MINIO_BIN / WARP_BIN (prebuilt binaries; built into CACHE when unset),
-#      RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl).
+#      ZKFSM_SINGLE_PROTECTION (EC:2+2, matching MinIO EC:2), RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${CACHE:-${TMPDIR:-/tmp}/zc-bench-cache}"
@@ -79,7 +79,7 @@ NET=zc-bench-net
 start_target() { # product topo
   local p=$1 t=$2 n mem drive cpus ncpu
   if [[ $t == single ]]; then n=1 mem=$SINGLE_MEM drive=$SINGLE_DRIVE ncpu=$NCPU; else n=4 mem=$NODE_MEM drive=$NODE_DRIVE ncpu=1; fi
-  local eps="/data{1...4}" zkp=replica:2 parity=EC:2
+  local eps="/data{1...4}" zkp=${ZKFSM_SINGLE_PROTECTION:-EC:2+2} parity=EC:2
   if [[ $t == cluster ]]; then
     eps="http://zc-bench-node-{1...4}:9000/data{1...4}"
     zkp=EC:12+4 parity=EC:4

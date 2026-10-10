@@ -60,7 +60,7 @@ test "every closed-set profile maps to a strategy" {
     var bufs: [16][std.fs.max_path_bytes]u8 = undefined;
     var paths: [16][]const u8 = undefined;
     var nb: [4]u8 = undefined;
-    for ([_][]const u8{ "single", "replica:2", "replica:3", "EC:4+2", "EC:8+4", "EC:12+4" }) |name| {
+    for ([_][]const u8{ "single", "replica:2", "replica:3", "EC:2+2", "EC:4+2", "EC:8+4", "EC:12+4" }) |name| {
         const p = try placement.Profile.parse(name);
         const w = p.width();
         for (0..w) |i| {
