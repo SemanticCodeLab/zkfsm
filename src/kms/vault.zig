@@ -15,6 +15,8 @@ const log = std.log.scoped(.kms_vault);
 pub const Auth = union(enum) {
     token: []const u8,
     approle: struct { role_id: []const u8, secret_id: []const u8, mount: []const u8 = "approle" },
+    /// TLS certificate auth: the client certificate in `Config.http.tls` is the credential.
+    cert: struct { mount: []const u8 = "cert", role: []const u8 = "" },
 };
 
 pub const Config = struct {
@@ -54,13 +56,20 @@ pub const Client = struct {
     }
 
     fn login(c: *Client) Error!void {
-        const ar = switch (c.cfg.auth) {
+        var mount: []const u8 = undefined;
+        const body = switch (c.cfg.auth) {
             .token => return,
-            .approle => |a| a,
+            .approle => |ar| b: {
+                mount = ar.mount;
+                break :b try jsonObject(c.gpa, &.{ .{ "role_id", .{ .string = ar.role_id } }, .{ "secret_id", .{ .string = ar.secret_id } } });
+            },
+            .cert => |ca| b: {
+                mount = ca.mount;
+                break :b if (ca.role.len > 0) try jsonObject(c.gpa, &.{.{ "name", .{ .string = ca.role } }}) else try c.gpa.dupe(u8, "{}");
+            },
         };
-        const body = try jsonObject(c.gpa, &.{ .{ "role_id", .{ .string = ar.role_id } }, .{ "secret_id", .{ .string = ar.secret_id } } });
         defer wipeFree(c.gpa, body);
-        const path = try std.fmt.allocPrint(c.gpa, "auth/{s}/login", .{ar.mount});
+        const path = try std.fmt.allocPrint(c.gpa, "auth/{s}/login", .{mount});
         defer c.gpa.free(path);
         var resp = try c.raw(c.gpa, .POST, path, body, null);
         defer wipeResp(c.gpa, &resp);

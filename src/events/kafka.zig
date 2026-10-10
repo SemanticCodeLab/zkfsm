@@ -5,7 +5,7 @@ const std = @import("std");
 const target = @import("target.zig");
 const net = @import("net.zig");
 
-pub const keys = [_][]const u8{ "brokers", "topic", "sasl", "sasl_username", "sasl_password", "sasl_mechanism", "tls", "tls_skip_verify", "tls_client_auth", "client_tls_cert", "client_tls_key", "version", "batch_size", "queue_dir", "queue_limit", "comment" };
+pub const keys = [_][]const u8{ "brokers", "topic", "sasl", "sasl_username", "sasl_password", "sasl_mechanism", "tls", "tls_skip_verify", "tls_client_auth", "client_tls_cert", "client_tls_key", "tls_ca_file", "tls_server_name", "tls_min_version", "version", "batch_size", "queue_dir", "queue_limit", "comment" };
 
 const default_port: u16 = 9092;
 const max_frame: usize = 64 << 20;
@@ -304,8 +304,6 @@ pub fn create(gpa: std.mem.Allocator, s: target.Settings) target.InitError!targe
 fn createKafka(gpa: std.mem.Allocator, s: target.Settings) target.InitError!*Kafka {
     const topic = s.get("topic");
     if (topic.len == 0 or topic.len > 249) return error.InvalidConfig;
-    // std's TLS client cannot present client certificates.
-    if (s.flag("tls_client_auth") or s.get("client_tls_cert").len > 0 or s.get("client_tls_key").len > 0) return error.InvalidConfig;
     const mech = try parseMechanism(s.get("sasl_mechanism"));
     if (s.flag("sasl") and s.get("sasl_username").len == 0) return error.InvalidConfig;
 
@@ -327,7 +325,8 @@ fn createKafka(gpa: std.mem.Allocator, s: target.Settings) target.InitError!*Kaf
     k.brokers = list.items;
     k.topic = try a.dupe(u8, topic);
     if (s.flag("sasl")) k.sasl = .{ .mech = mech, .user = try a.dupe(u8, s.get("sasl_username")), .pass = try a.dupe(u8, s.get("sasl_password")) };
-    if (s.flag("tls")) k.opts.tls = .{ .skip_verify = s.flag("tls_skip_verify") };
+    // tls_client_auth is the broker's policy in MinIO; the certificate decides here.
+    if (s.flag("tls")) k.opts.tls = try net.tlsOptions(a, s, .{ .cert = "client_tls_cert", .key = "client_tls_key" });
     return k;
 }
 
@@ -713,7 +712,7 @@ test "settings validation" {
     try testing.expectError(error.InvalidConfig, T.mk(&.{.{ .key = "topic", .value = "t" }}));
     try testing.expectError(error.InvalidConfig, T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "h:x" } }));
     try testing.expectError(error.InvalidConfig, T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "h" }, .{ .key = "sasl_mechanism", .value = "gssapi" } }));
-    try testing.expectError(error.InvalidConfig, T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "h" }, .{ .key = "tls_client_auth", .value = "on" } }));
+    try testing.expectError(error.InvalidConfig, T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "h" }, .{ .key = "tls", .value = "on" }, .{ .key = "client_tls_cert", .value = "/nonexistent" } }));
     try testing.expectError(error.InvalidConfig, T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "h" }, .{ .key = "sasl", .value = "on" } }));
     const c = try T.mk(&.{ .{ .key = "topic", .value = "t" }, .{ .key = "brokers", .value = "a:1, b ,[::1]:3" }, .{ .key = "sasl", .value = "on" }, .{ .key = "sasl_username", .value = "u" }, .{ .key = "sasl_mechanism", .value = "SCRAM-SHA-512" }, .{ .key = "tls", .value = "on" } });
     defer c.deinit();

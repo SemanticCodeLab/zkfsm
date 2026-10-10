@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TLS 1.3 interop: openssl, curl, an S3 CLI, mc, python ssl; negative and fuzz cases.
+# TLS 1.3 and 1.2 interop: openssl, curl, an S3 CLI, mc, python ssl; negative and fuzz cases.
 # Keys and certificates are generated per run in a temp dir and never kept.
 set -euo pipefail
 S3CLI_BIN="${S3CLI_BIN:-aws}"
@@ -9,7 +9,10 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+freeport() { # retries: the host's ephemeral range can be briefly exhausted
+  for _ in 1 2 3 4 5; do python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])' 2>/dev/null && return 0; sleep 1; done
+  return 1
+}
 pass=0
 fail=0
 check() { # name expected actual
@@ -93,11 +96,74 @@ check "key update" 1 "$(grep -c 'HTTP/1.1 200' <<<"$ku")"
 check "key update sent" 2 "$(grep -c 'KEYUPDATE' <<<"$ku")"
 
 # ---- negatives: old versions ----
-for v in tls1 tls1_1 tls1_2; do
+for v in tls1 tls1_1; do
   out="$(sclient "$PORT" "-$v" -cipher 'DEFAULT:@SECLEVEL=0')"
   check "reject $v" 1 "$(grep -c 'Cipher is (NONE)' <<<"$out")"
 done
-check "tls1_2 alert protocol_version" 1 "$(sclient "$PORT" -tls1_2 | grep -c 'alert protocol version')"
+MP="$(freeport)"
+start "$MP" --certs-dir "$WORK/certs" --tls-min-version 1.3
+check "min 1.3 rejects tls1_2" 1 "$(sclient "$MP" -tls1_2 | grep -c 'Cipher is (NONE)')"
+check "min 1.3 alert protocol_version" 1 "$(sclient "$MP" -tls1_2 | grep -c 'alert protocol version')"
+check "min 1.3 serves tls1_3" 1 "$(sclient "$MP" -tls1_3 | grep -c 'Verify return code: 0 (ok)')"
+kill "${PIDS[-1]}"; wait "${PIDS[-1]}" 2>/dev/null || true; unset 'PIDS[-1]'
+check "bad --tls-min-version refused" 2 "$(set +e; "$BIN" --anonymous --data "$WORK/x" --tls-min-version 1.1 >/dev/null 2>&1; echo $?)"
+
+# ---- TLS 1.2: every suite, both groups, EMS, secure renegotiation, ALPN ----
+t12() { # port cipher groups
+  local out
+  out="$(sclient "$1" -tls1_2 -cipher "$2" -groups "$3" -servername localhost -alpn http/1.1)"
+  echo "$(grep -c 'Verify return code: 0 (ok)' <<<"$out")/$(grep -o "TLSv1.2, Cipher is $2" <<<"$out" | head -1)/$(grep -c 'Extended master secret: yes' <<<"$out")/$(grep -c 'Secure Renegotiation IS supported' <<<"$out")/$(grep -c 'ALPN protocol: http/1.1' <<<"$out")"
+}
+# The ECDSA leaf is P-256, so a 1.2 client must list P-256 even when it prefers X25519.
+for cipher in ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA-CHACHA20-POLY1305; do
+  for groups in X25519:P-256 P-256; do
+    check "tls1_2 $cipher $groups" "1/TLSv1.2, Cipher is $cipher/1/1/1" "$(t12 "$PORT" "$cipher" "$groups")"
+  done
+done
+check "tls1_2 x25519 temp key" 1 "$(sclient "$PORT" -tls1_2 -groups X25519:P-256 | grep -c 'Temp Key: X25519')"
+check "tls1_2 ecdsa without P-256 refused" 1 "$(sclient "$PORT" -tls1_2 -groups X25519 | grep -c 'Cipher is (NONE)')"
+check "tls1_2 cbc-only refused (ecdsa)" 1 "$(sclient "$PORT" -tls1_2 -cipher ECDHE-ECDSA-AES128-SHA256 | grep -c 'Cipher is (NONE)')"
+check "tls1_2 without EMS refused" 1 "$(sclient "$PORT" -tls1_2 -no_ems | grep -c 'alert handshake failure')"
+check "tls1_2 h2-only alpn refused" 1 "$(sclient "$PORT" -tls1_2 -alpn h2 | grep -c 'alert no application protocol')"
+# Client-initiated renegotiation (R) is refused; the server keeps running.
+rn="$( (sleep 0.5; echo R; sleep 1) | timeout 20 openssl s_client -connect "127.0.0.1:$PORT" -CAfile ca.crt -tls1_2 2>&1 || true)"
+check "tls1_2 renegotiation refused" 1 "$(grep -c -i -m1 'no.renegotiation' <<<"$rn")"
+check "server alive after renegotiation" 200 "$(alive "$PORT")"
+RP="$(freeport)"
+start "$RP" --tls-cert rsa2048.chain --tls-key rsa2048.p8.key
+for cipher in ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-CHACHA20-POLY1305; do
+  for groups in X25519 P-256; do
+    check "tls1_2 $cipher $groups" "1/TLSv1.2, Cipher is $cipher/1/1/1" "$(t12 "$RP" "$cipher" "$groups")"
+  done
+done
+check "tls1_2 rsa key refuses ecdsa suite" 1 "$(sclient "$RP" -tls1_2 -cipher ECDHE-ECDSA-AES128-GCM-SHA256 | grep -c 'Cipher is (NONE)')"
+check "tls1_2 cbc-only refused (rsa)" 1 "$(sclient "$RP" -tls1_2 -cipher ECDHE-RSA-AES128-SHA | grep -c 'Cipher is (NONE)')"
+check "tls1_2 static rsa refused" 1 "$(sclient "$RP" -tls1_2 -cipher AES128-GCM-SHA256 | grep -c 'Cipher is (NONE)')"
+h12="$( (sleep 0.5; printf 'GET /minio/health/live HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1) |
+  timeout 20 openssl s_client -connect "127.0.0.1:$RP" -CAfile ca.crt -tls1_2 2>&1 || true)"
+check "tls1_2 http request" 1 "$(grep -c 'HTTP/1.1 200' <<<"$h12")"
+kill "${PIDS[-1]}"; wait "${PIDS[-1]}" 2>/dev/null || true; unset 'PIDS[-1]'
+
+# ---- TLS 1.2 client certificates ----
+openssl ecparam -name prime256v1 -genkey -noout -out cli.key 2>/dev/null
+openssl req -new -key cli.key -subj /CN=tls12-client -out cli.csr 2>/dev/null
+openssl x509 -req -in cli.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -out cli.crt 2>/dev/null
+openssl genrsa -out clirsa.key 2048 2>/dev/null
+openssl req -new -key clirsa.key -subj /CN=tls12-rsa-client -out clirsa.csr 2>/dev/null
+openssl x509 -req -in clirsa.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 2 -out clirsa.crt 2>/dev/null
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout rogue.key -out rogue.crt -days 2 -subj /CN=rogue 2>/dev/null
+CP="$(freeport)"
+start "$CP" --tls-cert ec.chain --tls-key ec.p8.key --tls-client-ca "$WORK/ca.crt"
+mreq() { # extra s_client args; prints 1 when the HTTP request succeeded
+  (sleep 0.5; printf 'GET /minio/health/live HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1) |
+    { timeout 20 openssl s_client -connect "127.0.0.1:$CP" -CAfile ca.crt "$@" 2>&1 || true; } | grep -c 'HTTP/1.1 200' || true
+}
+check "tls1_2 mtls ec client" 1 "$(mreq -tls1_2 -cert cli.crt -key cli.key)"
+check "tls1_2 mtls rsa client" 1 "$(mreq -tls1_2 -cert clirsa.crt -key clirsa.key)"
+check "tls1_2 mtls no cert (optional)" 1 "$(mreq -tls1_2)"
+check "tls1_2 mtls untrusted cert refused" 0 "$(mreq -tls1_2 -cert rogue.crt -key rogue.key)"
+check "tls1_3 mtls ec client" 1 "$(mreq -tls1_3 -cert cli.crt -key cli.key)"
+kill "${PIDS[-1]}"; wait "${PIDS[-1]}" 2>/dev/null || true; unset 'PIDS[-1]'
 
 # ---- RSA-PSS with each key size and format ----
 for kf in rsa2048.pkcs1.key rsa3072.p8.key rsa4096.pkcs1.key rsa2048.p8.key; do
@@ -130,6 +196,9 @@ check "curl get md5" "$MD5" "$(curl -s "${c[@]}" "$AEP/tlsb/obj.bin" | md5sum | 
 check "curl range" "$(head -c 20 obj.bin | tail -c 10 | md5sum)" "$(curl -s "${c[@]}" -r 10-19 "$AEP/tlsb/obj.bin" | md5sum)"
 check "curl http version" "1.1" "$(curl -s -o /dev/null -w '%{http_version}' "${c[@]}" "$AEP/tlsb")"
 check "curl untrusted refused" 60 "$(curl -s -o /dev/null "$AEP/" ; echo $?)"
+check "curl tls1.2 get md5" "$MD5" "$(curl -s --tls-max 1.2 "${c[@]}" "$AEP/tlsb/obj.bin" | md5sum | cut -d' ' -f1)"
+check "curl tls1.2 put" 200 "$(curl -s -o /dev/null -w '%{http_code}' --tls-max 1.2 "${c[@]}" -T obj.bin "$AEP/tlsb/obj12.bin")"
+check "curl tls1.2 negotiated" 1 "$(curl -sv --tls-max 1.2 -o /dev/null "${c[@]}" "$AEP/tlsb" 2>&1 | grep -c -m1 'TLSv1.2 (IN)\|SSL connection using TLSv1.2')"
 check "curl keep-alive reuse" 2 "$(curl -sv "${c[@]}" "$AEP/tlsb" "$AEP/tlsb" 2>&1 | grep -c 'HTTP/1.1 200')"
 
 # ---- S3 CLI ----
@@ -175,16 +244,38 @@ with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as raw:
 EOF
 )"
 
+# ---- python ssl capped at TLS 1.2: S3 GET on the anonymous instance ----
+check "python ssl tls1.2 s3 get" "TLSv1.2 http/1.1 200 $MD5" "$(python3 - "$AP" "$WORK/ca.crt" <<'PY'
+import hashlib, socket, ssl, sys
+ctx = ssl.create_default_context(cafile=sys.argv[2])
+ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+ctx.set_alpn_protocols(["http/1.1"])
+with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as raw:
+    s = ctx.wrap_socket(raw, server_hostname="localhost")
+    s.sendall(b"GET /tlsb/obj.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    data = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    print(s.version(), s.selected_alpn_protocol(), head.split(b" ")[1].decode(), hashlib.md5(body).hexdigest())
+PY
+)"
+
 # ---- fuzz: mutated ClientHellos and truncated records must not crash ----
 python3 - "$PORT" <<'EOF'
 import random, socket, ssl, sys
 port = int(sys.argv[1])
-inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-obj = ctx.wrap_bio(inc, out, server_hostname="localhost")
-try: obj.do_handshake()
-except ssl.SSLWantReadError: pass
-hello = out.read()
+def first_flight(maxv):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    if maxv: ctx.maximum_version = maxv
+    inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+    obj = ctx.wrap_bio(inc, out, server_hostname="localhost")
+    try: obj.do_handshake()
+    except ssl.SSLWantReadError: pass
+    return out.read()
+hellos = [first_flight(None), first_flight(ssl.TLSVersion.TLSv1_2)]
 rng = random.Random(1234)
 def send(data, wait=0.3):
     s = socket.create_connection(("127.0.0.1", port)); s.settimeout(wait)
@@ -193,7 +284,8 @@ def send(data, wait=0.3):
         while s.recv(4096): pass
     except OSError: pass
     s.close()
-for i in range(400):
+for i in range(800):
+    hello = hellos[i % 2]
     b = bytearray(hello)
     for _ in range(rng.randint(1, 8)):
         op = rng.random(); j = rng.randrange(len(b))
@@ -203,7 +295,8 @@ for i in range(400):
         else: b[j:j] = bytes(rng.randrange(256) for _ in range(rng.randint(1, 16)))
         if not b: b = bytearray(hello[:5])
     send(bytes(b), 0.2)
-for n in range(0, len(hello), 7): send(hello[:n], 0.1)          # truncated records
+for hello in hellos:
+    for n in range(0, len(hello), 7): send(hello[:n], 0.1)      # truncated records
 send(b"\x16\x03\x03\xff\xff" + b"\x00" * 64)                      # oversized length
 send(b"\x17\x03\x03\x00\x10" + b"\x00" * 16)                      # app data before handshake
 print("fuzz done")

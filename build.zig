@@ -56,9 +56,9 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("s3load", "Build the HTTP load generator").dependOn(&b.addInstallArtifact(s3load, .{}).step);
 
-    // IAM is not wired into main.zig yet; test it as its own root.
+    // IAM tests as their own root (src/ so iam can import the tls layer).
     const iam_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/iam/root.zig"),
+        .root_source_file = b.path("src/iam_tests.zig"),
         .target = target,
         .optimize = optimize,
     }) });
@@ -82,4 +82,31 @@ pub fn build(b: *std.Build) void {
     const live_run = b.addRunArtifact(live);
     live_run.has_side_effects = true;
     b.step("test-remote", "Run live remote backend tests").dependOn(&live_run.step);
+
+    // Kubernetes operator (zkfsm.io/v1 Cluster); shares the admin-payload cipher with the server.
+    const dial_mod = b.createModule(.{ .root_source_file = b.path("src/tls/dial.zig"), .target = target, .optimize = optimize });
+    const kube_mod = b.createModule(.{
+        .root_source_file = b.path("k8s/kube.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "tls_dial", .module = dial_mod }},
+    });
+    const sio_mod = b.createModule(.{ .root_source_file = b.path("src/admin/sio.zig"), .target = target, .optimize = optimize });
+    const op_mod = b.createModule(.{
+        .root_source_file = b.path("k8s/operator/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "kube", .module = kube_mod }, .{ .name = "sio", .module = sio_mod } },
+    });
+    const operator = b.addExecutable(.{ .name = "zkfsm-operator", .root_module = op_mod });
+    b.installArtifact(operator);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = op_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = kube_mod })).step);
+
+    // CSI driver for local drives (csi.zkfsm.io): node plugin and controller.
+    const csi_mod = b.createModule(.{ .root_source_file = b.path("k8s/csi/main.zig"), .target = target, .optimize = optimize });
+    b.installArtifact(b.addExecutable(.{ .name = "zkfsm-csi", .root_module = csi_mod }));
+    const csi_tests = b.addRunArtifact(b.addTest(.{ .root_module = csi_mod }));
+    test_step.dependOn(&csi_tests.step);
+    b.step("test-csi", "Run zkfsm-csi unit tests").dependOn(&csi_tests.step);
 }
