@@ -35,6 +35,14 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(erasure_tests).step);
 
+    // The hardware hash paths need the LLVM backend, also in Debug.
+    const hw_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/core/hwhash.zig"),
+        .target = target,
+        .optimize = optimize,
+    }), .use_llvm = true });
+    test_step.dependOn(&b.addRunArtifact(hw_tests).step);
+
     // Benchmarks always build ReleaseFast regardless of -Doptimize.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/erasure_bench.zig"),

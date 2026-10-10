@@ -3,7 +3,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 
-pub const Sha256 = std.crypto.hash.sha2.Sha256;
+pub const Sha256 = @import("hwhash.zig").Sha256;
 pub const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const algorithm = "AWS4-HMAC-SHA256";

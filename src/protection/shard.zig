@@ -38,7 +38,7 @@ pub fn chunkOffset(index: u64) u64 {
 
 pub fn chunkCrc(data: []const u8) [4]u8 {
     var c: [4]u8 = undefined;
-    std.mem.writeInt(u32, &c, Crc32c.hash(data), .little);
+    std.mem.writeInt(u32, &c, core.hwhash.crc32c(data), .little);
     return c;
 }
 
@@ -47,7 +47,7 @@ pub fn verifyChunk(crc_and_data: []const u8) ?[]const u8 {
     if (crc_and_data.len < crc_len) return null;
     const want = std.mem.readInt(u32, crc_and_data[0..4], .little);
     const data = crc_and_data[crc_len..];
-    return if (Crc32c.hash(data) == want) data else null;
+    return if (core.hwhash.crc32c(data) == want) data else null;
 }
 
 const record_magic = "ZKR1";
