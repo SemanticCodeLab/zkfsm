@@ -269,11 +269,16 @@ test "submit, run expire to completion, list and cancel" {
     try std.testing.expectEqual(Manager.CancelResult.not_found, m.cancel("nope"));
     try std.testing.expectEqual(@as(usize, 1), (try m.list(a, .expire)).len);
     try std.testing.expectEqual(@as(usize, 0), (try m.list(a, .replicate)).len);
+    // The record is saved after the state flips; wait for the worker to finish.
+    for (m.jobs.items) |j| while (!j.done.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
     // A second manager over the same store sees the finished job.
     var m2 = Manager.init(gpa, .{ .svc = &svc });
     m2.start();
     defer {
-        for (m2.jobs.items) |j| j.destroy();
+        for (m2.jobs.items) |j| {
+            while (!j.done.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+            j.destroy();
+        }
         m2.jobs.deinit(gpa);
     }
     try std.testing.expectEqualStrings("complete", (try m2.get(a, &id)).?.state);

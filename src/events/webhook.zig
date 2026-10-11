@@ -4,7 +4,7 @@ const std = @import("std");
 const target = @import("target.zig");
 const net = @import("net.zig");
 
-pub const keys = [_][]const u8{ "endpoint", "auth_token", "queue_dir", "queue_limit", "client_cert", "client_key", "tls_skip_verify", "comment" };
+pub const keys = [_][]const u8{ "endpoint", "auth_token", "queue_dir", "queue_limit", "client_cert", "client_key", "tls_skip_verify", "tls_ca_file", "tls_server_name", "tls_min_version", "comment" };
 
 const max_status_line = 512;
 
@@ -15,13 +15,14 @@ const Webhook = struct {
     path: []const u8,
     host_header: []const u8,
     secure: bool,
-    skip_verify: bool,
+    tls: net.TlsOptions = .{},
+    arena: std.heap.ArenaAllocator,
     auth: []const u8,
     owned: std.ArrayList([]u8) = .empty,
 
     fn send(ctx: *anyopaque, msg: *const target.Message) target.SendError!void {
         const self: *Webhook = @ptrCast(@alignCast(ctx));
-        const c = net.dial(self.gpa, self.host, self.port, .{ .tls = if (self.secure) .{ .skip_verify = self.skip_verify } else null }) catch |e| return switch (e) {
+        const c = net.dial(self.gpa, self.host, self.port, .{ .tls = if (self.secure) self.tls else null }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Unreachable,
         };
@@ -40,6 +41,7 @@ const Webhook = struct {
         const self: *Webhook = @ptrCast(@alignCast(ctx));
         for (self.owned.items) |s| self.gpa.free(s);
         self.owned.deinit(self.gpa);
+        self.arena.deinit();
         self.gpa.destroy(self);
     }
 
@@ -69,12 +71,12 @@ pub fn create(gpa: std.mem.Allocator, s: target.Settings) target.InitError!targe
     const endpoint = s.get("endpoint");
     const uri = std.Uri.parse(endpoint) catch return error.InvalidConfig;
     const secure = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) true else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) false else return error.InvalidConfig;
-    if (s.get("client_cert").len > 0 or s.get("client_key").len > 0) return error.InvalidConfig;
     var hb: [std.Uri.host_name_max]u8 = undefined;
     const host = uri.getHost(&hb) catch return error.InvalidConfig;
     const self = try gpa.create(Webhook);
-    self.* = .{ .gpa = gpa, .host = "", .port = uri.port orelse if (secure) 443 else 80, .path = "/", .host_header = "", .secure = secure, .skip_verify = s.flag("tls_skip_verify"), .auth = "" };
+    self.* = .{ .gpa = gpa, .host = "", .port = uri.port orelse if (secure) 443 else 80, .path = "/", .host_header = "", .secure = secure, .auth = "", .arena = .init(gpa) };
     errdefer Webhook.deinit(self);
+    if (secure) self.tls = try net.tlsOptions(self.arena.allocator(), s, .{});
     self.host = try self.own(host);
     const hh = try hostHeader(gpa, host, uri.port);
     defer gpa.free(hh);

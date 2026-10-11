@@ -1,4 +1,4 @@
-//! TLS 1.3 handshake message parsing and construction (RFC 8446 section 4).
+//! TLS 1.3 and 1.2 handshake message parsing and construction (RFC 8446 4, RFC 5246 7.4).
 //! Every length read from the peer is checked against the enclosing slice.
 const std = @import("std");
 const tls = std.crypto.tls;
@@ -7,6 +7,9 @@ pub const ParseError = error{ DecodeError, IllegalParameter, ProtocolVersion };
 
 pub const ext = struct {
     pub const server_name: u16 = 0;
+    pub const ec_point_formats: u16 = 11;
+    pub const extended_master_secret: u16 = 23;
+    pub const renegotiation_info: u16 = 0xff01;
     pub const supported_groups: u16 = 10;
     pub const signature_algorithms: u16 = 13;
     pub const alpn: u16 = 16;
@@ -51,6 +54,11 @@ pub const ClientHello = struct {
     session_id: []const u8,
     suites: []const u8,
     tls13: bool = false,
+    tls12: bool = false,
+    /// RFC 7627 extended_master_secret offered.
+    ems: bool = false,
+    /// renegotiated_connection from renegotiation_info (RFC 5746), if sent.
+    reneg: ?[]const u8 = null,
     groups: ?[]const u8 = null,
     key_shares: ?[]const u8 = null,
     sig_algs: ?[]const u8 = null,
@@ -71,8 +79,11 @@ pub const ClientHello = struct {
         if (h.suites.len < 2 or h.suites.len % 2 != 0) return error.DecodeError;
         const comp = try c.vec(u8);
         if (c.left() == 0) {
-            // No extensions at all: a pre-1.3 hello.
-            return error.ProtocolVersion;
+            // No extensions at all: at most a 1.2 hello.
+            if (legacy_version < 0x0303) return error.ProtocolVersion;
+            if (comp.len == 0 or std.mem.indexOfScalar(u8, comp, 0) == null) return error.IllegalParameter;
+            h.tls12 = true;
+            return h;
         }
         const exts = try c.vec(u16);
         if (c.left() != 0) return error.DecodeError;
@@ -92,8 +103,22 @@ pub const ClientHello = struct {
                     if (v.left() != 0 or list.len == 0 or list.len % 2 != 0) return error.DecodeError;
                     var i: usize = 0;
                     while (i < list.len) : (i += 2) {
-                        if (std.mem.readInt(u16, list[i..][0..2], .big) == 0x0304) h.tls13 = true;
+                        switch (std.mem.readInt(u16, list[i..][0..2], .big)) {
+                            0x0304 => h.tls13 = true,
+                            0x0303 => h.tls12 = true,
+                            else => {},
+                        }
                     }
+                },
+                ext.extended_master_secret => {
+                    if (data.len != 0) return error.DecodeError;
+                    h.ems = true;
+                },
+                ext.renegotiation_info => {
+                    if (h.reneg != null) return error.IllegalParameter;
+                    var v: Cursor = .{ .b = data };
+                    h.reneg = try v.vec(u8);
+                    if (v.left() != 0) return error.DecodeError;
                 },
                 ext.supported_groups => h.groups = try evenList(data),
                 ext.signature_algorithms => h.sig_algs = try evenList(data),
@@ -127,8 +152,12 @@ pub const ClientHello = struct {
                 else => {},
             }
         }
-        if (!h.tls13 or legacy_version < 0x0301) return error.ProtocolVersion;
-        if (comp.len != 1 or comp[0] != 0) return error.IllegalParameter;
+        // Without supported_versions the legacy field is the offer (RFC 8446 4.2.1).
+        if (!seen.isSet(ext.supported_versions) and legacy_version >= 0x0303) h.tls12 = true;
+        if ((!h.tls13 and !h.tls12) or legacy_version < 0x0301) return error.ProtocolVersion;
+        if (h.tls13) {
+            if (comp.len != 1 or comp[0] != 0) return error.IllegalParameter;
+        } else if (std.mem.indexOfScalar(u8, comp, 0) == null) return error.IllegalParameter;
         return h;
     }
 
@@ -330,6 +359,105 @@ pub fn certificateRequest(b: *Builder, schemes: []const tls.SignatureScheme) Bui
     try b.end(u24, m);
 }
 
+// ---- TLS 1.2 messages ----
+
+pub const Hello12 = struct {
+    random: [32]u8,
+    suite: u16,
+    alpn: ?[]const u8,
+    ack_sni: bool,
+    secure_reneg: bool,
+};
+
+/// ServerHello with an empty session id (no resumption) and the EMS extension.
+pub fn serverHello12(b: *Builder, h: Hello12) Builder.Error!void {
+    try b.int(u8, @intFromEnum(tls.HandshakeType.server_hello));
+    const m = try b.begin(u24);
+    try b.int(u16, 0x0303);
+    try b.bytes(&h.random);
+    try b.int(u8, 0);
+    try b.int(u16, h.suite);
+    try b.int(u8, 0);
+    const e = try b.begin(u16);
+    if (h.secure_reneg) try b.bytes(&.{ 0xff, 0x01, 0, 1, 0 });
+    try b.bytes(&.{ 0, ext.extended_master_secret, 0, 0 });
+    try b.bytes(&.{ 0, ext.ec_point_formats, 0, 2, 1, 0 });
+    if (h.alpn) |p| {
+        try b.int(u16, ext.alpn);
+        const x = try b.begin(u16);
+        const l = try b.begin(u16);
+        try b.int(u8, @intCast(p.len));
+        try b.bytes(p);
+        try b.end(u16, l);
+        try b.end(u16, x);
+    }
+    if (h.ack_sni) try b.bytes(&.{ 0, 0, 0, 0 });
+    try b.end(u16, e);
+    try b.end(u24, m);
+}
+
+/// Certificate without request context or per-entry extensions (RFC 5246 7.4.2).
+pub fn certificate12(b: *Builder, chain: []const []const u8) Builder.Error!void {
+    try b.int(u8, @intFromEnum(tls.HandshakeType.certificate));
+    const m = try b.begin(u24);
+    const l = try b.begin(u24);
+    for (chain) |c| {
+        const x = try b.begin(u24);
+        try b.bytes(c);
+        try b.end(u24, x);
+    }
+    try b.end(u24, l);
+    try b.end(u24, m);
+}
+
+/// ECParameters + public point: the signed part of ServerKeyExchange (RFC 8422 5.4).
+pub fn ecdheParams(b: *Builder, group: u16, point: []const u8) Builder.Error!void {
+    try b.int(u8, 3); // named_curve
+    try b.int(u16, group);
+    const p = try b.begin(u8);
+    try b.bytes(point);
+    try b.end(u8, p);
+}
+
+pub fn certificateRequest12(b: *Builder, schemes: []const tls.SignatureScheme) Builder.Error!void {
+    try b.int(u8, @intFromEnum(tls.HandshakeType.certificate_request));
+    const m = try b.begin(u24);
+    try b.bytes(&.{ 2, 1, 64 }); // rsa_sign, ecdsa_sign
+    const l = try b.begin(u16);
+    for (schemes) |sc| try b.int(u16, @intFromEnum(sc));
+    try b.end(u16, l);
+    try b.int(u16, 0);
+    try b.end(u24, m);
+}
+
+pub fn serverHelloDone(b: *Builder) Builder.Error!void {
+    try b.bytes(&.{ @intFromEnum(tls.HandshakeType.server_hello_done), 0, 0, 0 });
+}
+
+/// Splits a 1.2 client Certificate body into DER entries; empty means no certificate.
+pub fn parseCertificate12(body: []const u8, out: *[max_peer_chain][]const u8) CertificateError![]const []const u8 {
+    var c: Cursor = .{ .b = body };
+    const list = try c.vec(u24);
+    if (c.left() != 0) return error.DecodeError;
+    var l: Cursor = .{ .b = list };
+    var n: usize = 0;
+    while (l.left() > 0) : (n += 1) {
+        const cert = try l.vec(u24);
+        if (cert.len == 0) return error.DecodeError;
+        if (n == max_peer_chain) return error.BadCertificate;
+        out[n] = cert;
+    }
+    return out[0..n];
+}
+
+/// ClientKeyExchange body: one ECPoint (RFC 8422 5.7).
+pub fn parseClientKeyExchange(body: []const u8) ParseError![]const u8 {
+    var c: Cursor = .{ .b = body };
+    const point = try c.vec(u8);
+    if (c.left() != 0 or point.len == 0) return error.DecodeError;
+    return point;
+}
+
 pub const max_peer_chain = 8;
 pub const CertificateError = ParseError || error{BadCertificate};
 
@@ -377,6 +505,32 @@ test "client hello rejects duplicates, bad lengths, and pre-1.3" {
     try std.testing.expectError(error.ProtocolVersion, ClientHello.parse(&old));
     const long = [_]u8{ 0x03, 0x03 } ++ [_]u8{0} ** 32 ++ [_]u8{ 0, 0, 2, 0x13, 0x01, 1, 0, 0, 7, 0, 43, 0, 9, 2, 3, 4 };
     try std.testing.expectError(error.DecodeError, ClientHello.parse(&long));
+}
+
+test "client hello version offers" {
+    const pre = [_]u8{ 0x03, 0x03 } ++ [_]u8{0} ** 32 ++ [_]u8{ 0, 0, 2, 0xc0, 0x2b, 1, 0 };
+    // No extensions, legacy 1.2: a 1.2 offer without EMS.
+    const a = try ClientHello.parse(&pre);
+    try std.testing.expect(a.tls12 and !a.tls13 and !a.ems);
+    // supported_versions {0303} plus EMS and empty renegotiation_info.
+    const b = pre ++ [_]u8{ 0, 16, 0, 43, 0, 3, 2, 3, 3, 0, 23, 0, 0, 0xff, 1, 0, 1, 0 };
+    const hb = try ClientHello.parse(&b);
+    try std.testing.expect(hb.tls12 and !hb.tls13 and hb.ems and hb.reneg.?.len == 0);
+    // supported_versions without 1.2/1.3 overrides legacy_version.
+    const c = pre ++ [_]u8{ 0, 7, 0, 43, 0, 3, 2, 3, 2 };
+    try std.testing.expectError(error.ProtocolVersion, ClientHello.parse(&c));
+    const bad_ems = pre ++ [_]u8{ 0, 5, 0, 23, 0, 1, 0 };
+    try std.testing.expectError(error.DecodeError, ClientHello.parse(&bad_ems));
+}
+
+test "tls 1.2 message bounds" {
+    var out: [max_peer_chain][]const u8 = undefined;
+    try std.testing.expectEqual(0, (try parseCertificate12(&.{ 0, 0, 0 }, &out)).len);
+    try std.testing.expectEqualSlices(u8, &.{0xaa}, (try parseCertificate12(&.{ 0, 0, 4, 0, 0, 1, 0xaa }, &out))[0]);
+    try std.testing.expectError(error.DecodeError, parseCertificate12(&.{ 0, 0, 4, 0, 0, 2, 0xaa }, &out));
+    try std.testing.expectError(error.DecodeError, parseClientKeyExchange(&.{ 2, 1 }));
+    try std.testing.expectError(error.DecodeError, parseClientKeyExchange(&.{0}));
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9 }, try parseClientKeyExchange(&.{ 2, 9, 9 }));
 }
 
 test "certificate request encoding" {

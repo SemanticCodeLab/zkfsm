@@ -10,6 +10,7 @@ const object = @import("../object/root.zig");
 const s3 = @import("../s3/root.zig");
 const kms = @import("../kms/root.zig");
 const common = @import("common.zig");
+const setup = @import("setup.zig");
 
 const sse = kms.sse;
 const kstream = kms.stream;
@@ -233,6 +234,19 @@ fn configKey(bid: core.BucketId) backend.PhysicalKey {
     return .{ .space = .system, .hex = std.fmt.bytesToHex(h[0..16].*, .lower) };
 }
 
+/// Bucket default encryption, or null when none is set.
+pub fn bucketConfig(svc: *object.ObjectService, arena: std.mem.Allocator, bucket: []const u8) object.Error!?BucketConfig {
+    const bid = try svc.bucketId(bucket);
+    const bytes = svc.store.getRecord(configKey(bid), arena) catch |e| switch (e) {
+        error.NotFound => return null,
+        else => return object.service.mapBackend(e),
+    };
+    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.Corrupt;
+    const scheme = sse.Scheme.parse(bytes[0..nl]) orelse return error.Corrupt;
+    if (scheme == .c) return error.Corrupt;
+    return .{ .scheme = scheme, .key_id = bytes[nl + 1 ..] };
+}
+
 const subresources = [_][]const u8{ "tagging", "retention", "legal-hold", "acl", "attributes", "restore", "torrent", "select" };
 
 const MpError = DispatchError || mp.Error || error{ MalformedXML, EntityTooLarge };
@@ -246,12 +260,61 @@ const Source = struct { info: ObjectInfo, path: []const u8, version: ?core.Versi
 pub const SseExt = struct {
     gpa: std.mem.Allocator,
     /// Null without a configured KMS; SSE-C still works.
-    kms: ?kms.Kms,
-    default_key: []const u8,
+    /// Read and called only under `mutex`, which also guards backend swaps.
+    kms: ?kms.Kms = null,
+    default_key: []const u8 = "",
     mutex: std.Thread.Mutex = .{},
+    stats: kms.metered.Stats = .{},
+    backend_name: []const u8 = "none",
+    holder: ?*setup.Holder = null,
 
     pub fn extension(self: *SseExt) s3.Extension {
         return .{ .name = "sse", .ctx = self, .route = route };
+    }
+
+    /// Serves the backend in `h` (counted); call before serving.
+    pub fn attach(self: *SseExt, h: *setup.Holder) void {
+        if (self.stats.started_s == 0) self.stats.started_s = std.time.timestamp();
+        self.holder = h;
+        self.backend_name = h.spec.backend.text();
+        self.default_key = h.default_key;
+        self.kms = null;
+        if (h.handle) |inner| {
+            h.metered = .{ .inner = inner, .stats = &self.stats };
+            self.kms = h.metered.kms();
+        }
+    }
+
+    pub const Active = struct { kms: kms.Kms, default_key: []const u8, holder: ?*setup.Holder };
+
+    /// Locks the KMS; on a non-null result the caller must `unlockKms`.
+    pub fn lockKms(self: *SseExt) ?Active {
+        self.mutex.lock();
+        const k = self.kms orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        return .{ .kms = k, .default_key = self.default_key, .holder = self.holder };
+    }
+
+    pub fn unlockKms(self: *SseExt) void {
+        self.mutex.unlock();
+    }
+
+    /// Prometheus families for the KMS (metrics.global.extra).
+    pub fn renderMetrics(ctx: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *SseExt = @ptrCast(@alignCast(ctx));
+        try self.stats.render(self.backend_name, w);
+    }
+
+    /// Replaces the backend once no call is in flight; frees a replaced
+    /// runtime-created holder.
+    pub fn swap(self: *SseExt, h: *setup.Holder) void {
+        self.mutex.lock();
+        const old = self.holder;
+        self.attach(h);
+        self.mutex.unlock();
+        if (old) |o| if (o.heap) o.destroy(self.gpa);
     }
 
     fn route(ctx: *anyopaque, c: *Ctx) ConnError!bool {
@@ -285,15 +348,7 @@ pub const SseExt = struct {
 
     pub fn loadConfig(self: *SseExt, c: *Ctx, bucket: []const u8) DispatchError!?BucketConfig {
         _ = self;
-        const bid = try c.svc.bucketId(bucket);
-        const bytes = c.svc.store.getRecord(configKey(bid), c.arena) catch |e| switch (e) {
-            error.NotFound => return null,
-            else => return object.service.mapBackend(e),
-        };
-        const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.Corrupt;
-        const scheme = sse.Scheme.parse(bytes[0..nl]) orelse return error.Corrupt;
-        if (scheme == .c) return error.Corrupt;
-        return .{ .scheme = scheme, .key_id = bytes[nl + 1 ..] };
+        return bucketConfig(c.svc, c.arena, bucket);
     }
 
     /// Explicit SSE headers, else the bucket default; false when neither applies.
@@ -411,19 +466,17 @@ pub const SseExt = struct {
         const scheme = sse.Scheme.parse(h.algorithm orelse return badArg(c)) orelse return badArg(c);
         if (scheme == .c) return badArg(c);
         if (scheme == .s3 and (h.kms_key != null or h.context != null)) return badArg(c);
-        const k = self.kms orelse {
-            try noKms(c);
-            return null;
-        };
-        const key_id = h.kms_key orelse self.default_key;
-        if (!kms.types.validKeyName(key_id)) return badArg(c);
+        if (h.kms_key) |id| if (!kms.types.validKeyName(id)) return badArg(c);
         const pairs = parseContext(c.arena, h.context) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Invalid => return badArg(c),
         };
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return sse.newKmsObjectKey(self.gpa, k, scheme, key_id, path, pairs) catch |e| {
+        const a = self.lockKms() orelse {
+            try noKms(c);
+            return null;
+        };
+        defer self.unlockKms();
+        return sse.newKmsObjectKey(self.gpa, a.kms, scheme, h.kms_key orelse a.default_key, path, pairs) catch |e| {
             try kmsFail(c, e);
             return null;
         };
@@ -527,13 +580,12 @@ pub const SseExt = struct {
             try s3.handler.fail(c, .InvalidArgument);
             return null;
         }
-        const k = self.kms orelse {
+        const a = self.lockKms() orelse {
             try noKms(c);
             return null;
         };
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return sse.openKmsObjectKey(self.gpa, k, meta, path) catch |e| {
+        defer self.unlockKms();
+        return sse.openKmsObjectKey(self.gpa, a.kms, meta, path) catch |e| {
             try kmsFail(c, e);
             return null;
         };

@@ -1,0 +1,38 @@
+image:
+  repository: ghcr.io/semanticcodelab/zkfsm-csi
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Block devices to adopt in addition to the default /sys/block scan, comma separated
+# (e.g. "/dev/loop*" for test clusters). Only blank or ZKFSM-CSI-labeled drives are used.
+driveGlob: ""
+# Test mode: treat every subdirectory of this host path as an already-mounted drive.
+driveDir: ""
+# Host directory for drive mount points and state.json.
+stateDir: /var/lib/zkfsm-csi
+kubeletDir: /var/lib/kubelet
+minDriveSize: 536870912
+
+storageClass:
+  create: true
+  name: zkfsm-direct
+  isDefault: false
+  fsType: xfs
+
+provisioner:
+  image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+registrar:
+  image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+
+controller:
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+
+node:
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  priorityClassName: system-node-critical

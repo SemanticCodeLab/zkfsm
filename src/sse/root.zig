@@ -5,6 +5,7 @@ pub const setup = @import("setup.zig");
 pub const handler = @import("handler.zig");
 pub const select_api = @import("select_api.zig");
 pub const kms_admin = @import("kms_admin.zig");
+pub const kms_rekey = @import("kms_rekey.zig");
 
 pub const Sse = handler.SseExt;
 pub const SelectApi = select_api.SelectExt;
@@ -16,4 +17,5 @@ test {
     _ = handler;
     _ = select_api;
     _ = kms_admin;
+    _ = kms_rekey;
 }

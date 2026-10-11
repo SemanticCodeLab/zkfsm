@@ -170,7 +170,7 @@ if [[ -n "$vault_up" ]]; then
   ROLE_ID=$(vapi "$VADDR/v1/auth/approle/role/zkfsm/role-id" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["role_id"])')
   SECRET_ID=$(vapi -X POST "$VADDR/v1/auth/approle/role/zkfsm/secret-id" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["secret_id"])')
   (cd "$ROOT" && ZKFSM_KMS_TEST_VAULT_ADDR="$VADDR" ZKFSM_KMS_TEST_VAULT_TOKEN="$VTOKEN" ZKFSM_KMS_TEST_VAULT_ROLE_ID="$ROLE_ID" \
-    ZKFSM_KMS_TEST_VAULT_SECRET_ID="$SECRET_ID" zig test src/kms/root.zig --test-filter "vault live" >"$WORK/vault-unit.log" 2>&1) \
+    ZKFSM_KMS_TEST_VAULT_SECRET_ID="$SECRET_ID" zig test src/kms_tests.zig --test-filter "vault live" >"$WORK/vault-unit.log" 2>&1) \
     || fail "vault live unit test"
   if grep -q "skipped" "$WORK/vault-unit.log"; then fail "vault live unit test skipped"; fi
   ok "vault live: Transit, KV2, AppRole"
@@ -209,7 +209,7 @@ fi
 if [[ -n "$kms_up" ]]; then
   for _ in $(seq 100); do curl -s -o /dev/null "$KEP/" && break; sleep 0.1; done
   (cd "$ROOT" && ZKFSM_KMS_API_TEST_ENDPOINT="$KEP" AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-    zig test src/kms/root.zig --test-filter "kms-api live" >"$WORK/kmsapi-unit.log" 2>&1) || fail "kms-api live unit test"
+    zig test src/kms_tests.zig --test-filter "kms-api live" >"$WORK/kmsapi-unit.log" 2>&1) || fail "kms-api live unit test"
   if grep -q "skipped" "$WORK/kmsapi-unit.log"; then fail "kms-api live unit test skipped"; fi
   ok "kms-api live: create, data keys, context binding, rotation, list"
 

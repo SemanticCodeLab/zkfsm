@@ -1,0 +1,8 @@
+zkfsm-csi installed: driver csi.zkfsm.io, StorageClass {{ .Values.storageClass.name }} (WaitForFirstConsumer).
+
+Each node adopts only blank drives (first 64 KiB zero) or drives labeled ZKFSM-CSI;
+volumes are directories on one drive, pinned to that node via topology.csi.zkfsm.io/node.
+
+DeleteVolume does not erase data. To reclaim space on a node after a PV is gone:
+  kubectl -n {{ .Release.Namespace }} exec <node-pod> -c zkfsm-csi -- \
+    zkfsm-csi node --gc --volume <pv-name> --state-dir {{ .Values.stateDir }}{{ if .Values.driveDir }} --drive-dir {{ .Values.driveDir }}{{ end }}
