@@ -18,6 +18,7 @@ tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Co
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
 tests/replication.sh       # bucket and site replication across three deployments (set MC)
+tests/batch.sh             # mc batch replicate/keyrotate/expire jobs, cancel, resume (set MC)
 ```
 
 ## Run
@@ -367,6 +368,15 @@ Sites share a `site-replicator-0` service account. New buckets are versioned and
 pushed to peers with versioning, object lock, policy, lifecycle, tags, encryption, and
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
+
+### Batch jobs
+
+`mc batch generate|start|list|status|describe|cancel` run `replicate` (local to remote,
+remote to local, or local to local; version ids, times, tags and delete markers kept),
+`keyrotate` (SSE-S3/SSE-KMS objects resealed under a new key, version ids kept) and
+`expire` (rules by type, name, age, size, tags, metadata, `purge.retainVersions`) jobs
+in the background. Progress is checkpointed, so jobs resume after a restart; failed
+passes retry per `retry`, and `notify` receives the final status. Single-node mode only.
 
 ### Bucket notifications and audit logging
 
