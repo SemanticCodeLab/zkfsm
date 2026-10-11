@@ -108,12 +108,61 @@ const Shards = struct {
     }
 };
 
+/// Keeps a few full-block buffers between requests: mapping and faulting fresh
+/// pages for every megabyte costs more than encoding it. One length per pool.
+const Slabs = struct {
+    mutex: std.Thread.Mutex = .{},
+    len: usize = 0,
+    free: [keep][*]u8 = undefined,
+    n: usize = 0,
+
+    const keep = 32;
+
+    fn take(p: *Slabs, gpa: std.mem.Allocator, len: usize) error{OutOfMemory}![]u8 {
+        {
+            p.mutex.lock();
+            defer p.mutex.unlock();
+            if (p.len == len and p.n > 0) {
+                p.n -= 1;
+                return p.free[p.n][0..len];
+            }
+        }
+        return gpa.alloc(u8, len);
+    }
+
+    fn give(p: *Slabs, gpa: std.mem.Allocator, buf: []u8) void {
+        {
+            p.mutex.lock();
+            defer p.mutex.unlock();
+            if (p.n == 0) p.len = buf.len;
+            if (p.len == buf.len and p.n < keep) {
+                p.free[p.n] = buf.ptr;
+                p.n += 1;
+                return;
+            }
+        }
+        gpa.free(buf);
+    }
+
+    fn deinit(p: *Slabs, gpa: std.mem.Allocator) void {
+        for (p.free[0..p.n]) |b| gpa.free(b[0..p.len]);
+        p.n = 0;
+    }
+};
+
 pub const ErasureStore = struct {
     gpa: std.mem.Allocator,
     drives: *placement.DriveSet,
     codec: erasure.Codec,
     /// Records and system keys: replicated on every placed drive.
     meta: ReplicaStore,
+    put_slabs: Slabs = .{},
+    get_slabs: Slabs = .{},
+
+    pub fn deinit(self: *ErasureStore) void {
+        self.put_slabs.deinit(self.gpa);
+        self.get_slabs.deinit(self.gpa);
+    }
 
     pub fn init(gpa: std.mem.Allocator, drives: *placement.DriveSet, profile: erasure.Profile) ErasureStore {
         return .{ .gpa = gpa, .drives = drives, .codec = .init(profile), .meta = .init(gpa, drives) };
@@ -189,10 +238,12 @@ pub const ErasureStore = struct {
         // Buffers sized to the object when its size is known: small objects stay small.
         const cap: u32 = if (opts.size_hint) |h| @intCast(@max(1, @min(block_size, h))) else block_size;
         const sl = std.math.divCeil(u32, cap, k) catch unreachable;
-        const blk = try self.gpa.alloc(u8, cap);
-        defer self.gpa.free(blk);
-        const sbuf = try self.gpa.alloc(u8, n * sl);
-        defer self.gpa.free(sbuf);
+        // Full blocks come from the slab pool; small objects are cheap to allocate.
+        const pooled = cap == block_size;
+        const both = if (pooled) try self.put_slabs.take(self.gpa, cap + n * sl) else try self.gpa.alloc(u8, cap + n * sl);
+        defer if (pooled) self.put_slabs.give(self.gpa, both) else self.gpa.free(both);
+        const blk = both[0..cap];
+        const sbuf = both[cap..];
         var slices: [max_n][]u8 = undefined;
 
         var total: u64 = 0;
@@ -407,8 +458,9 @@ pub const ErasureStore = struct {
         const lay = Layout.init(h.size, h.block_size, k) catch return error.IoFailed;
         const sl = h.maxShardLen();
         const jl: usize = @intCast(@min(h.block_size, h.size));
-        const sbuf = try self.gpa.alloc(u8, n * sl + 4 + sl + jl);
-        defer self.gpa.free(sbuf);
+        const pooled = jl == block_size;
+        const sbuf = if (pooled) try self.get_slabs.take(self.gpa, n * sl + 4 + sl + jl) else try self.gpa.alloc(u8, n * sl + 4 + sl + jl);
+        defer if (pooled) self.get_slabs.give(self.gpa, sbuf) else self.gpa.free(sbuf);
         var slices: [max_n][]u8 = undefined;
         for (0..n) |i| slices[i] = sbuf[i * sl ..][0..sl];
         const scratch = sbuf[n * sl ..][0 .. 4 + sl];
@@ -627,6 +679,7 @@ test "EC:4+2 survives two lost shards and heals them" {
     var set = try placement.DriveSet.open(gpa, &paths, .{ .erasure = .{ .data = 4, .parity = 2 } });
     defer set.deinit();
     var store = ErasureStore.init(gpa, &set, .ec4_2);
+    defer store.deinit();
     const be = store.backend();
 
     const data = try gpa.alloc(u8, block_size + 777);
@@ -687,6 +740,7 @@ test "small objects get compact shards; sizes round-trip" {
     var set = try placement.DriveSet.open(gpa, &paths, .{ .erasure = .{ .data = 2, .parity = 2 } });
     defer set.deinit();
     var store = ErasureStore.init(gpa, &set, .ec2_2);
+    defer store.deinit();
     const be = store.backend();
     const data = try gpa.alloc(u8, 2 * block_size + 3);
     defer gpa.free(data);

@@ -40,6 +40,14 @@ pub const Strategy = union(enum) {
         }
     }
 
+    /// Frees pooled buffers; the stores stay in the caller's `Stores`.
+    pub fn deinit(self: Strategy) void {
+        switch (self) {
+            .replica => {},
+            .erasure => |s| s.deinit(),
+        }
+    }
+
     pub fn backend(self: Strategy) iface.StorageBackend {
         return switch (self) {
             inline else => |s| s.backend(),

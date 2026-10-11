@@ -220,7 +220,10 @@ pub const Node = struct {
 
     pub fn destroy(n: *Node) void {
         n.stop();
-        for (n.pools) |*p| for (p.sets) |*s| s.drives.deinit();
+        for (n.pools) |*p| for (p.sets) |*s| {
+            s.strategy.deinit();
+            s.drives.deinit();
+        };
         n.locks.deinit();
         n.table.deinit();
         n.leases.deinit();

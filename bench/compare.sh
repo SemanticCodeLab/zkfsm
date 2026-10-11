@@ -2,10 +2,12 @@
 # warp PUT/GET/LIST/mixed against zkfsm, MinIO and RustFS in docker containers with
 # identical CPU/memory/tmpfs limits, single node (4 drives) and 4 nodes x 4 drives.
 # Targets run one after another; see bench/RESULTS.md for methodology.
+# Drives are tmpfs charged to the container: they must hold a whole put run (about
+# 1000 x 1 MiB objects a second at 2x), or the run measures a full drive instead.
 #
 # env: PRODUCTS ("zkfsm minio rustfs"), TOPOS ("single cluster"), WORKLOADS (see below),
-#      DUR (20s), DUR_PUT_1M (4s), CONC (32), SERVER_CPUS (0,1,2,3), CLIENT_CPUS (4-7), CLIENT_NCPU (4),
-#      SINGLE_MEM (8g), SINGLE_DRIVE (1536m), NODE_MEM (3g), NODE_DRIVE (512m),
+#      DUR (20s), DUR_PUT_1M (5s), CONC (32), SERVER_CPUS (0,1,2,3), CLIENT_CPUS (4-7), CLIENT_NCPU (4),
+#      SINGLE_MEM (18g), SINGLE_DRIVE (3584m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
 #      ZKFSM_BIN / MINIO_BIN / WARP_BIN (prebuilt binaries; built into CACHE when unset),
 #      ZKFSM_SINGLE_PROTECTION (EC:2+2, matching MinIO EC:2), RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl).
@@ -17,13 +19,13 @@ PRODUCTS="${PRODUCTS:-zkfsm minio rustfs}"
 TOPOS="${TOPOS:-single cluster}"
 WORKLOADS="${WORKLOADS:-put-4k put-1m get-4k get-1m list-4k mixed-4k mixed-1m}"
 DUR="${DUR:-20s}"
-DUR_PUT_1M="${DUR_PUT_1M:-4s}"
+DUR_PUT_1M="${DUR_PUT_1M:-5s}"
 CONC="${CONC:-32}"
 SERVER_CPUS="${SERVER_CPUS:-0,1,2,3}"
 CLIENT_CPUS="${CLIENT_CPUS:-4-7}"
 CLIENT_NCPU="${CLIENT_NCPU:-4}"
-SINGLE_MEM="${SINGLE_MEM:-8g}"
-SINGLE_DRIVE="${SINGLE_DRIVE:-1536m}"
+SINGLE_MEM="${SINGLE_MEM:-18g}"
+SINGLE_DRIVE="${SINGLE_DRIVE:-3584m}"
 NODE_MEM="${NODE_MEM:-3g}"
 NODE_DRIVE="${NODE_DRIVE:-512m}"
 RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:latest}"

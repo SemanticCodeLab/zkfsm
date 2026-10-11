@@ -335,6 +335,7 @@ pub fn run(opts: Options) u8 {
         std.log.err("protection {s} is not supported", .{drives.profile.name()});
         return 1;
     };
+    defer strategy.deinit();
     const be = strategy.backend();
     var healer = heal.Healer.init(gpa, &drives, strategy, .{});
     std.log.info("{d} drive(s), protection {s}", .{ drives.count(), drives.profile.name() });
