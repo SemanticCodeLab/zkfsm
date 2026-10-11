@@ -73,8 +73,32 @@ extern fn @"llvm.x86.avx512.pshuf.b.512"(V, V) V;
 extern fn @"llvm.x86.avx2.pshuf.b"(V, V) V;
 extern fn @"llvm.x86.ssse3.pshuf.b.128"(V, V) V;
 
+/// A portable x86-64 build has no pshufb at compile time; the CPU is asked once.
+const probe_ssse3 = x86_llvm and !has_ssse3;
+var ssse3_state: std.atomic.Value(u8) = .init(0);
+
+fn cpuHasSsse3() bool {
+    if (!probe_ssse3) return false;
+    const st = ssse3_state.load(.monotonic);
+    if (st != 0) return st == 2;
+    var c: u32 = undefined;
+    asm volatile ("cpuid"
+        : [c] "={ecx}" (c),
+        : [_] "{eax}" (@as(u32, 1)),
+          [_] "{ecx}" (@as(u32, 0)),
+        : .{ .ebx = true, .edx = true });
+    const has = c & (1 << 9) != 0;
+    ssse3_state.store(if (has) 2 else 1, .monotonic);
+    return has;
+}
+
 /// Per-128-bit-lane table lookup (pshufb semantics for indices < 16).
-inline fn lookup(t: V, idx: V) V {
+inline fn lookup(comptime via_asm: bool, t: V, idx: V) V {
+    if (via_asm) return asm ("pshufb %[idx], %[t]"
+        : [t] "=x" (-> V),
+        : [_] "0" (t),
+          [idx] "x" (idx),
+    );
     if (has_avx512) return @"llvm.x86.avx512.pshuf.b.512"(t, idx);
     if (has_avx2) return @"llvm.x86.avx2.pshuf.b"(t, idx);
     if (has_ssse3) return @"llvm.x86.ssse3.pshuf.b.128"(t, idx);
@@ -99,12 +123,15 @@ pub fn mulMatrix(coeffs: []const u8, inputs: []const []const u8, outputs: []cons
     std.debug.assert(coeffs.len == inputs.len * outputs.len);
     switch (outputs.len) {
         0 => {},
-        inline 1...max_outputs => |n| kernel(n, coeffs, inputs, outputs, from, to),
+        inline 1...max_outputs => |n| if (cpuHasSsse3())
+            kernel(n, probe_ssse3, coeffs, inputs, outputs, from, to)
+        else
+            kernel(n, false, coeffs, inputs, outputs, from, to),
         else => unreachable,
     }
 }
 
-fn kernel(comptime n_out: usize, coeffs: []const u8, inputs: []const []const u8, outputs: []const []u8, from: usize, to: usize) void {
+fn kernel(comptime n_out: usize, comptime via_asm: bool, coeffs: []const u8, inputs: []const []const u8, outputs: []const []u8, from: usize, to: usize) void {
     const n_in = inputs.len;
     var lo: [max_outputs][max_inputs]V = undefined;
     var hi: [max_outputs][max_inputs]V = undefined;
@@ -125,7 +152,7 @@ fn kernel(comptime n_out: usize, coeffs: []const u8, inputs: []const []const u8,
             const xl = x & mask;
             const xh = x >> four;
             inline for (0..n_out) |o| {
-                acc[o] ^= lookup(lo[o][i], xl) ^ lookup(hi[o][i], xh);
+                acc[o] ^= lookup(via_asm, lo[o][i], xl) ^ lookup(via_asm, hi[o][i], xh);
             }
         }
         inline for (0..n_out) |o| outputs[o][pos..][0..lanes].* = acc[o];

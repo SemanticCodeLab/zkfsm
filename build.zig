@@ -35,6 +35,18 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(erasure_tests).step);
 
+    // The run-time selected pshufb kernel only exists in a portable (baseline CPU) LLVM build.
+    if (target.result.cpu.arch == .x86_64) {
+        var q = target.query;
+        q.cpu_model = .baseline;
+        const portable_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = erasure_src,
+            .target = b.resolveTargetQuery(q),
+            .optimize = optimize,
+        }), .use_llvm = true });
+        test_step.dependOn(&b.addRunArtifact(portable_tests).step);
+    }
+
     // The hardware hash paths need the LLVM backend, also in Debug.
     const hw_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/core/hwhash.zig"),
