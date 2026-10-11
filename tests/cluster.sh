@@ -79,6 +79,23 @@ for i in 1 2 3 4; do start "$i"; done
 for i in 1 2 3 4; do wait_ready "$i" 120; done
 check "four nodes ready" "200 200 200 200" "$(ready 1) $(ready 2) $(ready 3) $(ready 4)"
 
+# ---- a failed bootstrap exits cleanly with a clear error ----
+# Node 4 comes back with two of its drives swapped: the sets cannot be opened.
+kill "${PIDS[4]}"
+wait "${PIDS[4]}" 2>/dev/null || true
+PIDS[4]=0
+swap() { mv "$WORK/n4/d1" "$WORK/n4/dx"; mv "$WORK/n4/d2" "$WORK/n4/d1"; mv "$WORK/n4/dx" "$WORK/n4/d2"; }
+swap
+rc=0
+ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" timeout 60 "$BIN" "${POOLS[@]}" --listen "127.0.0.1:${PORT[4]}" \
+  --node-address "127.0.0.1:${PORT[4]}" --protection EC:4+2 >"$WORK/boot.log" 2>&1 || rc=$?
+swap
+check "failed bootstrap exits with status 1" 1 "$rc"
+check "and says why" yes "$(grep -q 'formatted for a different layout' "$WORK/boot.log" && grep -q 'cluster bootstrap failed: LayoutMismatch' "$WORK/boot.log" && echo yes || { cat "$WORK/boot.log" >&2; echo no; })"
+check "without crashing" 0 "$(grep -ciE 'segmentation|panic|unreachable|stack trace' "$WORK/boot.log" || true)"
+start 4
+wait_ready 4 60
+
 # ---- identical views through every node ----
 cli 1 s3 mb s3://clu >/dev/null
 for n in 1 2 3 4; do head -c $((n * 70000 + 13)) /dev/urandom >"$WORK/obj/cli$n"; cli "$n" s3 cp --no-progress "$WORK/obj/cli$n" "s3://clu/cli$n" >/dev/null; done

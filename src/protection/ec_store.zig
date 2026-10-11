@@ -545,7 +545,7 @@ pub const ErasureStore = struct {
             pend[i] = w;
         }
         if (rep.healthy < k) {
-            switch (self.fragments(&s)) {
+            switch (self.fragments(&s, placed)) {
                 .purge => {
                     std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
                     s.close();
@@ -605,12 +605,14 @@ pub const ErasureStore = struct {
     /// interrupted write or a missed delete (a stored object has at least k), never
     /// readable again. Purged once older than the grace. Corrupt shards of a stored
     /// object still count as files, so damage is reported as loss, not purged.
-    fn fragments(self: *const ErasureStore, s: *const Shards) enum { no, young, purge } {
+    fn fragments(self: *const ErasureStore, s: *const Shards, placed: []const u8) enum { no, young, purge } {
         if (!self.clustered() or s.offline > 0) return .no;
         const files = self.width() - s.missing;
         if (files >= self.codec.k) return .no;
         const now = core.time.nowNs();
-        return if (s.mtime != 0 and now - s.mtime > replica.tombstone_grace_ns) .purge else .young;
+        if (s.mtime == 0 or now - s.mtime <= replica.tombstone_grace_ns) return .young;
+        // A replaced drive may be why shards are missing: that is loss, not a leftover.
+        return if (self.drives.anyFresh(placed)) .no else .purge;
     }
 
     pub fn healKey(self: *ErasureStore, key: PhysicalKey) KeyReport {
@@ -787,4 +789,69 @@ test "padded shards of older objects stay readable" {
     try testing.expectEqual(@as(u32, block_size / 4), d.shardLen(0));
     const c: Header = .{ .k = 4, .m = 2, .index = 0, .block_size = block_size, .size = 10, .compact = true };
     try testing.expectEqual(@as(u32, 3), Header.decode(&c.encode()).?.shardLen(0));
+}
+
+test "cluster set: old shards below k are purged as leftovers, unless a drive was replaced" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [6][std.fs.max_path_bytes]u8 = undefined;
+    var members: [6]placement.drives.Member = undefined;
+    var nb: [4]u8 = undefined;
+    for (&members, 0..) |*m, i| {
+        const name = try std.fmt.bufPrint(&nb, "d{d}", .{i});
+        try tmp.dir.makePath(name);
+        m.* = .{ .path = try tmp.dir.realpath(name, &bufs[i]), .node = @intCast(i) };
+    }
+    const tmpl: placement.layout.FormatV2 = .{ .deployment = @splat(1), .layout = @splat(2), .pool = 0, .set = 0, .index = 0, .set_size = 6, .profile = .{ .erasure = .{ .data = 4, .parity = 2 } } };
+    var set = try placement.DriveSet.openCluster(gpa, &members, tmpl, false);
+    defer set.deinit();
+    var store = ErasureStore.init(gpa, &set, .ec4_2);
+    defer store.deinit();
+    const be = store.backend();
+    const old_ns: i128 = core.time.nowNs() - 2 * @as(i128, replica.tombstone_grace_ns);
+
+    const key: PhysicalKey = .{ .space = .data, .hex = "44444444444444444444444444444444".* };
+    var pbuf: [max_drives]u8 = undefined;
+    const pl = set.placed(key, &pbuf);
+    var kb: [64]u8 = undefined;
+    const rel = try iface.local.keyPath(key, @ptrCast(&kb));
+    var pb: [160]u8 = undefined;
+    const Fx = struct {
+        // Stores the object, then leaves `keep` shards behind as a missed delete would.
+        fn leave(b: iface.StorageBackend, dir: std.fs.Dir, k: PhysicalKey, placed: []const u8, r: []const u8, keep: usize, mtime: ?i128) !void {
+            var src: std.Io.Reader = .fixed("shards of a deleted object");
+            _ = try b.put(k, &src, .{});
+            var buf: [160]u8 = undefined;
+            for (placed, 0..) |d, i| {
+                const path = try std.fmt.bufPrint(&buf, "d{d}/{s}", .{ d, r });
+                if (i >= keep) {
+                    try dir.deleteFile(path);
+                } else if (mtime) |t| {
+                    var f = try dir.openFile(path, .{ .mode = .read_write });
+                    defer f.close();
+                    try f.updateTimes(t, t);
+                }
+            }
+        }
+    };
+    // Young fragments may belong to a write in flight: neither purged nor lost.
+    try Fx.leave(be, tmp.dir, key, pl, rel, 3, null);
+    const young = store.healKey(key);
+    try testing.expect(!young.purged and !young.lost);
+    // Old ones with a replaced drive in the set are reported as loss and kept.
+    try Fx.leave(be, tmp.dir, key, pl, rel, 3, old_ns);
+    set.drives[pl[5]].fresh.store(true, .release);
+    const kept = store.healKey(key);
+    try testing.expect(kept.lost and !kept.purged);
+    try tmp.dir.access(try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ pl[0], rel }), .{});
+    // With every drive settled they are leftovers of a missed delete: purged.
+    set.drives[pl[5]].fresh.store(false, .release);
+    const gone = store.healKey(key);
+    try testing.expect(gone.purged and !gone.lost);
+    try testing.expectError(error.NotFound, be.stat(key));
+    // Four of six shards is a live object: rebuilt, never purged.
+    try Fx.leave(be, tmp.dir, key, pl, rel, 4, old_ns);
+    const live = store.healKey(key);
+    try testing.expect(!live.purged and live.repaired == 2);
 }
