@@ -132,10 +132,7 @@ pub const Garbage = struct {
 
 /// Caller holds the mutex. Tag bytes borrow from `arena`.
 fn loadConfigLocked(svc: *Svc, arena: std.mem.Allocator, bid: core.BucketId) Error!BucketConfig {
-    const bytes = svc.store.getRecord(placement.bucketConfigKey(bid), arena) catch |e| return switch (e) {
-        error.NotFound => .{},
-        else => service.mapBackend(e),
-    };
+    const bytes = try svc.docGet(arena, placement.bucketConfigKey(bid)) orelse return .{};
     return metadata.bucket_config.decode(bytes) catch error.Corrupt;
 }
 
@@ -145,7 +142,7 @@ fn storeConfigLocked(svc: *Svc, bid: core.BucketId, cfg: BucketConfig) Error!voi
         error.OutOfMemory => error.OutOfMemory,
     };
     defer svc.gpa.free(bytes);
-    svc.store.putRecord(placement.bucketConfigKey(bid), bytes) catch |e| return service.mapBackend(e);
+    try svc.docPut(placement.bucketConfigKey(bid), bytes);
 }
 
 pub fn getConfig(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8) Error!BucketConfig {

@@ -237,10 +237,7 @@ fn configKey(bid: core.BucketId) backend.PhysicalKey {
 /// Bucket default encryption, or null when none is set.
 pub fn bucketConfig(svc: *object.ObjectService, arena: std.mem.Allocator, bucket: []const u8) object.Error!?BucketConfig {
     const bid = try svc.bucketId(bucket);
-    const bytes = svc.store.getRecord(configKey(bid), arena) catch |e| switch (e) {
-        error.NotFound => return null,
-        else => return object.service.mapBackend(e),
-    };
+    const bytes = try svc.docGet(arena, configKey(bid)) orelse return null;
     const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.Corrupt;
     const scheme = sse.Scheme.parse(bytes[0..nl]) orelse return error.Corrupt;
     if (scheme == .c) return error.Corrupt;
@@ -377,10 +374,8 @@ pub const SseExt = struct {
                 return s3.handler.respondXml(c, .ok, a.written());
             },
             .DELETE => {
-                c.svc.store.deleteRecord(key) catch |e| switch (e) {
-                    error.NotFound => {},
-                    else => return object.service.mapBackend(e),
-                };
+                try c.svc.docDelete(key);
+                c.svc.publishPending();
                 return s3.handler.respondEmpty(c, .no_content, &.{});
             },
             .PUT => {
@@ -396,7 +391,8 @@ pub const SseExt = struct {
                 const key_id = std.mem.trim(u8, s3.versioning.elemText(body, "KMSMasterKeyID") orelse "", " \r\n\t");
                 if (key_id.len > 0 and (scheme != .kms or !kms.types.validKeyName(key_id))) return s3.handler.fail(c, .InvalidArgument);
                 const rec = try std.fmt.allocPrint(c.arena, "{s}\n{s}", .{ scheme.wire(), key_id });
-                c.svc.store.putRecord(key, rec) catch |e| return object.service.mapBackend(e);
+                try c.svc.docPut(key, rec);
+                c.svc.publishPending();
                 return s3.handler.respondEmpty(c, .ok, &.{});
             },
             else => return s3.handler.fail(c, .MethodNotAllowed),

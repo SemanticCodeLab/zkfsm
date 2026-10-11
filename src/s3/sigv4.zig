@@ -494,6 +494,8 @@ pub const BodyReader = struct {
     prev: sv.Hex,
     chunk_sig: sv.Hex = undefined,
     remaining: u64 = 0,
+    /// Payload bytes delivered so far (chunked bodies).
+    decoded: u64 = 0,
     state: enum { header, data, done } = .header,
     /// Set when the body was rejected; the handler reports it as the S3 error.
     failure: ?Code = null,
@@ -601,7 +603,11 @@ pub const BodyReader = struct {
             if (!std.mem.eql(u8, crlf, "\r\n")) return self.fail(.InvalidArgument);
             if (!self.chunkSignatureOk()) return self.fail(.SignatureDoesNotMatch);
             self.state = .header;
+            // The declared payload is complete: check the closing chunk now, so a consumer
+            // that stops at the object size still sees a bad tail and the connection is reusable.
+            if (self.auth.decoded_length) |dl| if (self.decoded + n == dl) try self.readChunkHeader();
         }
+        self.decoded += n;
         w.advance(n);
         return n;
     }

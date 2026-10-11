@@ -63,5 +63,6 @@ test {
     _ = tenancy;
     _ = replica;
     _ = bucket_meta;
+    _ = @import("doc_cache.zig");
     _ = objmeta;
 }

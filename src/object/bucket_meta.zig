@@ -45,10 +45,7 @@ pub fn get(svc: *Svc, arena: std.mem.Allocator, bucket: []const u8, kind: Kind) 
 }
 
 pub fn getById(svc: *Svc, arena: std.mem.Allocator, bid: core.BucketId, kind: Kind) Error!?[]const u8 {
-    const bytes = svc.store.getRecord(key(bid, kind), arena) catch |e| return switch (e) {
-        error.NotFound => null,
-        else => service.mapBackend(e),
-    };
+    const bytes = try svc.docGet(arena, key(bid, kind)) orelse return null;
     return if (bytes.len == 0) null else bytes;
 }
 
@@ -60,19 +57,13 @@ pub fn set(svc: *Svc, bucket: []const u8, kind: Kind, doc: ?[]const u8) Error!vo
     const held = try svc.clusterLock("bucketmeta", bucket, @tagName(kind));
     defer svc.clusterUnlock(held);
     const k = key(bid, kind);
-    if (d.len == 0) {
-        svc.store.deleteRecord(k) catch |e| switch (e) {
-            error.NotFound => {},
-            else => return service.mapBackend(e),
-        };
-        return;
-    }
-    svc.store.putRecord(k, d) catch |e| return service.mapBackend(e);
+    if (d.len == 0) return svc.docDelete(k);
+    try svc.docPut(k, d);
 }
 
 /// Removes every document of a deleted bucket; best effort.
 pub fn dropAll(svc: *Svc, bid: core.BucketId) void {
-    inline for (@typeInfo(Kind).@"enum".fields) |f| svc.store.deleteRecord(key(bid, @enumFromInt(f.value))) catch {};
+    inline for (@typeInfo(Kind).@"enum".fields) |f| svc.docDelete(key(bid, @enumFromInt(f.value))) catch {};
 }
 
 test "bucket documents set, get, delete, and per-bucket-id isolation" {

@@ -12,6 +12,7 @@ const lock = @import("lock.zig");
 const conditional = @import("conditional.zig");
 const index_mod = @import("index.zig");
 const replica = @import("replica.zig");
+const doc_cache = @import("doc_cache.zig");
 
 const Md5 = core.checksum.Md5;
 
@@ -224,6 +225,8 @@ pub const ObjectService = struct {
     /// Changes made under `mutex`, published when the operation's lock is released.
     pending: std.ArrayList(Pending) = .empty,
     pending_mutex: std.Thread.Mutex = .{},
+    /// Bucket documents kept in memory; peers drop theirs on a catalog notice.
+    docs: doc_cache.DocCache = .{},
     /// Remote tiers; set right after init when tiering is available.
     tiers: ?*tier_mod.Registry = null,
     /// Replication engine; set right after init, before serving.
@@ -268,6 +271,7 @@ pub const ObjectService = struct {
     }
 
     pub fn deinit(self: *ObjectService) void {
+        self.docs.deinit(self.gpa);
         self.index.deinit();
         self.catalog.deinit();
         for (self.pending.items) |p| self.freeChange(p.change);
@@ -291,6 +295,38 @@ pub const ObjectService = struct {
         if (replica.origin != null) return;
         const s = self.replication orelse return;
         s.vtable.notify(s.ctx, ev);
+    }
+
+    // ---- bucket documents ----
+
+    /// A bucket document in `arena` (null when absent), from memory when cached.
+    pub fn docGet(self: *ObjectService, arena: std.mem.Allocator, key: backend.PhysicalKey) Error!?[]u8 {
+        const gen = switch (try self.docs.get(arena, key)) {
+            .found => |b| return b,
+            .absent => return null,
+            .miss => |g| g,
+        };
+        const bytes = self.store.getRecord(key, arena) catch |e| switch (e) {
+            error.NotFound => {
+                self.docs.fill(self.gpa, key, gen, null);
+                return null;
+            },
+            else => return mapBackend(e),
+        };
+        self.docs.fill(self.gpa, key, gen, bytes);
+        return bytes;
+    }
+
+    /// Writes a bucket document; peers hear of it when the operation publishes.
+    pub fn docPut(self: *ObjectService, key: backend.PhysicalKey, bytes: []const u8) Error!void {
+        defer self.docs.wrote(self.gpa, key);
+        self.store.putRecord(key, bytes) catch |e| return mapBackend(e);
+    }
+
+    /// Deletes a bucket document; an absent one is fine.
+    pub fn docDelete(self: *ObjectService, key: backend.PhysicalKey) Error!void {
+        defer self.docs.wrote(self.gpa, key);
+        self.store.deleteRecord(key) catch |e| if (e != error.NotFound) return mapBackend(e);
     }
 
     // ---- cluster coordination ----
@@ -338,6 +374,8 @@ pub const ObjectService = struct {
 
     pub fn publishPending(self: *ObjectService) void {
         const c = self.cluster orelse return;
+        // Peers reload the catalog and with it drop their cached bucket documents.
+        if (self.docs.dirty.swap(false, .acq_rel)) self.emit(.catalog);
         var pend: std.ArrayList(Pending) = blk: {
             self.pending_mutex.lock();
             defer self.pending_mutex.unlock();
@@ -392,6 +430,7 @@ pub const ObjectService = struct {
 
     /// Re-reads the bucket catalog; buckets that vanished leave the index too.
     pub fn reloadCatalog(self: *ObjectService) Error!void {
+        self.docs.clear(self.gpa);
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.reloadCatalogLocked();
@@ -476,7 +515,7 @@ pub const ObjectService = struct {
             self.catalog.add(.{ .name = name_copy, .id = saved.id, .created_ns = saved.created_ns }) catch {};
             return e;
         };
-        self.store.deleteRecord(placement.bucketConfigKey(saved.id)) catch {};
+        self.docDelete(placement.bucketConfigKey(saved.id)) catch {};
         self.index.dropBucket(saved.id);
         index_store.dropStream(self, saved.id.bytes);
         self.emit(.catalog);
