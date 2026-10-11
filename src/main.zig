@@ -19,11 +19,13 @@ const sse = @import("sse/root.zig");
 const tables = @import("tables/root.zig");
 const lambda = @import("lambda/root.zig");
 const batch = @import("batch/root.zig");
+const migrate = @import("migrate/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
-    \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
+    \\usage: zkfsm migrate ... (import a source deployment; zkfsm migrate --help)
+    \\       zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
     \\             [--domain D]... [--path-prefix P] [--health-prefix P] [--metrics-path P] [--no-minio-compat]
     \\             [--lifecycle-interval S]
     \\  heal             run one scan/heal pass over the drives and exit
@@ -284,6 +286,7 @@ pub fn run(opts: Options) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = std.process.argsAlloc(arena) catch return 1;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "migrate")) return migrate.main(gpa, args[1..]);
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
@@ -1036,4 +1039,5 @@ test {
     _ = batch;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
+    _ = migrate;
 }
