@@ -90,10 +90,16 @@ pub const LocalBackend = struct {
     /// Renames tmp into place and fsyncs the parent directory.
     fn commit(self: *LocalBackend, tmp: []const u8, final: []const u8) Error!void {
         const dir = std.fs.path.dirname(final) orelse ".";
-        self.root.makePath(dir) catch |e| return mapFs(e);
         const grow = if (self.usage != null) self.sizeAt(tmp) else 0;
         const shrink = if (self.usage != null) self.sizeAt(final) else 0;
-        self.root.rename(tmp, final) catch |e| return mapFs(e);
+        // The fan-out directory usually exists: create it only when the rename says no.
+        self.root.rename(tmp, final) catch |e| switch (e) {
+            error.FileNotFound => {
+                self.root.makePath(dir) catch |me| return mapFs(me);
+                self.root.rename(tmp, final) catch |re| return mapFs(re);
+            },
+            else => return mapFs(e),
+        };
         self.account(grow, shrink);
         // A plain openDir yields an O_PATH fd, which fsync rejects.
         var d = self.root.openDir(dir, .{ .iterate = true }) catch |e| return mapFs(e);

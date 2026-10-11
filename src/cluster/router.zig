@@ -141,7 +141,14 @@ pub const Router = struct {
         // Counted so a blob cannot land in a pool after it was confirmed draining.
         const counted = self.pools.len > 1 and self.enterUnguarded();
         defer if (counted) self.leaveUnguarded();
-        return at(&self.pools[self.pickPool()], key).put(key, source, opts);
+        const pool = &self.pools[self.pickPool()];
+        const meta = try at(pool, key).put(key, source, opts);
+        // Charged at once, so a burst between two space refreshes still spreads by bytes.
+        if (self.pools.len > 1) {
+            var cur = pool.free.load(.monotonic);
+            while (pool.free.cmpxchgWeak(cur, cur -| meta.size, .monotonic, .monotonic)) |v| cur = v;
+        }
+        return meta;
     }
 
     fn get(ctx: *anyopaque, key: PhysicalKey, range: ?iface.Range, sink: *std.Io.Writer) Error!iface.ObjectMeta {

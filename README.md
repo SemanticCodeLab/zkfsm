@@ -138,7 +138,9 @@ zkfsm --data http://127.0.0.1:{9001...9004}/srv/d{1...4} --listen 127.0.0.1:9001
   the cluster store's system namespace. Nodes mirror changes through
   notifications sent when the lock is released, reload the catalog and IAM
   every `--cluster-refresh` seconds, and rebuild the key index when a peer
-  returns or at startup.
+  returns or at startup. Bucket documents (configuration, CORS, ACL, default
+  encryption, ...) are served from memory; a node that missed the notification
+  of a change sees it at the next refresh.
 - **Health**: `/health/ready` is 200 only when the node can reach a lock
   majority and write quorum for every set, so load balancers route around
   nodes in a minority. See `deploy/lb/nginx.conf`, `deploy/lb/haproxy.cfg`,

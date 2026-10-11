@@ -333,6 +333,11 @@ POOLS=(--data "${PC[@]}" --data "${PD[@]}")
 start_all
 aliases
 load_data 2
+# Enough mid-sized objects that no single blob decides the balance.
+for i in $(seq 1 40); do
+  head -c 1048576 /dev/urandom >"$WORK/obj/mid$i"
+  curl -s -o /dev/null "${sig[@]}" -T "$WORK/obj/mid$i" "$(ep 2)/plain/mid$i"
+done
 snapshot 2 >"$WORK/before"
 stop_all
 POOLS=(--data "${PC[@]}" --data "${PD[@]}" --data "${PE[@]}")

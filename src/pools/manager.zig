@@ -627,6 +627,13 @@ pub const Manager = struct {
                         break;
                     }
                     if (m.stopping()) return;
+                    // A blob larger than twice the excess would leave this pool further
+                    // from the goal than it is now: keep it and look for smaller ones.
+                    if (key.space == .data) if (set.stat(key)) |st| {
+                        const u = m.usage(p);
+                        const want: u64 = @intFromFloat(goal * @as(f64, @floatFromInt(u.total)));
+                        if (m.raw(st.size) > 2 * ((u.total -| u.free) -| want)) continue;
+                    } else |_| {};
                     if (mover.moveKey(r, m.gpa, key, p, buf)) |res| {
                         if (res.outcome == .moved and key.space == .data) {
                             s.objects += 1;
