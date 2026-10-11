@@ -87,9 +87,9 @@ fn update(reg: *s3ext.Registry, a: Allocator, plain: []const u8, del: bool) Erro
         }
         const merged = try config.merge(a, table, t);
         for (merged) |m| if (std.mem.eql(u8, m.id, t.id) and m.enabled()) {
-            _ = config.endpoint(a, m) catch |err| return switch (err) {
+            _ = config.check(a, m) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.InvalidConfig => api.badRequest(a, "invalid lambda target: need an http(s) endpoint; client certificates are not supported"),
+                error.InvalidConfig => api.badRequest(a, "invalid lambda target: need an http(s) endpoint and readable TLS files (client_cert with client_key)"),
             };
         };
         table = merged;

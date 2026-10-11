@@ -702,8 +702,8 @@ fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: 
 fn lambdaRegistry(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService) error{ BadArgs, OutOfMemory }!lambda.Registry {
     var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
     const targets = try lambda.config.fromEnv(arena, &env);
-    for (targets) |t| _ = lambda.config.endpoint(arena, t) catch {
-        std.log.err("lambda_webhook:{s} from the environment: need an http(s) endpoint (client certificates unsupported)", .{t.id});
+    for (targets) |t| _ = lambda.config.check(arena, t) catch {
+        std.log.err("lambda_webhook:{s} from the environment: need an http(s) endpoint and readable TLS files (client cert with key)", .{t.id});
         return error.BadArgs;
     };
     var reg = lambda.Registry.init(gpa, svc, targets);

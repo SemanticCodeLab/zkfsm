@@ -16,6 +16,7 @@ pub const Options = struct {
     connect_timeout_ms: u32 = 5000,
     /// Per read/write deadline, including waiting for the response head.
     io_timeout_ms: u32 = 30000,
+    /// Forces verification off for every target (tests).
     skip_verify: bool = false,
 };
 
@@ -38,10 +39,12 @@ pub const Response = struct {
 };
 
 pub fn post(gpa: Allocator, arena: Allocator, ep: config.Endpoint, auth: ?[]const u8, body: []const u8, o: Options) Error!*Response {
+    var tls_opts = ep.tls;
+    if (tls_opts) |*t| t.skip_verify = t.skip_verify or o.skip_verify;
     const c = net.dial(gpa, ep.host, ep.port, .{
         .connect_timeout_ms = o.connect_timeout_ms,
         .io_timeout_ms = o.io_timeout_ms,
-        .tls = if (ep.secure) .{ .skip_verify = o.skip_verify } else null,
+        .tls = tls_opts,
     }) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.Unreachable,

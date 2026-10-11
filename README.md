@@ -426,7 +426,10 @@ through a webhook function, as MinIO does. Functions come from
 The caller needs `s3:GetObject`; the webhook gets the MinIO event JSON with a presigned
 `inputS3Url` (signed with the caller's key) and its reply is streamed back, with
 `x-amz-fwd-header-*` and `x-amz-fwd-status` / `-error-code` / `-error-message` mapped.
-Client certificates for the webhook are not supported. Tested by `tests/lambda.sh`.
+An https webhook can demand a client certificate: set `client_cert` / `client_key`
+(`..._CLIENT_CERT_<id>` / `..._CLIENT_KEY_<id>`), and optionally `tls_ca_file`,
+`tls_server_name`, `tls_min_version` (1.2 or 1.3) and `tls_skip_verify`; unreadable
+files are refused when configured. Tested by `tests/lambda.sh`.
 
 ### Server-side encryption and KMS
 

@@ -1,13 +1,14 @@
 //! Object Lambda webhook targets: `lambda_webhook[:id] key=value ...` lines (admin
 //! config API), MINIO_/ZKFSM_LAMBDA_WEBHOOK_<KEY>[_<ID>] env vars, endpoint parsing.
 const std = @import("std");
+const tls = @import("../tls/root.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const subsys = "lambda_webhook";
 /// Id of a target configured without one.
 pub const default_id = "_";
-pub const keys = [_][]const u8{ "enable", "endpoint", "auth_token", "client_cert", "client_key", "comment" };
+pub const keys = [_][]const u8{ "enable", "endpoint", "auth_token", "client_cert", "client_key", "tls_skip_verify", "tls_ca_file", "tls_server_name", "tls_min_version", "comment" };
 
 const max_lines = 64;
 const max_value = 4096;
@@ -209,13 +210,23 @@ pub const Endpoint = struct {
     path: []const u8,
     host_header: []const u8,
     secure: bool,
+    /// Set for https endpoints; strings borrow from the target.
+    tls: ?tls.TlsOptions = null,
 };
 
 pub const EndpointError = error{ InvalidConfig, OutOfMemory };
 
-/// Parses an http(s) endpoint; client certificates are not supported by the std TLS client.
+/// Parses the endpoint and loads its TLS files once, so bad settings fail when configured.
+pub fn check(a: Allocator, t: Target) EndpointError!Endpoint {
+    const ep = try endpoint(a, t);
+    if (ep.tls) |o| try o.check(a);
+    return ep;
+}
+
+/// Parses an http(s) endpoint and its TLS settings (files are not opened here).
 pub fn endpoint(a: Allocator, t: Target) EndpointError!Endpoint {
-    if (t.get("client_cert").len > 0 or t.get("client_key").len > 0) return error.InvalidConfig;
+    if ((t.get("client_cert").len > 0) != (t.get("client_key").len > 0)) return error.InvalidConfig;
+    const min_version = tls.dial.parseMinVersion(t.get("tls_min_version")) orelse return error.InvalidConfig;
     const raw = t.get("endpoint");
     if (raw.len == 0) return error.InvalidConfig;
     const uri = std.Uri.parse(raw) catch return error.InvalidConfig;
@@ -235,7 +246,15 @@ pub fn endpoint(a: Allocator, t: Target) EndpointError!Endpoint {
     const hh = if (uri.port) |p|
         (if (v6) try std.fmt.allocPrint(a, "[{s}]:{d}", .{ host, p }) else try std.fmt.allocPrint(a, "{s}:{d}", .{ host, p }))
     else if (v6) try std.fmt.allocPrint(a, "[{s}]", .{host}) else host;
-    return .{ .host = host, .port = uri.port orelse if (secure) 443 else 80, .path = path, .host_header = hh, .secure = secure };
+    const opts: ?tls.TlsOptions = if (secure) .{
+        .skip_verify = isOn(t.get("tls_skip_verify")),
+        .ca_file = t.get("tls_ca_file"),
+        .server_name = t.get("tls_server_name"),
+        .client_cert_file = t.get("client_cert"),
+        .client_key_file = t.get("client_key"),
+        .min_version = min_version,
+    } else null;
+    return .{ .host = host, .port = uri.port orelse if (secure) 443 else 80, .path = path, .host_header = hh, .secure = secure, .tls = opts };
 }
 
 /// `Authorization` value: a bare token becomes a bearer credential.
@@ -287,4 +306,11 @@ test "env targets" {
     try tst.expectEqualStrings("Bearer tok", (try authHeader(a, ts[0])).?);
     try tst.expectError(error.InvalidConfig, endpoint(a, .{ .kvs = &.{.{ .key = "endpoint", .value = "ftp://x" }} }));
     try tst.expectError(error.InvalidConfig, endpoint(a, .{ .kvs = &.{ .{ .key = "endpoint", .value = "https://x" }, .{ .key = "client_cert", .value = "/c" } } }));
+    try tst.expectError(error.InvalidConfig, endpoint(a, .{ .kvs = &.{ .{ .key = "endpoint", .value = "https://x" }, .{ .key = "tls_min_version", .value = "1.1" } } }));
+    const mtls: Target = .{ .kvs = &.{ .{ .key = "endpoint", .value = "https://x" }, .{ .key = "client_cert", .value = "/nonexistent" }, .{ .key = "client_key", .value = "/nonexistent" }, .{ .key = "tls_min_version", .value = "1.3" } } };
+    const o = (try endpoint(a, mtls)).tls.?;
+    try tst.expectEqualStrings("/nonexistent", o.client_cert_file);
+    try tst.expectEqual(tls.dial.MinVersion.tls_1_3, o.min_version);
+    try tst.expectError(error.InvalidConfig, check(a, mtls));
+    try tst.expect((try endpoint(a, .{ .kvs = &.{.{ .key = "endpoint", .value = "http://x" }} })).tls == null);
 }

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Object Lambda test webhook: `lambda_helper.py PORT LOGDIR`.
+"""Object Lambda test webhook: `lambda_helper.py PORT LOGDIR [CERT KEY CA [tls1.2]]`.
 
 Paths pick the behavior: /upper and /rot13 fetch inputS3Url (forwarding the
 caller's Range) and transform it; /deny answers with x-amz-fwd-status 403;
 /fail answers 500; /chunked streams the uppercase body in chunks.
 Each event body is saved as LOGDIR/last.json; Authorization as LOGDIR/auth.
+With CERT KEY CA it serves HTTPS and demands a client certificate signed by CA
+(the caller's "CN VERSION" goes to LOGDIR/peer); "tls1.2" caps the protocol.
 """
 import codecs
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -60,6 +63,14 @@ class H(BaseHTTPRequestHandler):
             f.write(raw)
         with open(os.path.join(LOG, "auth"), "w") as f:
             f.write(self.headers.get("Authorization", ""))
+        if TLS:
+            cn = ""
+            for rdn in (self.connection.getpeercert() or {}).get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        cn = v
+            with open(os.path.join(LOG, "peer"), "w") as f:
+                f.write(cn + " " + self.connection.version())
         evt = json.loads(raw)
         ctx = evt["getObjectContext"]
         base = {"x-amz-request-route": ctx["outputRoute"], "x-amz-request-token": ctx["outputToken"]}
@@ -92,4 +103,27 @@ class H(BaseHTTPRequestHandler):
         return self.reply(200, out, base)
 
 
-ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+TLS = None
+if len(sys.argv) > 5:
+    TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    TLS.load_cert_chain(sys.argv[3], sys.argv[4])
+    TLS.load_verify_locations(sys.argv[5])
+    TLS.verify_mode = ssl.CERT_REQUIRED
+    if sys.argv[6:] == ["tls1.2"]:
+        TLS.minimum_version = TLS.maximum_version = ssl.TLSVersion.TLSv1_2
+
+
+class S(ThreadingHTTPServer):
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if not TLS:
+            return sock, addr
+        try:
+            sock.settimeout(10)
+            return TLS.wrap_socket(sock, server_side=True), addr
+        except (OSError, ssl.SSLError):
+            sock.close()
+            raise OSError("handshake refused")
+
+
+S(("127.0.0.1", PORT), H).serve_forever()
