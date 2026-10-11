@@ -6,8 +6,8 @@ const target = @import("target.zig");
 const net = @import("net.zig");
 
 const log = std.log.scoped(.events_postgres);
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const HmacSha256 = @import("../core/hwhash.zig").HmacSha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
 const Md5 = std.crypto.hash.Md5;
 
 /// Values split at known keys, so the connection string's own words are not keys here.

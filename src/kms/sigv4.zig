@@ -2,8 +2,8 @@
 //! payload (enough for the KMS JSON 1.1 API).
 const std = @import("std");
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
-const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
+const Hmac = @import("../core/hwhash.zig").HmacSha256;
 const Allocator = std.mem.Allocator;
 
 pub const Credentials = struct {

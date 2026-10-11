@@ -402,7 +402,7 @@ pub const MetaInfo = struct {
 fn digest(a: Allocator, bytes: []const u8) Allocator.Error![]const u8 {
     if (bytes.len == 0) return "";
     var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
+    @import("../core/hwhash.zig").Sha256.hash(bytes, &d, .{});
     return a.dupe(u8, std.fmt.bytesToHex(d[0..8].*, .lower)[0..]);
 }
 

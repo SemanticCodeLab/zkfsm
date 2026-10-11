@@ -22,7 +22,7 @@ const chunk_payload = 4 * 1024 * 1024;
 const uploads_stream: [16]u8 = [_]u8{0xff} ** 16;
 
 fn hashKey(parts: []const []const u8) backend.PhysicalKey {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("../core/hwhash.zig").Sha256.init(.{});
     for (parts) |p| h.update(p);
     var d: [32]u8 = undefined;
     h.final(&d);

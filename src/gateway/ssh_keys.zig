@@ -6,7 +6,7 @@ const tls_keys = @import("../tls/keys.zig");
 const tls_rsa = @import("../tls/rsa.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const M = std.crypto.ff.Modulus(tls_rsa.max_bits);
 

@@ -28,7 +28,7 @@ const magic_hex = "5a42";
 /// `5a42<kind><26 hex of sha256(bucket id)>` in the system space.
 pub fn key(bid: core.BucketId, kind: Kind) backend.PhysicalKey {
     var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&bid.bytes, &d, .{});
+    @import("../core/hwhash.zig").Sha256.hash(&bid.bytes, &d, .{});
     const hex = std.fmt.bytesToHex(d, .lower);
     var k: backend.PhysicalKey = .{ .space = .system, .hex = undefined };
     @memcpy(k.hex[0..4], magic_hex);

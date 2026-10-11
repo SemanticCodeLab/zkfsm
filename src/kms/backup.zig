@@ -7,7 +7,7 @@ const keyring = @import("keyring.zig");
 
 const Allocator = std.mem.Allocator;
 const Aes = std.crypto.aead.aes_gcm.Aes256Gcm;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
 
 pub const format_version: u32 = 1;
 const bundle_aad = "zkfsm-kms-backup-bundle-v1";

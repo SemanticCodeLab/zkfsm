@@ -3,7 +3,7 @@
 const std = @import("std");
 const policy = @import("policy.zig");
 
-const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+const Hmac = @import("../core/hwhash.zig").HmacSha256;
 const b64 = std.base64.url_safe_no_pad;
 
 pub const limits = struct {

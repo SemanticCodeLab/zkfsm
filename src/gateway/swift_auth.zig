@@ -2,7 +2,7 @@
 const std = @import("std");
 const ctEql = @import("access.zig").ctEql;
 
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha256 = @import("../core/hwhash.zig").HmacSha256;
 
 pub const token_prefix = "AUTH_tk";
 pub const max_name = 128;
@@ -111,7 +111,7 @@ pub fn sign(out: *[max_mac]u8, d: Digest, key: []const u8, method: []const u8, e
         inline else => |t| {
             const H = switch (t) {
                 .sha1 => std.crypto.auth.hmac.HmacSha1,
-                .sha256 => std.crypto.auth.hmac.sha2.HmacSha256,
+                .sha256 => @import("../core/hwhash.zig").HmacSha256,
                 .sha512 => std.crypto.auth.hmac.sha2.HmacSha512,
             };
             H.create(out[0..H.mac_length], body, key);

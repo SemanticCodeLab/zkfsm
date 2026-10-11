@@ -11,7 +11,7 @@ const Error = iface.Error;
 const ObjectMeta = iface.ObjectMeta;
 const PutError = remote.PutError;
 const Writer = std.Io.Writer;
-const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+const Hmac = @import("../core/hwhash.zig").HmacSha256;
 const b64 = std.base64.standard;
 const log = std.log.scoped(.azure_backend);
 

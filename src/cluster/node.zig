@@ -1415,7 +1415,7 @@ fn measure(le: *LocalEp) void {
 }
 
 fn topoFingerprint(t: *const topology.Topology) [16]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("../core/hwhash.zig").Sha256.init(.{});
     h.update("zkfsm-topology-v1\n");
     for (t.pools) |p| {
         h.update("pool\n");

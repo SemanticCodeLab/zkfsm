@@ -2,7 +2,7 @@
 //! timestamp, nonce, and body digest, with a replay window of seen nonces.
 const std = @import("std");
 
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha256 = @import("../core/hwhash.zig").HmacSha256;
 
 pub const Secret = [32]u8;
 
@@ -50,7 +50,7 @@ pub fn rootFingerprint(secret: Secret, access_key: []const u8, secret_key: []con
 
 pub fn bodyDigest(body: []const u8) [64]u8 {
     var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body, &d, .{});
+    @import("../core/hwhash.zig").Sha256.hash(body, &d, .{});
     return std.fmt.bytesToHex(d, .lower);
 }
 

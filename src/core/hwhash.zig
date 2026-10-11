@@ -1,6 +1,6 @@
 //! SHA-256 and CRC-32C on the CPU's own instructions (SHA-NI, SSE4.2) when it has
 //! them, checked once at run time, so a portable build hashes at hardware speed.
-//! Other CPUs and architectures use the standard library.
+//! Other CPUs get portable rounds (the standard library's are several times slower).
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -48,11 +48,7 @@ pub const Sha256 = struct {
     pub const digest_length = 32;
     pub const block_length = 64;
     pub const Options = struct {};
-    const Std = std.crypto.hash.sha2.Sha256;
 
-    /// Chosen at the first update, so `init` also works at comptime.
-    mode: enum { undecided, fast, soft } = .undecided,
-    soft: Std,
     s: [8]u32 = iv,
     buf: [64]u8 = undefined,
     buf_len: u8 = 0,
@@ -61,12 +57,7 @@ pub const Sha256 = struct {
     const iv = [8]u32{ 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19 };
 
     pub fn init(_: Options) Sha256 {
-        return .{ .soft = Std.init(.{}) };
-    }
-
-    fn fast(d: *Sha256) bool {
-        if (d.mode == .undecided) d.mode = if (is_x86_64 and cpu().sha) .fast else .soft;
-        return d.mode == .fast;
+        return .{};
     }
 
     pub fn hash(b: []const u8, out: *[digest_length]u8, opts: Options) void {
@@ -76,7 +67,7 @@ pub const Sha256 = struct {
     }
 
     pub fn update(d: *Sha256, b: []const u8) void {
-        if (!d.fast()) return d.soft.update(b);
+        const ni = !@inComptime() and is_x86_64 and cpu().sha;
         var in = b;
         d.total += in.len;
         if (d.buf_len > 0) {
@@ -85,20 +76,19 @@ pub const Sha256 = struct {
             d.buf_len += @intCast(n);
             in = in[n..];
             if (d.buf_len < 64) return;
-            compressNi(&d.s, &d.buf);
+            compress(ni, &d.s, &d.buf);
             d.buf_len = 0;
         }
-        while (in.len >= 64) : (in = in[64..]) compressNi(&d.s, in[0..64]);
+        while (in.len >= 64) : (in = in[64..]) compress(ni, &d.s, in[0..64]);
         @memcpy(d.buf[0..in.len], in);
         d.buf_len = @intCast(in.len);
     }
 
     pub fn final(d: *Sha256, out: *[digest_length]u8) void {
-        if (!d.fast()) return d.soft.final(out);
         const bits = d.total * 8;
         var pad: [72]u8 = @splat(0);
         pad[0] = 0x80;
-        const fill = if (d.buf_len < 56) 56 - d.buf_len else 120 - @as(usize, d.buf_len);
+        const fill = if (d.buf_len < 56) 56 - @as(usize, d.buf_len) else 120 - @as(usize, d.buf_len);
         std.mem.writeInt(u64, pad[fill..][0..8], bits, .big);
         d.update(pad[0 .. fill + 8]);
         for (d.s, 0..) |w, i| std.mem.writeInt(u32, out[i * 4 ..][0..4], w, .big);
@@ -110,6 +100,34 @@ pub const Sha256 = struct {
         return out;
     }
 };
+
+pub const HmacSha256 = std.crypto.auth.hmac.Hmac(Sha256);
+
+inline fn compress(ni: bool, s: *[8]u32, block: *const [64]u8) void {
+    if (ni) compressNi(s, block) else compressSoft(s, block);
+}
+
+fn compressSoft(s: *[8]u32, block: *const [64]u8) void {
+    const rotr = std.math.rotr;
+    var w: [64]u32 = undefined;
+    for (0..16) |i| w[i] = std.mem.readInt(u32, block[i * 4 ..][0..4], .big);
+    for (16..64) |i| {
+        const s0 = rotr(u32, w[i - 15], 7) ^ rotr(u32, w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const s1 = rotr(u32, w[i - 2], 17) ^ rotr(u32, w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] +% s0 +% w[i - 7] +% s1;
+    }
+    var v = s.*;
+    for (0..64) |i| {
+        const e = v[4];
+        const a = v[0];
+        const t1 = v[7] +% (rotr(u32, e, 6) ^ rotr(u32, e, 11) ^ rotr(u32, e, 25)) +% ((e & v[5]) ^ (~e & v[6])) +% K[i] +% w[i];
+        const t2 = (rotr(u32, a, 2) ^ rotr(u32, a, 13) ^ rotr(u32, a, 22)) +% ((a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2]));
+        // Through a temporary: the literal would otherwise be built in place over `v`.
+        const next: [8]u32 = .{ t1 +% t2, a, v[1], v[2], v[3] +% t1, e, v[5], v[6] };
+        v = next;
+    }
+    for (s, v) |*x, y| x.* +%= y;
+}
 
 const K = [64]u32{
     0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
@@ -126,7 +144,7 @@ const V4 = @Vector(4, u32);
 
 /// One 64-byte block with SHA-NI. State lanes: x = {F,E,B,A}, y = {H,G,D,C}.
 fn compressNi(s: *[8]u32, block: *const [64]u8) void {
-    if (!is_x86_64) unreachable;
+    if (!is_x86_64) return compressSoft(s, block);
     var w: [16]V4 = undefined;
     for (0..16) |i| {
         const q = i / 4;
@@ -210,6 +228,21 @@ test "sha256 matches the standard library across lengths and splits" {
         var i: usize = 0;
         while (i < len) : (i += 13) d.update(data[i..@min(len, i + 13)]);
         try std.testing.expectEqualSlices(u8, &want, &d.finalResult());
+        // The portable rounds, whatever the CPU offers.
+        var st = Sha256.iv;
+        var blocks: [768]u8 = @splat(0);
+        @memcpy(blocks[0..len], data[0..len]);
+        blocks[len] = 0x80;
+        const end = (len + 9 + 63) / 64 * 64;
+        std.mem.writeInt(u64, blocks[end - 8 ..][0..8], len * 8, .big);
+        i = 0;
+        while (i < end) : (i += 64) compressSoft(&st, blocks[i..][0..64]);
+        for (st, 0..) |w, j| try std.testing.expectEqual(std.mem.readInt(u32, want[j * 4 ..][0..4], .big), w);
+        var mac_want: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_want, data[0..len], "key");
+        var mac: [32]u8 = undefined;
+        HmacSha256.create(&mac, data[0..len], "key");
+        try std.testing.expectEqualSlices(u8, &mac_want, &mac);
     }
     var abc: [32]u8 = undefined;
     Sha256.hash("abc", &abc, .{});

@@ -162,7 +162,7 @@ pub const Kafka = struct {
                 const out = try k.saslStep(msg);
                 k.gpa.free(out);
             },
-            .sha256 => try k.scram(Scram(std.crypto.hash.sha2.Sha256)),
+            .sha256 => try k.scram(Scram(@import("../core/hwhash.zig").Sha256)),
             .sha512 => try k.scram(Scram(std.crypto.hash.sha2.Sha512)),
         }
     }
@@ -682,7 +682,7 @@ test "record batch encoding" {
 }
 
 test "scram sha256 rfc 7677 vector" {
-    const S = Scram(std.crypto.hash.sha2.Sha256);
+    const S = Scram(@import("../core/hwhash.zig").Sha256);
     var s = try S.init(testing.allocator, "user", "pencil", "rOprNGfwEbeRWgbNEkqO");
     defer s.deinit();
     try testing.expectEqualStrings("n,,n=user,r=rOprNGfwEbeRWgbNEkqO", s.client_first);

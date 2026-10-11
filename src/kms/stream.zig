@@ -160,7 +160,7 @@ fn encryptWithAad(c: []u8, tag: *[tag_len]u8, m: []const u8, prefix: []const u8,
     } else {
         // Long AAD: bind its SHA-256 instead.
         var h: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(aad, &h, .{});
+        @import("../core/hwhash.zig").Sha256.hash(aad, &h, .{});
         @memcpy(small[0..prefix.len], prefix);
         @memcpy(small[prefix.len..][0..32], &h);
         Aes.encrypt(c, tag, m, small[0 .. prefix.len + 32], nonce, key);
@@ -175,7 +175,7 @@ fn decryptWithAad(m: []u8, c: []const u8, tag: [tag_len]u8, prefix: []const u8, 
         @memcpy(small[prefix.len..][0..aad.len], aad);
         ad_len += aad.len;
     } else {
-        std.crypto.hash.sha2.Sha256.hash(aad, small[prefix.len..][0..32], .{});
+        @import("../core/hwhash.zig").Sha256.hash(aad, small[prefix.len..][0..32], .{});
         ad_len += 32;
     }
     Aes.decrypt(m, c, tag, small[0..ad_len], nonce, key) catch return error.AuthenticationFailed;

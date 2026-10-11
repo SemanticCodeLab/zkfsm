@@ -778,11 +778,11 @@ pub fn runLiveSuite(gpa: std.mem.Allocator, rb: *remote.RemoteObjectBackend, big
     for (out.written(), 0..) |byte, i| try t.expectEqual(PatternReader.patternByte(off + i), byte);
 
     var hbuf: [64 * 1024]u8 = undefined;
-    var hw: Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&hbuf);
+    var hw: Writer.Hashing(@import("../core/hwhash.zig").Sha256) = .init(&hbuf);
     _ = try b.get(big, null, &hw.writer);
     try hw.writer.flush();
     const get_ns = timer.lap();
-    var want_h = std.crypto.hash.sha2.Sha256.init(.{});
+    var want_h = @import("../core/hwhash.zig").Sha256.init(.{});
     var pr2 = PatternReader.init(big_len, &pbuf);
     var chunk: [64 * 1024]u8 = undefined;
     while (true) {

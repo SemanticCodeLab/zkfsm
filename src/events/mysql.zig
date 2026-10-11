@@ -8,7 +8,7 @@ const net = @import("net.zig");
 
 const log = std.log.scoped(.events_mysql);
 const Sha1 = std.crypto.hash.Sha1;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
 
 pub const keys = [_][]const u8{
     "dsn_string", "table", "format",   "max_open_connections", "queue_dir", "queue_limit", "comment",

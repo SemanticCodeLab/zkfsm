@@ -227,7 +227,7 @@ pub const BucketConfig = struct { scheme: sse.Scheme, key_id: []const u8 = "" };
 /// bucket id so a recreated bucket never inherits a stale config.
 fn configKey(bid: core.BucketId) backend.PhysicalKey {
     var h: [32]u8 = undefined;
-    var s = std.crypto.hash.sha2.Sha256.init(.{});
+    var s = @import("../core/hwhash.zig").Sha256.init(.{});
     s.update("zkfsm/sse-bucket-config/v1\x00");
     s.update(&bid.bytes);
     s.final(&h);

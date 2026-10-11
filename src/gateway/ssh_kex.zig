@@ -5,7 +5,7 @@ const wire = @import("ssh_wire.zig");
 const cipher = @import("ssh_cipher.zig");
 const keys = @import("ssh_keys.zig");
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../core/hwhash.zig").Sha256;
 const X25519 = std.crypto.dh.X25519;
 const MlKem = std.crypto.kem.ml_kem.MLKem768;
 

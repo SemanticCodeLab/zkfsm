@@ -113,7 +113,7 @@ pub fn freeSets(gpa: std.mem.Allocator, sets: [][]u32) void {
 }
 
 fn derive(comptime T: type, deployment: [16]u8, parts: []const u32) T {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("../core/hwhash.zig").Sha256.init(.{});
     h.update("zkfsm-layout-v2");
     h.update(&deployment);
     for (parts) |p| h.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, p)));

@@ -21,7 +21,7 @@ const magic_hex = "5a52";
 /// `5a52<kind><26 hex of sha256(name)>`.
 pub fn key(kind: Kind, name: []const u8) PhysicalKey {
     var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(name, &d, .{});
+    @import("../core/hwhash.zig").Sha256.hash(name, &d, .{});
     const hex = std.fmt.bytesToHex(d, .lower);
     var k: PhysicalKey = .{ .space = .system, .hex = undefined };
     @memcpy(k.hex[0..4], magic_hex);

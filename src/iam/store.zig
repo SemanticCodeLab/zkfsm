@@ -341,7 +341,7 @@ pub const Store = struct {
 
     fn digestOf(bytes: ?[]const u8) [32]u8 {
         var d: [32]u8 = @splat(0);
-        if (bytes) |b| std.crypto.hash.sha2.Sha256.hash(b, &d, .{});
+        if (bytes) |b| @import("../core/hwhash.zig").Sha256.hash(b, &d, .{});
         return d;
     }
 

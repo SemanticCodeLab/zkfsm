@@ -214,7 +214,7 @@ pub const Hasher = union(Algorithm) {
     crc32c: Crc32c,
     crc64nvme: Crc64Nvme,
     sha1: std.crypto.hash.Sha1,
-    sha256: std.crypto.hash.sha2.Sha256,
+    sha256: @import("hwhash.zig").Sha256,
 
     pub fn init(alg: Algorithm) Hasher {
         return switch (alg) {
@@ -222,7 +222,7 @@ pub const Hasher = union(Algorithm) {
             .crc32c => .{ .crc32c = .{} },
             .crc64nvme => .{ .crc64nvme = .{} },
             .sha1 => .{ .sha1 = std.crypto.hash.Sha1.init(.{}) },
-            .sha256 => .{ .sha256 = std.crypto.hash.sha2.Sha256.init(.{}) },
+            .sha256 => .{ .sha256 = @import("hwhash.zig").Sha256.init(.{}) },
         };
     }
 

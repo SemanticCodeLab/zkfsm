@@ -125,7 +125,7 @@ fn findLocal(nodes: []const Node, self_addr: ?[]const u8, listen_host: []const u
 
 /// Fingerprint of one pool's layout: its endpoint list, set size, and profile.
 pub fn poolFingerprint(pool: Pool, set_size: usize, profile: placement.Profile) [16]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("../core/hwhash.zig").Sha256.init(.{});
     h.update("zkfsm-pool-v1\n");
     for (pool.endpoints) |e| {
         h.update(e.url);

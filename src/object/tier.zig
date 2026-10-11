@@ -41,7 +41,7 @@ pub const AdminError = service.Error || error{
 /// Derives the sealing key from the root secret.
 pub fn sealKey(root_access_key: []const u8, root_secret: []const u8) [32]u8 {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-    var ikm: std.crypto.hash.sha2.Sha256 = .init(.{});
+    var ikm: @import("../core/hwhash.zig").Sha256 = .init(.{});
     ikm.update(root_access_key);
     ikm.update(&.{0});
     ikm.update(root_secret);
@@ -430,7 +430,7 @@ pub const Registry = struct {
         };
         defer r.gpa.free(bytes);
         var h: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &h, .{});
+        @import("../core/hwhash.zig").Sha256.hash(bytes, &h, .{});
         if (r.loaded) |l| if (std.mem.eql(u8, &l, &h)) return;
         var arena = std.heap.ArenaAllocator.init(r.gpa);
         defer arena.deinit();

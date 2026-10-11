@@ -45,7 +45,7 @@ pub const SetId = Id128("set");
 pub const NameId = Id128("name");
 
 pub fn nameId(bucket: BucketId, key: []const u8) NameId {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("hwhash.zig").Sha256.init(.{});
     h.update(&bucket.bytes);
     h.update(key);
     var d: [32]u8 = undefined;
@@ -63,7 +63,7 @@ pub fn newVersionId(now_ns: i128) VersionId {
 
 /// Stable id for one version of a (bucket, key); addresses noncurrent versions.
 pub fn versionNameId(bucket: BucketId, key: []const u8, version: VersionId) NameId {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = @import("hwhash.zig").Sha256.init(.{});
     h.update("version\x00");
     h.update(&bucket.bytes);
     h.update(&version.bytes);

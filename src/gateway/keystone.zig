@@ -109,7 +109,7 @@ pub const Cache = struct {
 
     fn keyOf(token: []const u8) [32]u8 {
         var k: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(token, &k, .{});
+        @import("../core/hwhash.zig").Sha256.hash(token, &k, .{});
         return k;
     }
 

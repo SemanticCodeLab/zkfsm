@@ -134,7 +134,7 @@ fn readBody(c: *Ctx) ConnError!?[]const u8 {
         };
     if (c.auth.mode == .sha256) {
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+        @import("core/hwhash.zig").Sha256.hash(body, &digest, .{});
         if (!std.mem.eql(u8, &digest, &c.auth.sha256)) {
             try s3.handler.fail(c, .XAmzContentSHA256Mismatch);
             return null;
