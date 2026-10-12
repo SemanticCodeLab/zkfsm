@@ -21,7 +21,35 @@ pub const FetchError = error{ OutOfMemory, FetchFailed, TooLarge };
 pub const Fetcher = struct {
     ctx: ?*anyopaque = null,
     get: *const fn (ctx: ?*anyopaque, a: Allocator, url: []const u8, max: usize) FetchError![]u8 = httpGet,
+    /// Form POST (token endpoint); `basic` is an encoded `user:pass` or empty.
+    post: *const fn (ctx: ?*anyopaque, a: Allocator, url: []const u8, form: []const u8, basic: []const u8, max: usize) FetchError![]u8 = httpPost,
 };
+
+fn httpPost(_: ?*anyopaque, a: Allocator, url: []const u8, form: []const u8, basic: []const u8, max: usize) FetchError![]u8 {
+    var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
+    defer client.deinit();
+    const buf = try a.alloc(u8, max);
+    var w: std.Io.Writer = .fixed(buf);
+    const auth = try std.fmt.allocPrint(a, "Basic {s}", .{basic});
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = form,
+        .response_writer = &w,
+        .keep_alive = false,
+        .headers = .{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .authorization = if (basic.len > 0) .{ .override = auth } else .default,
+        },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+    }) catch |e| return switch (e) {
+        error.WriteFailed => error.TooLarge,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.FetchFailed,
+    };
+    if (res.status != .ok) return error.FetchFailed;
+    return w.buffered();
+}
 
 fn httpGet(_: ?*anyopaque, a: Allocator, url: []const u8, max: usize) FetchError![]u8 {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
@@ -47,6 +75,8 @@ pub const WebIdentity = struct {
     expires_s: ?i64,
     issuer: []const u8,
     audience: []const u8,
+    /// `nonce` claim, checked by the authorization-code login.
+    nonce: ?[]const u8 = null,
 };
 
 pub const Error = error{ OutOfMemory, NoProvider, ProviderUnavailable, InvalidToken, ExpiredToken, NoPolicy, InvalidTenant };
@@ -122,6 +152,21 @@ pub const Federation = struct {
         return last;
     }
 
+    /// The enabled OpenID provider configured as `name`.
+    pub fn provider(self: *Federation, a: Allocator, name: []const u8) Error!idp.OpenId {
+        const entries = try idp.effective(a, self.store, self.env, .openid);
+        for (entries) |e| if (std.mem.eql(u8, e.name, name)) {
+            const p = idp.OpenId.from(e.name, e.settings);
+            if (p.enabled) return p;
+        };
+        return error.NoProvider;
+    }
+
+    /// Validates `token` against provider `p` and maps it like `webIdentity`.
+    pub fn identityFrom(self: *Federation, a: Allocator, p: idp.OpenId, token: []const u8, now_s: i64) Error!WebIdentity {
+        return self.tryProvider(a, p, token, now_s);
+    }
+
     fn tryProvider(self: *Federation, a: Allocator, p: idp.OpenId, token: []const u8, now_s: i64) Error!WebIdentity {
         const claims = try self.verifyWith(a, p, token, now_s);
         const subject = claims.string(p.user_claim) orelse return error.InvalidToken;
@@ -148,6 +193,7 @@ pub const Federation = struct {
             .expires_s = claims.int("exp"),
             .issuer = claims.string("iss") orelse "",
             .audience = p.client_id,
+            .nonce = claims.string("nonce"),
         };
     }
 

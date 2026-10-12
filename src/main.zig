@@ -16,6 +16,7 @@ const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
+const console_wire = @import("console_wire.zig");
 const tables = @import("tables/root.zig");
 const lambda = @import("lambda/root.zig");
 const batch = @import("batch/root.zig");
@@ -117,6 +118,7 @@ const Config = struct {
     tls_min_version: tls.Version = .tls12,
     kms: sse.setup.Flags = .{},
     obs: observe.config.Flags = .{},
+    console: console_wire.Flags = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -232,6 +234,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.health_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--metrics-path")) {
             cfg.metrics_path = args[i];
+        } else if (cfg.console.set(a, args[i]) catch return error.BadArgs) {
+            continue;
         } else if (sse.setup.Flags.isFlag(a)) {
             if (!cfg.kms.set(a, args[i])) return error.BadArgs;
         } else if (observe.config.Flags.isFlag(a)) {
@@ -294,7 +298,7 @@ pub fn run(opts: Options) u8 {
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
-        std.debug.print("{s}{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, observe.config.usage, opts.extra_usage });
+        std.debug.print("{s}{s}{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, observe.config.usage, console_wire.usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     applyEnv(arena, &cfg) catch {
@@ -482,6 +486,11 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     defer gateways.stop();
+    var web: console_wire.Running = .{ .con = undefined, .probe = .{ .svc = &svc, .started_s = bridge.started_s, .region = ev_opts.region, .drives = &drives, .healer = if (cfg.scan_interval_s > 0) &healer else null } };
+    var inner: InnerListener = .{};
+    startConsole(gpa, arena, cfg, creds != null, &web, &inner, &server, auth, admin_prefix, federation.env) catch return 2;
+    defer web.stop();
+    defer inner.stop();
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
     installStopSignals();
@@ -606,6 +615,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     active_server = &server;
     installStopSignals();
     var gateways: gateway.Running = .{};
+    var web: console_wire.Running = .{ .con = undefined, .probe = undefined };
+    var inner: InnerListener = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
         std.log.err("cannot start the listener", .{});
         return 1;
@@ -675,10 +686,14 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         }
         std.log.info("cluster: serving S3 on {f}", .{addr});
+        web.probe = .{ .svc = &svc, .started_s = bridge.started_s, .region = ev_opts.region, .node = node };
+        startConsole(gpa, arena, cfg, iam_ready, &web, &inner, &server, auth, admin_prefix, federation.env) catch break :blk 2;
         break :blk 0;
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    web.stop();
+    inner.stop();
     gateways.stop();
     node.stop();
     if (svc_ready) node.storage().sync() catch {};
@@ -1129,5 +1144,65 @@ test {
     _ = batch;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
+    _ = @import("console/root.zig");
+    _ = console_wire;
     _ = migrate;
+}
+
+/// TLS deployments: the console reaches S3 through a plain loopback listener.
+const InnerListener = struct {
+    server: s3.Server = undefined,
+    thread: ?std.Thread = null,
+
+    fn stop(l: *InnerListener) void {
+        const t = l.thread orelse return;
+        _ = l.server.requestStop();
+        t.join();
+        l.thread = null;
+    }
+};
+
+fn innerLoop(server: *s3.Server, addr: std.net.Address) void {
+    server.run(addr) catch |e| std.log.warn("console upstream listener failed: {t}", .{e});
+}
+
+fn startConsole(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, authenticated: bool, web: *console_wire.Running, inner: *InnerListener, server: *const s3.Server, auth: s3.sigv4.Config, admin_prefix: []const u8, idp_env: iam.idp.EnvConfig) error{BadArgs}!void {
+    const addr = cfg.console.listenAddress(arena) catch {
+        std.log.err("invalid --console-address: use HOST:PORT, :PORT or off", .{});
+        return error.BadArgs;
+    } orelse return;
+    if (!authenticated) {
+        std.log.info("console disabled: it needs authenticated mode", .{});
+        return;
+    }
+    const any_host = std.mem.eql(u8, cfg.host, "0.0.0.0") or std.mem.eql(u8, cfg.host, "::");
+    var up_host: []const u8 = if (any_host) "127.0.0.1" else cfg.host;
+    var up_port = cfg.port;
+    if (server.tls != null) {
+        up_host = "127.0.0.1";
+        up_port = console_wire.freeLoopbackPort() orelse {
+            std.log.warn("console not started: no loopback port for its upstream", .{});
+            return;
+        };
+        inner.server = server.*;
+        inner.server.tls = null;
+        const up = std.net.Address.parseIp(up_host, up_port) catch unreachable;
+        inner.thread = std.Thread.spawn(.{}, innerLoop, .{ &inner.server, up }) catch {
+            std.log.warn("console not started: cannot start its upstream listener", .{});
+            return;
+        };
+    }
+    web.start(gpa, addr, .{
+        .upstream = .{ .host = up_host, .port = up_port },
+        .region = if (web.probe.region.len > 0) web.probe.region else "us-east-1",
+        .admin_prefix = admin_prefix,
+        .metrics_path = cfg.metrics_path,
+        .session_ttl_s = cfg.console.session_s,
+        .s3_url = cfg.console.s3_url,
+        .s3_port = cfg.port,
+        .s3_tls = server.tls != null,
+        .secure = server.tls != null,
+        .iam = auth.iam,
+        .idp_env = idp_env,
+    }, server.svc, server.tls);
 }

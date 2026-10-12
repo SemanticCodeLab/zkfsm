@@ -20,6 +20,8 @@ pub const Kind = enum(u8) {
     request_payment = 8,
     location = 9,
     lifecycle_legacy = 10,
+    /// WebDAV gateway lock table (gateway-encoded).
+    webdav_locks = 11,
 };
 
 pub const max_doc_bytes = 64 * 1024;
@@ -68,6 +70,58 @@ pub fn set(svc: *Svc, bucket: []const u8, kind: Kind, doc: ?[]const u8) Error!vo
         return;
     }
     svc.store.putRecord(k, d) catch |e| return service.mapBackend(e);
+}
+
+/// `5a43<28 hex of sha256(name)>`: a deployment-wide document not tied to a bucket.
+fn namedKey(name: []const u8) backend.PhysicalKey {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(name, &d, .{});
+    const hex = std.fmt.bytesToHex(d, .lower);
+    var k: backend.PhysicalKey = .{ .space = .system, .hex = undefined };
+    @memcpy(k.hex[0..4], "5a43");
+    @memcpy(k.hex[4..], hex[0..28]);
+    return k;
+}
+
+/// Named document (gateway state shared by every node), or null when none is set.
+pub fn getNamed(svc: *Svc, arena: std.mem.Allocator, name: []const u8) Error!?[]const u8 {
+    const bytes = svc.store.getRecord(namedKey(name), arena) catch |e| return switch (e) {
+        error.NotFound => null,
+        else => service.mapBackend(e),
+    };
+    return if (bytes.len == 0) null else bytes;
+}
+
+/// Stores a named document; an empty `doc` deletes it.
+pub fn setNamed(svc: *Svc, name: []const u8, doc: []const u8) Error!void {
+    if (doc.len > max_doc_bytes) return error.InvalidRequest;
+    const held = try svc.clusterLock("nameddoc", name, "");
+    defer svc.clusterUnlock(held);
+    const k = namedKey(name);
+    if (doc.len == 0) {
+        svc.store.deleteRecord(k) catch |e| switch (e) {
+            error.NotFound => {},
+            else => return service.mapBackend(e),
+        };
+        return;
+    }
+    svc.store.putRecord(k, doc) catch |e| return service.mapBackend(e);
+}
+
+/// Stores `doc` unless the name already has one; returns the stored document in `arena`.
+pub fn initNamed(svc: *Svc, arena: std.mem.Allocator, name: []const u8, doc: []const u8) Error![]const u8 {
+    if (doc.len == 0 or doc.len > max_doc_bytes) return error.InvalidRequest;
+    const held = try svc.clusterLock("nameddoc", name, "");
+    defer svc.clusterUnlock(held);
+    const k = namedKey(name);
+    if (svc.store.getRecord(k, arena)) |cur| {
+        if (cur.len > 0) return cur;
+    } else |e| switch (e) {
+        error.NotFound => {},
+        else => return service.mapBackend(e),
+    }
+    svc.store.putRecord(k, doc) catch |e| return service.mapBackend(e);
+    return doc;
 }
 
 /// Removes every document of a deleted bucket; best effort.

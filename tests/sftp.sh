@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SFTP gateway end-to-end: OpenSSH sftp over every cipher, kex and host key
 # algorithm, a 100 MB round trip, reget/reput, paramiko checks, S3 visibility.
+# ZKFSM_GW_CLUSTER=1 runs against a 4-node cluster: SFTP on node 1, S3 checks on node 2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${ZKFSM_SFTP_PYTHON:-python3}"
@@ -13,7 +14,9 @@ SK=sftp-secret-key-123
 WORK="$(mktemp -d)"
 DATA="$WORK/data"
 PID=""
-cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; gw_cluster_stop; rm -rf "$WORK"; }
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 trap cleanup EXIT
 
 pass=0
@@ -29,19 +32,37 @@ s3() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$@"; }
 (cd "$ROOT" && zig build -Doptimize=ReleaseSafe -p "$WORK/out")
 BIN="$WORK/out/bin/zkfsm"
 
-start() { # extra flags...
-  ZKFSM_ACCESS_KEY=$AK ZKFSM_SECRET_KEY=$SK "$BIN" --data "$DATA" --listen "127.0.0.1:$PORT" \
-    --sftp "127.0.0.1:$SPORT" --sftp-authorized-keys "$WORK/authorized" "$@" 2>>"$WORK/server.log" &
-  PID=$!
-  for _ in $(seq 50); do curl -s -o /dev/null "$EP/" && return 0; sleep 0.1; done
-  echo "server did not start:"; cat "$WORK/server.log"; exit 1
-}
-stop() { kill "$PID"; wait "$PID" 2>/dev/null || true; PID=""; }
+LOG="$WORK/server.log"
+if [[ $GW_CLUSTER == 1 ]]; then
+  SPS=(0 "$SPORT" "$(freeport)" "$(freeport)" "$(freeport)")
+  sftp_node() { echo "--sftp 127.0.0.1:${SPS[$1]}"; }
+  LOG="$WORK/node1.log"
+  DATA="$WORK/n1/d1"
+  start() { # extra flags...
+    gw_cluster_start "$WORK" "sftp listening" "" sftp_node --sftp-authorized-keys "$WORK/authorized" "$@"
+    PID="${GW_PIDS[1]}"
+    EP="http://127.0.0.1:${GW_S3P[2]}"
+  }
+  stop() { gw_cluster_stop; PID=""; }
+else
+  start() { # extra flags...
+    ZKFSM_ACCESS_KEY=$AK ZKFSM_SECRET_KEY=$SK "$BIN" --data "$DATA" --listen "127.0.0.1:$PORT" \
+      --sftp "127.0.0.1:$SPORT" --sftp-authorized-keys "$WORK/authorized" "$@" 2>>"$LOG" &
+    PID=$!
+    for _ in $(seq 50); do curl -s -o /dev/null "$EP/" && return 0; sleep 0.1; done
+    echo "server did not start:"; cat "$LOG"; exit 1
+  }
+  stop() { kill "$PID"; wait "$PID" 2>/dev/null || true; PID=""; }
+fi
 
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/id"
 echo "$AK $(cut -d' ' -f1,2 "$WORK/id.pub") test" > "$WORK/authorized"
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/host_ed"
 ssh-keygen -q -t rsa -b 3072 -m PEM -N '' -C '' -f "$WORK/host_rsa"
+ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$WORK/host_ec"
+ssh-keygen -q -t ecdsa -b 256 -m PEM -N '' -C '' -f "$WORK/host_ec_pem"
+ssh-keygen -q -t ecdsa -b 256 -N '' -C '' -f "$WORK/id_ec"
+echo "$AK $(cut -d' ' -f1,2 "$WORK/id_ec.pub") ec" >> "$WORK/authorized"
 
 SSHOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o LogLevel=ERROR)
 if command -v sshpass >/dev/null; then
@@ -57,16 +78,23 @@ sftpb() { # batchfile, extra ssh options...
 # Generated host key: persisted 0600 in the state directory, stable across restarts.
 start
 KEYFILE="$DATA/.zkfsm/sftp_host_ed25519_key"
-check "host key generated" "600" "$(stat -c %a "$KEYFILE" 2>/dev/null)"
-FP1=$(grep -o 'SHA256:[^ ]*' "$WORK/server.log" | tail -1)
+FP1=$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)
+if [[ $GW_CLUSTER == 1 ]]; then
+  # No per-node state directory: the generated key is shared by all nodes.
+  check "host key shared across nodes" "$FP1" "$(ssh-keyscan -t ed25519 -p "${SPS[3]}" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
+else
+  check "host key generated" "600" "$(stat -c %a "$KEYFILE" 2>/dev/null)"
+fi
 stop
 start
-check "host key stable" "$FP1" "$(grep -o 'SHA256:[^ ]*' "$WORK/server.log" | tail -1)"
+check "host key stable" "$FP1" "$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)"
 check "fingerprint matches client view" "$FP1" "$(ssh-keyscan -t ed25519 -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
 stop
 
 # Configured host keys plus a small rekey limit so server-started re-exchange runs too.
-start --sftp-host-key "$WORK/host_ed" --sftp-host-key "$WORK/host_rsa" --sftp-rekey-bytes 4194304
+start --sftp-host-key "$WORK/host_ed" --sftp-host-key "$WORK/host_rsa" --sftp-host-key "$WORK/host_ec" --sftp-rekey-bytes 4194304
+check "ecdsa host key offered" "$(ssh-keygen -lf "$WORK/host_ec.pub" | awk '{print $2}')" \
+  "$(ssh-keyscan -t ecdsa -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
 
 printf 'mkdir /sftpbkt\nmkdir /sftpbkt/dir\nls /\n' > "$WORK/b1"
 check "mkdir bucket and dir" 0 "$(sftpb "$WORK/b1"; echo $?)"
@@ -77,7 +105,7 @@ BIGMD5=$(md5 "$WORK/big")
 printf 'small file\n' > "$WORK/small"
 for cipher in chacha20-poly1305@openssh.com aes256-gcm@openssh.com aes128-gcm@openssh.com; do
   for kex in mlkem768x25519-sha256 curve25519-sha256 curve25519-sha256@libssh.org; do
-    for hk in ssh-ed25519 rsa-sha2-512 rsa-sha2-256; do
+    for hk in ssh-ed25519 ecdsa-sha2-nistp256 rsa-sha2-512 rsa-sha2-256; do
       printf 'put %s /sftpbkt/dir/s.txt\nget /sftpbkt/dir/s.txt %s\n' "$WORK/small" "$WORK/small.out" > "$WORK/b2"
       rm -f "$WORK/small.out"
       sftpb "$WORK/b2" -c "$cipher" -o KexAlgorithms="$kex" -o HostKeyAlgorithms="$hk" || true
@@ -93,6 +121,9 @@ for cipher in chacha20-poly1305@openssh.com aes256-gcm@openssh.com; do
   check "100MB md5 $cipher" "$BIGMD5" "$(md5 "$WORK/big.out" 2>/dev/null || echo none)"
 done
 check "100MB via s3" "$BIGMD5" "$(s3 "$EP/sftpbkt/dir/big" | md5sum | cut -d' ' -f1)"
+# Streaming: a large put is stored part by part (multipart ETag), not spooled whole.
+check "100MB streamed as parts" 1 "$(s3 -I "$EP/sftpbkt/dir/big" | tr -d '\r' | grep -ic '^etag: "[0-9a-f]*-[0-9]*"')"
+check "no spool files left" 0 "$(find "$DATA" -name 'zkfsm-sftp-*.spool' | wc -l)"
 
 # reget: resume a truncated local copy; reput: finish a truncated remote copy.
 head -c 30000000 "$WORK/big" > "$WORK/big.out"
@@ -116,6 +147,10 @@ check "rm and rmdir" 0 "$(sftpb "$WORK/b7"; echo $?)"
 check "dir gone via s3" 0 "$(s3 "$EP/sftpbkt?list-type=2" | grep -c '<Key>')"
 printf 'rmdir /sftpbkt/missing\n' > "$WORK/b8"
 check "rmdir missing fails" 1 "$(sftpb "$WORK/b8" >/dev/null 2>&1; echo $?)"
+
+# ECDSA P-256 user key.
+printf 'ls /sftpbkt\n' > "$WORK/bec"
+check "ecdsa user key login" 0 "$(timeout 30 sftp -i "$WORK/id_ec" "${SSHOPTS[@]}" -o PasswordAuthentication=no -o PubkeyAcceptedAlgorithms=ecdsa-sha2-nistp256 -P "$SPORT" -b "$WORK/bec" "$AK@127.0.0.1" >/dev/null 2>&1; echo $?)"
 
 # Publickey with a key that is not registered must not log in.
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/other"
@@ -146,6 +181,14 @@ else
   echo "skip quota checks (set MC to the MinIO client)"
 fi
 check "server still alive" 0 "$(kill -0 "$PID"; echo $?)"
+stop
+# PEM (SEC1) EC host key only.
+start --sftp-host-key "$WORK/host_ec_pem"
+check "pem ecdsa host key" "$(ssh-keygen -lf "$WORK/host_ec_pem.pub" | awk '{print $2}')" \
+  "$(ssh-keyscan -t ecdsa -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
+printf 'put %s /sftpbkt/ec.txt\nget /sftpbkt/ec.txt %s\n' "$WORK/small" "$WORK/ec.out" > "$WORK/bec2"
+sftpb "$WORK/bec2" -o HostKeyAlgorithms=ecdsa-sha2-nistp256 || true
+check "pem ecdsa round trip" "$(md5 "$WORK/small")" "$(md5 "$WORK/ec.out" 2>/dev/null || echo none)"
 
 echo "sftp: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

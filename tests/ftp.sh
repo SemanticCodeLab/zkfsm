@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # FTP / FTPS gateway end to end: curl (ftp://, explicit --ssl-reqd, implicit ftps://)
 # and python ftplib (FTP, FTP_TLS, implicit), checked against the S3 API.
+# ZKFSM_GW_CLUSTER=1 runs against a 4-node cluster: FTP on node 1, S3 checks on node 2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="${ZKFSM_FTP_SCRATCH:-${TMPDIR:-/tmp}}"
 mkdir -p "$SCRATCH"
 WORK="$(mktemp -d "$SCRATCH/zkfsm-ftp.XXXXXX")"
 PID=""
-cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; gw_cluster_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 pass=0
 fail=0
@@ -24,6 +27,7 @@ PY="${PYTHON:-python3}"
 
 (cd "$ROOT" && zig build)
 BIN="$ROOT/zig-out/bin/zkfsm"
+gw_build "$WORK/rs"
 
 cd "$WORK"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.crt -days 2 \
@@ -31,12 +35,23 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls
 
 S3P=$(freeport); FTPP=$(freeport); FTPSP=$(freeport)
 PLO=$(( (RANDOM % 2000) + 40000 )); PHI=$((PLO + 40))
+if [[ $GW_CLUSTER == 1 ]]; then
+  FPS=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  FSS=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  ftp_node() { echo "--ftp 127.0.0.1:${FPS[$1]} --ftps 127.0.0.1:${FSS[$1]} --ftp-passive-ports $((PLO + ($1 - 1) * 50))-$((PLO + ($1 - 1) * 50 + 40))"; }
+  gw_tls "$WORK/tls"
+  cp "$WORK/tls/chain.crt" tls.crt; cp "$WORK/tls/leaf.key" tls.key
+  gw_cluster_start "$WORK" "ftps listening" "$WORK/tls" ftp_node
+  S3P="${GW_S3P[2]}"; FTPP="${FPS[1]}"; FTPSP="${FSS[1]}"
+  echo "cluster mode: 4 nodes, ftp on node 1, s3 on node 2"
+else
 ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/data" --listen "127.0.0.1:$S3P" \
   --tls-cert tls.crt --tls-key tls.key --ftp "127.0.0.1:$FTPP" --ftps "127.0.0.1:$FTPSP" \
   --ftp-passive-ports "$PLO-$PHI" 2>"$WORK/server.log" &
 PID=$!
 for _ in $(seq 300); do grep -q "ftps listening" "$WORK/server.log" 2>/dev/null && break; sleep 0.1; done
 grep -q "ftps listening" "$WORK/server.log" || { echo "server did not start:"; cat "$WORK/server.log"; exit 1; }
+fi
 
 EP="https://127.0.0.1:$S3P"
 s3() { curl -sk --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$@"; }
@@ -121,6 +136,41 @@ check "retr without pasv" "425" "$(raw "USER $AK" "PASS $SK" "RETR /cbkt/tls.bin
 check "rnto without rnfr" "503" "$(raw "USER $AK" "PASS $SK" "RNTO x" | sed -n 4p | cut -c1-3)"
 check "help" "214" "$(raw "HELP" | tail -1 | cut -c1-3)"
 check "auth tls" "234" "$(raw "AUTH TLS" | sed -n 2p | cut -c1-3)"
+
+# ---- active mode (PORT / EPRT) with bounce protection ----
+check "curl active PORT download" "$MD5" "$("${C[@]}" -P 127.0.0.1 --disable-eprt "$FTP/cbkt/dir/obj.bin" | md5sum | cut -d' ' -f1)"
+check "curl active EPRT download" "$MD5" "$("${C[@]}" -P 127.0.0.1 "$FTP/cbkt/dir/obj.bin" | md5sum | cut -d' ' -f1)"
+check "curl active upload" 0 "$("${C[@]}" -P 127.0.0.1 -T obj.bin "$FTP/cbkt/active.bin"; echo $?)"
+check "s3 sees active upload" "$MD5" "$(s3 "$EP/cbkt/active.bin" | md5sum | cut -d' ' -f1)"
+check "curl active list" 1 "$("${C[@]}" -P 127.0.0.1 -l "$FTP/cbkt/" | tr -d '\r' | grep -cx active.bin)"
+check "bounce PORT other host" "504" "$(raw "USER $AK" "PASS $SK" "PORT 10,1,2,3,40,1" | sed -n 4p | cut -c1-3)"
+check "bounce EPRT other host" "504" "$(raw "USER $AK" "PASS $SK" "EPRT |1|192.0.2.7|10241|" | sed -n 4p | cut -c1-3)"
+check "bounce PORT privileged port" "504" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0,1,0,25" | sed -n 4p | cut -c1-3)"
+check "PORT syntax error" "501" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0" | sed -n 4p | cut -c1-3)"
+check "EPRT unknown family" "501" "$(raw "USER $AK" "PASS $SK" "EPRT |9|x|1|" | sed -n 4p | cut -c1-3)"
+check "PORT own host ok" "200" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0,1,40,1" | sed -n 4p | cut -c1-3)"
+
+# ---- REST + STOR resumes an upload (small prefix in memory, large via part copy) ----
+head -c 7000000 /dev/urandom >rs.bin
+for split in 100000 6000000; do
+  "$PY" - "$FTPP" "$AK" "$SK" "$split" <<'PYEOF'
+import ftplib, io, sys
+port, ak, sk, cut = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+data = open("rs.bin", "rb").read()
+f = ftplib.FTP(); f.connect("127.0.0.1", port); f.login(ak, sk)
+f.storbinary("STOR /cbkt/rs.bin", io.BytesIO(data[:cut]))
+f.storbinary("STOR /cbkt/rs.bin", io.BytesIO(data[cut - 1000:]), rest=cut - 1000)
+f.set_pasv(False)
+f.storbinary("STOR /cbkt/rs-act.bin", io.BytesIO(data[:cut]))
+f.storbinary("STOR /cbkt/rs-act.bin", io.BytesIO(data[cut:]), rest=cut)
+f.quit()
+PYEOF
+  check "rest+stor resume at $split" "$(md5sum rs.bin | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs.bin" | md5sum | cut -d' ' -f1)"
+  check "rest+stor active at $split" "$(md5sum rs.bin | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs-act.bin" | md5sum | cut -d' ' -f1)"
+done
+check "rest beyond end refused" "554" "$(raw "USER $AK" "PASS $SK" "REST 99999999" "STOR /cbkt/rs.bin" | sed -n 5p | cut -c1-3)"
+check "appe large streams" 0 "$("${C[@]}" -a -T rs.bin "$FTP/cbkt/rs-act.bin"; echo $?)"
+check "appe result" "$( (cat rs.bin rs.bin) | md5sum | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs-act.bin" | md5sum | cut -d' ' -f1)"
 
 # ---- python ftplib ----
 head -c 52428800 /dev/urandom >big.bin

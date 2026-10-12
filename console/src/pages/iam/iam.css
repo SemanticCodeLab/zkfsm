@@ -1,0 +1,52 @@
+.iam-search {
+  max-width: 320px;
+  margin-bottom: 12px;
+}
+.iam-checklist {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px 10px;
+  margin: 0 0 12px;
+}
+.iam-checklist legend {
+  font-weight: 600;
+  font-size: 13px;
+  padding: 0 4px;
+}
+.iam-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 4px 12px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.iam-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.iam-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.iam-errors {
+  color: var(--danger);
+  margin: 0 0 12px;
+  padding-left: 18px;
+}
+.iam-template-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.iam-template-row input {
+  width: 180px;
+}
+td.iam-actions {
+  text-align: right;
+  white-space: nowrap;
+}

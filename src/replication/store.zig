@@ -10,6 +10,7 @@ pub const PhysicalKey = backend.PhysicalKey;
 pub const Kind = enum(u8) {
     config = 0x43,
     deployment = 0x44,
+    stats = 0x4d,
     queue = 0x51,
     resync = 0x52,
     site = 0x53,

@@ -10,6 +10,7 @@ const auth = @import("swift_auth.zig");
 const meta = @import("swift_meta.zig");
 const keystone = @import("keystone.zig");
 const objects = @import("swift_object.zig");
+const acl = @import("swift_acl.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -58,6 +59,12 @@ pub const Ctx = struct {
     is_copy: bool = false,
     /// PUT/POST without Content-Length or chunked encoding.
     length_missing: bool = false,
+    /// No token was sent: only container ACLs (referrer grants) can admit the request.
+    anon: bool = false,
+    /// The token belongs to another account: only container ACLs can admit the request.
+    foreign: bool = false,
+    acl_account: []const u8 = "",
+    acl_user: []const u8 = "",
 
     pub fn svc(c: *const Ctx) *object.ObjectService {
         return c.st.access.svc;
@@ -73,7 +80,32 @@ pub const Ctx = struct {
     }
 
     pub fn allowed(c: *const Ctx, op: Op, bucket: []const u8, key: []const u8) bool {
+        if (c.iamAllowed(op, bucket, key)) return true;
+        return bucket.len > 0 and !c.tempurl and c.aclAllowed(op, bucket);
+    }
+
+    /// The caller's own rights, ignoring container ACLs.
+    pub fn iamAllowed(c: *const Ctx, op: Op, bucket: []const u8, key: []const u8) bool {
+        if (c.anon or c.foreign) return false;
         return c.st.access.allowed(&c.who, op, bucket, key, c.peer, c.secure);
+    }
+
+    fn aclAllowed(c: *const Ctx, op: Op, bucket: []const u8) bool {
+        const Class = enum { read, list, write };
+        const class: Class = switch (op) {
+            .get_object, .head_object => .read,
+            .list_objects_v2, .head_bucket => .list,
+            .put_object, .delete_object => .write,
+            else => return false,
+        };
+        const cm = meta.getContainer(c.svc(), c.a, bucket) catch return false;
+        const who: ?acl.Who = if (c.anon) null else .{ .account = c.acl_account, .user = c.acl_user };
+        const referer = c.header("referer");
+        return switch (class) {
+            .read => acl.mayRead(meta.find(cm.sys, meta.sys_read) orelse "", who, referer),
+            .list => acl.mayList(meta.find(cm.sys, meta.sys_read) orelse "", who, referer),
+            .write => acl.mayWrite(meta.find(cm.sys, meta.sys_write) orelse "", who),
+        };
     }
 
     /// Full response; adds the transaction id, date, and content type.
@@ -124,6 +156,7 @@ pub const Ctx = struct {
     }
 
     pub fn denied(c: *Ctx) ConnError!void {
+        if (c.anon) return c.fail(.unauthorized, "This server could not verify that you are authorized to access the document you requested.");
         return c.fail(.forbidden, "Access was denied to this resource.");
     }
 };
@@ -216,7 +249,10 @@ fn now() i64 {
 /// Resolves X-Auth-Token to a principal bound to the URL's account; responds on failure.
 fn authenticate(c: *Ctx) ConnError!bool {
     const tok = c.header("x-auth-token") orelse c.header("x-storage-token") orelse {
-        try c.fail(.unauthorized, "This server could not verify that you are authorized to access the document you requested.");
+        // Anonymous: container ACLs decide; accounts are never reachable.
+        c.anon = true;
+        if (c.container.len > 0) return true;
+        try c.denied();
         return false;
     };
     if (std.mem.startsWith(u8, tok, auth.token_prefix)) {
@@ -225,14 +261,18 @@ fn authenticate(c: *Ctx) ConnError!bool {
             try c.fail(.unauthorized, "Invalid or expired token.");
             return false;
         };
-        if (!std.mem.startsWith(u8, c.account, "AUTH_") or !std.mem.eql(u8, c.account[5..], claims.account)) {
-            try c.denied();
-            return false;
-        }
         c.who = c.st.access.known(claims.access_key) orelse {
             try c.fail(.unauthorized, "Unknown identity.");
             return false;
         };
+        c.acl_account = try c.a.dupe(u8, claims.account);
+        c.acl_user = try c.a.dupe(u8, claims.access_key);
+        if (!std.mem.startsWith(u8, c.account, "AUTH_") or !std.mem.eql(u8, c.account[5..], claims.account)) {
+            c.foreign = true;
+            if (c.container.len > 0) return true;
+            try c.denied();
+            return false;
+        }
         return true;
     }
     const ks = c.st.ks orelse {
@@ -250,18 +290,30 @@ fn authenticate(c: *Ctx) ConnError!bool {
         try c.fail(.unauthorized, "Invalid token.");
         return false;
     };
+    c.acl_account = try c.a.dupe(u8, ki.projectId());
+    c.acl_user = try c.a.dupe(u8, ki.userName());
+    var pb: [keystone.max_policies]u8 = undefined;
+    if (ks.cfg.rolePolicies(&ki, &pb)) |pols| {
+        // Mapped roles decide; the identity is the project's key or the Keystone user.
+        const name = ks.cfg.mapped(ki.projectId(), ki.projectName()) orelse ki.userName();
+        c.who = access_mod.Principal.of(name) catch access_mod.Principal{};
+        c.who.setPolicies(pols) catch {
+            try c.denied();
+            return false;
+        };
+    } else {
+        const ak = ks.cfg.mapped(ki.projectId(), ki.projectName()) orelse "";
+        c.who = c.st.access.known(ak) orelse {
+            try c.denied();
+            return false;
+        };
+    }
     if (!std.mem.startsWith(u8, c.account, "AUTH_") or !std.mem.eql(u8, c.account[5..], ki.projectId())) {
+        c.foreign = true;
+        if (c.container.len > 0) return true;
         try c.denied();
         return false;
     }
-    const ak = ks.cfg.mapped(ki.projectId(), ki.projectName()) orelse {
-        try c.denied();
-        return false;
-    };
-    c.who = c.st.access.known(ak) orelse {
-        try c.denied();
-        return false;
-    };
     return true;
 }
 
@@ -317,6 +369,7 @@ fn info(c: *Ctx) ConnError!void {
         \\ "dlo": {{"max_segments": {d}}},
         \\ "tempurl": {{"methods": ["GET", "HEAD", "PUT"], "allowed_digests": ["sha1", "sha256", "sha512"],
         \\ "incoming_remove_headers": ["x-timestamp"], "outgoing_remove_headers": ["x-object-meta-*"]}},
+        \\ "versioned_writes": {{"allowed_flags": ["x-versions-location", "x-history-location"]}},
         \\ "tempauth": {{"enabled": {}}}, "keystoneauth": {{"enabled": {}}}}}
     , .{ @import("swift_slo.zig").max_segments, @import("swift_slo.zig").max_manifest_bytes, objects.max_dlo_segments, c.st.tempauth, c.st.ks != null });
     return c.send(.ok, if (c.method == .HEAD) "" else body, "application/json; charset=utf-8", &.{});
@@ -440,13 +493,45 @@ fn containerMetaChanges(c: *Ctx) ConnError!?[]meta.Meta {
     };
 }
 
-fn applyContainerMeta(c: *Ctx, changes: []const meta.Meta) ConnError!bool {
-    if (changes.len == 0) return true;
+/// ACL and versioning headers as settings changes; responds and returns null when invalid.
+fn containerSysChanges(c: *Ctx) ConnError!?[]meta.Meta {
+    var out: std.ArrayList(meta.Meta) = .empty;
+    inline for (.{ .{ "read", meta.sys_read, false }, .{ "write", meta.sys_write, true } }) |p| {
+        if (c.header("x-remove-container-" ++ p[0]) != null) try out.append(c.a, .{ .name = p[1], .value = "" });
+        if (c.header("x-container-" ++ p[0])) |v| {
+            const t = std.mem.trim(u8, v, " \t");
+            if (!acl.valid(t, p[2])) {
+                try c.fail(.bad_request, "Invalid container ACL.");
+                return null;
+            }
+            try out.append(c.a, .{ .name = p[1], .value = t });
+        }
+    }
+    if (c.header("x-remove-versions-location") != null or c.header("x-remove-history-location") != null)
+        try out.append(c.a, .{ .name = meta.sys_versions, .value = "" });
+    inline for (.{ .{ "x-versions-location", "stack" }, .{ "x-history-location", "history" } }) |p| if (c.header(p[0])) |raw| {
+        const dec = util.percentDecodeAlloc(c.a, std.mem.trim(u8, raw, " \t"), false) catch "/";
+        if (dec.len == 0) {
+            try out.append(c.a, .{ .name = meta.sys_versions, .value = "" });
+        } else {
+            const loc = util.bucketName(c.a, dec) catch dec;
+            if (std.mem.indexOfScalar(u8, loc, '/') != null or loc.len > 200 or !util.safeValue(loc) or std.mem.eql(u8, loc, c.container)) {
+                try c.fail(.bad_request, "Invalid versions location.");
+                return null;
+            }
+            try out.append(c.a, .{ .name = meta.sys_versions, .value = try std.fmt.allocPrint(c.a, p[1] ++ ":{s}", .{loc}) });
+        }
+    };
+    return out.items;
+}
+
+fn applyContainerMeta(c: *Ctx, changes: []const meta.Meta, sys: []const meta.Meta) ConnError!bool {
+    if (changes.len == 0 and sys.len == 0) return true;
     var owner: ?[]const u8 = null;
     for (changes) |m| if (std.mem.startsWith(u8, m.name, "temp-url-key")) {
         owner = c.who.accessKey();
     };
-    meta.updateContainer(c.svc(), c.a, c.container, changes, owner) catch |e| {
+    meta.updateContainer(c.svc(), c.a, c.container, changes, sys, owner) catch |e| {
         switch (e) {
             error.BadMetadata, error.TooMuchMetadata => try c.fail(.bad_request, "Invalid or too much container metadata."),
             error.Storage => try c.fail(.internal_server_error, "Storage error."),
@@ -460,12 +545,13 @@ fn applyContainerMeta(c: *Ctx, changes: []const meta.Meta) ConnError!bool {
 fn containerPut(c: *Ctx) ConnError!void {
     if (!c.allowed(.create_bucket, c.container, "")) return c.denied();
     const changes = (try containerMetaChanges(c)) orelse return;
+    const sys = (try containerSysChanges(c)) orelse return;
     var status: Status = .created;
     c.st.access.createBucket(&c.who, c.container) catch |e| switch (e) {
         error.BucketAlreadyExists => status = .accepted,
         else => return c.failObj(e),
     };
-    if (!try applyContainerMeta(c, changes)) return;
+    if (!try applyContainerMeta(c, changes, sys)) return;
     return c.send(status, "", null, &.{});
 }
 
@@ -473,7 +559,8 @@ fn containerPost(c: *Ctx) ConnError!void {
     if (!c.allowed(.put_bucket_tagging, c.container, "")) return c.denied();
     c.svc().headBucket(c.container) catch |e| return c.failObj(e);
     const changes = (try containerMetaChanges(c)) orelse return;
-    if (!try applyContainerMeta(c, changes)) return;
+    const sys = (try containerSysChanges(c)) orelse return;
+    if (!try applyContainerMeta(c, changes, sys)) return;
     return c.send(.no_content, "", null, &.{});
 }
 
@@ -495,6 +582,14 @@ fn containerGet(c: *Ctx) ConnError!void {
     try hs.append(c.a, .{ .name = "X-Container-Bytes-Used", .value = try std.fmt.allocPrint(c.a, "{d}", .{u.bytes}) });
     try hs.append(c.a, .{ .name = "X-Storage-Policy", .value = "default" });
     try metaHeaders(c, &hs, "X-Container-Meta-", cm.meta);
+    // Settings are shown to callers with their own rights, not to ACL guests.
+    if (c.iamAllowed(op, c.container, "")) {
+        if (meta.find(cm.sys, meta.sys_read)) |v| try hs.append(c.a, .{ .name = "X-Container-Read", .value = v });
+        if (meta.find(cm.sys, meta.sys_write)) |v| try hs.append(c.a, .{ .name = "X-Container-Write", .value = v });
+        if (meta.find(cm.sys, meta.sys_versions)) |v| if (std.mem.indexOfScalar(u8, v, ':')) |i| {
+            try hs.append(c.a, .{ .name = if (std.mem.eql(u8, v[0..i], "history")) "X-History-Location" else "X-Versions-Location", .value = v[i + 1 ..] });
+        };
+    }
     const fmt = listing.pickFormat(c.q("format"), c.header("accept"));
     if (c.method == .HEAD) return c.send(.no_content, "", fmt.contentType(), hs.items);
 
@@ -518,7 +613,7 @@ fn containerGet(c: *Ctx) ConnError!void {
         const name = if (take_obj) r.contents[i].key else r.common_prefixes[j];
         if (end_marker.len > 0 and !std.mem.lessThan(u8, name, end_marker)) break;
         if (take_obj) {
-            try rows.append(c.a, .{ .object = try objects.listingRow(c, r.contents[i]) });
+            if (try objects.listingRow(c, r.contents[i])) |row| try rows.append(c.a, .{ .object = row });
             i += 1;
         } else {
             try rows.append(c.a, .{ .subdir = name });

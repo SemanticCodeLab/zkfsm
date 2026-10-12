@@ -3,6 +3,7 @@
 const std = @import("std");
 const posix = std.posix;
 const root = @import("root.zig");
+const object = @import("../object/root.zig");
 const listener_mod = @import("listener.zig");
 const fs_mod = @import("fs.zig");
 const wire = @import("ssh_wire.zig");
@@ -30,7 +31,7 @@ pub const Config = struct {
 
 pub const usage =
     \\  --sftp HOST:PORT SFTP gateway (SSH-2 with the sftp subsystem; password = secret key)
-    \\  --sftp-host-key FILE  host key: openssh ed25519 or PEM RSA; repeatable (default:
+    \\  --sftp-host-key FILE  host key: ed25519, ECDSA P-256 or RSA; repeatable (default:
     \\                   generated ed25519 kept in the first drive's .zkfsm)
     \\  --sftp-authorized-keys FILE  public keys, one per line: ACCESS-KEY TYPE BASE64 [COMMENT]
     \\  --sftp-rekey-bytes N  re-exchange keys after N bytes (default: 1 GiB)
@@ -117,16 +118,37 @@ pub const Server = struct {
                 gpa.free(text);
             }
             s.host_keys[s.host_key_count] = keys.loadHostKey(gpa, text) catch |e| {
-                std.log.err("sftp: unusable host key {s}: {t} (ed25519 in OpenSSH format or RSA in PEM)", .{ path, e });
+                std.log.err("sftp: unusable host key {s}: {t} (ed25519/ECDSA P-256 in OpenSSH format, RSA/EC P-256 in PEM)", .{ path, e });
                 return error.BadConfig;
             };
             s.host_key_count += 1;
         }
         if (s.host_key_count > 0) return;
-        s.host_keys[0] = .{ .ed25519 = try persistentEd25519(gpa, s.deps.state_dir) };
+        s.host_keys[0] = .{ .ed25519 = if (s.deps.state_dir == null) sharedEd25519(gpa, s.deps.access.svc) else try persistentEd25519(gpa, s.deps.state_dir) };
         s.host_key_count = 1;
     }
 };
+
+/// Cluster nodes have no private state directory: the generated host key is one
+/// shared document, so clients see the same key on every node and after restarts.
+fn sharedEd25519(gpa: std.mem.Allocator, svc: *object.ObjectService) std.crypto.sign.Ed25519.KeyPair {
+    const Ed = std.crypto.sign.Ed25519;
+    const doc = "sftp-host-ed25519";
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    load: {
+        var buf: [1024]u8 = undefined;
+        const fresh = keys.encodeOpenSsh(Ed.KeyPair.generate(), &buf) catch break :load;
+        // The first node to start stores its key; the others adopt it.
+        const text = object.bucket_meta.initNamed(svc, arena, doc, fresh) catch break :load;
+        var k = keys.loadHostKey(gpa, text) catch break :load;
+        if (k == .ed25519) return k.ed25519;
+        k.deinit(gpa);
+    }
+    std.log.warn("sftp: host key could not be shared; using an ephemeral one", .{});
+    return Ed.KeyPair.generate();
+}
 
 fn persistentEd25519(gpa: std.mem.Allocator, state_dir: ?[]const u8) root.StartError!std.crypto.sign.Ed25519.KeyPair {
     const Ed = std.crypto.sign.Ed25519;
@@ -361,7 +383,11 @@ const Conn = struct {
         const path = c.srv.cfg.authorized_keys orelse return .{ .failure = true };
         const alg = keys.SigAlg.parse(alg_name) orelse return .{ .failure = true };
         const kt = keys.blobType(blob) orelse return .{ .failure = true };
-        const want_kt = if (alg == .ssh_ed25519) "ssh-ed25519" else "ssh-rsa";
+        const want_kt = switch (alg) {
+            .ssh_ed25519 => "ssh-ed25519",
+            .ecdsa_nistp256 => "ecdsa-sha2-nistp256",
+            .rsa_sha2_256, .rsa_sha2_512 => "ssh-rsa",
+        };
         if (!std.mem.eql(u8, kt, want_kt)) return .{ .failure = true };
         const gpa = c.srv.gpa;
         const text = std.fs.cwd().readFileAlloc(gpa, path, keys.max_authorized_file) catch {

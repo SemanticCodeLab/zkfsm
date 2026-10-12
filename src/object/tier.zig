@@ -10,6 +10,7 @@ const blob = @import("blob.zig");
 
 pub const Config = metadata.tier_config.Config;
 pub const Kind = metadata.tier_config.Kind;
+pub const Auth = metadata.tier_config.Auth;
 pub const validName = metadata.tier_config.validName;
 
 const Svc = service.ObjectService;
@@ -84,6 +85,8 @@ pub const Tier = struct {
     /// Normalized: empty or ending in '/'.
     prefix: []const u8,
     client: union(enum) { s3: backend.s3.S3Client, azure: backend.azure.AzureClient, custom: backend.remote.Provider },
+    /// Short-lived credentials for non-key auth modes; the client borrows it.
+    source: ?*backend.creds.Source = null,
 
     pub const name_max = 4096 + 48;
 
@@ -96,43 +99,95 @@ pub const Tier = struct {
         errdefer t.arena.deinit();
         const a = t.arena.allocator();
         var c = cfg;
-        inline for (.{ "name", "endpoint", "access_key", "secret_key", "bucket", "prefix", "region", "storage_class" }) |f|
-            @field(c, f) = try a.dupe(u8, @field(cfg, f));
+        inline for (metadata.tier_config.string_fields) |f| @field(c, f) = try a.dupe(u8, @field(cfg, f));
         t.cfg = c;
         const p = std.mem.trimLeft(u8, c.prefix, "/");
         t.prefix = if (p.len == 0 or p[p.len - 1] == '/') p else try std.fmt.allocPrint(a, "{s}/", .{p});
         if (c.bucket.len == 0) return error.InvalidTierConfig;
         const creds: backend.s3.Credentials = .{ .access_key = c.access_key, .secret_key = c.secret_key };
+        if (c.auth != .keys) t.source = try makeSource(gpa, a, c);
+        errdefer if (t.source) |src| src.deinit();
         switch (c.kind) {
             .s3, .minio => {
                 const ep = if (c.endpoint.len > 0) c.endpoint else "https://s3.amazonaws.com";
-                if (c.access_key.len == 0 or c.secret_key.len == 0) return error.InvalidTierConfig;
+                if (c.auth == .keys and (c.access_key.len == 0 or c.secret_key.len == 0)) return error.InvalidTierConfig;
+                if (c.auth != .keys and c.auth != .role) return error.InvalidTierConfig;
                 t.client = .{ .s3 = backend.s3.S3Client.init(gpa, .{
                     .endpoint = ep,
                     .region = if (c.region.len > 0) c.region else "us-east-1",
                     .bucket = c.bucket,
                     .credentials = creds,
                     .retry = retry,
+                    .storage_class = c.storage_class,
+                    .source = t.source,
                 }) catch |e| return mapInit(e) };
             },
             .gcs => {
-                if (c.access_key.len == 0 or c.secret_key.len == 0) return error.InvalidTierConfig;
+                if (c.auth == .keys and (c.access_key.len == 0 or c.secret_key.len == 0)) return error.InvalidTierConfig;
+                if (c.auth != .keys and c.auth != .service_account) return error.InvalidTierConfig;
                 var sc = backend.gcs.s3Config(.{ .bucket = c.bucket, .credentials = creds, .retry = retry });
-                if (c.endpoint.len > 0) sc.endpoint = c.endpoint;
+                // The env override (tests, private gateways) wins over the client's default.
+                if (std.posix.getenv("ZKFSM_TIER_GCS_ENDPOINT")) |e| sc.endpoint = e else if (c.endpoint.len > 0) sc.endpoint = c.endpoint;
+                sc.storage_class = c.storage_class;
+                sc.storage_class_header = "x-goog-storage-class";
+                sc.source = t.source;
                 t.client = .{ .s3 = backend.s3.S3Client.init(gpa, sc) catch |e| return mapInit(e) };
             },
             .azure => {
+                if (c.auth != .keys and c.auth != .service_principal) return error.InvalidTierConfig;
                 t.client = .{ .azure = undefined };
                 t.client.azure.init(gpa, .{
                     .account = c.access_key,
-                    .key = c.secret_key,
+                    .key = if (c.auth == .keys) c.secret_key else "",
                     .container = c.bucket,
-                    .endpoint = if (c.endpoint.len > 0) c.endpoint else null,
+                    .endpoint = std.posix.getenv("ZKFSM_TIER_AZURE_ENDPOINT") orelse if (c.endpoint.len > 0) c.endpoint else null,
                     .retry = retry,
+                    .access_tier = c.storage_class,
+                    .source = t.source,
                 }) catch |e| return mapInit(e);
             },
         }
         return t;
+    }
+
+    /// Credential source for `c` (strings in the tier arena); node settings come from env.
+    fn makeSource(gpa: std.mem.Allocator, a: std.mem.Allocator, c: Config) AdminError!*backend.creds.Source {
+        const env = std.posix.getenv;
+        const kind: backend.creds.Kind = switch (c.auth) {
+            .keys => return error.InvalidTierConfig,
+            .service_account => .{ .service_account = .{
+                .email = c.access_key,
+                .private_key_pem = c.secret_key,
+                .token_uri = if (c.token_uri.len > 0) c.token_uri else "https://oauth2.googleapis.com/token",
+            } },
+            .service_principal => .{ .client_secret = .{
+                .authority = if (c.token_uri.len > 0) c.token_uri else env("ZKFSM_TIER_AZURE_AUTHORITY") orelse "https://login.microsoftonline.com",
+                .tenant = c.tenant_id,
+                .client_id = c.client_id,
+                .secret = c.secret_key,
+            } },
+            .role => blk: {
+                const file = if (c.token_file.len > 0) c.token_file else env("ZKFSM_TIER_WEB_IDENTITY_TOKEN_FILE") orelse "";
+                const arn = if (c.role_arn.len > 0) c.role_arn else env("ZKFSM_TIER_ROLE_ARN") orelse "";
+                if (file.len > 0) break :blk .{ .web_identity = .{
+                    .sts_endpoint = env("ZKFSM_TIER_STS_ENDPOINT") orelse "https://sts.amazonaws.com",
+                    .role_arn = arn,
+                    .token_file = file,
+                } };
+                break :blk .{ .metadata = .{
+                    .full_uri = env("ZKFSM_TIER_CREDENTIALS_URL") orelse "",
+                    .auth_token = env("ZKFSM_TIER_CREDENTIALS_TOKEN") orelse "",
+                    .base = env("ZKFSM_TIER_METADATA_ENDPOINT") orelse "http://169.254.169.254",
+                } };
+            },
+        };
+        if (c.auth == .service_principal and (c.tenant_id.len == 0 or c.client_id.len == 0 or c.secret_key.len == 0)) return error.InvalidTierConfig;
+        const src = try a.create(backend.creds.Source);
+        src.init(gpa, kind) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidConfig => error.InvalidTierConfig,
+        };
+        return src;
     }
 
     fn mapInit(e: error{ InvalidConfig, OutOfMemory }) AdminError {
@@ -160,6 +215,7 @@ pub const Tier = struct {
             .azure => |*c| c.deinit(),
             .custom => {},
         }
+        if (t.source) |src| src.deinit();
         t.arena.deinit();
         t.reg.gpa.destroy(t);
     }
@@ -357,6 +413,8 @@ pub const Registry = struct {
     stats_ns: i128 = 0,
     /// Object ids with a restore in flight.
     restoring: std.AutoHashMapUnmanaged([16]u8, void) = .empty,
+    /// Background restores still running; deinit waits for them.
+    workers: std.atomic.Value(u32) = .init(0),
     /// Per-tier transition activity; keys owned by gpa.
     daily: std.StringHashMapUnmanaged(Daily) = .empty,
 
@@ -365,6 +423,7 @@ pub const Registry = struct {
     }
 
     pub fn deinit(r: *Registry) void {
+        while (r.workers.load(.acquire) > 0) std.Thread.sleep(10 * std.time.ns_per_ms);
         for (r.tiers.items) |t| t.release();
         r.tiers.deinit(r.gpa);
         for (r.pinned.items) |t| t.release();
@@ -436,8 +495,7 @@ pub const Registry = struct {
         const out = try arena.alloc(Config, r.tiers.items.len);
         for (r.tiers.items, out) |t, *o| {
             o.* = t.cfg;
-            inline for (.{ "name", "endpoint", "access_key", "secret_key", "bucket", "prefix", "region", "storage_class" }) |f|
-                @field(o, f) = try arena.dupe(u8, @field(t.cfg, f));
+            inline for (metadata.tier_config.string_fields) |f| @field(o, f) = try arena.dupe(u8, @field(t.cfg, f));
         }
         return out;
     }
@@ -545,6 +603,13 @@ pub const Registry = struct {
     pub const Creds = struct {
         access_key: ?[]const u8 = null,
         secret_key: ?[]const u8 = null,
+        /// Switches the auth mode; the fields below replace the stored ones.
+        auth: ?Auth = null,
+        role_arn: []const u8 = "",
+        token_file: []const u8 = "",
+        token_uri: []const u8 = "",
+        tenant_id: []const u8 = "",
+        client_id: []const u8 = "",
     };
 
     /// Replaces credentials after probing them.
@@ -558,12 +623,17 @@ pub const Registry = struct {
         var next = cur;
         if (creds.access_key) |v| next.access_key = v;
         if (creds.secret_key) |v| next.secret_key = v;
+        if (creds.auth) |m| {
+            next.auth = m;
+            inline for (.{ "role_arn", "token_file", "token_uri", "tenant_id", "client_id" }) |f| @field(next, f) = @field(creds, f);
+        }
         try probe(r, next, false);
         try r.update(next, struct {
             fn f(x: Config, _: std.mem.Allocator, l: *std.ArrayList(Config)) AdminError!void {
                 for (l.items) |*e| if (std.mem.eql(u8, e.name, x.name)) {
-                    e.access_key = x.access_key;
-                    e.secret_key = x.secret_key;
+                    const keep = e.*;
+                    e.* = x;
+                    e.created_ns = keep.created_ns;
                     return;
                 };
                 return error.NoSuchTier;

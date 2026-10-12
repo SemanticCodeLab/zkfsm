@@ -36,11 +36,35 @@ pub const Rule = struct {
     noncurrent_transition_days: ?u32 = null,
     noncurrent_transition_newer: ?u32 = null,
     noncurrent_transition_tier: []const u8 = "",
+    /// Later transitions of the chain, ordered by days (or date) after the first one.
+    more_transitions: []const Step = &.{},
+    more_noncurrent: []const NoncurrentStep = &.{},
 
     pub fn hasTransition(r: Rule) bool {
         return r.transition_tier.len > 0 or r.noncurrent_transition_tier.len > 0;
     }
+
+    /// Every current-version transition, first one included.
+    pub fn transitions(r: Rule, a: std.mem.Allocator) error{OutOfMemory}![]const Step {
+        if (r.transition_tier.len == 0) return &.{};
+        const out = try a.alloc(Step, 1 + r.more_transitions.len);
+        out[0] = .{ .days = r.transition_days, .date_ns = r.transition_date_ns, .tier = r.transition_tier };
+        @memcpy(out[1..], r.more_transitions);
+        return out;
+    }
+
+    pub fn noncurrentTransitions(r: Rule, a: std.mem.Allocator) error{OutOfMemory}![]const NoncurrentStep {
+        const d = r.noncurrent_transition_days orelse return &.{};
+        const out = try a.alloc(NoncurrentStep, 1 + r.more_noncurrent.len);
+        out[0] = .{ .days = d, .newer = r.noncurrent_transition_newer, .tier = r.noncurrent_transition_tier };
+        @memcpy(out[1..], r.more_noncurrent);
+        return out;
+    }
 };
+
+pub const Step = struct { days: ?u32 = null, date_ns: ?i128 = null, tier: []const u8 };
+pub const NoncurrentStep = struct { days: u32, newer: ?u32 = null, tier: []const u8 };
+pub const max_steps = 16;
 
 pub const max_tier_len = 64;
 
@@ -55,6 +79,11 @@ pub fn encode(gpa: std.mem.Allocator, rules: []const Rule) Error![]u8 {
     for (rules) |r| {
         if (r.id.len > max_id_len or r.filter.prefix.len > max_prefix_len) return error.InvalidRule;
         if (r.transition_tier.len > max_tier_len or r.noncurrent_transition_tier.len > max_tier_len) return error.InvalidRule;
+        if (r.more_transitions.len > max_steps or r.more_noncurrent.len > max_steps) return error.InvalidRule;
+        for (r.more_transitions) |x| if (x.tier.len == 0 or x.tier.len > max_tier_len) return error.InvalidRule;
+        for (r.more_noncurrent) |x| if (x.tier.len == 0 or x.tier.len > max_tier_len) return error.InvalidRule;
+        if (r.more_transitions.len > 0 and r.transition_tier.len == 0) return error.InvalidRule;
+        if (r.more_noncurrent.len > 0 and r.noncurrent_transition_tier.len == 0) return error.InvalidRule;
         const t = tags_mod.encode(gpa, r.filter.tags) catch |e| return switch (e) {
             error.InvalidTag => error.InvalidRule,
             error.OutOfMemory => error.OutOfMemory,
@@ -69,7 +98,7 @@ fn encodeRule(w: *std.Io.Writer, r: Rule, tags: []const u8) std.Io.Writer.Error!
     try codec.putInt(w, u16, @intCast(r.id.len));
     try w.writeAll(r.id);
     try w.writeByte(@as(u8, @intFromBool(r.enabled)) | @as(u8, @intFromBool(r.expired_object_delete_marker)) << 1 |
-        @as(u8, @intFromBool(r.hasTransition())) << 2);
+        @as(u8, @intFromBool(r.hasTransition())) << 2 | @as(u8, @intFromBool(hasMore(r))) << 3);
     try codec.putInt(w, u16, @intCast(r.filter.prefix.len));
     try w.writeAll(r.filter.prefix);
     try codec.putInt(w, u16, @intCast(tags.len));
@@ -96,6 +125,55 @@ fn encodeRule(w: *std.Io.Writer, r: Rule, tags: []const u8) std.Io.Writer.Error!
         try w.writeByte(@intCast(t.len));
         try w.writeAll(t);
     }
+    if (!hasMore(r)) return;
+    try w.writeByte(@intCast(r.more_transitions.len));
+    for (r.more_transitions) |x| {
+        try w.writeByte(@as(u8, @intFromBool(x.days != null)) | @as(u8, @intFromBool(x.date_ns != null)) << 1);
+        if (x.days) |d| try codec.putInt(w, u32, d);
+        if (x.date_ns) |d| try codec.putInt(w, i128, d);
+        try w.writeByte(@intCast(x.tier.len));
+        try w.writeAll(x.tier);
+    }
+    try w.writeByte(@intCast(r.more_noncurrent.len));
+    for (r.more_noncurrent) |x| {
+        try codec.putInt(w, u32, x.days);
+        try w.writeByte(@intFromBool(x.newer != null));
+        if (x.newer) |n| try codec.putInt(w, u32, n);
+        try w.writeByte(@intCast(x.tier.len));
+        try w.writeAll(x.tier);
+    }
+}
+
+fn hasMore(r: Rule) bool {
+    return r.more_transitions.len > 0 or r.more_noncurrent.len > 0;
+}
+
+fn decodeMore(arena: std.mem.Allocator, c: *codec.Cursor, r: *Rule) (codec.DecodeError || error{OutOfMemory})!void {
+    const n = (try c.take(1))[0];
+    if (n > max_steps) return error.Corrupt;
+    const ts = try arena.alloc(Step, n);
+    for (ts) |*x| {
+        const h = (try c.take(1))[0];
+        if (h & ~@as(u8, 3) != 0) return error.Corrupt;
+        x.* = .{ .tier = "" };
+        if (h & 1 != 0) x.days = try c.int(u32);
+        if (h & 2 != 0) x.date_ns = try c.int(i128);
+        x.tier = try c.take((try c.take(1))[0]);
+        if (x.tier.len == 0) return error.Corrupt;
+    }
+    const m = (try c.take(1))[0];
+    if (m > max_steps or n + m == 0) return error.Corrupt;
+    const ns = try arena.alloc(NoncurrentStep, m);
+    for (ns) |*x| {
+        x.* = .{ .days = try c.int(u32), .tier = "" };
+        const h = (try c.take(1))[0];
+        if (h > 1) return error.Corrupt;
+        if (h == 1) x.newer = try c.int(u32);
+        x.tier = try c.take((try c.take(1))[0]);
+        if (x.tier.len == 0) return error.Corrupt;
+    }
+    r.more_transitions = ts;
+    r.more_noncurrent = ns;
 }
 
 /// Decodes into `arena`; strings borrow from `bytes`. Empty bytes mean no rules.
@@ -109,7 +187,7 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) (codec.DecodeError ||
         r.* = .{};
         r.id = try c.take(try c.int(u16));
         const flags = (try c.take(1))[0];
-        if (flags & ~@as(u8, 7) != 0) return error.Corrupt;
+        if (flags & ~@as(u8, 15) != 0 or flags & 12 == 8) return error.Corrupt;
         r.enabled = flags & 1 != 0;
         r.expired_object_delete_marker = flags & 2 != 0;
         r.filter.prefix = try c.take(try c.int(u16));
@@ -133,6 +211,7 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) (codec.DecodeError ||
             r.transition_tier = try c.take((try c.take(1))[0]);
             r.noncurrent_transition_tier = try c.take((try c.take(1))[0]);
             if (!r.hasTransition()) return error.Corrupt;
+            if (flags & 8 != 0) try decodeMore(arena, &c, r);
         }
     }
     if (c.pos != bytes.len) return error.Corrupt;
@@ -148,11 +227,16 @@ test "lifecycle rules roundtrip" {
         .{ .enabled = false, .expiration_date_ns = 86400 * std.time.ns_per_s, .noncurrent_days = 7, .newer_noncurrent_versions = 2, .abort_upload_days = 3 },
         .{ .expired_object_delete_marker = true, .filter = .{ .size_lt = 5 } },
         .{ .transition_days = 3, .transition_tier = "WARM", .noncurrent_transition_days = 1, .noncurrent_transition_newer = 2, .noncurrent_transition_tier = "COLD" },
+        .{ .transition_days = 1, .transition_tier = "A", .more_transitions = &.{ .{ .days = 5, .tier = "B" }, .{ .days = 9, .tier = "C" } }, .noncurrent_transition_days = 1, .noncurrent_transition_tier = "A", .more_noncurrent = &.{.{ .days = 4, .newer = 1, .tier = "B" }} },
     };
     const b = try encode(gpa, &rules);
     defer gpa.free(b);
     const d = try decode(arena.allocator(), b);
-    try std.testing.expectEqual(@as(usize, 4), d.len);
+    try std.testing.expectEqual(@as(usize, 5), d.len);
+    try std.testing.expectEqualStrings("C", d[4].more_transitions[1].tier);
+    try std.testing.expectEqual(@as(?u32, 9), d[4].more_transitions[1].days);
+    try std.testing.expectEqual(@as(?u32, 1), d[4].more_noncurrent[0].newer);
+    try std.testing.expectEqual(@as(usize, 0), d[3].more_transitions.len);
     try std.testing.expectEqualStrings("WARM", d[3].transition_tier);
     try std.testing.expectEqualStrings("COLD", d[3].noncurrent_transition_tier);
     try std.testing.expectEqual(@as(?u32, 2), d[3].noncurrent_transition_newer);

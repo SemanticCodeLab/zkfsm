@@ -24,6 +24,7 @@ const extras = @import("bucket_extras.zig");
 const postobject = @import("postobject.zig");
 const attributes = @import("attributes.zig");
 const checksums = @import("checksums.zig");
+const throttle = @import("throttle.zig");
 
 const Request = std.http.Server.Request;
 const Header = std.http.Header;
@@ -74,6 +75,9 @@ pub const Ctx = struct {
     headers: []const Header = &.{},
     /// S3 error code of the response, if it was an error (access logs, traces).
     err_code: []const u8 = "",
+    /// Owning tenant of the addressed bucket and body bytes sent (rate limits).
+    bucket_tenant: []const u8 = "",
+    sent_bytes: u64 = 0,
 };
 
 pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: std.mem.Allocator) ConnError!void {
@@ -136,6 +140,8 @@ pub fn handle(svc: *object.ObjectService, env: authz.Env, req: *Request, arena: 
     for (env.extensions) |x| if (x.before_authz and try x.route(x.ctx, &ctx)) return;
     const ar: authz.Request = .{ .method = ctx.method, .bucket = ctx.route.bucket, .key = ctx.route.key, .query = ctx.route.query, .copy_source = ctx.copy_source };
     if (!try authorize(&ctx, ar, now_s)) return;
+    if (!throttle.admit(&ctx)) return fail(&ctx, .SlowDown);
+    defer throttle.charge(&ctx);
     for (env.extensions) |x| if (!x.before_authz and try x.route(x.ctx, &ctx)) return;
     try runBuiltin(&ctx);
 }
@@ -154,6 +160,7 @@ pub fn authorize(c: *Ctx, request: authz.Request, now_s: i64) ConnError!bool {
         if (object.tenancy.access(c.svc, c.arena, ar.bucket)) |acc| {
             if (!tenancy.mayReach(env.auth, c.auth, caller_tenant, acc.tenant)) return denyWith(c, .AccessDenied);
             ar.bucket_policy = acc.policy;
+            c.bucket_tenant = try c.arena.dupe(u8, acc.tenant);
         } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
         access.restrictPolicy(c, &ar) catch |e| {
             try failDispatch(c, e);
@@ -539,6 +546,7 @@ fn getObject(c: *Ctx) DispatchError!void {
     });
     c.resp_headers = hdrs.items;
     const len = if (range) |r| r.length else info.size;
+    if (c.method == .GET) c.sent_bytes = len;
     var out_buf: [io_buf_len]u8 = undefined;
     const st: std.http.Status = c.status_override orelse if (range != null) .partial_content else .ok;
     metrics.global.last_status = @intFromEnum(st);

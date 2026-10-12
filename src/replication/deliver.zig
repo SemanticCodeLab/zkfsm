@@ -162,7 +162,7 @@ fn replicaHeaders(a: Allocator, hs: *std.ArrayList(Header), info: object.ObjectI
 
 fn sendObject(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
     return sendObjectInner(r, hc, a, d, e, info) catch |err| switch (err) {
-        error.OutOfMemory, error.SourceFailed, error.InvalidEndpoint => failed(r, d, e, info.size, @errorName(err)),
+        error.OutOfMemory, error.SourceFailed, error.SinkFailed, error.InvalidEndpoint => failed(r, d, e, info.size, @errorName(err)),
         error.Unreachable => unreachable_(r, d, e, info.size),
     };
 }

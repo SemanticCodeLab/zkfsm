@@ -12,6 +12,19 @@ pub const Principal = struct {
     key_len: u8 = 0,
     /// Anonymous mode (no IAM store): everything is allowed.
     open: bool = false,
+    /// Externally proven identity: comma-separated IAM policy names replace the key lookup.
+    policies_buf: [256]u8 = undefined,
+    policies_len: u16 = 0,
+
+    pub fn policies(p: *const Principal) ?[]const u8 {
+        return if (p.policies_len > 0) p.policies_buf[0..p.policies_len] else null;
+    }
+
+    pub fn setPolicies(p: *Principal, names: []const u8) error{NameTooLong}!void {
+        if (names.len > p.policies_buf.len) return error.NameTooLong;
+        @memcpy(p.policies_buf[0..names.len], names);
+        p.policies_len = @intCast(names.len);
+    }
 
     pub fn accessKey(p: *const Principal) []const u8 {
         return p.key_buf[0..p.key_len];
@@ -142,7 +155,7 @@ pub const Access = struct {
             .now_s = now,
             .resource_policy = if (bucket_policy) |*p| p else null,
         };
-        return st.authorize(.{ .access_key = who.accessKey() }, iam.actions.mapping(op).action, arn, &ctx).allowed();
+        return st.authorize(.{ .access_key = who.accessKey(), .federated_policies = who.policies() }, iam.actions.mapping(op).action, arn, &ctx).allowed();
     }
 };
 

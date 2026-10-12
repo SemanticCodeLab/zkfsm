@@ -89,6 +89,37 @@ with s.open(f"{base}/sparse.bin", "wb") as f:
 with s.open(f"{base}/sparse.bin", "rb") as f:
     check("offset writes", b"head" + b"\0" * 6 + b"tail", f.read())
 
+# In-place rewrite of an existing file (no truncate) keeps the other bytes.
+with s.open(f"{base}/sparse.bin", "r+b") as f:
+    f.seek(2)
+    f.write(b"XY")
+with s.open(f"{base}/sparse.bin", "rb") as f:
+    check("in-place rewrite", b"heXY" + b"\0" * 6 + b"tail", f.read())
+
+# Streaming upload larger than one part, written in pipelined blocks.
+big = os.urandom(20_000_000)
+with s.open(f"{base}/stream.bin", "wb") as f:
+    f.set_pipelined(True)
+    for i in range(0, len(big), 32768):
+        f.write(big[i:i + 32768])
+check("streamed upload size", len(big), s.stat(f"{base}/stream.bin").st_size)
+with s.open(f"{base}/stream.bin", "rb") as f:
+    check("streamed upload md5", md5(big), md5(f.read()))
+# A write below already streamed parts is refused instead of corrupting the file.
+try:
+    with s.open(f"{base}/stream2.bin", "wb") as f:
+        f.write(big[:17_000_000])
+        f.seek(0)
+        f.write(b"x")
+    check("rewind after parts refused", True, False)
+except IOError:
+    check("rewind after parts refused", True, True)
+s.remove(f"{base}/stream.bin")
+try:
+    s.remove(f"{base}/stream2.bin")
+except IOError:
+    pass
+
 s.rename(f"{base}/sparse.bin", f"{base}/moved.bin")
 check("rename", sorted(["file.bin", "moved.bin", "resume.bin"]), sorted(s.listdir(base)))
 try:

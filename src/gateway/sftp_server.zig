@@ -1,6 +1,6 @@
 //! SFTP v3 request handling over the gateway file view. Reads are ranged object
-//! reads behind a small read-ahead cache; writes spool to an unlinked temp file
-//! at their offsets and become one object on CLOSE.
+//! reads behind a small read-ahead cache. Writes stream out as multipart parts;
+//! only a rewrite inside an existing file spools to an unlinked temp file.
 const std = @import("std");
 const wire = @import("ssh_wire.zig");
 const proto = @import("sftp_proto.zig");
@@ -31,8 +31,12 @@ const File = struct {
     cache: []u8 = &.{},
     cache_off: u64 = 0,
     cache_len: usize = 0,
-    /// Write mode: unlinked spool file holding the whole new content.
+    /// Write mode, rewrite of existing bytes: unlinked spool with the whole content.
     spool: ?std.fs.File = null,
+    /// Write mode, streaming: sequential writes become multipart parts.
+    up: ?fs_mod.Upload = null,
+    /// Existing size kept by an open without TRUNC; settled by the first write.
+    pending: ?u64 = null,
     size: u64 = 0,
     dirty: bool = false,
     append: bool = false,
@@ -92,6 +96,7 @@ pub const Session = struct {
         switch (h.*) {
             .file => |*f| {
                 if (f.spool) |sp| sp.close();
+                if (f.up) |*u| u.deinit();
                 if (f.cache.len > 0) s.gpa.free(f.cache);
                 f.arena.deinit();
             },
@@ -246,6 +251,7 @@ pub const Session = struct {
         var keep = false;
         defer if (!keep) {
             if (f.spool) |sp| sp.close();
+            if (f.up) |*u| u.deinit();
             f.arena.deinit();
         };
         @memcpy(f.path_buf[0..path.len], path);
@@ -262,11 +268,14 @@ pub const Session = struct {
             } else |e| if (e != error.NotFound) return s.fsStatus(id, e);
             if (exists and flags & proto.Open.creat != 0 and flags & proto.Open.excl != 0) return s.fsStatus(id, error.Exists);
             if (!exists and flags & proto.Open.creat == 0) return s.fsStatus(id, error.NotFound);
-            f.spool = s.makeSpool() catch return s.status(id, .failure, "cannot create spool file");
+            f.up = fs_mod.Upload.begin(s.fs, s.gpa, path) catch |e| return s.fsStatus(id, e);
             f.append = flags & proto.Open.append != 0;
             f.dirty = !exists or flags & proto.Open.trunc != 0;
             if (exists and flags & proto.Open.trunc == 0) {
-                if (s.preload(&f)) |_| {} else |e| return s.fsStatus(id, e);
+                const st = s.fs.stat(arena, path) catch |e| return s.fsStatus(id, e);
+                if (st.size > s.limits.max_file) return s.fsStatus(id, error.TooLarge);
+                f.pending = st.size;
+                f.size = st.size;
             }
         }
         const made = s.newHandle(.{ .file = f }) catch |e| return switch (e) {
@@ -285,6 +294,15 @@ pub const Session = struct {
         const file = try s.spool_dir.createFile(name, .{ .read = true, .exclusive = true, .mode = 0o600 });
         s.spool_dir.deleteFile(name) catch {};
         return file;
+    }
+
+    /// Leaves streaming mode: the existing object goes to a spool for in-place rewrites.
+    fn toSpool(s: *Session, f: *File) fs_mod.Error!void {
+        if (f.up) |*u| u.deinit();
+        f.up = null;
+        f.pending = null;
+        f.spool = s.makeSpool() catch return error.Storage;
+        try s.preload(f);
     }
 
     /// Copies the existing object into the spool so partial rewrites keep the rest.
@@ -314,6 +332,7 @@ pub const Session = struct {
         var w = try s.begin(T.data, id);
         try w.u32be(@intCast(n));
         const dst = try w.reserve(n);
+        if (f.info == null and f.spool == null) return s.status(id, .failure, "streaming upload handle is write-only");
         if (f.spool) |sp| {
             const got = sp.preadAll(dst, off) catch return s.status(id, .failure, "spool read failed");
             if (got != n) return s.status(id, .failure, "short spool read");
@@ -338,10 +357,21 @@ pub const Session = struct {
         const f = (try s.fileOf(r)) orelse return s.status(id, .failure, "invalid handle");
         var off = try r.u64be();
         const data = try r.string();
-        const sp = f.spool orelse return s.status(id, .permission_denied, "handle not open for writing");
+        if (f.spool == null and f.up == null) return s.status(id, .permission_denied, "handle not open for writing");
         if (f.append) off = f.size;
         if (off > s.limits.max_file or data.len > s.limits.max_file - off) return s.status(id, .failure, "file too large");
-        sp.pwriteAll(data, off) catch return s.status(id, .failure, "spool write failed");
+        if (f.pending) |n| {
+            if (off >= n) {
+                f.up.?.copyPrefix(s.arena.allocator(), n) catch |e| return s.fsStatus(id, e);
+                f.pending = null;
+            } else s.toSpool(f) catch |e| return s.fsStatus(id, e);
+        }
+        if (f.up) |*u| {
+            u.writeAt(off, data) catch |e| return switch (e) {
+                error.Unordered => s.status(id, .failure, "write below already streamed data"),
+                else => |x| s.fsStatus(id, x),
+            };
+        } else f.spool.?.pwriteAll(data, off) catch return s.status(id, .failure, "spool write failed");
         f.size = @max(f.size, off + data.len);
         f.dirty = true;
         return s.status(id, .ok, "");
@@ -353,7 +383,7 @@ pub const Session = struct {
         defer s.freeHandle(h[0]);
         if (h[0].* == .file) {
             const f = &h[0].file;
-            if (f.spool != null and f.dirty) {
+            if ((f.spool != null or f.up != null) and f.dirty) {
                 if (s.commit(f)) |_| {} else |e| return s.fsStatus(id, e);
             }
         }
@@ -361,6 +391,7 @@ pub const Session = struct {
     }
 
     fn commit(s: *Session, f: *File) fs_mod.Error!void {
+        if (f.up) |*u| return u.finish();
         const buf = try s.gpa.alloc(u8, 64 * 1024);
         defer s.gpa.free(buf);
         var fr = f.spool.?.reader(buf);
@@ -400,10 +431,21 @@ pub const Session = struct {
     fn fsetstat(s: *Session, id: u32, r: *wire.Reader) ReqError![]const u8 {
         const h = (try s.lookup(r)) orelse return s.status(id, .failure, "invalid handle");
         const a = try proto.Attrs.decode(r);
-        if (h[0].* == .file) if (h[0].file.spool) |sp| if (a.size) |size| {
+        if (h[0].* == .file) if (a.size) |size| {
             const f = &h[0].file;
+            if (f.spool == null and f.up == null) return s.status(id, .ok, "");
             if (size > s.limits.max_file) return s.status(id, .failure, "file too large");
-            sp.setEndPos(size) catch return s.status(id, .failure, "truncate failed");
+            if (f.pending != null) s.toSpool(f) catch |e| return s.fsStatus(id, e);
+            if (f.up) |*u| {
+                if (size >= u.size()) {
+                    u.writeAt(size, &.{}) catch |e| return switch (e) {
+                        error.Unordered => s.status(id, .failure, "truncate failed"),
+                        else => |x| s.fsStatus(id, x),
+                    };
+                } else if (size >= u.flushed) {
+                    u.buf.shrinkRetainingCapacity(@intCast(size - u.flushed));
+                } else return s.status(id, .failure, "cannot truncate below streamed data");
+            } else f.spool.?.setEndPos(size) catch return s.status(id, .failure, "truncate failed");
             f.size = size;
             f.dirty = true;
         };
