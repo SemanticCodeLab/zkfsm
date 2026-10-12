@@ -1086,13 +1086,13 @@ pub const Node = struct {
 
     fn garbageFn(ctx: *anyopaque, id: core.ObjectId) void {
         const n: *Node = @ptrCast(@alignCast(ctx));
-        if (!n.gc.add(n.gpa, id, gc_grace_ns, true)) n.storage().delete(placement.dataKey(id)) catch {};
+        if (!n.gc.add(n.gpa, id, gc_grace_ns, null)) n.storage().delete(placement.dataKey(id)) catch {};
     }
 
     /// Deletes blobs whose grace passed (all with `all`) and tells the next online
     /// peer about new ones, so they go even if this node dies before their time.
     fn collectGarbage(n: *Node, all: bool) void {
-        var due: std.ArrayListUnmanaged(core.ObjectId) = .empty;
+        var due: std.ArrayListUnmanaged(Gc.Item) = .empty;
         defer due.deinit(n.gpa);
         var fresh: std.ArrayListUnmanaged(core.ObjectId) = .empty;
         defer fresh.deinit(n.gpa);
@@ -1105,13 +1105,16 @@ pub const Node = struct {
                 n.sendNotes(next, notes);
             } else |_| {}
         };
-        for (due.items) |id| {
+        for (due.items) |item| {
             if (!all and n.stop_ev.isSet()) {
                 // Shutting down: hand the rest back; the final pass deletes them.
-                _ = n.gc.add(n.gpa, id, 0, false);
+                _ = n.gc.add(n.gpa, item.id, 0, item.owner);
                 continue;
             }
-            n.storage().delete(placement.dataKey(id)) catch {};
+            // A backup entry covers its owner dying before the blob's time. An owner
+            // that has been online ever since deleted it itself.
+            if (item.owner) |o| if (!all and o.node < n.topo.nodes.len and n.rpc.isOnline(o.node) and n.rpc.upCount(o.node) == o.ups) continue;
+            n.storage().delete(placement.dataKey(item.id)) catch {};
         }
     }
 
@@ -1225,7 +1228,7 @@ pub const Node = struct {
         var mark: ?wire.Mark = null;
         while (it.next() catch null) |note| switch (note) {
             .mark => |m| mark = m,
-            .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, false),
+            .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, if (from < n.topo.nodes.len) .{ .node = from, .ups = n.rpc.upCount(from) } else .{ .node = from, .ups = 0 }),
             .pools => if (n.pools_hook) |h| h.func(h.ctx),
             .iam => if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.warn("iam reload failed: {t}", .{e}),
             .change => |c| {
@@ -1396,7 +1399,9 @@ const Gc = struct {
     backup: std.ArrayListUnmanaged(Item) = .empty,
     announce: std.ArrayListUnmanaged(core.ObjectId) = .empty,
 
-    const Item = struct { id: core.ObjectId, due_ns: i128 };
+    /// `owner` set: a peer's blob, kept in case that peer dies before deleting it.
+    const Item = struct { id: core.ObjectId, due_ns: i128, owner: ?Owner = null };
+    const Owner = struct { node: u16, ups: u32 };
     const cap = 1 << 20;
 
     fn deinit(g: *Gc, gpa: std.mem.Allocator) void {
@@ -1406,24 +1411,24 @@ const Gc = struct {
     }
 
     /// False when the list is full; the caller deletes at once then.
-    fn add(g: *Gc, gpa: std.mem.Allocator, id: core.ObjectId, grace: i128, own: bool) bool {
+    fn add(g: *Gc, gpa: std.mem.Allocator, id: core.ObjectId, grace: i128, owner: ?Owner) bool {
         g.mutex.lock();
         defer g.mutex.unlock();
-        const list = if (own) &g.own else &g.backup;
+        const list = if (owner == null) &g.own else &g.backup;
         if (list.items.len >= cap) return false;
-        list.append(gpa, .{ .id = id, .due_ns = core.time.nowNs() + grace }) catch return false;
-        if (own) g.announce.append(gpa, id) catch {};
+        list.append(gpa, .{ .id = id, .due_ns = core.time.nowNs() + grace, .owner = owner }) catch return false;
+        if (owner == null) g.announce.append(gpa, id) catch {};
         return true;
     }
 
     /// Moves due ids (lists are in due order) into `due`, new ones into `fresh`.
-    fn take(g: *Gc, gpa: std.mem.Allocator, now: i128, all: bool, due: *std.ArrayListUnmanaged(core.ObjectId), fresh: *std.ArrayListUnmanaged(core.ObjectId)) void {
+    fn take(g: *Gc, gpa: std.mem.Allocator, now: i128, all: bool, due: *std.ArrayListUnmanaged(Item), fresh: *std.ArrayListUnmanaged(core.ObjectId)) void {
         g.mutex.lock();
         defer g.mutex.unlock();
         for ([_]*std.ArrayListUnmanaged(Item){ &g.own, &g.backup }) |list| {
             var k: usize = 0;
             while (k < list.items.len and (all or list.items[k].due_ns <= now)) : (k += 1) {
-                due.append(gpa, list.items[k].id) catch break;
+                due.append(gpa, list.items[k]) catch break;
             }
             list.replaceRangeAssumeCapacity(0, k, &.{});
         }

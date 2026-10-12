@@ -257,7 +257,12 @@ pub const Manager = struct {
             }
             for (todo.items) |t| {
                 const ok = m.ask(t.resource, t.uid, "refresh");
-                if (@popCount(ok) < m.quorum()) std.log.warn("lock {s}: lease refresh lost its majority", .{t.resource});
+                if (@popCount(ok) >= m.quorum()) continue;
+                // Released while the refresh was on its way: nothing was lost.
+                m.mutex.lock();
+                const still = m.held.contains(t.uid);
+                m.mutex.unlock();
+                if (still) std.log.warn("lock {s}: lease refresh lost its majority", .{t.resource});
             }
         }
     }

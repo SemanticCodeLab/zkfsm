@@ -105,6 +105,8 @@ pub const Peer = struct {
     freed: std.Thread.Condition = .{},
     /// Resolved addresses, reused for `resolve_ttl_ns`: a busy node dials often and
     /// a slow resolver must not look like a dead peer.
+    /// Times the peer came (back) online: unchanged means it never went away.
+    ups: std.atomic.Value(u32) = .init(0),
     /// When the peer last answered a call (ms since the epoch); 0 before the first.
     last_answer_ms: std.atomic.Value(i64) = .init(0),
     addrs: [max_addrs]std.net.Address = undefined,
@@ -164,6 +166,10 @@ pub const Rpc = struct {
         return t != 0 and std.time.milliTimestamp() - t <= ms;
     }
 
+    pub fn upCount(self: *Rpc, node: u16) u32 {
+        return self.peers[node].ups.load(.monotonic);
+    }
+
     pub fn isOnline(self: *Rpc, node: u16) bool {
         return node == self.self_node or self.peers[node].online.load(.acquire);
     }
@@ -183,6 +189,7 @@ pub const Rpc = struct {
     fn setState(self: *Rpc, node: u16, up: bool, why: []const u8) void {
         const p = &self.peers[node];
         if (p.online.swap(up, .acq_rel) == up) return;
+        if (up) _ = p.ups.fetchAdd(1, .monotonic);
         if (up) std.log.info("node {s} is online", .{p.name}) else std.log.warn("node {s} is offline ({s})", .{ p.name, why });
         if (!up) self.dropIdle(p);
         if (self.on_change) |cb| cb.func(cb.ctx, node, up);
