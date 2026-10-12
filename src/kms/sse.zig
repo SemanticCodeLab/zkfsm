@@ -186,23 +186,56 @@ pub fn newKmsObjectKey(gpa: Allocator, kms: types.Kms, scheme: Scheme, key_id: [
 /// SSE-KMS / SSE-S3 on GET: recover the DEK from stored metadata.
 pub fn openKmsObjectKey(gpa: Allocator, kms: types.Kms, meta: SealedMeta, object_path: []const u8) KmsError![32]u8 {
     if (meta.scheme == .c) return error.InvalidArgument;
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, meta.context_json, .{}) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidMetadata,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidMetadata;
-    const obj = parsed.value.object;
-    const user = try gpa.alloc(types.Context.Pair, obj.count());
-    defer gpa.free(user);
-    for (obj.keys(), obj.values(), user) |k, v, *p| {
-        if (v != .string) return error.InvalidMetadata;
-        p.* = .{ .key = k, .value = v.string };
-    }
-    const pairs = try objectContext(gpa, user, object_path);
-    defer gpa.free(pairs);
-    return kms.decryptDataKey(gpa, meta.key_id, meta.sealed_key, .{ .pairs = pairs });
+    var bound = try BoundContext.init(gpa, meta.context_json, object_path);
+    defer bound.deinit(gpa);
+    return kms.decryptDataKey(gpa, meta.key_id, meta.sealed_key, .{ .pairs = bound.pairs });
 }
+
+/// Re-seals an object's DEK under `new_key_id` with the same context; the
+/// object data is untouched. Returns the replacement metadata headers.
+pub fn rewrapKmsObjectKey(gpa: Allocator, kms: types.Kms, meta: SealedMeta, object_path: []const u8, new_key_id: []const u8) KmsError![]Header {
+    if (meta.scheme == .c) return error.InvalidArgument;
+    var bound = try BoundContext.init(gpa, meta.context_json, object_path);
+    defer bound.deinit(gpa);
+    const ctx: types.Context = .{ .pairs = bound.pairs };
+    var dek = try kms.decryptDataKey(gpa, meta.key_id, meta.sealed_key, ctx);
+    defer std.crypto.secureZero(u8, &dek);
+    var dk = try kms.sealDataKey(gpa, new_key_id, &dek, ctx);
+    defer dk.deinit(gpa);
+    var out = meta;
+    out.key_id = new_key_id;
+    out.key_version = dk.key_version;
+    out.sealed_key = dk.sealed;
+    return out.encode(gpa);
+}
+
+/// Stored user context plus the object binding.
+const BoundContext = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    pairs: []types.Context.Pair,
+
+    fn init(gpa: Allocator, context_json: []const u8, object_path: []const u8) KmsError!BoundContext {
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, context_json, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidMetadata,
+        };
+        errdefer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidMetadata;
+        const obj = parsed.value.object;
+        const user = try gpa.alloc(types.Context.Pair, obj.count());
+        defer gpa.free(user);
+        for (obj.keys(), obj.values(), user) |k, v, *p| {
+            if (v != .string) return error.InvalidMetadata;
+            p.* = .{ .key = k, .value = v.string };
+        }
+        return .{ .parsed = parsed, .pairs = try objectContext(gpa, user, object_path) };
+    }
+
+    fn deinit(b: *BoundContext, gpa: Allocator) void {
+        gpa.free(b.pairs);
+        b.parsed.deinit();
+    }
+};
 
 /// SSE-C customer key after header validation. Wipe with `deinit`.
 pub const CustomerKey = struct {
@@ -321,4 +354,17 @@ test "sse-kms object key round trip and binding" {
     const reserved = [_]types.Context.Pair{.{ .key = object_context_key, .value = "x" }};
     try testing.expectError(error.InvalidArgument, newKmsObjectKey(gpa, kms, .kms, "tenant", "bkt/a", &reserved));
     try testing.expectError(error.MissingMetadata, SealedMeta.decode(nk.headers[0..2], &scratch));
+
+    var ki2 = try kms.createKey(gpa, "next");
+    ki2.deinit(gpa);
+    const hs = try rewrapKmsObjectKey(gpa, kms, meta, "bkt/a.txt", "next");
+    defer {
+        freeHeaders(gpa, hs);
+        gpa.free(hs);
+    }
+    var scratch2: [1024]u8 = undefined;
+    const m2 = try SealedMeta.decode(hs, &scratch2);
+    try testing.expectEqualStrings("next", m2.key_id);
+    const dek2 = try openKmsObjectKey(gpa, kms, m2, "bkt/a.txt");
+    try testing.expectEqualSlices(u8, &nk.dek, &dek2);
 }

@@ -11,6 +11,7 @@ pub const vault = @import("vault.zig");
 pub const sigv4 = @import("sigv4.zig");
 pub const kms_api = @import("kms_api.zig");
 pub const backup = @import("backup.zig");
+pub const metered = @import("metered.zig");
 
 pub const Kms = types.Kms;
 pub const Context = types.Context;
@@ -28,4 +29,5 @@ test {
     _ = sigv4;
     _ = kms_api;
     _ = backup;
+    _ = metered;
 }

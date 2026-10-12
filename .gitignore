@@ -4,3 +4,4 @@ data/
 console/node_modules/
 console/test-results/
 console/playwright-report/
+.venv-scratch/

@@ -48,6 +48,8 @@ pub const Config = struct {
     list_page_size: u16 = 1000,
     /// SigV4 service name in the credential scope.
     service: []const u8 = "s3",
+    /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
+    ca_file: []const u8 = "",
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -73,7 +75,10 @@ pub const S3Client = struct {
         if (cfg.list_page_size == 0 or cfg.region.len == 0) return error.InvalidConfig;
         if (cfg.addressing == .virtual_host and std.mem.indexOfScalar(u8, cfg.bucket, '.') != null and ep.tls)
             return error.InvalidConfig; // dotted buckets break wildcard TLS certs
-        return .{ .gpa = gpa, .cfg = cfg, .endpoint = ep, .http = .{ .allocator = gpa } };
+        var c: S3Client = .{ .gpa = gpa, .cfg = cfg, .endpoint = ep, .http = .{ .allocator = gpa } };
+        errdefer c.http.deinit();
+        if (ep.tls) try rhttp.useCaFile(&c.http, gpa, cfg.ca_file);
+        return c;
     }
 
     pub fn deinit(self: *S3Client) void {

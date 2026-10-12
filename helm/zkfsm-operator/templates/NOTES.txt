@@ -1,0 +1,6 @@
+zkfsm-operator watches {{ if .Values.watchNamespace }}namespace {{ .Values.watchNamespace }}{{ else }}all namespaces{{ end }}.
+Create a root credentials Secret (keys accessKey, secretKey) and a zkfsm.io/v1 Cluster, e.g.:
+
+  kubectl create secret generic s3-root --from-literal=accessKey=admin --from-literal=secretKey=change-me-please
+  kubectl apply -f https://raw.githubusercontent.com/semanticcodelab/zkfsm/main/deploy/k8s/examples/cluster.yaml
+  kubectl get zkc

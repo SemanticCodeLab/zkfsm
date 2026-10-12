@@ -30,8 +30,9 @@ fn split(ns: i128) Parts {
 /// ISO-8601 as used in S3 XML: 2006-02-03T16:45:09.000Z
 pub fn iso8601(ns: i128, buf: *[24]u8) []const u8 {
     const p = split(ns);
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
-        p.year, p.month, p.day, p.hour, p.min, p.sec,
+    const ms: u32 = @intCast(@divTrunc(@mod(ns, std.time.ns_per_s), std.time.ns_per_ms));
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        p.year, p.month, p.day, p.hour, p.min, p.sec, ms,
     }) catch unreachable; // fixed width fits
 }
 
@@ -107,4 +108,5 @@ test "time formatting" {
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", httpDate(ns, &b1));
     var b2: [24]u8 = undefined;
     try std.testing.expectEqualStrings("1994-11-06T08:49:37.000Z", iso8601(ns, &b2));
+    try std.testing.expectEqualStrings("1994-11-06T08:49:37.250Z", iso8601(ns + 250 * std.time.ns_per_ms, &b2));
 }

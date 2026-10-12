@@ -1,0 +1,157 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusters.zkfsm.io
+spec:
+  group: zkfsm.io
+  scope: Namespaced
+  names:
+    kind: Cluster
+    listKind: ClusterList
+    plural: clusters
+    singular: cluster
+    shortNames: [zkc]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Ready, type: string, jsonPath: .status.readyServers}
+        - {name: Servers, type: string, jsonPath: .status.servers}
+        - {name: Image, type: string, jsonPath: .status.currentImage, priority: 1}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [pools, credsSecret]
+              x-kubernetes-validations:
+                - rule: "(has(self.tls) && has(self.tls.mode) ? self.tls.mode : 'none') == (has(oldSelf.tls) && has(oldSelf.tls.mode) ? oldSelf.tls.mode : 'none')"
+                  message: tls.mode is fixed at creation; the scheme is part of every drive's endpoint fingerprint
+              properties:
+                image: {type: string, description: "zkfsm server image."}
+                imagePullPolicy: {type: string, enum: [Always, IfNotPresent, Never]}
+                credsSecret:
+                  type: string
+                  description: Secret with keys accessKey and secretKey for the root user.
+                protection:
+                  type: string
+                  description: Protection for a new deployment, e.g. EC:4+2; empty picks one from the drive count.
+                setSize: {type: integer, minimum: 0, maximum: 16}
+                clusterDomain: {type: string}
+                serviceType: {type: string, enum: [ClusterIP, NodePort, LoadBalancer]}
+                priorityClassName: {type: string}
+                podAnnotations:
+                  type: object
+                  additionalProperties: {type: string}
+                env:
+                  type: array
+                  description: Extra container environment variables.
+                  items: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                pools:
+                  type: array
+                  minItems: 1
+                  description: Pools in endpoint-list order. Append to expand; never reorder or resize a pool.
+                  maxItems: 16
+                  x-kubernetes-validations:
+                    - rule: oldSelf.all(o, self.exists(n, n.name == o.name && n.servers == o.servers && n.drivesPerServer == o.drivesPerServer))
+                      message: pools cannot be removed or resized; append a pool or set decommission
+                  items:
+                    type: object
+                    required: [name, servers]
+                    properties:
+                      name: {type: string, maxLength: 40, pattern: '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'}
+                      servers: {type: integer, minimum: 1, maximum: 64}
+                      drivesPerServer: {type: integer, minimum: 1, maximum: 16, default: 1}
+                      size:
+                        type: string
+                        pattern: '^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$'
+                        default: 10Gi
+                      storageClassName: {type: string}
+                      decommission:
+                        type: boolean
+                        description: Drain this pool through the admin API, then remove it from the cluster.
+                      resources: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                      nodeSelector:
+                        type: object
+                        additionalProperties: {type: string}
+                      tolerations:
+                        type: array
+                        items: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                      affinity: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                tls:
+                  type: object
+                  properties:
+                    mode: {type: string, enum: [none, selfSigned, certManager], default: none}
+                    issuerRef:
+                      type: object
+                      required: [name]
+                      properties:
+                        name: {type: string}
+                        kind: {type: string}
+                        group: {type: string}
+                kms:
+                  type: object
+                  required: [backend]
+                  properties:
+                    backend: {type: string, description: "Value of ZKFSM_KMS_BACKEND."}
+                    defaultKey: {type: string}
+                    secretName: {type: string, description: "Secret exposed as environment (backend settings)."}
+                iam:
+                  type: object
+                  properties:
+                    policies:
+                      type: array
+                      items:
+                        type: object
+                        required: [name, document]
+                        properties:
+                          name: {type: string}
+                          document: {type: string, description: "IAM policy JSON."}
+                    users:
+                      type: array
+                      items:
+                        type: object
+                        required: [secretName]
+                        properties:
+                          secretName: {type: string, description: "Secret with accessKey and secretKey."}
+                          policies:
+                            type: array
+                            items: {type: string}
+                    buckets:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name: {type: string}
+                          objectLock: {type: boolean}
+                ingress: &ingress
+                  type: object
+                  properties:
+                    enabled: {type: boolean}
+                    host: {type: string}
+                    className: {type: string}
+                    tlsSecretName: {type: string}
+                    annotations:
+                      type: object
+                      additionalProperties: {type: string}
+                console:
+                  type: object
+                  properties:
+                    enabled: {type: boolean}
+                    image: {type: string}
+                    port: {type: integer}
+                    env:
+                      type: array
+                      items: {type: object, x-kubernetes-preserve-unknown-fields: true}
+                    ingress: *ingress
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
