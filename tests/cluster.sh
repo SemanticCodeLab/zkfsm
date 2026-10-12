@@ -157,13 +157,15 @@ for _ in $(seq 100); do grep -q open "$WORK/hog.log" && break; sleep 0.1; done
 sleep 1
 check "node 1 S3 workers saturated" 000 "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$(ep 1)/health/live" || true)"
 off0=$(grep -c "127.0.0.1:${PORT[1]} is offline" "$WORK/n2.log" || true)
-n1a=$(find "$WORK"/n1/d* -path '*/data/*' -type f | wc -l)
+touch "$WORK/sat.mark"
 for k in 1 2 3 4 5 6; do
   head -c $((k * 1000 + 3)) /dev/urandom >"$WORK/obj/sat$k"
   [[ "$(cput 2 "sat$k" "$WORK/obj/sat$k")" == 200 ]] || echo "put sat$k failed"
 done
-n1b=$(find "$WORK"/n1/d* -path '*/data/*' -type f | wc -l)
-check "node 1 took its shards of writes made meanwhile" yes "$([[ $((n1b - n1a)) -ge 6 ]] && echo yes || echo no)"
+# Shard files written since the mark: all six of each object, some of them on node 1
+# (how many depends on placement; none would mean its drives were skipped).
+check "writes made meanwhile kept every shard" 36 "$(find "$WORK"/n*/d* -path '*/data/*' -type f -newer "$WORK/sat.mark" | wc -l)"
+check "node 1 took its shards of them" yes "$([[ $(find "$WORK"/n1/d* -path '*/data/*' -type f -newer "$WORK/sat.mark" | wc -l) -ge 1 ]] && echo yes || echo no)"
 cget 2 sat3 "$WORK/got" >/dev/null
 check "and reads through node 2 work" "$(md5 "$WORK/obj/sat3")" "$(md5 "$WORK/got")"
 check "node 1 stayed online for its peers" "$off0" "$(grep -c "127.0.0.1:${PORT[1]} is offline" "$WORK/n2.log" || true)"
