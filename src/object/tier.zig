@@ -126,7 +126,8 @@ pub const Tier = struct {
                 if (c.auth == .keys and (c.access_key.len == 0 or c.secret_key.len == 0)) return error.InvalidTierConfig;
                 if (c.auth != .keys and c.auth != .service_account) return error.InvalidTierConfig;
                 var sc = backend.gcs.s3Config(.{ .bucket = c.bucket, .credentials = creds, .retry = retry });
-                if (c.endpoint.len > 0) sc.endpoint = c.endpoint;
+                // The env override (tests, private gateways) wins over the client's default.
+                if (std.posix.getenv("ZKFSM_TIER_GCS_ENDPOINT")) |e| sc.endpoint = e else if (c.endpoint.len > 0) sc.endpoint = c.endpoint;
                 sc.storage_class = c.storage_class;
                 sc.storage_class_header = "x-goog-storage-class";
                 sc.source = t.source;
@@ -139,7 +140,7 @@ pub const Tier = struct {
                     .account = c.access_key,
                     .key = if (c.auth == .keys) c.secret_key else "",
                     .container = c.bucket,
-                    .endpoint = if (c.endpoint.len > 0) c.endpoint else null,
+                    .endpoint = std.posix.getenv("ZKFSM_TIER_AZURE_ENDPOINT") orelse if (c.endpoint.len > 0) c.endpoint else null,
                     .retry = retry,
                     .access_tier = c.storage_class,
                     .source = t.source,
