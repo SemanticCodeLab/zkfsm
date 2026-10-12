@@ -684,9 +684,12 @@ fn accountInfo(c: *const Ctx) Error!Response {
         for (buckets) |b| {
             const arn = try std.fmt.allocPrint(c.a, "arn:aws:s3:::{s}/*", .{b.name});
             const tb = try c.a.create([24]u8);
+            const u = object.quota.usage(svc, b.name) catch object.quota.Usage{};
             try list.append(c.a, .{
                 .name = b.name,
                 .created = core.time.iso8601(b.created_ns, tb),
+                .size = u.bytes,
+                .objects = u.objects,
                 .access = .{
                     .read = store.authorize(id, "s3:GetObject", arn, &ctx).allowed(),
                     .write = store.authorize(id, "s3:PutObject", arn, &ctx).allowed(),
