@@ -7,14 +7,17 @@ Keys are generated with the openssl CLI (RS256 and ES256). Endpoints:
   GET  /token?sub=..&...      a signed JWT; query params become claims
                               (alg=RS256|ES256, kid=..., ttl=seconds, policy/groups lists
                               comma-separated -> arrays when name ends with [])
-  GET  /auth?redirect_uri=..&state=..&client_id=..   authorization-code login: redirects
-                              back with a code for sub=sso-user, policy=readwrite
-  POST /token                 exchanges that code (form body) for {"id_token": ...}
   POST /rotate                replace the RSA key (new kid); old tokens stop validating
+  GET  /login?sub=..&...      claims for the next /auth login (same syntax as /token)
+  GET  /auth?...              authorization endpoint: auto-approves, 302 to redirect_uri
+                              with a one-time code (records nonce and PKCE challenge)
+  POST /token                 authorization_code grant: checks client, redirect_uri, and
+                              the PKCE verifier, returns {"id_token": ...} with the nonce
   GET  /stats                 fetch counters as JSON
 Prints the listening port on stdout, then serves until killed.
 """
 import base64
+import hashlib
 import http.server
 import json
 import os
@@ -27,8 +30,7 @@ import urllib.parse
 
 WORK = tempfile.mkdtemp(prefix="mock-idp-")
 LOCK = threading.Lock()
-STATS = {"discovery": 0, "jwks": 0, "auth": 0, "exchange": 0}
-CODES = {}
+STATS = {"discovery": 0, "jwks": 0}
 
 
 def b64u(b):
@@ -73,6 +75,8 @@ def der_to_raw(sig):
 
 KEYS = {"rsa": new_rsa("rsa-1"), "ec": new_ec("ec-1")}
 GEN = [1]
+NEXT_LOGIN = [{"sub": "code-user"}]
+CODES = {}
 
 
 def sign(alg, kid, claims):
@@ -100,8 +104,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def base(self):
         return "http://%s" % self.headers.get("Host")
 
+    def claims_from(self, q):
+        now = int(time.time())
+        claims = {"iss": self.base(), "aud": q.pop("aud", "zkfsm"), "iat": now, "exp": now + int(q.pop("ttl", "3600"))}
+        for k, v in q.items():
+            if k.endswith("[]"):
+                claims[k[:-2]] = [x for x in v.split(",") if x]
+            else:
+                claims[k] = v
+        return claims
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/login":
+            NEXT_LOGIN[0] = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+            return self.reply(200, "{}")
+        if u.path == "/auth":
+            q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+            STATS["auth"] = STATS.get("auth", 0) + 1
+            STATS["last_auth"] = q
+            if q.get("response_type") != "code" or q.get("code_challenge_method") != "S256" or not q.get("code_challenge"):
+                return self.reply(400, json.dumps({"error": "invalid_request"}))
+            code = b64u(os.urandom(18))
+            with LOCK:
+                CODES[code] = {"client_id": q.get("client_id"), "redirect_uri": q.get("redirect_uri"),
+                               "challenge": q["code_challenge"], "nonce": q.get("nonce"), "login": dict(NEXT_LOGIN[0])}
+            loc = q["redirect_uri"] + ("&" if "?" in q["redirect_uri"] else "?") + urllib.parse.urlencode({"code": code, "state": q.get("state", "")})
+            self.send_response(302)
+            self.send_header("Location", loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if u.path == "/.well-known/openid-configuration":
             STATS["discovery"] += 1
             b = self.base()
@@ -115,19 +148,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, json.dumps({"keys": keys}))
         if u.path == "/stats":
             return self.reply(200, json.dumps(STATS))
-        if u.path == "/auth":
-            q = dict(urllib.parse.parse_qsl(u.query))
-            STATS["auth"] += 1
-            code = b64u(os.urandom(12))
-            with LOCK:
-                CODES[code] = {"aud": q.get("client_id", "zkfsm"), "redirect_uri": q.get("redirect_uri", "")}
-            sep = "&" if "?" in q.get("redirect_uri", "") else "?"
-            loc = "%s%scode=%s&state=%s" % (q.get("redirect_uri", ""), sep, code, urllib.parse.quote(q.get("state", "")))
-            self.send_response(302)
-            self.send_header("Location", loc)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
         if u.path == "/token":
             q = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
             alg = q.pop("alg", "RS256")
@@ -150,17 +170,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/token":
             n = int(self.headers.get("Content-Length") or 0)
-            form = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode()))
+            f = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode()))
+            STATS["token_post"] = STATS.get("token_post", 0) + 1
+            client = f.get("client_id")
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                user, _, secret = base64.b64decode(auth[6:]).decode().partition(":")
+                client = urllib.parse.unquote_plus(user)
+                STATS["basic_secret"] = urllib.parse.unquote_plus(secret)
             with LOCK:
-                grant = CODES.pop(form.get("code", ""), None)
-            if not grant or form.get("grant_type") != "authorization_code" or form.get("redirect_uri") != grant["redirect_uri"]:
+                ent = CODES.pop(f.get("code", ""), None)
+            if f.get("grant_type") != "authorization_code" or ent is None:
                 return self.reply(400, json.dumps({"error": "invalid_grant"}))
-            STATS["exchange"] += 1
-            now = int(time.time())
-            claims = {"iss": self.base(), "aud": grant["aud"], "iat": now, "exp": now + 3600, "sub": "sso-user", "policy": "readwrite"}
+            want = b64u(hashlib.sha256(f.get("code_verifier", "").encode()).digest())
+            if want != ent["challenge"] or client != ent["client_id"] or f.get("redirect_uri") != ent["redirect_uri"]:
+                return self.reply(400, json.dumps({"error": "invalid_grant"}))
+            claims = self.claims_from(dict(ent["login"]))
+            if ent["nonce"] is not None and "nonce" not in claims:
+                claims["nonce"] = ent["nonce"]
             with LOCK:
                 tok = sign("RS256", None, claims)
-            return self.reply(200, json.dumps({"id_token": tok, "access_token": "opaque", "token_type": "Bearer"}))
+            return self.reply(200, json.dumps({"access_token": "opaque", "token_type": "Bearer", "id_token": tok}))
         if self.path == "/rotate":
             with LOCK:
                 GEN[0] += 1

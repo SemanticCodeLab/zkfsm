@@ -88,7 +88,9 @@ pub fn start(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeError
     if (d.authorization_endpoint.len == 0) return fail(req, a, "The identity provider has no authorization endpoint.");
     const redirect = if (p.redirect_uri.len > 0) p.redirect_uri else try c.redirectUri(req, a);
     const state = session.Store.newId();
-    c.sessions.putPending(&state, .{ .provider = p.name, .redirect_uri = redirect, .created_s = now }) catch |e| switch (e) {
+    const verifier = session.Store.newId();
+    const nonce = session.Store.newId();
+    c.sessions.putPending(&state, .{ .provider = p.name, .redirect_uri = redirect, .created_s = now, .verifier = verifier, .nonce = nonce }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TooManySessions => return fail(req, a, "Too many logins in progress."),
     };
@@ -101,8 +103,31 @@ pub fn start(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeError
     root.formEncodeTo(w, redirect) catch return error.OutOfMemory;
     w.writeAll("&scope=") catch return error.OutOfMemory;
     root.formEncodeTo(w, try scopes(a, p.scopes)) catch return error.OutOfMemory;
-    w.print("&state={s}", .{&state}) catch return error.OutOfMemory;
+    w.print("&state={s}&nonce={s}&code_challenge_method=S256&code_challenge={s}", .{ &state, &nonce, &challenge(&verifier) }) catch return error.OutOfMemory;
     return root.respond(req, .see_other, "text/plain", "", &.{.{ .name = "location", .value = loc.written() }});
+}
+
+/// PKCE S256 challenge: base64url(sha256(verifier)), unpadded.
+fn challenge(verifier: []const u8) [43]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+    var out: [43]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&out, &digest);
+    return out;
+}
+
+/// The `nonce` claim of a JWT, unverified (STS checks the signature afterwards).
+fn nonceOf(a: Allocator, jwt: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, jwt, '.');
+    _ = it.next() orelse return null;
+    const payload = it.next() orelse return null;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(payload) catch return null;
+    const buf = a.alloc(u8, n) catch return null;
+    dec.decode(buf, payload) catch return null;
+    const Claims = struct { nonce: []const u8 = "" };
+    const cl = std.json.parseFromSliceLeaky(Claims, a, buf, .{ .ignore_unknown_fields = true }) catch return null;
+    return if (cl.nonce.len > 0) cl.nonce else null;
 }
 
 /// Space-separated scopes, always including `openid`.
@@ -138,6 +163,7 @@ pub fn callback(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeEr
     root.formEncodeTo(fw, pending.redirect_uri) catch return error.OutOfMemory;
     fw.writeAll("&client_id=") catch return error.OutOfMemory;
     root.formEncodeTo(fw, p.client_id) catch return error.OutOfMemory;
+    fw.print("&code_verifier={s}", .{&pending.verifier}) catch return error.OutOfMemory;
     if (p.client_secret.len > 0) {
         fw.writeAll("&client_secret=") catch return error.OutOfMemory;
         root.formEncodeTo(fw, p.client_secret) catch return error.OutOfMemory;
@@ -149,6 +175,8 @@ pub fn callback(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeEr
     const Tok = struct { id_token: []const u8 = "" };
     const tok = std.json.parseFromSliceLeaky(Tok, a, tok_doc, .{ .ignore_unknown_fields = true }) catch return fail(req, a, "Malformed token response.");
     if (tok.id_token.len == 0) return fail(req, a, "The identity provider returned no ID token.");
+    const echoed = nonceOf(a, tok.id_token) orelse return fail(req, a, "The ID token carries no nonce.");
+    if (!std.mem.eql(u8, echoed, &pending.nonce)) return fail(req, a, "The ID token belongs to another login.");
 
     var sts: Writer.Allocating = .init(a);
     const sw = &sts.writer;
@@ -175,6 +203,18 @@ pub fn callback(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeEr
         .provider = prov,
         .expires_s = @min(got.expires_s, now + c.ttl()),
     }, now, "/");
+}
+
+test "pkce challenge and nonce claim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // RFC 7636 appendix B.
+    try std.testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", &challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"));
+    // {"alg":"none"}.{"sub":"u","nonce":"n-1"}.
+    try std.testing.expectEqualStrings("n-1", nonceOf(a, "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1Iiwibm9uY2UiOiJuLTEifQ.").?);
+    try std.testing.expect(nonceOf(a, "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1In0.") == null);
+    try std.testing.expect(nonceOf(a, "garbage") == null);
 }
 
 test "scopes always include openid" {

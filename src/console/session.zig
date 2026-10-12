@@ -27,6 +27,9 @@ pub const Pending = struct {
     provider: []const u8,
     redirect_uri: []const u8,
     created_s: i64,
+    /// PKCE code verifier and the nonce the ID token must echo.
+    verifier: Id,
+    nonce: Id,
 };
 
 pub const Error = error{ OutOfMemory, TooManySessions };
@@ -122,7 +125,7 @@ pub const Store = struct {
         errdefer s.gpa.free(prov);
         const redir = try s.gpa.dupe(u8, p.redirect_uri);
         errdefer s.gpa.free(redir);
-        try s.pending.put(s.gpa, key, .{ .provider = prov, .redirect_uri = redir, .created_s = p.created_s });
+        try s.pending.put(s.gpa, key, .{ .provider = prov, .redirect_uri = redir, .created_s = p.created_s, .verifier = p.verifier, .nonce = p.nonce });
     }
 
     /// Removes and returns the pending login (copied into `a`) if it is fresh.
@@ -132,7 +135,7 @@ pub const Store = struct {
         const kv = s.pending.fetchRemove(state) orelse return null;
         defer freePending(s.gpa, kv.key, kv.value);
         if (now_s - kv.value.created_s > limits.pending_ttl_s) return null;
-        return .{ .provider = try a.dupe(u8, kv.value.provider), .redirect_uri = try a.dupe(u8, kv.value.redirect_uri), .created_s = kv.value.created_s };
+        return .{ .provider = try a.dupe(u8, kv.value.provider), .redirect_uri = try a.dupe(u8, kv.value.redirect_uri), .created_s = kv.value.created_s, .verifier = kv.value.verifier, .nonce = kv.value.nonce };
     }
 };
 
@@ -169,7 +172,8 @@ test "sessions expire and are removed" {
     const id2 = try st.create(.{ .user = "u", .access_key = "AK", .secret_key = "SK", .session_token = "", .provider = "password", .expires_s = 100 }, 0);
     st.remove(&id2);
     try std.testing.expect(try st.get(arena.allocator(), &id2, 0) == null);
-    try st.putPending("state1", .{ .provider = "p", .redirect_uri = "r", .created_s = 0 });
-    try std.testing.expect((try st.takePending(arena.allocator(), "state1", 10)) != null);
+    const v = Store.newId();
+    try st.putPending("state1", .{ .provider = "p", .redirect_uri = "r", .created_s = 0, .verifier = v, .nonce = Store.newId() });
+    try std.testing.expectEqualStrings(&v, &(try st.takePending(arena.allocator(), "state1", 10)).?.verifier);
     try std.testing.expect((try st.takePending(arena.allocator(), "state1", 10)) == null);
 }

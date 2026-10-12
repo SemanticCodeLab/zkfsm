@@ -153,6 +153,7 @@ python3 "$ROOT/tests/mock_idp.py" >"$WORK/idp.port" 2>"$WORK/idp.log" &
 IDP_PID=$!
 for _ in $(seq 100); do [[ -s "$WORK/idp.port" ]] && break; sleep 0.1; done
 IDP="http://127.0.0.1:$(cat "$WORK/idp.port")"
+curl -s -o /dev/null "$IDP/login?sub=sso-user&policy=readwrite&aud=zkfsm-console"
 curl -s -c "$JAR" -H 'x-console-csrf: 1' -d '{"accessKey":"admin","secretKey":"adminsecret"}' "$API/login" >/dev/null
 check "add openid provider" 200 "$(status "${C[@]}" -X PUT -H 'x-console-encrypt: 1' --data-binary "config_url=$IDP/.well-known/openid-configuration client_id=zkfsm-console claim_name=policy display_name=Corp" "$API/s3/minio/admin/v3/idp-config/openid/corp")"
 METHODS="$(curl -s "$API/login/methods")"
@@ -173,6 +174,8 @@ else
   check "server flow absent" "/?error=" "$(header location "$CON/minio/admin/v3/oidc/authorize/corp" | cut -c1-8)"
 fi
 LOC="$(header location "$API/oidc/start?provider=corp")"
+contains "login uses PKCE" "&code_challenge_method=S256&code_challenge=" "$LOC"
+contains "login sends a nonce" "&nonce=" "$LOC"
 contains "redirect to provider" "$IDP/auth?response_type=code&client_id=zkfsm-console" "$LOC"
 contains "redirect has state" "&state=" "$LOC"
 CB="$(header location "$LOC")"
