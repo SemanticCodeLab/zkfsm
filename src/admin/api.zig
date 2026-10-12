@@ -638,13 +638,16 @@ fn listAccessKeysBulk(c: *const Ctx) Error!Response {
 
 // ---------------------------------------------------------------- info
 
+/// Reported deployment id; replication installs the persistent one at startup.
+pub var deployment_id: []const u8 = "zkfsm";
+
 fn serverInfo(c: *const Ctx) Error!Response {
     if (!try c.can(.server_info)) return denied(c.a);
     const buckets: usize = if (c.env.svc) |svc| (svc.listBuckets(c.a) catch &.{}).len else 0;
     return c.json(.{
         .mode = "online",
         .region = c.env.region,
-        .deploymentID = "zkfsm",
+        .deploymentID = deployment_id,
         .buckets = .{ .count = buckets },
         .objects = .{ .count = 0 },
         .usage = .{ .size = 0 },

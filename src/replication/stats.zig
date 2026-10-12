@@ -26,6 +26,8 @@ pub const Stats = struct {
     queued: u64 = 0,
     retries: u64 = 0,
     started_ns: i128 = 0,
+    /// Counters changed since the last save.
+    dirty: bool = false,
 
     pub fn deinit(s: *Stats) void {
         for (s.targets.values()) |t| {
@@ -66,15 +68,18 @@ pub const Stats = struct {
         const t = s.targetLocked(bucket, arn) orelse return;
         t.sent_count += 1;
         t.sent_bytes += bytes;
+        s.dirty = true;
     }
 
     pub fn failed(s: *Stats, bucket: []const u8, arn: []const u8, bytes: u64) void {
         s.mutex.lock();
         defer s.mutex.unlock();
         s.retries += 1;
+        s.dirty = true;
         const t = s.targetLocked(bucket, arn) orelse return;
         t.failed_count += 1;
         t.failed_bytes += bytes;
+        s.dirty = true;
     }
 
     pub fn received(s: *Stats, bytes: u64) void {
@@ -82,6 +87,7 @@ pub const Stats = struct {
         defer s.mutex.unlock();
         s.received_count += 1;
         s.received_bytes += bytes;
+        s.dirty = true;
     }
 
     /// Records a reachability observation for a target.
@@ -100,6 +106,62 @@ pub const Stats = struct {
             t.online = false;
             t.offline_since_ns = now;
             t.offline_count += 1;
+        }
+    }
+
+    /// Durable counters; gauges (pending, online, latency) are not kept.
+    pub const Saved = struct {
+        received_count: u64 = 0,
+        received_bytes: u64 = 0,
+        retries: u64 = 0,
+        targets: []const SavedTarget = &.{},
+    };
+    pub const SavedTarget = struct {
+        bucket: []const u8,
+        arn: []const u8,
+        sent_count: u64 = 0,
+        sent_bytes: u64 = 0,
+        failed_count: u64 = 0,
+        failed_bytes: u64 = 0,
+        offline_count: u64 = 0,
+        downtime_ns: i64 = 0,
+    };
+
+    /// Counters to persist, copied into `a`; null when nothing changed since the last call.
+    pub fn takeDirty(s: *Stats, a: std.mem.Allocator) std.mem.Allocator.Error!?Saved {
+        s.mutex.lock();
+        defer s.mutex.unlock();
+        if (!s.dirty) return null;
+        const ts = try a.alloc(SavedTarget, s.targets.count());
+        for (s.targets.values(), ts) |t, *o| o.* = .{
+            .bucket = try a.dupe(u8, t.bucket),
+            .arn = try a.dupe(u8, t.arn),
+            .sent_count = t.sent_count,
+            .sent_bytes = t.sent_bytes,
+            .failed_count = t.failed_count,
+            .failed_bytes = t.failed_bytes,
+            .offline_count = t.offline_count,
+            .downtime_ns = @intCast(@min(t.downtime_ns, std.math.maxInt(i64))),
+        };
+        s.dirty = false;
+        return .{ .received_count = s.received_count, .received_bytes = s.received_bytes, .retries = s.retries, .targets = ts };
+    }
+
+    /// Adds saved counters to the live ones (startup).
+    pub fn restore(s: *Stats, saved: Saved) void {
+        s.mutex.lock();
+        defer s.mutex.unlock();
+        s.received_count += saved.received_count;
+        s.received_bytes += saved.received_bytes;
+        s.retries += saved.retries;
+        for (saved.targets) |st| {
+            const t = s.targetLocked(st.bucket, st.arn) orelse continue;
+            t.sent_count += st.sent_count;
+            t.sent_bytes += st.sent_bytes;
+            t.failed_count += st.failed_count;
+            t.failed_bytes += st.failed_bytes;
+            t.offline_count += st.offline_count;
+            t.downtime_ns += st.downtime_ns;
         }
     }
 
@@ -151,4 +213,13 @@ test "stats render" {
     try std.testing.expect(std.mem.indexOf(u8, out, "zkfsm_replication_sent_bytes_total{bucket=\"b\",target=\"arn:x\"} 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zkfsm_replication_target_online{bucket=\"b\",target=\"arn:x\"} 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zkfsm_replication_received_bytes_total 5") != null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const saved = (try s.takeDirty(arena.allocator())).?;
+    try std.testing.expect((try s.takeDirty(arena.allocator())) == null);
+    var s2: Stats = .{ .gpa = std.testing.allocator };
+    defer s2.deinit();
+    s2.restore(saved);
+    try std.testing.expectEqual(@as(u64, 10), s2.snapshot("arn:x").?.sent_bytes);
+    try std.testing.expectEqual(@as(u64, 5), s2.received_bytes);
 }
