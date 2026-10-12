@@ -422,6 +422,7 @@ pub fn run(opts: Options) u8 {
     defer obs.destroy();
     obs.sources.drives = cfg.data;
     obs.sources.parity = parityOf(drives.profile);
+    obs.sources.width = widthOf(drives.profile);
     obs.sources.repl = &repl;
     obs.sources.notifier = &notif;
     obs_hook.set(obs);
@@ -647,6 +648,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         obs = startObserve(gpa, arena, cfg, &svc, if (iam_ready) &iam_store else null, node.localPath() orelse ".", node_name, &std.fmt.bytesToHex(node.deployment, .lower), admin_prefix) orelse break :blk 2;
         obs.?.sources.drives = localDrives(arena, node) catch &.{};
         obs.?.sources.parity = parityOf(node.profile);
+        obs.?.sources.width = widthOf(node.profile);
         obs.?.sources.repl = &repl;
         obs.?.sources.notifier = &notif;
         obs.?.sources.nodes = .{ .ctx = node, .func = clusterNodes };
@@ -802,6 +804,14 @@ fn localNodeName(arena: std.mem.Allocator, cfg: Config, addr: std.net.Address) [
     var hb: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const h = std.posix.gethostname(&hb) catch "localhost";
     return std.fmt.allocPrint(arena, "{s}:{d}", .{ h, cfg.port }) catch "localhost";
+}
+
+fn widthOf(p: placement.Profile) u32 {
+    return switch (p) {
+        .single => 1,
+        .replica => |n| n,
+        .erasure => |e| @as(u32, e.data) + e.parity,
+    };
 }
 
 fn parityOf(p: placement.Profile) u32 {

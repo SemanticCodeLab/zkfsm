@@ -115,6 +115,8 @@ pub const RootOptions = struct {
     traceparent: ?[]const u8 = null,
     /// Without a parent, start a new (ratio-sampled) trace; else export nothing.
     fresh: bool = true,
+    /// Do not become the thread's current span: nested work is not traced under it.
+    detached: bool = false,
 };
 
 /// Starts the span of an incoming request or a background task; it becomes current.
@@ -133,9 +135,11 @@ pub fn root(name: []const u8, kind: Kind, typ: Type, o: RootOptions) Span {
     std.crypto.random.bytes(&ctx.span_id);
     var s: Span = .{ .name = name, .kind = kind, .typ = typ, .ctx = ctx, .parent = if (remote) |r| r.span_id else null };
     s.recording = (ctx.sampled and state.exporting.load(.monotonic)) or liveFor(typ);
-    s.prev = current;
-    s.restores = true;
-    current = ctx;
+    if (!o.detached) {
+        s.prev = current;
+        s.restores = true;
+        current = ctx;
+    }
     if (s.recording) s.start_ns = std.time.nanoTimestamp();
     return s;
 }

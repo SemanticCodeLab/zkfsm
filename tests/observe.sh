@@ -82,7 +82,7 @@ python3 "$ROOT/tests/lambda_helper.py" "$WH" "$WORK/hook" &
 PIDS+=($!)
 mkdir -p "$WORK/hook"
 export MINIO_LAMBDA_WEBHOOK_ENABLE_up=on MINIO_LAMBDA_WEBHOOK_ENDPOINT_up="http://127.0.0.1:$WH/upper"
-start --kms-backend local --kms-dir "$WORK/kms" --ftp "127.0.0.1:$FPORT"
+start --kms-backend local --kms-dir "$WORK/kms" --ftp "127.0.0.1:$FPORT" --scan-interval 2
 "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null
 echo "hello observability" >"$WORK/f.txt"
 "$MC" mb z/obs z/logs z/denied z/granted >/dev/null
@@ -163,6 +163,16 @@ PY2
 sleep 0.5
 kill "$TBP" 2>/dev/null || true
 wait "$TBP" 2>/dev/null || true
+"$MC" admin trace z --call scanner --call healing --json >"$WORK/trace-scan.json" 2>&1 &
+TSC=$!
+sleep 1
+wait_for 8 grep -q '"heal.pass"' "$WORK/trace-scan.json" || true
+kill "$TSC" 2>/dev/null || true
+wait "$TSC" 2>/dev/null || true
+check "trace --call scanner streams scan passes" yes "$(yes_no grep -q '"scanner.pass"' "$WORK/trace-scan.json")"
+check "trace --call healing streams heal passes" yes "$(yes_no grep -q '"heal.pass"' "$WORK/trace-scan.json")"
+check "v3 scanner counts real passes" yes "$(yes_no grep -qE '^minio_scanner_bucket_scans_finished\{server="[^"]*"\} [1-9]' <<<"$("$MC" admin prometheus metrics z scanner --api-version v3 2>&1)")"
+check "scan passes are exported spans" yes "$(yes_no wait_for 5 has_spans "s['name']=='scanner.pass' and 'scanner.entries' in s['attrs']")"
 check "trace --call batch-expiration streams the pass" yes "$(yes_no grep -q '"batch.expire"' "$WORK/trace-batch.json")"
 
 echo "--- OTLP logs and metrics"

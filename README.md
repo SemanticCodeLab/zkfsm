@@ -432,7 +432,8 @@ mc admin prometheus generate z --api-version v3          # scrape config with a 
   internode RPC (the `traceparent` travels with the call, so remote nodes continue
   the trace), KMS (data keys and key management), remote tiers, lifecycle passes,
   replication (forwarded to the target), and Object Lambda webhook calls (which get
-  the `traceparent` too). Table catalog requests and batch job passes are root spans. Incoming W3C `traceparent` headers are honored; their sampled flag wins
+  the `traceparent` too). Table catalog requests, batch job passes, and scanner and
+  heal passes are root spans. Incoming W3C `traceparent` headers are honored; their sampled flag wins
   over `--otel-sample-ratio` / `OTEL_TRACES_SAMPLER[_ARG]`. Logs (info and above, with
   trace ids) and every v3 metric are exported too. Standard variables apply:
   `OTEL_EXPORTER_OTLP_[<SIGNAL>_]ENDPOINT`, `_HEADERS`, `OTEL_SERVICE_NAME`,
@@ -453,7 +454,8 @@ mc admin prometheus generate z --api-version v3          # scrape config with a 
   carries the `zkfsm_*` subsystem families (replication, notification targets, KMS).
   `/metrics` and `/minio/v2/metrics/cluster` are unchanged.
 - `mc admin trace` streams S3/admin calls with HTTP detail and, by `--call`, storage,
-  internode, KMS, ILM (tier), replication, batch job, and gateway events, with `--errors` and
+  internode, KMS, ILM (tier), replication, batch job, scanner, healing, and gateway
+  events, with `--errors` and
   `--response-duration` filters; in a cluster any node streams every node's events.
   `mc admin logs` replays recent server log lines and follows new ones.
 - Server access logs: PutBucketLogging now delivers records in the S3 server access

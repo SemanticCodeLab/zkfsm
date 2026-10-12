@@ -6,6 +6,7 @@ const s3 = @import("../s3/root.zig");
 const object = @import("../object/root.zig");
 const iam = @import("../iam/root.zig");
 const metrics = @import("../metrics/root.zig");
+const heal = @import("../heal/root.zig");
 const replication = @import("../replication/root.zig");
 const events = @import("../events/root.zig");
 const apistats = @import("apistats.zig");
@@ -30,6 +31,8 @@ pub const Sources = struct {
     drives: []const []const u8 = &.{},
     profile: []const u8 = "",
     parity: u32 = 0,
+    /// Shards per object (data + parity, or replica count); 0 = unknown.
+    width: u32 = 0,
     nodes: ?NodeInfo = null,
     repl: ?*replication.Replicator = null,
     notifier: ?*events.Notifier = null,
@@ -295,10 +298,17 @@ fn clusterHealth(src: *Sources, _: std.mem.Allocator, w: *Writer) WError!void {
         .{ "minio_cluster_health_nodes_online_count", n[1] },
         .{ "minio_cluster_health_capacity_raw_total_bytes", total },
         .{ "minio_cluster_health_capacity_raw_free_bytes", free },
-        .{ "minio_cluster_health_capacity_usable_total_bytes", total },
-        .{ "minio_cluster_health_capacity_usable_free_bytes", free },
+        .{ "minio_cluster_health_capacity_usable_total_bytes", usable(src, total) },
+        .{ "minio_cluster_health_capacity_usable_free_bytes", usable(src, free) },
     };
     inline for (g) |m| try w.print("# TYPE {s} gauge\n{s} {d}\n", .{ m[0], m[0], m[1] });
+}
+
+/// Raw bytes scaled by the data share of the protection profile.
+fn usable(src: *Sources, raw: u64) u64 {
+    const n: u64 = src.width;
+    if (n == 0 or src.parity >= n) return raw;
+    return @intCast(@as(u128, raw) * (n - src.parity) / n);
 }
 
 fn usageObjects(src: *Sources, a: std.mem.Allocator, w: *Writer) WError!void {
@@ -489,9 +499,18 @@ fn bucketReplication(src: *Sources, w: *Writer, bucket: []const u8) WError!void 
 }
 
 fn scanner(src: *Sources, _: std.mem.Allocator, w: *Writer) WError!void {
-    const up_ns = std.time.nanoTimestamp() - src.started_ns;
-    try w.print("# TYPE minio_scanner_last_activity_seconds gauge\nminio_scanner_last_activity_seconds{{server=\"{s}\"}} {d}\n", .{ src.server, @divTrunc(@max(up_ns, 0), std.time.ns_per_s) });
-    try w.print("# TYPE minio_scanner_bucket_scans_finished counter\nminio_scanner_bucket_scans_finished{{server=\"{s}\"}} 0\n", .{src.server});
+    const st = heal.stats;
+    const last = st.last_finished_s.load(.monotonic);
+    const since = if (last > 0) std.time.timestamp() - last else @as(i64, @intCast(@divTrunc(@max(std.time.nanoTimestamp() - src.started_ns, 0), std.time.ns_per_s)));
+    const g = .{
+        .{ "minio_scanner_bucket_scans_started", "counter", st.passes_started.load(.monotonic) },
+        .{ "minio_scanner_bucket_scans_finished", "counter", st.passes_finished.load(.monotonic) },
+        .{ "minio_scanner_objects_scanned", "counter", st.entries_scanned.load(.monotonic) },
+        .{ "minio_scanner_versions_scanned", "counter", st.keys_checked.load(.monotonic) },
+        .{ "minio_scanner_last_activity_seconds", "gauge", @as(u64, @intCast(@max(since, 0))) },
+    };
+    inline for (g) |m| try w.print("# TYPE {s} {s}\n{s}{{server=\"{s}\"}} {d}\n", .{ m[0], m[1], m[0], src.server, m[2] });
+    try w.print("# TYPE zkfsm_heal_repaired_total counter\nzkfsm_heal_repaired_total{{server=\"{s}\"}} {d}\n", .{ src.server, st.repaired.load(.monotonic) });
 }
 
 /// zkfsm-only series under the root: OTLP exporter and access-log delivery health.
