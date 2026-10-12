@@ -18,6 +18,7 @@ tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Co
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
 tests/replication.sh       # bucket and site replication across three deployments (set MC)
+tests/batch.sh             # mc batch replicate/keyrotate/expire jobs, cancel, resume (set MC)
 ```
 
 ## Run
@@ -401,6 +402,15 @@ pushed to peers with versioning, object lock, policy, lifecycle, tags, encryptio
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
 
+### Batch jobs
+
+`mc batch generate|start|list|status|describe|cancel` run `replicate` (local to remote,
+remote to local, or local to local; version ids, times, tags and delete markers kept),
+`keyrotate` (SSE-S3/SSE-KMS objects resealed under a new key, version ids kept) and
+`expire` (rules by type, name, age, size, tags, metadata, `purge.retainVersions`) jobs
+in the background. Progress is checkpointed, so jobs resume after a restart; failed
+passes retry per `retry`, and `notify` receives the final status. Single-node mode only.
+
 ### Bucket notifications and audit logging
 
 Targets are configured at runtime with `mc admin config set` (stored cluster-wide,
@@ -440,6 +450,20 @@ mc watch z/photos --events put
   (sent, failed, dropped, queue length, online). In a cluster each node publishes the
   events of the requests it serves from its own queue.
 
+### Object Lambda
+
+`GET /bucket/key?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook` runs the object
+through a webhook function, as MinIO does. Functions come from
+`MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on` plus `..._ENDPOINT_<id>` / `..._AUTH_TOKEN_<id>`
+(or `ZKFSM_LAMBDA_WEBHOOK_...`), or `mc admin config set lambda_webhook:<id> endpoint=...`.
+The caller needs `s3:GetObject`; the webhook gets the MinIO event JSON with a presigned
+`inputS3Url` (signed with the caller's key) and its reply is streamed back, with
+`x-amz-fwd-header-*` and `x-amz-fwd-status` / `-error-code` / `-error-message` mapped.
+An https webhook can demand a client certificate: set `client_cert` / `client_key`
+(`..._CLIENT_CERT_<id>` / `..._CLIENT_KEY_<id>`), and optionally `tls_ca_file`,
+`tls_server_name`, `tls_min_version` (1.2 or 1.3) and `tls_skip_verify`; unreadable
+files are refused when configured. Tested by `tests/lambda.sh`.
+
 ### Server-side encryption and KMS
 
 SSE-S3, SSE-KMS and SSE-C work on PutObject, GetObject/HeadObject (with
@@ -468,6 +492,21 @@ key/create,key/rotate,key/list,key/status}`, gated by `kms:*` policy actions.
 KV2 backends) sealed under that key. `POST /minio/kms/v1/restore[?dry-run=true]`
 takes the same document back and never overwrites existing keys.
 
+Key lifecycle (local and KV2 backends; also under `/minio/admin/v3/kms/`):
+`POST key/enable|key/disable?key-id=` (a disabled key seals no new data keys;
+existing objects stay readable), `GET|PUT|DELETE key/tags?key-id=` (body
+`{"tags":{"k":"v"}}`), `DELETE key/delete?key-id=[&force=true]` (refused with 409
+while the key is the default, a bucket default, or seals any object version),
+`GET key/list?state=`. `POST key/rekey?bucket=&prefix=&key-id=&from-key-id=&marker=&max-keys=`
+re-seals object data keys under another key without touching data, one page per
+call (follow `next-marker`). `GET|POST config` reads or swaps the backend at
+runtime (`{"backend":"local|static|vault|kms-api","default_key":..,"dir":..,
+"secret_key":..,"vault":{"addr","token"|"role_id"+"secret_id","engine","namespace"},
+"kms_api":{"region","endpoint","access_key","secret_key"}}`); the new backend must
+pass a data key round trip before it replaces the old one. `GET metrics` and the
+`zkfsm_kms_*` Prometheus families report per-operation requests, errors and
+latency, key counts, reconfigurations and rekeyed objects.
+
 Storage: the blob is DARE ciphertext (64 KiB AES-256-GCM packages bound to the
 object path and part number); the sealed data key lives in internal record
 headers that are never sent to clients. HEAD and listings report the plaintext
@@ -489,6 +528,24 @@ functions (`SUBSTRING`, `TRIM`, `UPPER`, `LOWER`, `CHAR_LENGTH`, `EXTRACT`,
 `DATE_ADD`, `DATE_DIFF`, `TO_STRING`, `TO_TIMESTAMP`, `UTCNOW`). Results stream
 as event-stream `Records`, `Progress`, `Stats` and `End` frames, CSV or JSON.
 `tests/select.sh` checks every case against DuckDB.
+
+### S3 Tables and Iceberg REST catalog
+
+A table bucket is an ordinary bucket enabled for catalog use. The S3 Tables
+API (signing name `s3tables`, e.g. the boto3 `s3tables` client) covers
+table buckets (create/get/list/delete, bucket policy), namespaces, tables,
+`GetTableMetadataLocation` and `UpdateTableMetadataLocation` with
+`versionToken` compare-and-swap, and `RenameTable`. The Iceberg REST catalog
+is served at `/iceberg/v1` (alias `/_iceberg/v1`); the warehouse (bucket name
+or table bucket ARN) becomes the URL prefix. It supports config, namespace
+CRUD and properties, table list/create (including staged create)/load/
+exists/register/rename/drop (with purge) and commits with all standard
+requirements and updates; a commit writes a new metadata file and swaps the
+table pointer atomically, answering `409 CommitFailedException` on conflict.
+Clients sign with SigV4 (`s3tables` or `s3`) and write data files with plain
+S3. Catalog state lives under the reserved `.zkfsm-tables/` prefix, which S3
+requests cannot reach. Format v2 only; no views or multi-table transactions.
+`tests/tables.sh` drives it with curl, PyIceberg and boto3.
 
 ### Protocol gateways
 
@@ -515,6 +572,26 @@ zkfsm --data /data --tls-cert cert.pem --tls-key key.pem \
   mapped to IAM keys with `--swift-keystone-map`).
 
 `zkfsm --help` lists every gateway flag.
+
+### Migrating from MinIO
+
+`zkfsm migrate` imports a MinIO deployment, keeping version ids, modification times,
+delete markers, user metadata, tags, retention and legal hold, and bucket configurations
+(versioning, Object Lock, policy, tagging, lifecycle, encryption, notification, quota):
+
+```sh
+# offline, from the drives of a stopped deployment (erasure-coded, checksums verified,
+# missing drives read through parity); also imports users, groups, and policies
+ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=secret123 \
+  zkfsm migrate --from-minio '/mnt/minio{1...4}' --to /data{1...4} --verify
+# online, from a running server
+ZKFSM_MIGRATE_ACCESS_KEY=... ZKFSM_MIGRATE_SECRET_KEY=... \
+  zkfsm migrate --from-s3 http://minio:9000 --to /data --verify
+```
+
+Progress is checkpointed in the destination, so an interrupted run resumes. Encrypted,
+compressed, and tiered objects are skipped offline (the online pull reads them through
+the server). `tests/migrate.sh` runs both paths against a real server.
 
 ## Compatibility
 
@@ -564,6 +641,7 @@ Pre-1.0. Working today and covered by tests:
   certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
   SSE-C with static, Vault, cloud KMS-API, and local key backends.
 - **S3 Select**: SQL over CSV, JSON and Parquet.
+- **S3 Tables**: table buckets and an Iceberg REST catalog (PyIceberg tested).
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and

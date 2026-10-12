@@ -53,6 +53,44 @@ pub const KeyInfo = struct {
     }
 };
 
+/// User tag on a master key. Owned by the allocator of the producing call.
+pub const Tag = struct { key: []u8, value: []u8 };
+
+pub const max_tags = 50;
+pub const max_tag_key_len = 128;
+pub const max_tag_value_len = 256;
+
+pub fn validTag(key: []const u8, value: []const u8) bool {
+    if (key.len == 0 or key.len > max_tag_key_len or value.len > max_tag_value_len) return false;
+    for (key) |ch| if (ch < 0x20 or ch == 0x7f) return false;
+    for (value) |ch| if (ch < 0x20 or ch == 0x7f) return false;
+    return true;
+}
+
+pub fn freeTags(gpa: std.mem.Allocator, tags: []Tag) void {
+    for (tags) |t| {
+        gpa.free(t.key);
+        gpa.free(t.value);
+    }
+    gpa.free(tags);
+}
+
+pub fn dupeTags(gpa: std.mem.Allocator, tags: []const Tag) error{OutOfMemory}![]Tag {
+    const out = try gpa.alloc(Tag, tags.len);
+    var n: usize = 0;
+    errdefer freeTags(gpa, out[0..n]);
+    for (tags) |t| {
+        const k = try gpa.dupe(u8, t.key);
+        const v = gpa.dupe(u8, t.value) catch |e| {
+            gpa.free(k);
+            return e;
+        };
+        out[n] = .{ .key = k, .value = v };
+        n += 1;
+    }
+    return out;
+}
+
 pub fn freeKeyInfos(gpa: std.mem.Allocator, list: []KeyInfo) void {
     for (list) |*k| k.deinit(gpa);
     gpa.free(list);
@@ -118,6 +156,13 @@ pub const Kms = struct {
         listKeys: *const fn (*anyopaque, std.mem.Allocator) Error![]KeyInfo,
         keyStatus: *const fn (*anyopaque, std.mem.Allocator, []const u8) Error!KeyInfo,
         rotateKey: *const fn (*anyopaque, std.mem.Allocator, []const u8) Error!KeyInfo,
+        /// Optional lifecycle and metadata operations; null means Unsupported.
+        setKeyState: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, KeyState) Error!void = null,
+        deleteKey: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) Error!void = null,
+        keyTags: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) Error![]Tag = null,
+        setKeyTags: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const Tag) Error!void = null,
+        /// Seals a caller-held DEK under the key's current version (rekey).
+        sealDataKey: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, *const [dek_len]u8, Context) Error!DataKey = null,
     };
 
     pub fn kind(k: Kms) BackendKind {
@@ -140,6 +185,32 @@ pub const Kms = struct {
     }
     pub fn rotateKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!KeyInfo {
         return k.vtable.rotateKey(k.ptr, gpa, key_id);
+    }
+    pub fn setKeyState(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, state: KeyState) Error!void {
+        const f = k.vtable.setKeyState orelse return error.Unsupported;
+        if (state != .enabled and state != .disabled) return error.InvalidArgument;
+        return f(k.ptr, gpa, key_id, state);
+    }
+    pub fn deleteKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!void {
+        const f = k.vtable.deleteKey orelse return error.Unsupported;
+        return f(k.ptr, gpa, key_id);
+    }
+    pub fn keyTags(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error![]Tag {
+        const f = k.vtable.keyTags orelse return error.Unsupported;
+        return f(k.ptr, gpa, key_id);
+    }
+    pub fn setKeyTags(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, tags: []const Tag) Error!void {
+        const f = k.vtable.setKeyTags orelse return error.Unsupported;
+        if (tags.len > max_tags) return error.InvalidArgument;
+        for (tags, 0..) |t, i| {
+            if (!validTag(t.key, t.value)) return error.InvalidArgument;
+            for (tags[0..i]) |o| if (std.mem.eql(u8, o.key, t.key)) return error.InvalidArgument;
+        }
+        return f(k.ptr, gpa, key_id, tags);
+    }
+    pub fn sealDataKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, dek: *const [dek_len]u8, ctx: Context) Error!DataKey {
+        const f = k.vtable.sealDataKey orelse return error.Unsupported;
+        return f(k.ptr, gpa, key_id, dek, ctx);
     }
 };
 

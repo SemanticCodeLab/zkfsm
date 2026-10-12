@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+# zkfsm-csi: pinned Zig toolchain -> static musl binary -> alpine with mkfs tools.
+# Build from the repo root: docker build -f k8s/Dockerfile.csi .
+
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS zig
+ARG ZIG_VERSION=0.15.2
+ARG ZIG_SHA256_AMD64=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+ARG ZIG_SHA256_ARM64=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
+ARG BUILDARCH
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    case "$BUILDARCH" in \
+      amd64) arch=x86_64; sum="$ZIG_SHA256_AMD64" ;; \
+      arm64) arch=aarch64; sum="$ZIG_SHA256_ARM64" ;; \
+      *) echo "unsupported build arch $BUILDARCH" >&2; exit 1 ;; \
+    esac; \
+    name="zig-${arch}-linux-${ZIG_VERSION}"; \
+    curl -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/${name}.tar.xz"; \
+    echo "${sum}  /tmp/zig.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm /tmp/zig.tar.xz
+ENV PATH=/opt/zig:$PATH
+
+FROM zig AS build
+ARG TARGETARCH
+WORKDIR /src
+COPY k8s/csi ./k8s/csi
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) t=x86_64-linux-musl ;; \
+      arm64) t=aarch64-linux-musl ;; \
+      *) echo "unsupported target arch $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out; \
+    zig build-exe k8s/csi/main.zig --name zkfsm-csi -target "$t" -O ReleaseSafe -femit-bin=/out/zkfsm-csi
+
+FROM alpine:3.20
+RUN apk add --no-cache xfsprogs e2fsprogs
+COPY --from=build /out/zkfsm-csi /usr/local/bin/zkfsm-csi
+ENTRYPOINT ["/usr/local/bin/zkfsm-csi"]
+CMD ["--help"]

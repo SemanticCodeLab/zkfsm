@@ -1,0 +1,9 @@
+apiVersion: v2
+name: zkfsm-csi
+description: Local-drive CSI driver (csi.zkfsm.io) that turns node disks into topology-pinned volumes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/SemanticCodeLab/zkfsm
+sources:
+  - https://github.com/SemanticCodeLab/zkfsm

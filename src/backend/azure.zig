@@ -33,6 +33,8 @@ pub const Config = struct {
     block_size: usize = 16 * MiB,
     retry: rhttp.RetryPolicy = .{},
     list_page_size: u16 = 5000,
+    /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
+    ca_file: []const u8 = "",
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -94,6 +96,10 @@ pub const AzureClient = struct {
         if (n > self.key_buf.len) return error.InvalidConfig;
         b64.Decoder.decode(self.key_buf[0..n], cfg.key) catch return error.InvalidConfig;
         self.key_len = n;
+        if (self.endpoint.tls) rhttp.useCaFile(&self.http, gpa, cfg.ca_file) catch |e| {
+            self.http.deinit();
+            return e;
+        };
     }
 
     pub fn deinit(self: *AzureClient) void {

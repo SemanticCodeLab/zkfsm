@@ -326,6 +326,7 @@ pub fn listUploads(svc: *ObjectService, arena: std.mem.Allocator, bucket: []cons
     if (svc.index.stale) try svc.rebuildIndex();
     var out: std.ArrayList(UploadRecord) = .empty;
     for (try svc.index.uploadsOf(arena, bid, prefix)) |u| {
+        if (@import("list.zig").isReserved(u.upload.key)) continue;
         const r = loadUploadLocked(svc, arena, bid, u.upload.key, u.id) catch |e| switch (e) {
             error.NoSuchUpload => continue,
             else => return e,
