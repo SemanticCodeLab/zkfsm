@@ -13,6 +13,11 @@ pub const max_total = 4096;
 pub const tag_prefix = "swift-meta:";
 pub const max_container_name = 128 - tag_prefix.len;
 pub const owner_tag = "swift-owner";
+pub const sys_prefix = "swift-sys:";
+pub const sys_read = "read";
+pub const sys_write = "write";
+pub const sys_versions = "versions";
+pub const sys_expiry = "expiry";
 const owner_name = "@owner";
 
 pub const Meta = struct { name: []const u8, value: []const u8 };
@@ -189,7 +194,13 @@ fn decode(a: std.mem.Allocator, bytes: []const u8) Error!Account {
 
 // ---- containers (bucket tags) ----
 
-pub const Container = struct { meta: []Meta, owner: ?[]const u8, other: []object.Tag };
+pub const Container = struct {
+    meta: []Meta,
+    /// Gateway settings (ACLs, versions location, expiry marker), keyed by short name.
+    sys: []Meta = &.{},
+    owner: ?[]const u8,
+    other: []object.Tag,
+};
 
 pub fn getContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8) object.Error!Container {
     const tags = object.versioning.getBucketTags(svc, a, bucket) catch |e| switch (e) {
@@ -197,23 +208,28 @@ pub fn getContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []
         else => return e,
     };
     var meta: std.ArrayList(Meta) = .empty;
+    var sys: std.ArrayList(Meta) = .empty;
     var other: std.ArrayList(object.Tag) = .empty;
     var owner: ?[]const u8 = null;
     for (tags) |t| {
         if (std.mem.startsWith(u8, t.key, tag_prefix)) {
             try meta.append(a, .{ .name = t.key[tag_prefix.len..], .value = t.value });
+        } else if (std.mem.startsWith(u8, t.key, sys_prefix)) {
+            try sys.append(a, .{ .name = t.key[sys_prefix.len..], .value = t.value });
         } else if (std.mem.eql(u8, t.key, owner_tag)) owner = t.value else try other.append(a, t);
     }
-    return .{ .meta = meta.items, .owner = owner, .other = other.items };
+    return .{ .meta = meta.items, .sys = sys.items, .owner = owner, .other = other.items };
 }
 
-/// Merges `changes` into the container's metadata, keeping foreign tags.
-pub fn updateContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8, changes: []const Meta, owner: ?[]const u8) (object.Error || Error)!void {
+/// Merges `changes` (metadata) and `sys_changes` (settings), keeping foreign tags.
+pub fn updateContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8, changes: []const Meta, sys_changes: []const Meta, owner: ?[]const u8) (object.Error || Error)!void {
     const cur = try getContainer(svc, a, bucket);
     const merged = try merge(a, cur.meta, changes);
+    const sys = try merge(a, cur.sys, sys_changes);
     var tags: std.ArrayList(object.Tag) = .empty;
     try tags.appendSlice(a, cur.other);
     for (merged) |m| try tags.append(a, .{ .key = try std.fmt.allocPrint(a, tag_prefix ++ "{s}", .{m.name}), .value = m.value });
+    for (sys) |m| try tags.append(a, .{ .key = try std.fmt.allocPrint(a, sys_prefix ++ "{s}", .{m.name}), .value = m.value });
     if (owner orelse cur.owner) |o| try tags.append(a, .{ .key = owner_tag, .value = o });
     if (tags.items.len > 50) return error.TooMuchMetadata;
     try object.versioning.setBucketTags(svc, bucket, if (tags.items.len == 0) null else tags.items);

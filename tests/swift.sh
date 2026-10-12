@@ -44,7 +44,8 @@ BIN="$ROOT/zig-out/bin/zkfsm"
 python3 "$ROOT/tests/swift_keystone_mock.py" "$KSPORT" "$SW" 2>"$WORK/mock.log" &
 MPID=$!
 KSFLAGS=(--swift-keystone "$KSURL/v3" --swift-keystone-user svc --swift-keystone-password svcpass
-  --swift-keystone-project service --swift-keystone-map aaaa1111="$AK" --swift-keystone-map beta=rouser)
+  --swift-keystone-project service --swift-keystone-map aaaa1111="$AK" --swift-keystone-map beta=rouser
+  --swift-keystone-role-map operator=readwrite --swift-keystone-role-map reader=readonly --swift-expirer-interval 1)
 start() {
   ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$DATA" --listen "127.0.0.1:$S3PORT" \
     --swift "127.0.0.1:$SWPORT" "$@" 2>>"$WORK/server.log" &
@@ -317,6 +318,122 @@ check "keystone readonly get" 200 "$(status -H "X-Auth-Token: $BT" "$SW/v1/AUTH_
 check "keystone readonly put" 403 "$(status -X PUT -H "X-Auth-Token: $BT" --data-binary @a.txt "$SW/v1/AUTH_bbbb2222/kscont/ro.txt")"
 check "keystone readonly delete" 403 "$(status -X DELETE -H "X-Auth-Token: $BT" "$SW/v1/AUTH_bbbb2222/kscont/f.bin")"
 check "keystone readonly list" 403 "$(status -H "X-Auth-Token: $BT" "$SW/v1/AUTH_bbbb2222/kscont")"
+# ---- Keystone roles mapped to IAM policies (project dddd4444 has no key mapping) ----
+DT=$(kstoken dave davepass delta)
+ET=$(kstoken erin erinpass delta)
+KD="$SW/v1/AUTH_dddd4444"
+check "role operator creates container" 201 "$(status -X PUT -H "X-Auth-Token: $DT" "$KD/rolecont")"
+check "role operator put" 201 "$(status -X PUT -H "X-Auth-Token: $DT" --data-binary @a.txt "$KD/rolecont/a.txt")"
+check "role reader get" 200 "$(status -H "X-Auth-Token: $ET" "$KD/rolecont/a.txt")"
+check "role reader list (readonly has no listing)" 403 "$(status -H "X-Auth-Token: $ET" "$KD/rolecont")"
+check "role reader put denied" 403 "$(status -X PUT -H "X-Auth-Token: $ET" --data-binary @a.txt "$KD/rolecont/b.txt")"
+check "role reader delete denied" 403 "$(status -X DELETE -H "X-Auth-Token: $ET" "$KD/rolecont/a.txt")"
+check "role reader cannot create container" 403 "$(status -X PUT -H "X-Auth-Token: $ET" "$KD/rolecont2")"
+check "unmapped role still needs a project key" 403 "$(status -H "X-Auth-Token: $CT" "$SW/v1/AUTH_cccc3333/rolecont")"
+
+# ---- container ACLs ----
+RT=$(header x-auth-token -H "X-Auth-User: other:rouser" -H "X-Auth-Key: rousersecret1" "$SW/auth/v1.0")
+R=(-H "X-Auth-Token: $RT")
+check "acl container" 201 "$(status -X PUT "${T[@]}" "$SURL/aclc")"
+check "acl object" 201 "$(status -X PUT "${T[@]}" --data-binary @a.txt "$SURL/aclc/a.txt")"
+check "anonymous read denied" 401 "$(status "$SURL/aclc/a.txt")"
+check "foreign account read denied" 403 "$(status "${R[@]}" "$SURL/aclc/a.txt")"
+check "invalid acl refused" 400 "$(status -X POST "${T[@]}" -H 'X-Container-Read: .bogus' "$SURL/aclc")"
+check "referrer in write acl refused" 400 "$(status -X POST "${T[@]}" -H 'X-Container-Write: .r:*' "$SURL/aclc")"
+check "set public read" 204 "$(status -X POST "${T[@]}" -H 'X-Container-Read: .r:*' "$SURL/aclc")"
+check "acl shown to owner" ".r:*" "$(header x-container-read -I "${T[@]}" "$SURL/aclc")"
+check "anonymous read" 200 "$(status "$SURL/aclc/a.txt")"
+check "anonymous head" 200 "$(status -I "$SURL/aclc/a.txt")"
+check "anonymous listing needs rlistings" 401 "$(status "$SURL/aclc")"
+check "anonymous write denied" 401 "$(status -X PUT --data-binary @a.txt "$SURL/aclc/anon.txt")"
+check "anonymous delete denied" 401 "$(status -X DELETE "$SURL/aclc/a.txt")"
+check "anonymous account denied" 401 "$(status "$SURL")"
+check "set rlistings" 204 "$(status -X POST "${T[@]}" -H 'X-Container-Read: .r:*,.rlistings' "$SURL/aclc")"
+check "anonymous listing" a.txt "$(curl -s "$SURL/aclc")"
+check "acl hidden from guests" "" "$(header x-container-read -I "$SURL/aclc")"
+check "set referrer acl" 204 "$(status -X POST "${T[@]}" -H 'X-Container-Read: .r:.example.com,.r:-evil.example.com' "$SURL/aclc")"
+check "referrer match" 200 "$(status -H 'Referer: http://www.example.com/page' "$SURL/aclc/a.txt")"
+check "referrer denied host" 401 "$(status -H 'Referer: http://evil.example.com/' "$SURL/aclc/a.txt")"
+check "referrer mismatch" 401 "$(status -H 'Referer: http://example.org/' "$SURL/aclc/a.txt")"
+check "no referrer" 401 "$(status "$SURL/aclc/a.txt")"
+check "set user acls" 204 "$(status -X POST "${T[@]}" -H 'X-Container-Read: other:rouser' -H 'X-Container-Write: other:rouser' "$SURL/aclc")"
+check "user acl read" 200 "$(status "${R[@]}" "$SURL/aclc/a.txt")"
+check "user acl list" 200 "$(status "${R[@]}" "$SURL/aclc")"
+check "user acl write" 201 "$(status -X PUT "${R[@]}" --data-binary @a.txt "$SURL/aclc/guest.txt")"
+check "user acl delete" 204 "$(status -X DELETE "${R[@]}" "$SURL/aclc/guest.txt")"
+check "user acl cannot change container" 403 "$(status -X POST "${R[@]}" -H 'X-Container-Read: .r:*' "$SURL/aclc")"
+check "user acl cannot delete container" 403 "$(status -X DELETE "${R[@]}" "$SURL/aclc")"
+check "user acl is per container" 403 "$(status "${R[@]}" "$SURL/kscont/f.bin")"
+check "write acl alone grants no read" 204 "$(status -X POST "${T[@]}" -H 'X-Remove-Container-Read: x' "$SURL/aclc")"
+check "read after acl removal" 403 "$(status "${R[@]}" "$SURL/aclc/a.txt")"
+check "write still granted" 201 "$(status -X PUT "${R[@]}" --data-binary @a.txt "$SURL/aclc/guest2.txt")"
+check "account wildcard acl" 204 "$(status -X POST "${T[@]}" -H 'X-Container-Read: other' -H 'X-Remove-Container-Write: x' "$SURL/aclc")"
+check "account wildcard read" 200 "$(status "${R[@]}" "$SURL/aclc/a.txt")"
+check "write acl removed" 403 "$(status -X PUT "${R[@]}" --data-binary @a.txt "$SURL/aclc/guest3.txt")"
+check "swift client post acl" 0 "$(ok "$SWIFT" post aclc --read-acl '.r:*,.rlistings')"
+check "swift client stat acl" ".r:*,.rlistings" "$("$SWIFT" stat aclc | awk '/Read ACL:/{print $3}')"
+check "acl is not user metadata" "" "$(header x-container-meta-read -I "${T[@]}" "$SURL/aclc")"
+
+# ---- object expiry ----
+NOW=$(date +%s)
+check "expiry container" 201 "$(status -X PUT "${T[@]}" "$SURL/expc")"
+check "delete-at in past" 400 "$(status -X PUT "${T[@]}" -H "X-Delete-At: $((NOW - 10))" --data-binary @a.txt "$SURL/expc/past.txt")"
+check "delete-at not a number" 400 "$(status -X PUT "${T[@]}" -H 'X-Delete-At: soon' --data-binary @a.txt "$SURL/expc/bad.txt")"
+check "delete-after not positive" 400 "$(status -X PUT "${T[@]}" -H 'X-Delete-After: 0' --data-binary @a.txt "$SURL/expc/bad.txt")"
+check "put with delete-after" 201 "$(status -X PUT "${T[@]}" -H 'X-Delete-After: 3' --data-binary @a.txt "$SURL/expc/soon.txt")"
+check "put with far delete-at" 201 "$(status -X PUT "${T[@]}" -H "X-Delete-At: $((NOW + 3600))" --data-binary @a.txt "$SURL/expc/later.txt")"
+check "put kept" 201 "$(status -X PUT "${T[@]}" --data-binary @a.txt "$SURL/expc/keep.txt")"
+check "delete-at header" "$((NOW + 3600))" "$(header x-delete-at -I "${T[@]}" "$SURL/expc/later.txt")"
+check "post sets delete-after" 202 "$(status -X POST "${T[@]}" -H 'X-Delete-After: 3' "$SURL/expc/keep.txt")"
+check "post clears delete-at" 202 "$(status -X POST "${T[@]}" -H 'X-Remove-Delete-At: x' "$SURL/expc/later.txt")"
+check "delete-at cleared" "" "$(header x-delete-at -I "${T[@]}" "$SURL/expc/later.txt")"
+check "copy drops expiry" 201 "$(status -X PUT "${T[@]}" -H 'X-Copy-From: expc/soon.txt' -H 'Content-Length: 0' "$SURL/expc/copy.txt")"
+check "copy has no delete-at" "" "$(header x-delete-at -I "${T[@]}" "$SURL/expc/copy.txt")"
+check "visible before expiry" 200 "$(status "${T[@]}" "$SURL/expc/soon.txt")"
+sleep 4
+check "expired get" 404 "$(status "${T[@]}" "$SURL/expc/soon.txt")"
+check "expired head" 404 "$(status -I "${T[@]}" "$SURL/expc/keep.txt")"
+check "expired hidden from listing" "copy.txt later.txt" "$(curl -s "${T[@]}" "$SURL/expc" | tr '\n' ' ' | sed 's/ $//')"
+check "expirer container put" 201 "$(status -X PUT "${T[@]}" "$SURL/expd")"
+check "expirer object" 201 "$(status -X PUT "${T[@]}" -H 'X-Delete-After: 2' --data-binary @a.txt "$SURL/expd/gone.txt")"
+gone=1
+for _ in $(seq 60); do [[ "$(s3 -o /dev/null -w '%{http_code}' "$EP/expd/gone.txt")" == 404 ]] && { gone=0; break; }; sleep 0.25; done
+check "expirer removed the object (seen via s3)" 0 "$gone"
+check "unexpired survive the expirer" 200 "$(status "${T[@]}" "$SURL/expc/later.txt")"
+
+# ---- object versioning ----
+check "versions archive container" 201 "$(status -X PUT "${T[@]}" "$SURL/varch")"
+check "versioned container" 201 "$(status -X PUT "${T[@]}" -H 'X-Versions-Location: varch' "$SURL/vcont")"
+check "versions location header" varch "$(header x-versions-location -I "${T[@]}" "$SURL/vcont")"
+check "self as versions location refused" 400 "$(status -X POST "${T[@]}" -H 'X-Versions-Location: vcont' "$SURL/vcont")"
+for v in one two three; do printf 'version %s' "$v" >"$WORK/v.txt"; status -X PUT "${T[@]}" --data-binary @"$WORK/v.txt" "$SURL/vcont/doc.txt" >/dev/null; sleep 0.05; done
+check "current is newest" "version three" "$(curl -s "${T[@]}" "$SURL/vcont/doc.txt")"
+check "two archived versions" 2 "$(curl -s "${T[@]}" "$SURL/varch?prefix=007doc.txt/" | grep -c .)"
+check "delete restores previous" 204 "$(status -X DELETE "${T[@]}" "$SURL/vcont/doc.txt")"
+check "restored two" "version two" "$(curl -s "${T[@]}" "$SURL/vcont/doc.txt")"
+check "archive shrank" 1 "$(curl -s "${T[@]}" "$SURL/varch?prefix=007doc.txt/" | grep -c .)"
+status -X DELETE "${T[@]}" "$SURL/vcont/doc.txt" >/dev/null
+check "restored one" "version one" "$(curl -s "${T[@]}" "$SURL/vcont/doc.txt")"
+check "last delete removes" 204 "$(status -X DELETE "${T[@]}" "$SURL/vcont/doc.txt")"
+check "gone after last delete" 404 "$(status "${T[@]}" "$SURL/vcont/doc.txt")"
+check "copy archives the destination" 201 "$(status -X PUT "${T[@]}" --data-binary @a.txt "$SURL/vcont/c.txt")"
+check "copy over it" 201 "$(status -X PUT "${T[@]}" -H 'X-Copy-From: expc/later.txt' -H 'Content-Length: 0' "$SURL/vcont/c.txt")"
+check "copy archived" 1 "$(curl -s "${T[@]}" "$SURL/varch?prefix=005c.txt/" | grep -c .)"
+check "versioning off" 204 "$(status -X POST "${T[@]}" -H 'X-Remove-Versions-Location: x' "$SURL/vcont")"
+check "location header gone" "" "$(header x-versions-location -I "${T[@]}" "$SURL/vcont")"
+status -X PUT "${T[@]}" --data-binary @a.txt "$SURL/vcont/c.txt" >/dev/null
+check "no archive when off" 1 "$(curl -s "${T[@]}" "$SURL/varch?prefix=005c.txt/" | grep -c .)"
+check "missing archive container" 204 "$(status -X POST "${T[@]}" -H 'X-Versions-Location: nosucharch' "$SURL/vcont")"
+check "overwrite without archive fails" 412 "$(status -X PUT "${T[@]}" --data-binary @a.txt "$SURL/vcont/c.txt")"
+check "history container" 201 "$(status -X PUT "${T[@]}" -H 'X-History-Location: varch' "$SURL/hcont")"
+check "history location header" varch "$(header x-history-location -I "${T[@]}" "$SURL/hcont")"
+printf h1 >"$WORK/h.txt"; status -X PUT "${T[@]}" --data-binary @"$WORK/h.txt" "$SURL/hcont/h.txt" >/dev/null; sleep 0.05
+printf h2 >"$WORK/h.txt"; status -X PUT "${T[@]}" --data-binary @"$WORK/h.txt" "$SURL/hcont/h.txt" >/dev/null; sleep 0.05
+check "history delete" 204 "$(status -X DELETE "${T[@]}" "$SURL/hcont/h.txt")"
+check "history delete does not restore" 404 "$(status "${T[@]}" "$SURL/hcont/h.txt")"
+check "history keeps both and a marker" 3 "$(curl -s "${T[@]}" "$SURL/varch?prefix=005h.txt/" | grep -c .)"
+check "history marker type" 1 "$(curl -s "${T[@]}" "$SURL/varch?prefix=005h.txt/&format=json" | grep -c 'swift_versions_deleted=1')"
+check "info advertises versioned writes" x-versions-location "$(curl -s "$SW/info" | jget 'd["versioned_writes"]["allowed_flags"][0]')"
 V0=$(curl -s "$KSURL/stats" | jget 'd["validations"]')
 for _ in 1 2 3; do status -H "X-Auth-Token: $AT" "$SW/v1/AUTH_aaaa1111/kscont" >/dev/null; done
 check "keystone cache" "$V0" "$(curl -s "$KSURL/stats" | jget 'd["validations"]')"

@@ -18,6 +18,7 @@ pub const Config = struct {
     insecure: bool = false,
     token_ttl_s: u32 = 86400,
     keystone: keystone.Config = .{},
+    expirer_interval_s: u32 = 300,
 
     pub fn enabled(c: Config) bool {
         return c.listen != null;
@@ -37,6 +38,8 @@ pub const usage =
     \\  --swift-keystone-domain NAME     user and project domain (default Default)
     \\  --swift-keystone-admin-token T   fixed service token instead of user/password
     \\  --swift-keystone-map P=KEY       map Keystone project (id or name) to an IAM access key (repeatable)
+    \\  --swift-keystone-role-map R=POL  authorize tokens with Keystone role R by IAM policies POL[,POL] (repeatable)
+    \\  --swift-expirer-interval SECS    sweep for expired objects (X-Delete-At) every SECS (default 300, 0 off)
     \\
 ;
 
@@ -77,6 +80,10 @@ pub fn parseFlag(cfg: *Config, flag: []const u8, value: []const u8) root.FlagErr
         cfg.keystone.admin_token = value;
     } else if (eql(u8, flag, "--swift-keystone-map")) {
         try cfg.keystone.addMap(value);
+    } else if (eql(u8, flag, "--swift-keystone-role-map")) {
+        try cfg.keystone.addRoleMap(value);
+    } else if (eql(u8, flag, "--swift-expirer-interval")) {
+        cfg.expirer_interval_s = std.fmt.parseInt(u32, value, 10) catch return error.BadArgs;
     } else return false;
     return true;
 }
@@ -87,6 +94,8 @@ pub const Server = struct {
     state: handler.State,
     listener: listener_mod.Listener,
     host_buf: [64]u8 = undefined,
+    expirer: ?std.Thread = null,
+    expirer_interval_s: u32 = 0,
 
     pub fn start(deps: root.Deps, cfg: Config) root.StartError!*Server {
         const addr = cfg.listen orelse return error.BadConfig;
@@ -119,11 +128,14 @@ pub const Server = struct {
         };
         try self.listener.start(addr);
         self.state.host = std.fmt.bufPrint(&self.host_buf, "{f}", .{self.listener.bound}) catch "127.0.0.1";
+        self.expirer_interval_s = cfg.expirer_interval_s;
+        if (cfg.expirer_interval_s > 0) self.expirer = std.Thread.spawn(.{}, expireLoop, .{self}) catch null;
         return self;
     }
 
     pub fn stop(self: *Server) void {
         self.listener.stop(5);
+        if (self.expirer) |t| t.join();
         if (self.state.ks) |k| k.destroy();
         self.state.accounts.deinit();
         self.gpa.destroy(self);
@@ -132,6 +144,18 @@ pub const Server = struct {
     /// Bound address (useful with port 0).
     pub fn address(self: *const Server) std.net.Address {
         return self.listener.bound;
+    }
+
+    /// Removes objects past their X-Delete-At; reads and listings already hide them.
+    fn expireLoop(self: *Server) void {
+        var waited_ms: u64 = 0;
+        while (!self.listener.isStopping()) {
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+            waited_ms += 200;
+            if (waited_ms < @as(u64, self.expirer_interval_s) * 1000) continue;
+            waited_ms = 0;
+            @import("swift_object.zig").sweepExpired(self.state.access.svc, self.gpa, handler.usage_budget);
+        }
     }
 
     fn serve(ctx: *anyopaque, conn: std.net.Server.Connection) void {
@@ -241,4 +265,5 @@ test {
     _ = @import("swift_listing.zig");
     _ = @import("swift_slo.zig");
     _ = @import("swift_object.zig");
+    _ = @import("swift_acl.zig");
 }

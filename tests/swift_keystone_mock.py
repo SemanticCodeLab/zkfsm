@@ -24,7 +24,10 @@ USERS = {
     "alice": ("alicepass", "aaaa1111", "alpha"),
     "bob": ("bobpass", "bbbb2222", "beta"),
     "carol": ("carolpass", "cccc3333", "gamma"),
+    "dave": ("davepass", "dddd4444", "delta"),
+    "erin": ("erinpass", "dddd4444", "delta"),
 }
+ROLES = {"dave": ["operator", "member"], "erin": ["reader"]}
 TOKENS = {}
 LOCK = threading.Lock()
 STATS = {"validations": 0, "issued": 0}
@@ -40,7 +43,7 @@ def token_body(user, with_catalog):
         "methods": ["password"],
         "user": {"id": "u-" + user, "name": user, "domain": DOMAIN},
         "project": {"id": pid, "name": pname, "domain": DOMAIN},
-        "roles": [{"id": "r-member", "name": "member"}],
+        "roles": [{"id": "r-" + r, "name": r} for r in ROLES.get(user, ["member"])],
         "issued_at": now.strftime(fmt),
         "expires_at": exp.strftime(fmt),
         "audit_ids": [uuid.uuid4().hex[:22]],
