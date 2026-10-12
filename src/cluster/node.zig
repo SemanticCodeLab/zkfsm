@@ -1249,9 +1249,9 @@ pub const Node = struct {
                 if (node == nn.topo.local) return;
                 // A peer still bootstrapping cannot serve drive I/O yet.
                 const h = nn.hello(node) catch |e| {
-                    // Every connection busy means the peer is up and working; so does an
-                    // answer to any other call a moment ago (a loaded peer is slow to probe).
-                    if (e != error.Busy and !nn.rpc.answeredWithin(node, probe_grace_ms)) nn.rpc.markDown(node, "no answer to probes");
+                    // Every connection busy means the peer is up and working.
+                    // A refusal already took it down in the call; this covers late answers.
+                    if (e != error.Busy) nn.rpc.markDown(node, "no answer to probes", true);
                     return;
                 };
                 nn.rpc.setOnline(node, h.drives);
@@ -1384,8 +1384,6 @@ fn statCapacity(le: *LocalEp) void {
 }
 
 const heartbeat_ns = std.time.ns_per_s;
-/// A peer that answered a call this recently is alive even if a probe timed out.
-const probe_grace_ms = 3000;
 /// Replaced blobs outlive their record this long (reads that resolved it finish).
 const gc_grace_ns: i128 = 10 * std.time.ns_per_s;
 /// A peer deletes our garbage after this, in case we could not.

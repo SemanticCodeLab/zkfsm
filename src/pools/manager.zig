@@ -701,11 +701,16 @@ pub const Manager = struct {
         m.applyModes(try m.loadFresh(arena.allocator()));
     }
 
+    /// Holds the mover to `rate`: waits until `bytes` are due, however large the last
+    /// blob was, so a run never finishes ahead of its rate. A stop ends the wait.
     fn throttle(ev: *std.Thread.ResetEvent, rate: u64, started: i128, bytes: u64) void {
         if (rate == 0) return;
         const due: i128 = @divTrunc(@as(i128, bytes) * std.time.ns_per_s, rate);
-        const ahead = due - (std.time.nanoTimestamp() - started);
-        if (ahead > 0) ev.timedWait(@intCast(@min(ahead, std.time.ns_per_s))) catch {};
+        while (!ev.isSet()) {
+            const ahead = due - (std.time.nanoTimestamp() - started);
+            if (ahead <= 0) return;
+            ev.timedWait(@intCast(@min(ahead, std.time.ns_per_s))) catch {};
+        }
     }
 };
 

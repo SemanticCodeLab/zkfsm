@@ -38,6 +38,8 @@ const io_buf = 64 * 1024;
 const max_head = 16 * 1024;
 const connect_timeout_ms = 3000;
 const resolve_ttl_ns: i128 = 30 * std.time.ns_per_s;
+/// A peer that answered a call this recently is not marked offline by a failed one.
+const alive_grace_ms = 3000;
 /// How long a refused stream waits for the peer's status line.
 const refusal_wait_ms = 1000;
 /// Probes (heartbeats, bootstrap) may open this many connections past the cap.
@@ -53,6 +55,12 @@ const Conn = struct {
     wbuf: []u8,
     tls_rbuf: []u8 = &.{},
     tls_wbuf: []u8 = &.{},
+
+    /// The last read gave up waiting (the receive timeout), not a closed connection.
+    fn timedOut(c: *const Conn) bool {
+        const e = c.sr.getError() orelse return false;
+        return e == error.WouldBlock;
+    }
 
     fn reader(c: *Conn) *std.Io.Reader {
         return if (c.tls) |*t| &t.reader else c.sr.interface();
@@ -164,8 +172,11 @@ pub const Rpc = struct {
         self.setState(node, up, "its drives are not open");
     }
 
-    /// Takes a peer out of use; `why` goes to the log.
-    pub fn markDown(self: *Rpc, node: u16, why: []const u8) void {
+    /// Takes a peer out of use; `why` goes to the log. `slow` is a timeout rather than
+    /// a refusal: a peer that answered another call a moment ago is then only loaded,
+    /// and stays in use until it has been silent for the grace.
+    pub fn markDown(self: *Rpc, node: u16, why: []const u8, slow: bool) void {
+        if (slow and self.answeredWithin(node, alive_grace_ms)) return;
         self.setState(node, false, why);
     }
 
@@ -273,24 +284,31 @@ pub const Rpc = struct {
     }
 
     /// Dials the cached addresses; when none answers, looks the peer up again and
-    /// dials whatever is new (it may have moved).
-    fn dial(self: *Rpc, p: *Peer) ?std.net.Stream {
+    /// dials whatever is new (it may have moved). `slow` reports that an address
+    /// timed out instead of refusing.
+    fn dial(self: *Rpc, p: *Peer, slow: *bool) ?std.net.Stream {
         var old: [Peer.max_addrs]std.net.Address = undefined;
         const n_old = self.addresses(p, &old, false);
-        for (old[0..n_old]) |addr| return connectTimeout(addr, connect_timeout_ms) catch continue;
+        for (old[0..n_old]) |addr| return connectTimeout(addr, connect_timeout_ms) catch |e| {
+            if (e == error.ConnectionTimedOut) slow.* = true;
+            continue;
+        };
         var new: [Peer.max_addrs]std.net.Address = undefined;
         const n_new = self.addresses(p, &new, true);
         for (new[0..n_new]) |addr| {
             const known = for (old[0..n_old]) |o| {
                 if (o.eql(addr)) break true;
             } else false;
-            if (!known) return connectTimeout(addr, connect_timeout_ms) catch continue;
+            if (!known) return connectTimeout(addr, connect_timeout_ms) catch |e| {
+                if (e == error.ConnectionTimedOut) slow.* = true;
+                continue;
+            };
         }
         return null;
     }
 
-    fn connect(self: *Rpc, p: *Peer) Error!*Conn {
-        const s = self.dial(p) orelse return error.Transport;
+    fn connect(self: *Rpc, p: *Peer, slow: *bool) Error!*Conn {
+        const s = self.dial(p, slow) orelse return error.Transport;
         errdefer s.close();
         const c = try self.gpa.create(Conn);
         errdefer self.gpa.destroy(c);
@@ -332,7 +350,6 @@ pub const Rpc = struct {
     };
 
     /// Starts a call. With a byte body the response head is already read on return.
-    /// A failed probe leaves the peer's state to the caller (a loaded peer answers late).
     /// A reused connection that fails is retried once on a fresh one.
     pub fn call(self: *Rpc, node: u16, op: []const u8, query: []const u8, body: Body, opts: Opts) Error!Call {
         const p = &self.peers[node];
@@ -343,9 +360,10 @@ pub const Rpc = struct {
             const conn = self.takeIdle(p) orelse blk: {
                 reused = false;
                 try self.reserve(p, opts.probe);
-                break :blk self.connect(p) catch |e| {
+                var slow = false;
+                break :blk self.connect(p, &slow) catch |e| {
                     self.unreserve(p);
-                    if (e == error.Transport and !opts.probe) self.markDown(node, "cannot connect");
+                    if (e == error.Transport) self.markDown(node, "cannot connect", slow);
                     return e;
                 };
             };
@@ -354,14 +372,15 @@ pub const Rpc = struct {
             c.sendHead(op, query, body) catch |e| {
                 c.abandon();
                 if (e == error.Transport and reused and attempt == 0) continue;
-                if (e == error.Transport and !opts.probe) self.markDown(node, "request not sent");
+                if (e == error.Transport) self.markDown(node, "request not sent", false);
                 return e;
             };
             if (body == .stream) return c;
             c.receiveHead() catch |e| {
+                const slow = conn.timedOut();
                 c.abandon();
-                if (e == error.Transport and reused and attempt == 0) continue;
-                if (e == error.Transport and !opts.probe) self.markDown(node, "no answer to a call");
+                if (e == error.Transport and reused and attempt == 0 and !slow) continue;
+                if (e == error.Transport) self.markDown(node, "no answer to a call", slow);
                 return e;
             };
             return c;
@@ -465,7 +484,7 @@ pub const Call = struct {
         w.writeAll("0\r\n\r\n") catch return c.fail();
         c.conn.flush() catch return c.fail();
         c.receiveHead() catch |e| {
-            if (e == error.Transport) c.rpc.markDown(c.peer.node, "no answer to a streamed write");
+            if (e == error.Transport) c.rpc.markDown(c.peer.node, "no answer to a streamed write", c.conn.timedOut());
             return e;
         };
     }
@@ -477,7 +496,7 @@ pub const Call = struct {
         c.conn.setTimeout(refusal_wait_ms);
         if (c.status == 0) c.receiveHead() catch {
             c.status = 0;
-            c.rpc.markDown(c.peer.node, "streamed write broken");
+            c.rpc.markDown(c.peer.node, "streamed write broken", false);
         };
         return error.Transport;
     }
