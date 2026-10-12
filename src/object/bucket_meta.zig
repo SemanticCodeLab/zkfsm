@@ -108,6 +108,22 @@ pub fn setNamed(svc: *Svc, name: []const u8, doc: []const u8) Error!void {
     svc.store.putRecord(k, doc) catch |e| return service.mapBackend(e);
 }
 
+/// Stores `doc` unless the name already has one; returns the stored document in `arena`.
+pub fn initNamed(svc: *Svc, arena: std.mem.Allocator, name: []const u8, doc: []const u8) Error![]const u8 {
+    if (doc.len == 0 or doc.len > max_doc_bytes) return error.InvalidRequest;
+    const held = try svc.clusterLock("nameddoc", name, "");
+    defer svc.clusterUnlock(held);
+    const k = namedKey(name);
+    if (svc.store.getRecord(k, arena)) |cur| {
+        if (cur.len > 0) return cur;
+    } else |e| switch (e) {
+        error.NotFound => {},
+        else => return service.mapBackend(e),
+    }
+    svc.store.putRecord(k, doc) catch |e| return service.mapBackend(e);
+    return doc;
+}
+
 /// Removes every document of a deleted bucket; best effort.
 pub fn dropAll(svc: *Svc, bid: core.BucketId) void {
     inline for (@typeInfo(Kind).@"enum".fields) |f| svc.store.deleteRecord(key(bid, @enumFromInt(f.value))) catch {};

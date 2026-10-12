@@ -137,18 +137,14 @@ fn sharedEd25519(gpa: std.mem.Allocator, svc: *object.ObjectService) std.crypto.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var attempt: u8 = 0;
-    while (attempt < 2) : (attempt += 1) {
-        if (object.bucket_meta.getNamed(svc, arena, doc) catch null) |text| {
-            var k = keys.loadHostKey(gpa, text) catch break;
-            if (k == .ed25519) return k.ed25519;
-            k.deinit(gpa);
-            break;
-        }
+    load: {
         var buf: [1024]u8 = undefined;
-        const text = keys.encodeOpenSsh(Ed.KeyPair.generate(), &buf) catch break;
-        // Written under a cluster lock; read back so racing nodes agree on one key.
-        object.bucket_meta.setNamed(svc, doc, text) catch break;
+        const fresh = keys.encodeOpenSsh(Ed.KeyPair.generate(), &buf) catch break :load;
+        // The first node to start stores its key; the others adopt it.
+        const text = object.bucket_meta.initNamed(svc, arena, doc, fresh) catch break :load;
+        var k = keys.loadHostKey(gpa, text) catch break :load;
+        if (k == .ed25519) return k.ed25519;
+        k.deinit(gpa);
     }
     std.log.warn("sftp: host key could not be shared; using an ephemeral one", .{});
     return Ed.KeyPair.generate();
