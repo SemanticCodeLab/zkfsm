@@ -1,6 +1,6 @@
 //! Swift account and container metadata. Account metadata (incl. temp URL keys)
-//! lives in one small file per account under `<state_dir>/swift` (memory only
-//! without a state dir); container metadata is stored as reserved bucket tags.
+//! is one named document per account in the object layer, shared by every node;
+//! container metadata and settings are stored as reserved bucket tags.
 const std = @import("std");
 const object = @import("../object/root.zig");
 const util = @import("swift_util.zig");
@@ -13,6 +13,11 @@ pub const max_total = 4096;
 pub const tag_prefix = "swift-meta:";
 pub const max_container_name = 128 - tag_prefix.len;
 pub const owner_tag = "swift-owner";
+pub const sys_prefix = "swift-sys:";
+pub const sys_read = "read";
+pub const sys_write = "write";
+pub const sys_versions = "versions";
+pub const sys_expiry = "expiry";
 const owner_name = "@owner";
 
 pub const Meta = struct { name: []const u8, value: []const u8 };
@@ -76,17 +81,16 @@ pub const Account = struct { meta: []Meta, owner: ?[]const u8 };
 
 pub const AccountStore = struct {
     gpa: std.mem.Allocator,
-    /// `<state_dir>/swift`, or null for memory only.
+    /// Null keeps accounts in memory only (tests).
+    svc: ?*object.ObjectService = null,
+    /// `<state_dir>/swift`: read-only fallback for records written by older versions.
     dir: ?[]const u8 = null,
     mutex: std.Thread.Mutex = .{},
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, state_dir: ?[]const u8) error{OutOfMemory}!AccountStore {
-        var s: AccountStore = .{ .gpa = gpa };
-        if (state_dir) |d| {
-            s.dir = try std.fs.path.join(gpa, &.{ d, "swift" });
-            std.fs.cwd().makePath(s.dir.?) catch {};
-        }
+    pub fn init(gpa: std.mem.Allocator, svc: ?*object.ObjectService, state_dir: ?[]const u8) error{OutOfMemory}!AccountStore {
+        var s: AccountStore = .{ .gpa = gpa, .svc = svc };
+        if (state_dir) |d| s.dir = try std.fs.path.join(gpa, &.{ d, "swift" });
         return s;
     }
 
@@ -100,30 +104,28 @@ pub const AccountStore = struct {
         if (s.dir) |d| s.gpa.free(d);
     }
 
-    fn fileName(buf: []u8, account: []const u8) []const u8 {
-        var w: std.Io.Writer = .fixed(buf);
-        w.print("acct-{x}", .{account}) catch return "";
-        return w.buffered();
+    fn docName(buf: []u8, account: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "swift-account/{s}", .{account}) catch "";
     }
 
-    /// Encoded record (copied into `a`), loading it from disk on first use.
-    fn loadLocked(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error![]const u8 {
-        if (s.map.get(account)) |v| return a.dupe(u8, v);
+    fn legacy(s: *AccountStore, a: std.mem.Allocator, account: []const u8) []const u8 {
         const dir = s.dir orelse return "";
         var nb: [2 * util_max_account + 8]u8 = undefined;
-        const name = fileName(&nb, account);
-        var d = std.fs.cwd().openDir(dir, .{}) catch return error.Storage;
+        const name = std.fmt.bufPrint(&nb, "acct-{x}", .{account}) catch return "";
+        var d = std.fs.cwd().openDir(dir, .{}) catch return "";
         defer d.close();
-        const bytes = d.readFileAlloc(s.gpa, name, max_total * 3) catch |e| return switch (e) {
-            error.FileNotFound => "",
+        return d.readFileAlloc(a, name, max_total * 3) catch "";
+    }
+
+    /// Encoded record in `a`: the shared document, else a legacy file, else empty.
+    fn loadLocked(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error![]const u8 {
+        const svc = s.svc orelse return if (s.map.get(account)) |v| a.dupe(u8, v) else "";
+        var nb: [util_max_account + 16]u8 = undefined;
+        const doc = object.bucket_meta.getNamed(svc, a, docName(&nb, account)) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Storage,
         };
-        errdefer s.gpa.free(bytes);
-        const key = try s.gpa.dupe(u8, account);
-        errdefer s.gpa.free(key);
-        try s.map.put(s.gpa, key, bytes);
-        return a.dupe(u8, bytes);
+        return doc orelse s.legacy(a, account);
     }
 
     pub fn get(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error!Account {
@@ -149,14 +151,15 @@ pub const AccountStore = struct {
         const merged = try merge(a, cur.meta, changes);
         var w: std.Io.Writer.Allocating = .init(a);
         encode(&w.writer, merged, owner) catch return error.OutOfMemory;
+        if (s.svc) |svc| {
+            var nb: [util_max_account + 16]u8 = undefined;
+            return object.bucket_meta.setNamed(svc, docName(&nb, account), w.written()) catch |e| switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Storage,
+            };
+        }
         const bytes = try s.gpa.dupe(u8, w.written());
         errdefer s.gpa.free(bytes);
-        if (s.dir) |dir| {
-            var nb: [2 * util_max_account + 8]u8 = undefined;
-            var d = std.fs.cwd().openDir(dir, .{}) catch return error.Storage;
-            defer d.close();
-            d.writeFile(.{ .sub_path = fileName(&nb, account), .data = bytes }) catch return error.Storage;
-        }
         if (s.map.getPtr(account)) |v| {
             s.gpa.free(v.*);
             v.* = bytes;
@@ -189,7 +192,13 @@ fn decode(a: std.mem.Allocator, bytes: []const u8) Error!Account {
 
 // ---- containers (bucket tags) ----
 
-pub const Container = struct { meta: []Meta, owner: ?[]const u8, other: []object.Tag };
+pub const Container = struct {
+    meta: []Meta,
+    /// Gateway settings (ACLs, versions location, expiry marker), keyed by short name.
+    sys: []Meta = &.{},
+    owner: ?[]const u8,
+    other: []object.Tag,
+};
 
 pub fn getContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8) object.Error!Container {
     const tags = object.versioning.getBucketTags(svc, a, bucket) catch |e| switch (e) {
@@ -197,23 +206,28 @@ pub fn getContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []
         else => return e,
     };
     var meta: std.ArrayList(Meta) = .empty;
+    var sys: std.ArrayList(Meta) = .empty;
     var other: std.ArrayList(object.Tag) = .empty;
     var owner: ?[]const u8 = null;
     for (tags) |t| {
         if (std.mem.startsWith(u8, t.key, tag_prefix)) {
             try meta.append(a, .{ .name = t.key[tag_prefix.len..], .value = t.value });
+        } else if (std.mem.startsWith(u8, t.key, sys_prefix)) {
+            try sys.append(a, .{ .name = t.key[sys_prefix.len..], .value = t.value });
         } else if (std.mem.eql(u8, t.key, owner_tag)) owner = t.value else try other.append(a, t);
     }
-    return .{ .meta = meta.items, .owner = owner, .other = other.items };
+    return .{ .meta = meta.items, .sys = sys.items, .owner = owner, .other = other.items };
 }
 
-/// Merges `changes` into the container's metadata, keeping foreign tags.
-pub fn updateContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8, changes: []const Meta, owner: ?[]const u8) (object.Error || Error)!void {
+/// Merges `changes` (metadata) and `sys_changes` (settings), keeping foreign tags.
+pub fn updateContainer(svc: *object.ObjectService, a: std.mem.Allocator, bucket: []const u8, changes: []const Meta, sys_changes: []const Meta, owner: ?[]const u8) (object.Error || Error)!void {
     const cur = try getContainer(svc, a, bucket);
     const merged = try merge(a, cur.meta, changes);
+    const sys = try merge(a, cur.sys, sys_changes);
     var tags: std.ArrayList(object.Tag) = .empty;
     try tags.appendSlice(a, cur.other);
     for (merged) |m| try tags.append(a, .{ .key = try std.fmt.allocPrint(a, tag_prefix ++ "{s}", .{m.name}), .value = m.value });
+    for (sys) |m| try tags.append(a, .{ .key = try std.fmt.allocPrint(a, sys_prefix ++ "{s}", .{m.name}), .value = m.value });
     if (owner orelse cur.owner) |o| try tags.append(a, .{ .key = owner_tag, .value = o });
     if (tags.items.len > 50) return error.TooMuchMetadata;
     try object.versioning.setBucketTags(svc, bucket, if (tags.items.len == 0) null else tags.items);
@@ -242,21 +256,13 @@ test "metadata from headers and merge" {
     try std.testing.expectError(error.BadMetadata, fromHeaders(a, &.{.{ .name = "X-Container-Meta-a", .value = "v" ** 300 }}, "x-container-meta-", 100));
 }
 
-test "account store persists" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &pbuf);
+test "account store merges updates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    {
-        var s = try AccountStore.init(std.testing.allocator, dir);
-        defer s.deinit();
-        try s.update("AUTH_t", &.{.{ .name = "temp-url-key", .value = "k1" }}, "alice");
-        try s.update("AUTH_t", &.{.{ .name = "color", .value = "red" }}, "alice");
-    }
-    var s = try AccountStore.init(std.testing.allocator, dir);
+    var s = try AccountStore.init(std.testing.allocator, null, null);
     defer s.deinit();
+    try s.update("AUTH_t", &.{.{ .name = "temp-url-key", .value = "k1" }}, "alice");
+    try s.update("AUTH_t", &.{.{ .name = "color", .value = "red" }}, "alice");
     const acct = try s.get(arena.allocator(), "AUTH_t");
     try std.testing.expectEqualStrings("k1", find(acct.meta, "temp-url-key").?);
     try std.testing.expectEqualStrings("red", find(acct.meta, "color").?);

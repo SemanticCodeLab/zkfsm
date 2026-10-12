@@ -1,5 +1,6 @@
 //! heal: HealthScanner → HealPlanner → HealExecutor, as a background loop or one-shot pass.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const iface = @import("../backend/root.zig");
 const placement = @import("../placement/root.zig");
 const protection = @import("../protection/root.zig");
@@ -7,7 +8,7 @@ const protection = @import("../protection/root.zig");
 pub const scanner = @import("scanner.zig");
 pub const planner = @import("planner.zig");
 pub const executor = @import("executor.zig");
-pub const stats = @import("stats.zig");
+pub const pass_ring = @import("stats.zig");
 
 pub const Config = scanner.Config;
 pub const Report = executor.Report;
@@ -28,8 +29,35 @@ pub const Healer = struct {
     /// Cluster sets: whether this node verifies keys now (the set's heal leader, or
     /// it holds a fresh drive). Null: always.
     leader: ?Leader = null,
-    /// Pass counters for admin observability.
-    stats: stats.Stats = .{},
+    /// Pass counters and completion times for the admin views.
+    ring: pass_ring.Stats = .{},
+    /// Last finished pass, for status pages.
+    stats_lock: std.Thread.Mutex = .{},
+    stats: Status = .{},
+
+    pub const Status = struct {
+        running: bool = false,
+        passes: u64 = 0,
+        last_end_s: i64 = 0,
+        last: Report = .{},
+    };
+
+    pub fn status(self: *Healer) Status {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        return self.stats;
+    }
+
+    fn setRunning(self: *Healer, on: bool, r: ?Report) void {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        self.stats.running = on;
+        if (r) |x| {
+            self.stats.last = x;
+            self.stats.passes += 1;
+            self.stats.last_end_s = std.time.timestamp();
+        }
+    }
 
     pub const Leader = struct {
         ctx: *anyopaque,
@@ -44,23 +72,51 @@ pub const Healer = struct {
     pub fn runOnce(self: *Healer) Error!Report {
         self.pass_lock.lock();
         defer self.pass_lock.unlock();
-        self.stats.begin();
-        errdefer self.stats.abort();
+        self.ring.begin();
+        errdefer self.ring.abort();
+        self.setRunning(true, null);
+        var done: ?Report = null;
+        defer self.setRunning(false, done);
         var throttle: scanner.Throttle = .{ .per_sec = self.cfg.rate_per_sec, .stop = &self.stop_ev };
         var cfg = self.cfg;
         if (self.leader) |l| cfg.walk_keys = self.hasFresh() or l.func(l.ctx, self.drives);
         var sc: scanner.HealthScanner = .{ .gpa = self.gpa, .drives = self.drives, .throttle = &throttle, .cfg = cfg };
-        var scan = try sc.scan();
+        _ = stats.passes_started.fetchAdd(1, .monotonic);
+        // Detached: a pass touches every object, so its storage calls are not traced.
+        var scan_sp = core.trace.root("scanner.pass", .internal, .scanner, .{ .detached = true });
+        var scan = sc.scan() catch |e| {
+            scan_sp.fail(@errorName(e));
+            scan_sp.end();
+            return e;
+        };
         defer scan.deinit(self.gpa);
+        scan_sp.int("scanner.entries", @intCast(scan.entries));
+        scan_sp.end();
         var plan = try planner.plan(self.gpa, self.drives, &scan);
         defer plan.deinit(self.gpa);
         var report: Report = .{ .entries_scanned = scan.entries };
         var ex: executor.HealExecutor = .{ .drives = self.drives, .strategy = self.strategy, .throttle = &throttle };
-        try ex.run(&plan, &report);
+        var heal_sp = core.trace.root("heal.pass", .internal, .healing, .{ .detached = true });
+        ex.run(&plan, &report) catch |e| {
+            heal_sp.fail(@errorName(e));
+            heal_sp.end();
+            return e;
+        };
+        heal_sp.int("heal.keys_checked", @intCast(report.keys_checked));
+        heal_sp.int("heal.repaired", @intCast(report.replicas_repaired));
+        heal_sp.int("heal.unrepaired", @intCast(report.replicas_unrepaired));
+        if (!report.fullyRedundant()) heal_sp.fail("not fully redundant");
+        heal_sp.end();
+        _ = stats.passes_finished.fetchAdd(1, .monotonic);
+        _ = stats.entries_scanned.fetchAdd(report.entries_scanned, .monotonic);
+        _ = stats.keys_checked.fetchAdd(report.keys_checked, .monotonic);
+        _ = stats.repaired.fetchAdd(report.replicas_repaired, .monotonic);
+        stats.last_finished_s.store(std.time.timestamp(), .monotonic);
         if (report.fullyRedundant() and cfg.walk_keys and !scan.incomplete) {
             for (self.drives.drives) |*d| d.fresh.store(false, .release);
         }
-        self.stats.end(report.entries_scanned, report.keys_checked, report.replicas_repaired, report.replicas_unrepaired);
+        done = report;
+        self.ring.end(report.entries_scanned, report.keys_checked, report.replicas_repaired, report.replicas_unrepaired);
         return report;
     }
 
@@ -140,6 +196,17 @@ pub const Healer = struct {
 const wake_step_ns = std.time.ns_per_s;
 const fresh_retry_ns = 30 * std.time.ns_per_s;
 
+/// Process-wide pass counters (all erasure sets of this node), read by metrics.
+pub const stats = struct {
+    pub var passes_started: std.atomic.Value(u64) = .init(0);
+    pub var passes_finished: std.atomic.Value(u64) = .init(0);
+    pub var entries_scanned: std.atomic.Value(u64) = .init(0);
+    pub var keys_checked: std.atomic.Value(u64) = .init(0);
+    pub var repaired: std.atomic.Value(u64) = .init(0);
+    /// Unix seconds of the last finished pass; 0 before the first.
+    pub var last_finished_s: std.atomic.Value(i64) = .init(0);
+};
+
 pub fn logReport(r: Report) void {
     std.log.info(
         "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} purged={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
@@ -216,5 +283,5 @@ test {
     _ = scanner;
     _ = planner;
     _ = executor;
-    _ = stats;
+    _ = pass_ring;
 }

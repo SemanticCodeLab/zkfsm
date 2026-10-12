@@ -27,6 +27,18 @@ pub const hdr_etag = "x-minio-source-etag";
 const max_delete_attempts = 50;
 
 pub fn process(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Entry) Outcome {
+    var sp = core.trace.root("replication", .producer, .replication, .{});
+    defer sp.end();
+    sp.str("path", e.key);
+    sp.str("aws.s3.bucket", e.bucket);
+    sp.str("replication.op", @tagName(e.op));
+    const out = processInner(r, hc, a, e);
+    sp.str("replication.outcome", @tagName(out));
+    if (out == .retry) sp.fail("retry");
+    return out;
+}
+
+fn processInner(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Entry) Outcome {
     const bid = r.svc.bucketId(e.bucket) catch |err| return if (err == error.NoSuchBucket) .drop else .retry;
     const version = ov.parseVersionId(e.version) catch return .drop;
     const d = (r.destByArn(a, bid, e.bucket, e.arn) catch return .retry) orelse return .drop;
@@ -150,7 +162,7 @@ fn replicaHeaders(a: Allocator, hs: *std.ArrayList(Header), info: object.ObjectI
 
 fn sendObject(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
     return sendObjectInner(r, hc, a, d, e, info) catch |err| switch (err) {
-        error.OutOfMemory, error.SourceFailed, error.InvalidEndpoint => failed(r, d, e, info.size, @errorName(err)),
+        error.OutOfMemory, error.SourceFailed, error.SinkFailed, error.InvalidEndpoint => failed(r, d, e, info.size, @errorName(err)),
         error.Unreachable => unreachable_(r, d, e, info.size),
     };
 }

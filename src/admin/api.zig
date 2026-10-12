@@ -71,6 +71,9 @@ pub const Request = struct {
     body: []const u8,
     caller: Caller,
     now_s: i64,
+    /// Key derivation for sealed responses: PBKDF2 when the client asks for it
+    /// (the web console), else the madmin default Argon2id.
+    kdf: sio.Algorithm = .argon2id_aes_gcm,
 };
 
 pub const Response = struct {
@@ -129,7 +132,7 @@ pub const Ctx = struct {
 
     pub fn encrypted(c: *const Ctx, v: anytype) Error!Response {
         const plain = try std.json.Stringify.valueAlloc(c.a, v, .{ .emit_null_optional_fields = false });
-        const ct = sio.encrypt(c.a, c.req.caller.secret, plain) catch |e| return switch (e) {
+        const ct = sio.encryptAlg(c.a, c.req.kdf, c.req.caller.secret, plain) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => fail(c.a, .internal_server_error, "XMinioInternalError", "payload encryption failed"),
         };
@@ -638,13 +641,16 @@ fn listAccessKeysBulk(c: *const Ctx) Error!Response {
 
 // ---------------------------------------------------------------- info
 
+/// Reported deployment id; replication installs the persistent one at startup.
+pub var deployment_id: []const u8 = "zkfsm";
+
 fn serverInfo(c: *const Ctx) Error!Response {
     if (!try c.can(.server_info)) return denied(c.a);
     const buckets: usize = if (c.env.svc) |svc| (svc.listBuckets(c.a) catch &.{}).len else 0;
     return c.json(.{
         .mode = "online",
         .region = c.env.region,
-        .deploymentID = "zkfsm",
+        .deploymentID = deployment_id,
         .buckets = .{ .count = buckets },
         .objects = .{ .count = 0 },
         .usage = .{ .size = 0 },
@@ -681,9 +687,12 @@ fn accountInfo(c: *const Ctx) Error!Response {
         for (buckets) |b| {
             const arn = try std.fmt.allocPrint(c.a, "arn:aws:s3:::{s}/*", .{b.name});
             const tb = try c.a.create([24]u8);
+            const u = object.quota.usage(svc, b.name) catch object.quota.Usage{};
             try list.append(c.a, .{
                 .name = b.name,
                 .created = core.time.iso8601(b.created_ns, tb),
+                .size = u.bytes,
+                .objects = u.objects,
                 .access = .{
                     .read = store.authorize(id, "s3:GetObject", arn, &ctx).allowed(),
                     .write = store.authorize(id, "s3:PutObject", arn, &ctx).allowed(),

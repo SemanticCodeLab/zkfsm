@@ -15,6 +15,9 @@ const Error = service.Error;
 const Record = metadata.ObjectRecord;
 pub const Rule = metadata.lifecycle.Rule;
 pub const Filter = metadata.lifecycle.Filter;
+pub const Step = metadata.lifecycle.Step;
+pub const NoncurrentStep = metadata.lifecycle.NoncurrentStep;
+pub const max_steps = metadata.lifecycle.max_steps;
 pub const max_rules = metadata.lifecycle.max_rules;
 const day_ns: i128 = std.time.ns_per_day;
 
@@ -34,11 +37,11 @@ pub fn set(svc: *Svc, bucket: []const u8, rules: ?[]const Rule) Error!void {
     defer svc.gpa.free(enc);
     if (rules) |rs| {
         try validate(rs);
-        for (rs) |r| for ([_][]const u8{ r.transition_tier, r.noncurrent_transition_tier }) |t| {
-            if (t.len == 0) continue;
-            const reg = svc.tiers orelse return error.InvalidStorageClass;
-            if (!reg.exists(t)) return error.InvalidStorageClass;
-        };
+        for (rs) |r| {
+            for ([_][]const u8{ r.transition_tier, r.noncurrent_transition_tier }) |t| try tierExists(svc, t);
+            for (r.more_transitions) |x| try tierExists(svc, x.tier);
+            for (r.more_noncurrent) |x| try tierExists(svc, x.tier);
+        }
         enc = metadata.lifecycle.encode(svc.gpa, rs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.InvalidRule => error.InvalidRequest,
@@ -51,6 +54,38 @@ pub fn set(svc: *Svc, bucket: []const u8, rules: ?[]const Rule) Error!void {
     }.f);
 }
 
+fn tierExists(svc: *Svc, t: []const u8) Error!void {
+    if (t.len == 0) return;
+    const reg = svc.tiers orelse return error.InvalidStorageClass;
+    if (!reg.exists(t)) return error.InvalidStorageClass;
+}
+
+/// Chained transitions: strictly later steps, one kind (days or date), distinct tiers.
+fn validateChain(r: Rule) error{InvalidRequest}!void {
+    var prev_days = r.transition_days;
+    var prev_date = r.transition_date_ns;
+    for (r.more_transitions, 0..) |x, i| {
+        if ((x.days == null) == (x.date_ns == null)) return error.InvalidRequest;
+        if ((x.days == null) != (r.transition_days == null)) return error.InvalidRequest;
+        if (x.days) |d| if (d <= prev_days.?) return error.InvalidRequest;
+        if (x.date_ns) |d| if (d <= prev_date.? or @mod(d, day_ns) != 0) return error.InvalidRequest;
+        if (x.days) |t| if (r.expiration_days) |e| if (t >= e) return error.InvalidRequest;
+        if (std.mem.eql(u8, x.tier, r.transition_tier)) return error.InvalidRequest;
+        for (r.more_transitions[0..i]) |p| if (std.mem.eql(u8, p.tier, x.tier)) return error.InvalidRequest;
+        prev_days = x.days;
+        prev_date = x.date_ns;
+    }
+    var prev = r.noncurrent_transition_days orelse 0;
+    for (r.more_noncurrent, 0..) |x, i| {
+        if (x.days <= prev) return error.InvalidRequest;
+        if (r.noncurrent_days) |e| if (x.days >= e) return error.InvalidRequest;
+        if (x.newer) |n| if (n == 0 or n > 100) return error.InvalidRequest;
+        if (std.mem.eql(u8, x.tier, r.noncurrent_transition_tier)) return error.InvalidRequest;
+        for (r.more_noncurrent[0..i]) |p| if (std.mem.eql(u8, p.tier, x.tier)) return error.InvalidRequest;
+        prev = x.days;
+    }
+}
+
 /// Structural rules S3 enforces on PutBucketLifecycleConfiguration.
 pub fn validate(rules: []const Rule) error{InvalidRequest}!void {
     if (rules.len == 0 or rules.len > max_rules) return error.InvalidRequest;
@@ -59,6 +94,9 @@ pub fn validate(rules: []const Rule) error{InvalidRequest}!void {
         const any_action = r.expiration_days != null or r.expiration_date_ns != null or r.expired_object_delete_marker or
             r.noncurrent_days != null or r.abort_upload_days != null or r.hasTransition();
         if (!any_action) return error.InvalidRequest;
+        if (r.more_transitions.len > 0 and r.transition_tier.len == 0) return error.InvalidRequest;
+        if (r.more_noncurrent.len > 0 and r.noncurrent_transition_tier.len == 0) return error.InvalidRequest;
+        try validateChain(r);
         if ((r.transition_days != null or r.transition_date_ns != null) != (r.transition_tier.len > 0)) return error.InvalidRequest;
         if (r.transition_days != null and r.transition_date_ns != null) return error.InvalidRequest;
         if (r.transition_date_ns) |d| if (@mod(d, day_ns) != 0) return error.InvalidRequest;
@@ -156,11 +194,18 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
             if (try act(svc, bucket, key, null, c.created_ns, st)) st.expired += 1;
             break true;
         } else false;
-        if (!expired and c.tier.len == 0) for (rules) |r| {
+        if (!expired) for (rules) |r| {
             if (!r.enabled or r.transition_tier.len == 0 or !try matches(a, r.filter, c)) continue;
-            const due = if (r.transition_days) |d| dueAt(c.created_ns, d) <= now else if (r.transition_date_ns) |d| d <= now else false;
-            if (!due) continue;
-            count(try transition.transition(svc, bucket, c, r.transition_tier), &st.transitioned, st);
+            const steps = try r.transitions(a);
+            var target: ?usize = null;
+            for (steps, 0..) |x, i| {
+                const due = if (x.days) |d| dueAt(c.created_ns, d) <= now else if (x.date_ns) |d| d <= now else false;
+                if (due) target = i;
+            }
+            const to = target orelse continue;
+            const at = chainPos(c.tier, steps) orelse break;
+            if (at != null and at.? >= to) break;
+            count(try transition.transition(svc, bucket, c, steps[to].tier), &st.transitioned, st);
             break;
         };
     } else if (older.len == 0) {
@@ -188,15 +233,32 @@ fn applyKey(svc: *Svc, a: std.mem.Allocator, bucket: []const u8, rules: []const 
             if (try act(svc, bucket, key, o.rec.versionId(), null, st)) st.noncurrent_expired += 1;
             break true;
         } else false;
-        if (expired or o.rec.tier.len > 0 or o.rec.flags.delete_marker) continue;
+        if (expired or o.rec.flags.delete_marker) continue;
         for (rules) |r| {
-            const days = r.noncurrent_transition_days orelse continue;
-            if (!r.enabled or index < (r.noncurrent_transition_newer orelse 0)) continue;
-            if (dueAt(successor_ns, days) > now or !try matches(a, r.filter, o.rec)) continue;
-            count(try transition.transition(svc, bucket, o.rec, r.noncurrent_transition_tier), &st.noncurrent_transitioned, st);
+            if (!r.enabled or r.noncurrent_transition_days == null or !try matches(a, r.filter, o.rec)) continue;
+            const steps = try r.noncurrentTransitions(a);
+            var target: ?usize = null;
+            for (steps, 0..) |x, i| {
+                if (index < (x.newer orelse 0) or dueAt(successor_ns, x.days) > now) continue;
+                target = i;
+            }
+            const to = target orelse continue;
+            var tiers: [metadata.lifecycle.max_steps + 1]metadata.lifecycle.Step = undefined;
+            for (steps, 0..) |x, i| tiers[i] = .{ .tier = x.tier };
+            const at = chainPos(o.rec.tier, tiers[0..steps.len]) orelse break;
+            if (at != null and at.? >= to) break;
+            count(try transition.transition(svc, bucket, o.rec, steps[to].tier), &st.noncurrent_transitioned, st);
             break;
         }
     }
+}
+
+/// Where a version stands in a chain: null (local), the step index, or (outer null)
+/// a tier outside the chain, which is left alone.
+fn chainPos(tier_name: []const u8, steps: []const metadata.lifecycle.Step) ??usize {
+    if (tier_name.len == 0) return @as(?usize, null);
+    for (steps, 0..) |x, i| if (std.mem.eql(u8, x.tier, tier_name)) return @as(?usize, i);
+    return null;
 }
 
 fn count(o: transition.Outcome, done: *usize, st: *Stats) void {

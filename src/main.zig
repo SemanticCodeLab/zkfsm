@@ -18,11 +18,18 @@ const events = @import("events/root.zig");
 const ops = @import("ops/root.zig");
 const pools = @import("pools/root.zig");
 const sse = @import("sse/root.zig");
+const console_wire = @import("console_wire.zig");
+const tables = @import("tables/root.zig");
+const lambda = @import("lambda/root.zig");
+const batch = @import("batch/root.zig");
+const migrate = @import("migrate/root.zig");
+const observe = @import("observe/root.zig");
 
-pub const std_options: std.Options = .{ .log_level = .info };
+pub const std_options: std.Options = .{ .log_level = .info, .logFn = observe.logs.logFn };
 
 const usage =
-    \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
+    \\usage: zkfsm migrate ... (import a source deployment; zkfsm migrate --help)
+    \\       zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
     \\             [--domain D]... [--path-prefix P] [--health-prefix P] [--metrics-path P] [--no-minio-compat]
     \\             [--lifecycle-interval S]
     \\  heal             run one scan/heal pass over the drives and exit
@@ -74,6 +81,8 @@ const usage =
     \\             / ZKFSM_NOTIFY_... env (ENABLE=on); audit via audit_webhook / audit_kafka, or
     \\             ZKFSM_AUDIT_CONSOLE=on and ZKFSM_AUDIT_FILE=path; region from ZKFSM_REGION / MINIO_REGION;
     \\             queues under ZKFSM_EVENTS_DIR (default: <first drive>/.zkfsm/events)
+    \\lambda: GET ?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook via MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on and
+    \\             ..._ENDPOINT_<id> / _AUTH_TOKEN_<id> (or ZKFSM_LAMBDA_WEBHOOK_...), or mc admin config set lambda_webhook:<id>
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -111,6 +120,8 @@ const Config = struct {
     tls_client_ca: ?[]const u8 = null,
     tls_min_version: tls.Version = .tls12,
     kms: sse.setup.Flags = .{},
+    obs: observe.config.Flags = .{},
+    console: console_wire.Flags = .{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -226,8 +237,12 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.health_prefix = args[i];
         } else if (std.mem.eql(u8, a, "--metrics-path")) {
             cfg.metrics_path = args[i];
+        } else if (cfg.console.set(a, args[i]) catch return error.BadArgs) {
+            continue;
         } else if (sse.setup.Flags.isFlag(a)) {
             if (!cfg.kms.set(a, args[i])) return error.BadArgs;
+        } else if (observe.config.Flags.isFlag(a)) {
+            if (!cfg.obs.set(a, args[i])) return error.BadArgs;
         } else if (try gateway.parseFlag(&cfg.gateways, a, args[i])) {
             continue;
         } else if (opts.extra_flag) |f| {
@@ -282,10 +297,11 @@ pub fn run(opts: Options) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = std.process.argsAlloc(arena) catch return 1;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "migrate")) return migrate.main(gpa, args[1..]);
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
-        std.debug.print("{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, opts.extra_usage });
+        std.debug.print("{s}{s}{s}{s}{s}{s}", .{ usage, gateway.usage, sse.setup.usage, observe.config.usage, console_wire.usage, opts.extra_usage });
         return if (e == error.HelpRequested) 0 else 2;
     };
     applyEnv(arena, &cfg) catch {
@@ -409,16 +425,31 @@ pub fn run(opts: Options) u8 {
     startEvents(&notif, &svc, false);
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
     svc.events = ev_ext.sink();
-    const observers = [_]s3.Observer{ev_ext.observer()};
+    var obs_hook: observe.Late = .{};
+    const obs = startObserve(gpa, arena, cfg, &svc, auth.iam, cfg.data[0], localNodeName(arena, cfg, addr), &std.fmt.bytesToHex(drives.set.bytes, .lower), admin_prefix) orelse return 2;
+    defer obs.destroy();
+    obs.sources.drives = cfg.data;
+    obs.sources.parity = parityOf(drives.profile);
+    obs.sources.width = widthOf(drives.profile);
+    obs.sources.repl = &repl;
+    obs.sources.notifier = &notif;
+    obs_hook.set(obs);
+    const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
     var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .endpoint = std.fmt.allocPrint(arena, "{s}:{d}", .{ cfg.host, cfg.port }) catch return 1, .local = .{ .drives = &drives, .strategy = strategy, .healer = &healer } };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .ops = &ops_ctx };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg, .ops = &ops_ctx };
     var sse_route: sse.Sse = .{ .gpa = gpa };
     sse_route.attach(&kms_holder);
     metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
-    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var tables_route = tables.Tables.init(&svc, auth);
+    var batch_mgr = batch.Manager.init(gpa, .{ .svc = &svc, .sse = &sse_route });
+    batch_mgr.start();
+    var batch_api: batch.Api = .{ .m = &batch_mgr, .prefix = admin_prefix, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), batch_api.extension(), kms_admin.extension(), bridge.extension(), lambda_reg.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
+    const single_routes = [_]s3.server.RawRoute{ obs_hook.rawRoute(), tables_route.route() };
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -448,6 +479,7 @@ pub fn run(opts: Options) u8 {
         .limits = cfg.limits,
         .routing = .{ .path_prefix = cfg.path_prefix orelse "", .domains = cfg.domains, .website_domains = cfg.website_domains },
         .ops = .{ .health_prefix = cfg.health_prefix, .metrics_path = cfg.metrics_path, .minio_compat = cfg.minio_compat },
+        .raw_routes = &single_routes,
     };
     var gateways = gateway.Running.start(.{
         .gpa = gpa,
@@ -459,6 +491,11 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     defer gateways.stop();
+    var web: console_wire.Running = .{ .con = undefined, .probe = .{ .svc = &svc, .started_s = bridge.started_s, .region = ev_opts.region, .drives = &drives, .healer = if (cfg.scan_interval_s > 0) &healer else null } };
+    var inner: InnerListener = .{};
+    startConsole(gpa, arena, cfg, creds != null, &web, &inner, &server, auth, admin_prefix, federation.env) catch return 2;
+    defer web.stop();
+    defer inner.stop();
     metrics.global.counters.started_ns = std.time.nanoTimestamp();
     active_server = &server;
     ops_ctx.server = &server;
@@ -540,15 +577,20 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var notif_ready = false;
     defer if (notif_ready) notif.deinit();
     var ev_ext: events.s3ext.Ext = .{ .n = &notif };
-    const observers = [_]s3.Observer{ev_ext.observer()};
+    var obs_hook: observe.Late = .{};
+    var obs: ?*observe.Observe = null;
+    defer if (obs) |o| o.destroy();
+    const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
     var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .node = node, .pool_state = .{ .ctx = &pool_mgr, .func = pools.Manager.poolState } };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .ops = &ops_ctx, .pools = &pool_mgr };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg, .ops = &ops_ctx, .pools = &pool_mgr };
     var sse_route: sse.Sse = .{ .gpa = gpa };
     sse_route.attach(kms_holder);
     metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
-    const builtin_ext = [_]s3.Extension{ kms_admin.extension(), bridge.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var tables_route = tables.Tables.init(&svc, auth);
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), kms_admin.extension(), bridge.extension(), lambda_reg.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -564,7 +606,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{ ops_ctx.route(), cluster.server.route(node) };
+    const routes = [_]s3.server.RawRoute{ ops_ctx.route(), cluster.server.route(node), obs_hook.rawRoute(), tables_route.route() };
     var limits = cfg.limits;
     limits.rpc_workers = cluster.rpc.Rpc.serverWorkers(node.topo.nodes.len);
     var server: s3.Server = .{
@@ -586,6 +628,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     ops_ctx.server = &server;
     installStopSignals();
     var gateways: gateway.Running = .{};
+    var web: console_wire.Running = .{ .con = undefined, .probe = undefined };
+    var inner: InnerListener = .{};
     const serving = std.Thread.spawn(.{}, serveThread, .{ &server, addr, node }) catch {
         std.log.err("cannot start the listener", .{});
         return 1;
@@ -626,6 +670,17 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         const ev_opts = eventOptions(arena, cfg, node.localPath() orelse ".", addr) catch break :blk 2;
         notif = events.Notifier.init(gpa, &svc, ev_opts);
         notif_ready = true;
+        const node_name = node.topo.nodes[node.topo.local].name;
+        obs = startObserve(gpa, arena, cfg, &svc, if (iam_ready) &iam_store else null, node.localPath() orelse ".", node_name, &std.fmt.bytesToHex(node.deployment, .lower), admin_prefix) orelse break :blk 2;
+        obs.?.sources.drives = localDrives(arena, node) catch &.{};
+        obs.?.sources.parity = parityOf(node.profile);
+        obs.?.sources.width = widthOf(node.profile);
+        obs.?.sources.repl = &repl;
+        obs.?.sources.notifier = &notif;
+        obs.?.sources.nodes = .{ .ctx = node, .func = clusterNodes };
+        obs.?.peers = .{ .ctx = node, .count = node.nodeCount(), .call = eventsPeerCall };
+        obs_hook.set(obs.?);
+        peer_obs = &obs_hook;
         events_ext = .{ .ctx = &notif, .handle = eventsPeerHandle };
         startEvents(&notif, &svc, true);
         svc.events = ev_ext.sink();
@@ -647,10 +702,14 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             if (std.Thread.spawn(.{}, lifecycleLoop, .{ &svc, cfg.lifecycle_interval_s, @as(?*cluster.Node, node) })) |t| t.detach() else |_| {}
         }
         std.log.info("cluster: serving S3 on {f}", .{addr});
+        web.probe = .{ .svc = &svc, .started_s = bridge.started_s, .region = ev_opts.region, .node = node };
+        startConsole(gpa, arena, cfg, iam_ready, &web, &inner, &server, auth, admin_prefix, federation.env) catch break :blk 2;
         break :blk 0;
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    web.stop();
+    inner.stop();
     gateways.stop();
     pool_mgr.stop();
     node.stop();
@@ -703,6 +762,20 @@ fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: 
     };
 }
 
+/// Object Lambda targets from the environment; invalid ones stop startup.
+fn lambdaRegistry(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService) error{ BadArgs, OutOfMemory }!lambda.Registry {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    const targets = try lambda.config.fromEnv(arena, &env);
+    for (targets) |t| _ = lambda.config.check(arena, t) catch {
+        std.log.err("lambda_webhook:{s} from the environment: need an http(s) endpoint and readable TLS files (client cert with key)", .{t.id});
+        return error.BadArgs;
+    };
+    var reg = lambda.Registry.init(gpa, svc, targets);
+    reg.region = env.get("ZKFSM_REGION") orelse env.get("MINIO_REGION") orelse env.get("MINIO_SITE_REGION") orelse "";
+    if ((tlsPaths(arena, cfg) catch null) != null) reg.scheme = "https";
+    return reg;
+}
+
 var events_ext: cluster.node.Ext = undefined;
 
 fn eventsPeerCall(ctx: *anyopaque, peer: usize, a: std.mem.Allocator, body: []const u8) ?[]const u8 {
@@ -710,7 +783,10 @@ fn eventsPeerCall(ctx: *anyopaque, peer: usize, a: std.mem.Allocator, body: []co
     return node.extCall(peer, a, body, 8 * 1024 * 1024);
 }
 
+var peer_obs: ?*observe.Late = null;
+
 fn eventsPeerHandle(ctx: *anyopaque, a: std.mem.Allocator, body: []const u8) error{OutOfMemory}![]const u8 {
+    if (peer_obs) |l| if (try l.peerHandle(a, body)) |res| return res;
     const n: *events.Notifier = @ptrCast(@alignCast(ctx));
     return n.handlePeer(a, body);
 }
@@ -734,6 +810,62 @@ fn startEvents(n: *events.Notifier, svc: *object.ObjectService, cluster_mode: bo
     };
     metrics.global.extra[1] = .{ .ctx = n, .func = events.Notifier.render };
     n.startWatcher(if (cluster_mode) 10 else 60) catch |e| std.log.warn("events: config watcher not started: {t}", .{e});
+}
+
+/// Observability for this node: OTLP export, metrics v3, live streams, access logs.
+fn startObserve(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService, store: ?*iam.Store, drive: []const u8, node_name: []const u8, deployment: []const u8, admin_prefix: []const u8) ?*observe.Observe {
+    var env = std.process.getEnvMap(arena) catch return null;
+    const settings = observe.config.resolve(arena, cfg.obs, &env, node_name) catch |e| {
+        std.log.err("invalid observability settings (OTEL_* / --otel-* / ZKFSM_ACCESS_LOG_INTERVAL): {t}", .{e});
+        return null;
+    };
+    const state_dir = std.fs.path.join(arena, &.{ drive, ".zkfsm" }) catch return null;
+    return observe.Observe.create(gpa, svc, .{
+        .settings = settings,
+        .node = arena.dupe(u8, node_name) catch return null,
+        .deployment_id = arena.dupe(u8, deployment) catch return null,
+        .admin_prefix = admin_prefix,
+        .store = store,
+        .state_dir = state_dir,
+    }) catch null;
+}
+
+/// host:port this node is reached at (the listen address with a wildcard host replaced).
+fn localNodeName(arena: std.mem.Allocator, cfg: Config, addr: std.net.Address) []const u8 {
+    if (cfg.node_address) |n| return n;
+    if (!std.mem.eql(u8, cfg.host, "0.0.0.0") and !std.mem.eql(u8, cfg.host, "::")) return std.fmt.allocPrint(arena, "{f}", .{addr}) catch cfg.host;
+    var hb: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const h = std.posix.gethostname(&hb) catch "localhost";
+    return std.fmt.allocPrint(arena, "{s}:{d}", .{ h, cfg.port }) catch "localhost";
+}
+
+fn widthOf(p: placement.Profile) u32 {
+    return switch (p) {
+        .single => 1,
+        .replica => |n| n,
+        .erasure => |e| @as(u32, e.data) + e.parity,
+    };
+}
+
+fn parityOf(p: placement.Profile) u32 {
+    return switch (p) {
+        .single => 0,
+        .replica => |n| n - 1,
+        .erasure => |e| e.parity,
+    };
+}
+
+fn localDrives(arena: std.mem.Allocator, node: *cluster.Node) error{OutOfMemory}![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (node.local_eps) |pool| for (pool) |ep| if (ep) |e| try out.append(arena, e.path);
+    return out.items;
+}
+
+fn clusterNodes(ctx: *anyopaque) [2]usize {
+    const node: *cluster.Node = @ptrCast(@alignCast(ctx));
+    var online: usize = 0;
+    for (0..node.nodeCount()) |i| online += @intFromBool(i == node.topo.local or node.rpc.isOnline(@intCast(i)));
+    return .{ node.nodeCount(), online };
 }
 
 fn clusterReady(ctx: *anyopaque) bool {
@@ -806,6 +938,8 @@ fn lifecycleLoop(svc: *object.ObjectService, interval_s: u64, leader: ?*cluster.
     while (true) {
         std.Thread.sleep(interval_s * std.time.ns_per_s);
         if (leader) |l| if (!l.isLeader()) continue;
+        var sp = @import("core/root.zig").trace.root("ilm.lifecycle", .internal, .ilm, .{});
+        defer sp.end();
         const st = object.lifecycle.runOnce(svc, std.time.nanoTimestamp()) catch |e| {
             std.log.warn("lifecycle pass failed: {t}", .{e});
             continue;
@@ -1024,6 +1158,71 @@ test {
     _ = ops;
     _ = pools;
     _ = sse;
+    _ = observe;
+    _ = tables;
+    _ = lambda;
+    _ = batch;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
+    _ = @import("console/root.zig");
+    _ = console_wire;
+    _ = migrate;
+}
+
+/// TLS deployments: the console reaches S3 through a plain loopback listener.
+const InnerListener = struct {
+    server: s3.Server = undefined,
+    thread: ?std.Thread = null,
+
+    fn stop(l: *InnerListener) void {
+        const t = l.thread orelse return;
+        _ = l.server.requestStop();
+        t.join();
+        l.thread = null;
+    }
+};
+
+fn innerLoop(server: *s3.Server, addr: std.net.Address) void {
+    server.run(addr) catch |e| std.log.warn("console upstream listener failed: {t}", .{e});
+}
+
+fn startConsole(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, authenticated: bool, web: *console_wire.Running, inner: *InnerListener, server: *const s3.Server, auth: s3.sigv4.Config, admin_prefix: []const u8, idp_env: iam.idp.EnvConfig) error{BadArgs}!void {
+    const addr = cfg.console.listenAddress(arena) catch {
+        std.log.err("invalid --console-address: use HOST:PORT, :PORT or off", .{});
+        return error.BadArgs;
+    } orelse return;
+    if (!authenticated) {
+        std.log.info("console disabled: it needs authenticated mode", .{});
+        return;
+    }
+    const any_host = std.mem.eql(u8, cfg.host, "0.0.0.0") or std.mem.eql(u8, cfg.host, "::");
+    var up_host: []const u8 = if (any_host) "127.0.0.1" else cfg.host;
+    var up_port = cfg.port;
+    if (server.tls != null) {
+        up_host = "127.0.0.1";
+        up_port = console_wire.freeLoopbackPort() orelse {
+            std.log.warn("console not started: no loopback port for its upstream", .{});
+            return;
+        };
+        inner.server = server.*;
+        inner.server.tls = null;
+        const up = std.net.Address.parseIp(up_host, up_port) catch unreachable;
+        inner.thread = std.Thread.spawn(.{}, innerLoop, .{ &inner.server, up }) catch {
+            std.log.warn("console not started: cannot start its upstream listener", .{});
+            return;
+        };
+    }
+    web.start(gpa, addr, .{
+        .upstream = .{ .host = up_host, .port = up_port },
+        .region = if (web.probe.region.len > 0) web.probe.region else "us-east-1",
+        .admin_prefix = admin_prefix,
+        .metrics_path = cfg.metrics_path,
+        .session_ttl_s = cfg.console.session_s,
+        .s3_url = cfg.console.s3_url,
+        .s3_port = cfg.port,
+        .s3_tls = server.tls != null,
+        .secure = server.tls != null,
+        .iam = auth.iam,
+        .idp_env = idp_env,
+    }, server.svc, server.tls);
 }

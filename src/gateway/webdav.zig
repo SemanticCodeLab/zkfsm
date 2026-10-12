@@ -73,7 +73,7 @@ pub const Server = struct {
     deps: root.Deps,
     cfg: Config,
     lis: listener.Listener,
-    locks: lockm.Table,
+    locks: lockm.Store,
 
     pub fn start(deps: root.Deps, cfg: Config) root.StartError!*Server {
         if (deps.tls == null and !cfg.insecure and deps.access.iam != null) {
@@ -86,8 +86,10 @@ pub const Server = struct {
         s.deps = deps;
         s.cfg = cfg;
         s.lis = .{ .name = if (deps.tls != null) "webdav (https)" else "webdav (http)", .handler = .{ .ctx = s, .serve = serveConn }, .max_conns = 128, .idle_timeout_s = 120 };
-        s.locks.mu = .{};
-        for (&s.locks.locks) |*l| l.used = false;
+        s.locks.gpa = deps.gpa;
+        s.locks.svc = deps.access.svc;
+        s.locks.local.mu = .{};
+        for (&s.locks.local.locks) |*l| l.used = false;
         try s.lis.start(addr);
         return s;
     }
@@ -204,6 +206,10 @@ fn isCollection(k: fsm.Kind) bool {
 
 fn handle(ctx: *anyopaque, x: *http.Exchange) Error!void {
     const s: *Server = @ptrCast(@alignCast(ctx));
+    var sp = core.trace.root("webdav.request", .server, .gateway, .{});
+    defer sp.end();
+    sp.str("http.request.method", x.method);
+    sp.str("path", x.target);
     const enc = proto.stripPrefix(s.cfg.prefix, proto.uriPath(x.target)) orelse return send(x, .not_found, "", &.{});
     const path = resolve(x.arena, enc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -666,7 +672,7 @@ fn lockRes(r: *Req) Error!void {
             .timeout_s = timeout,
         }, r.now) catch |e| switch (e) {
             error.Locked => return davError(x, .locked, "<D:no-conflicting-lock/>"),
-            error.Full => return send(x, .service_unavailable, "", &.{}),
+            error.Full, error.Storage => return send(x, .service_unavailable, "", &.{}),
             error.TooLong, error.NoMatch => return send(x, .bad_request, "", &.{}),
         };
         if (!exists) {
@@ -692,7 +698,10 @@ fn lockRes(r: *Req) Error!void {
 
 fn unlockRes(r: *Req) Error!void {
     const tok = proto.parseLockToken(r.x.header("lock-token")) orelse return send(r.x, .bad_request, "", &.{});
-    r.s.locks.release(r.path, tok, r.now) catch return davError(r.x, .conflict, "<D:lock-token-matches-request-uri/>");
+    r.s.locks.release(r.path, tok, r.now) catch |e| return switch (e) {
+        error.Storage, error.Full => send(r.x, .service_unavailable, "", &.{}),
+        else => davError(r.x, .conflict, "<D:lock-token-matches-request-uri/>"),
+    };
     return send(r.x, .no_content, "", &.{});
 }
 

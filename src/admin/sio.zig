@@ -115,11 +115,16 @@ pub fn encryptWith(gpa: std.mem.Allocator, alg: Algorithm, password: []const u8,
 
 /// Encrypts with Argon2id + AES-256-GCM, madmin's default on hardware with AES.
 pub fn encrypt(gpa: std.mem.Allocator, password: []const u8, plain: []const u8) Error![]u8 {
+    return encryptAlg(gpa, .argon2id_aes_gcm, password, plain);
+}
+
+/// Seals with fresh random salt and nonce under the chosen key derivation.
+pub fn encryptAlg(gpa: std.mem.Allocator, alg: Algorithm, password: []const u8, plain: []const u8) Error![]u8 {
     var salt: [salt_len]u8 = undefined;
     var nonce: [nonce_len]u8 = undefined;
     std.crypto.random.bytes(&salt);
     std.crypto.random.bytes(&nonce);
-    return encryptWith(gpa, .argon2id_aes_gcm, password, plain, salt, nonce);
+    return encryptWith(gpa, alg, password, plain, salt, nonce);
 }
 
 /// Decrypts any of the three madmin formats. Input is untrusted.

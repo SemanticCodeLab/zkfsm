@@ -13,7 +13,8 @@ pub const limits = struct {
     pub const max_parent_bytes = 512;
     pub const max_roles_bytes = 1024;
     pub const max_tenant_bytes = 64;
-    pub const max_payload = 2 + 1 + access_key_len + 2 + max_parent_bytes + 8 + 2 + max_policy_bytes + 2 + max_roles_bytes + 1 + max_tenant_bytes;
+    pub const max_token_type_bytes = 64;
+    pub const max_payload = 2 + 1 + access_key_len + 2 + max_parent_bytes + 8 + 2 + max_policy_bytes + 2 + max_roles_bytes + 1 + max_tenant_bytes + 8 + 1 + 1 + max_token_type_bytes;
     pub const max_token_bytes = b64.Encoder.calcSize(max_payload + Hmac.mac_length);
 };
 
@@ -21,9 +22,19 @@ pub const access_key_len = 20;
 pub const secret_key_len = 40;
 const magic_v1 = [2]u8{ 'Z', '1' };
 /// v2 adds federated policy names and a tenant, and widens the parent length.
-const magic = [2]u8{ 'Z', '2' };
+const magic_v2 = [2]u8{ 'Z', '2' };
+/// v3 adds issue time, identity provider, and token revoke type (for revocation).
+const magic = [2]u8{ 'Z', '3' };
 
-pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant };
+/// Identity provider that vouched for the session; names match MinIO's userProvider.
+pub const Provider = enum(u8) {
+    builtin = 0,
+    openid = 1,
+    ldap = 2,
+    tls = 3,
+};
+
+pub const IssueError = error{ OutOfMemory, InvalidDuration, InvalidParent, SessionPolicyTooLarge, InvalidSessionPolicy, InvalidRoles, InvalidTenant, InvalidTokenType };
 pub const ValidateError = error{ MalformedToken, BadSignature, Expired, AccessKeyMismatch };
 
 pub const Request = struct {
@@ -35,6 +46,11 @@ pub const Request = struct {
     /// Federated sessions: comma-separated policy names that replace the parent lookup.
     federated_policies: ?[]const u8 = null,
     tenant: []const u8 = "",
+    provider: Provider = .builtin,
+    /// Free-form label a later revocation can target (MinIO `TokenRevokeType`).
+    token_type: []const u8 = "",
+    /// Issue time in ms; 0 takes `now_s`.
+    issued_ms: i64 = 0,
 };
 
 pub const Credentials = struct {
@@ -56,9 +72,35 @@ pub const Claims = struct {
     session_policy: ?[]const u8,
     federated_policies: ?[]const u8 = null,
     tenant: []const u8 = "",
+    /// 0 for tokens older than v3, so any revocation covers them.
+    issued_ms: i64 = 0,
+    provider: Provider = .builtin,
+    token_type: []const u8 = "",
 };
 
 pub const DecodeBuffer = [limits.max_payload + Hmac.mac_length]u8;
+
+/// Key shared by linked deployments (site replication); sessions minted under it carry
+/// `site_marker` at access key index 4 and validate on every site.
+pub const SiteKey = struct {
+    mutex: std.Thread.Mutex = .{},
+    key: ?[32]u8 = null,
+
+    pub fn set(k: *SiteKey, v: ?[32]u8) void {
+        k.mutex.lock();
+        defer k.mutex.unlock();
+        k.key = v;
+    }
+
+    pub fn get(k: *SiteKey) ?[32]u8 {
+        k.mutex.lock();
+        defer k.mutex.unlock();
+        return k.key;
+    }
+};
+
+pub var site_key: SiteKey = .{};
+pub const site_marker = '9';
 
 pub const Issuer = struct {
     key: [32]u8,
@@ -76,6 +118,7 @@ pub const Issuer = struct {
         }
         if (req.federated_policies) |r| if (r.len > limits.max_roles_bytes) return error.InvalidRoles;
         if (req.tenant.len > limits.max_tenant_bytes) return error.InvalidTenant;
+        if (req.token_type.len > limits.max_token_type_bytes) return error.InvalidTokenType;
         var creds: Credentials = .{
             .access_key = undefined,
             .secret_key = undefined,
@@ -85,7 +128,11 @@ pub const Issuer = struct {
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
         @memcpy(creds.access_key[0..4], "ASIA");
         for (creds.access_key[4..]) |*c| c.* = alphabet[rand.int(u5)];
-        creds.secret_key = self.secretFor(&creds.access_key);
+        const key = if (site_key.get()) |k| blk: {
+            creds.access_key[4] = site_marker;
+            break :blk k;
+        } else self.key;
+        creds.secret_key = secretWith(&key, &creds.access_key);
 
         var raw: DecodeBuffer = undefined;
         var w: std.Io.Writer = .fixed(&raw);
@@ -105,8 +152,12 @@ pub const Issuer = struct {
         } else w.writeInt(u16, 0xffff, .little) catch unreachable;
         w.writeByte(@intCast(req.tenant.len)) catch unreachable;
         w.writeAll(req.tenant) catch unreachable;
+        w.writeInt(i64, if (req.issued_ms != 0) req.issued_ms else now_s * 1000, .little) catch unreachable;
+        w.writeByte(@intFromEnum(req.provider)) catch unreachable;
+        w.writeByte(@intCast(req.token_type.len)) catch unreachable;
+        w.writeAll(req.token_type) catch unreachable;
         const payload_len = w.end;
-        self.mac(raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
+        macWith(&key, raw[0..payload_len], raw[payload_len..][0..Hmac.mac_length]);
         const signed = raw[0 .. payload_len + Hmac.mac_length];
         creds.session_token = try gpa.alloc(u8, b64.Encoder.calcSize(signed.len));
         _ = b64.Encoder.encode(creds.session_token, signed);
@@ -121,12 +172,17 @@ pub const Issuer = struct {
         b64.Decoder.decode(buf[0..n], token) catch return error.MalformedToken;
         const payload = buf[0 .. n - Hmac.mac_length];
         var want: [Hmac.mac_length]u8 = undefined;
-        self.mac(payload, &want);
-        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, buf[n - Hmac.mac_length ..][0..Hmac.mac_length].*))
-            return error.BadSignature;
+        const got = buf[n - Hmac.mac_length ..][0..Hmac.mac_length].*;
+        macWith(&self.key, payload, &want);
+        if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, got)) {
+            const k = site_key.get() orelse return error.BadSignature;
+            macWith(&k, payload, &want);
+            if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, got)) return error.BadSignature;
+        }
         var r: std.Io.Reader = .fixed(payload);
         const m = r.takeArray(2) catch return error.MalformedToken;
-        const v2 = std.mem.eql(u8, m, &magic);
+        const v3 = std.mem.eql(u8, m, &magic);
+        const v2 = v3 or std.mem.eql(u8, m, &magic_v2);
         if (!v2 and !std.mem.eql(u8, m, &magic_v1)) return error.MalformedToken;
         const ak_len = r.takeByte() catch return error.MalformedToken;
         const ak = r.take(ak_len) catch return error.MalformedToken;
@@ -143,6 +199,16 @@ pub const Issuer = struct {
             const tenant_len = r.takeByte() catch return error.MalformedToken;
             tenant = r.take(tenant_len) catch return error.MalformedToken;
         }
+        var issued_ms: i64 = 0;
+        var provider: Provider = .builtin;
+        var token_type: []const u8 = "";
+        if (v3) {
+            issued_ms = r.takeInt(i64, .little) catch return error.MalformedToken;
+            const pb = r.takeByte() catch return error.MalformedToken;
+            provider = std.meta.intToEnum(Provider, pb) catch return error.MalformedToken;
+            const tl = r.takeByte() catch return error.MalformedToken;
+            token_type = r.take(tl) catch return error.MalformedToken;
+        }
         if (r.seek != payload.len) return error.MalformedToken;
         if (now_s >= exp) return error.Expired;
         return .{
@@ -152,6 +218,9 @@ pub const Issuer = struct {
             .session_policy = if (pol.len == 0) null else pol,
             .federated_policies = roles,
             .tenant = tenant,
+            .issued_ms = issued_ms,
+            .provider = provider,
+            .token_type = token_type,
         };
     }
 
@@ -164,7 +233,12 @@ pub const Issuer = struct {
 
     /// Temporary secrets are derived, so no server-side session state is needed.
     pub fn secretFor(self: *const Issuer, access_key: []const u8) [secret_key_len]u8 {
-        var h = Hmac.init(&self.key);
+        if (access_key.len > 4 and access_key[4] == site_marker) if (site_key.get()) |k| return secretWith(&k, access_key);
+        return secretWith(&self.key, access_key);
+    }
+
+    fn secretWith(key: *const [32]u8, access_key: []const u8) [secret_key_len]u8 {
+        var h = Hmac.init(key);
         h.update("zkfsm-sts-secret\x00");
         h.update(access_key);
         var d: [Hmac.mac_length]u8 = undefined;
@@ -174,8 +248,8 @@ pub const Issuer = struct {
         return enc[0..secret_key_len].*;
     }
 
-    fn mac(self: *const Issuer, payload: []const u8, out: *[Hmac.mac_length]u8) void {
-        var h = Hmac.init(&self.key);
+    fn macWith(key: *const [32]u8, payload: []const u8, out: *[Hmac.mac_length]u8) void {
+        var h = Hmac.init(key);
         h.update("zkfsm-sts-token\x00");
         h.update(payload);
         h.final(out);
@@ -249,10 +323,33 @@ test "federated session carries policies and tenant" {
     try std.testing.expectEqualStrings(dn, cl.parent);
     try std.testing.expectEqualStrings("readwrite,diag", cl.federated_policies.?);
     try std.testing.expectEqualStrings("acme", cl.tenant);
+    var t = try test_issuer.issue(a, .{ .parent = "carol", .provider = .ldap, .token_type = "batch", .issued_ms = 1234 }, 0, prng.random());
+    defer t.deinit(a);
+    const tc = try test_issuer.validate(t.session_token, 0, &buf);
+    try std.testing.expectEqual(Provider.ldap, tc.provider);
+    try std.testing.expectEqualStrings("batch", tc.token_type);
+    try std.testing.expectEqual(@as(i64, 1234), tc.issued_ms);
+    try std.testing.expectError(error.InvalidTokenType, test_issuer.issue(a, .{ .parent = "x", .token_type = "t" ** 65 }, 0, prng.random()));
     var e = try test_issuer.issue(a, .{ .parent = "bob", .federated_policies = "" }, 0, prng.random());
     defer e.deinit(a);
     try std.testing.expectEqualStrings("", (try test_issuer.validate(e.session_token, 0, &buf)).federated_policies.?);
     var l = try test_issuer.issue(a, .{ .parent = "bob" }, 0, prng.random());
     defer l.deinit(a);
     try std.testing.expect((try test_issuer.validate(l.session_token, 0, &buf)).federated_policies == null);
+}
+
+test "site key sessions validate on another issuer" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(3);
+    site_key.set(@splat(9));
+    defer site_key.set(null);
+    var c = try test_issuer.issue(a, .{ .parent = "alice" }, 1000, prng.random());
+    defer c.deinit(a);
+    try std.testing.expectEqual(site_marker, c.access_key[4]);
+    const other: Issuer = .{ .key = @splat(8) };
+    var buf: DecodeBuffer = undefined;
+    _ = try other.verify(&c.access_key, c.session_token, 1100, &buf);
+    try std.testing.expectEqualSlices(u8, &c.secret_key, &other.secretFor(&c.access_key));
+    site_key.set(null);
+    try std.testing.expectError(error.BadSignature, other.validate(c.session_token, 1100, &buf));
 }

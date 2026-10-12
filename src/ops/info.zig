@@ -243,7 +243,7 @@ pub fn bgHealStatus(o: *Ops, c: *const Ctx) Error!Response {
             .id = try std.fmt.allocPrint(a, "{d}-{d}", .{ s.pool, s.set }),
             .pool_index = s.pool,
             .set_index = s.set,
-            .heal_status = if (s.healer.stats.running_since_ms.load(.acquire) != 0) "running" else "idle",
+            .heal_status = if (s.healer.ring.running_since_ms.load(.acquire) != 0) "running" else "idle",
             .total_objects = recordCount(s),
             .disks = disks.items,
         });

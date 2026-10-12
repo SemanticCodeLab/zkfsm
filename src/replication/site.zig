@@ -27,6 +27,8 @@ pub const Peer = struct {
     /// `http(s)://host:port` as given to `mc admin replicate add`.
     endpoint: []const u8,
     deployment_id: []const u8,
+    /// Synchronous replication to this site (`mc admin replicate update --sync`).
+    sync: bool = false,
 };
 
 pub const State = struct {
@@ -93,6 +95,15 @@ pub fn remoteFor(st: State, p: Peer) client.Remote {
         .access_key = st.svc_access_key,
         .secret_key = st.svc_secret,
     };
+}
+
+/// Lets STS sessions minted on any site validate on every peer.
+pub fn installStsKey(st: ?State) void {
+    const s = st orelse return iam.sts.site_key.set(null);
+    if (!s.enabled or s.svc_secret.len == 0) return iam.sts.site_key.set(null);
+    var k: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&k, "zkfsm-site-sts", s.svc_secret);
+    iam.sts.site_key.set(k);
 }
 
 // ---- change capture ----
@@ -198,6 +209,8 @@ const subresources = [_]struct { name: []const u8, root: []const u8, deletable: 
     .{ .name = "tagging", .root = "<Tagging", .deletable = true },
     .{ .name = "encryption", .root = "<ServerSideEncryptionConfiguration", .deletable = true },
     .{ .name = "cors", .root = "<CORSConfiguration", .deletable = true },
+    .{ .name = "website", .root = "<WebsiteConfiguration", .deletable = true },
+    .{ .name = "ownershipControls", .root = "<OwnershipControls", .deletable = true },
 };
 
 fn pushBucket(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, st: State, remote: client.Remote, bucket: []const u8) client.Error!Outcome {

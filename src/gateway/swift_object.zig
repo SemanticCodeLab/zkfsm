@@ -20,6 +20,8 @@ pub const max_dlo_segments = 10_000;
 pub const max_object_size: u64 = 5 * 1024 * 1024 * 1024 + 2;
 const slo_hdr = object.internal_prefix ++ "swift-slo";
 const dlo_hdr = object.internal_prefix ++ "swift-dlo";
+const delete_at_hdr = object.internal_prefix ++ "swift-delete-at";
+const deleted_marker_type = "application/x-deleted;swift_versions_deleted=1";
 const io_buf = 64 * 1024;
 
 pub fn dispatch(c: *Ctx) ConnError!void {
@@ -36,6 +38,177 @@ pub fn dispatch(c: *Ctx) ConnError!void {
 fn internal(info: object.ObjectInfo, name: []const u8) ?[]const u8 {
     for (info.internal) |x| if (std.mem.eql(u8, x.name, name)) return x.value;
     return null;
+}
+
+/// Unix second at which `info` expires (X-Delete-At), if set.
+pub fn deleteAt(info: object.ObjectInfo) ?i64 {
+    const v = internal(info, delete_at_hdr) orelse return null;
+    return std.fmt.parseInt(i64, v, 10) catch null;
+}
+
+fn expired(info: object.ObjectInfo) bool {
+    const at = deleteAt(info) orelse return false;
+    return at <= std.time.timestamp();
+}
+
+/// Head that treats expired objects as gone, removing them on the way.
+fn headLive(c: *Ctx, bucket: []const u8, key: []const u8) object.Error!object.ObjectInfo {
+    const info = try c.svc().head(c.a, bucket, key);
+    if (!expired(info)) return info;
+    c.svc().delete(bucket, key) catch {};
+    return error.NoSuchKey;
+}
+
+const Expiry = union(enum) { keep, clear, at: i64 };
+
+/// X-Delete-At / X-Delete-After / X-Remove-Delete-At; responds and returns null when invalid.
+fn expiryInput(c: *Ctx) ConnError!?Expiry {
+    const now = std.time.timestamp();
+    if (c.header("x-delete-after")) |v| {
+        const n = std.fmt.parseInt(i64, std.mem.trim(u8, v, " "), 10) catch -1;
+        if (n <= 0 or n > 100 * 365 * 86400) {
+            try c.fail(.bad_request, "Non-integer or non-positive X-Delete-After");
+            return null;
+        }
+        return .{ .at = now + n };
+    }
+    if (c.header("x-delete-at")) |v| {
+        const t = std.mem.trim(u8, v, " ");
+        if (t.len == 0) return .clear;
+        const n = std.fmt.parseInt(i64, t, 10) catch {
+            try c.fail(.bad_request, "Non-integer X-Delete-At");
+            return null;
+        };
+        if (n <= now) {
+            try c.fail(.bad_request, "X-Delete-At in past");
+            return null;
+        }
+        return .{ .at = n };
+    }
+    if (c.header("x-remove-delete-at") != null) return .clear;
+    return .keep;
+}
+
+/// Appends the expiry marker to `list` and flags the container for the expirer.
+fn applyExpiry(c: *Ctx, e: Expiry, bucket: []const u8, list: *std.ArrayList(object.Header)) ConnError!void {
+    switch (e) {
+        .keep => {},
+        .clear => try list.append(c.a, .{ .name = delete_at_hdr, .value = "" }),
+        .at => |t| {
+            try list.append(c.a, .{ .name = delete_at_hdr, .value = try std.fmt.allocPrint(c.a, "{d}", .{t}) });
+            const cm = meta.getContainer(c.svc(), c.a, bucket) catch return;
+            if (meta.find(cm.sys, meta.sys_expiry) == null)
+                meta.updateContainer(c.svc(), c.a, bucket, &.{}, &.{.{ .name = meta.sys_expiry, .value = "1" }}, null) catch {};
+        },
+    }
+}
+
+/// Deletes expired objects of containers that ever stored an expiring object.
+pub fn sweepExpired(svc: *object.ObjectService, gpa: std.mem.Allocator, budget: usize) void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const buckets = svc.listBuckets(arena_state.allocator()) catch return;
+    var left = budget;
+    const now = std.time.timestamp();
+    for (buckets) |b| {
+        const cm = meta.getContainer(svc, arena_state.allocator(), b.name) catch continue;
+        if (meta.find(cm.sys, meta.sys_expiry) == null) continue;
+        var cursor: std.ArrayList(u8) = .empty;
+        defer cursor.deinit(gpa);
+        while (left > 0) {
+            var page = std.heap.ArenaAllocator.init(gpa);
+            defer page.deinit();
+            const a = page.allocator();
+            const r = svc.list(a, b.name, .{ .start_after = cursor.items, .max_keys = @min(left, 1000) }) catch break;
+            for (r.contents) |e| {
+                const info = svc.head(a, b.name, e.key) catch continue;
+                const at = deleteAt(info) orelse continue;
+                if (at <= now) svc.delete(b.name, e.key) catch {};
+            }
+            left -|= r.contents.len;
+            if (!r.is_truncated or r.contents.len == 0) break;
+            cursor.clearRetainingCapacity();
+            cursor.appendSlice(gpa, r.contents[r.contents.len - 1].key) catch break;
+        }
+    }
+}
+
+// ---- object versioning (X-Versions-Location / X-History-Location) ----
+
+const Versions = struct { history: bool, container: []const u8 };
+
+fn versionsOf(c: *Ctx, bucket: []const u8) ?Versions {
+    const cm = meta.getContainer(c.svc(), c.a, bucket) catch return null;
+    const v = meta.find(cm.sys, meta.sys_versions) orelse return null;
+    const i = std.mem.indexOfScalar(u8, v, ':') orelse return null;
+    if (i + 1 >= v.len) return null;
+    return .{ .history = std.mem.eql(u8, v[0..i], "history"), .container = v[i + 1 ..] };
+}
+
+/// Archive name prefix: 3 hex digits of the name length, the name, a slash.
+fn archivePrefix(c: *Ctx, name: []const u8) ConnError![]const u8 {
+    return std.fmt.allocPrint(c.a, "{x:0>3}{s}/", .{ name.len, name });
+}
+
+/// Copies the current `bucket/key` (if any) into the versions container.
+/// Responds and returns false when the archive cannot take it.
+fn archiveCurrent(c: *Ctx, bucket: []const u8, key: []const u8) ConnError!bool {
+    const v = versionsOf(c, bucket) orelse return true;
+    const cur = headLive(c, bucket, key) catch |e| switch (e) {
+        error.NoSuchKey, error.NoSuchBucket => return true,
+        else => {
+            try c.failObj(e);
+            return false;
+        },
+    };
+    // Manifests of dynamic large objects are not versioned (as in Swift).
+    if (kindOf(cur) == .dlo) return true;
+    var tb: [32]u8 = undefined;
+    const name = try std.fmt.allocPrint(c.a, "{s}{s}", .{ try archivePrefix(c, key), util.timestamp(&tb, cur.created_ns) });
+    _ = object.copy.copyObject(c.svc(), .{ .bucket = bucket, .key = key }, v.container, name, .{}) catch |e| {
+        switch (e) {
+            error.NoSuchBucket => try c.fail(.precondition_failed, "The versions container does not exist."),
+            else => try c.failObj(e),
+        }
+        return false;
+    };
+    return true;
+}
+
+/// Newest archived version of `key` in `archive`, or null.
+fn newestArchived(c: *Ctx, archive: []const u8, key: []const u8) ConnError!?[]const u8 {
+    const prefix = try archivePrefix(c, key);
+    var last: ?[]const u8 = null;
+    var cursor: []const u8 = "";
+    while (true) {
+        const r = c.svc().list(c.a, archive, .{ .prefix = prefix, .start_after = cursor, .max_keys = 1000 }) catch return last;
+        if (r.contents.len == 0) break;
+        last = r.contents[r.contents.len - 1].key;
+        if (!r.is_truncated) break;
+        cursor = last.?;
+    }
+    return last;
+}
+
+/// DELETE on a versioned container: restore the previous version (stack mode)
+/// or archive the object and leave a delete marker (history mode).
+fn versionedDelete(c: *Ctx, v: Versions) ConnError!void {
+    if (v.history) {
+        if (!try archiveCurrent(c, c.container, c.object)) return;
+        var tb: [32]u8 = undefined;
+        const name = try std.fmt.allocPrint(c.a, "{s}{s}", .{ try archivePrefix(c, c.object), util.timestamp(&tb, std.time.nanoTimestamp()) });
+        var empty: std.Io.Reader = .fixed("");
+        _ = c.svc().put(v.container, name, &empty, .{ .content_type = deleted_marker_type, .content_length = 0 }) catch |e| return c.failObj(e);
+        c.svc().delete(c.container, c.object) catch |e| return c.failObj(e);
+        return c.send(.no_content, "", null, &.{});
+    }
+    const prev = (try newestArchived(c, v.container, c.object)) orelse {
+        c.svc().delete(c.container, c.object) catch |e| return c.failObj(e);
+        return c.send(.no_content, "", null, &.{});
+    };
+    _ = object.copy.copyObject(c.svc(), .{ .bucket = v.container, .key = prev }, c.container, c.object, .{}) catch |e| return c.failObj(e);
+    c.svc().delete(v.container, prev) catch {};
+    return c.send(.no_content, "", null, &.{});
 }
 
 /// ETag as Swift prints it: hex MD5, or "<hex>-<parts>" for multipart uploads.
@@ -205,9 +378,14 @@ fn sliceSegs(a: std.mem.Allocator, segs: []const blob.Segment, r: core.Range) er
     return out.items;
 }
 
-pub fn listingRow(c: *Ctx, e: object.list.Entry) ConnError!listing.ObjectRow {
+/// Null for an object past its X-Delete-At (it is removed on the way).
+pub fn listingRow(c: *Ctx, e: object.list.Entry) ConnError!?listing.ObjectRow {
     var row: listing.ObjectRow = .{ .name = e.key, .hash = try etagHex(c.a, e.etag), .bytes = e.size, .content_type = "application/octet-stream", .mtime_ns = e.mtime_ns };
     const info = c.svc().head(c.a, c.container, e.key) catch return row;
+    if (expired(info)) {
+        c.svc().delete(c.container, e.key) catch {};
+        return null;
+    }
     if (info.content_type.len > 0) row.content_type = info.content_type;
     if (internal(info, slo_hdr)) |v| if (std.mem.indexOfScalar(u8, v, ' ')) |sp| {
         row.bytes = std.fmt.parseInt(u64, v[0..sp], 10) catch row.bytes;
@@ -240,6 +418,7 @@ fn objectHeaders(c: *Ctx, r: Resolved, list: *std.ArrayList(Header)) ConnError!v
         .{ sys.content_language, "Content-Language" },
         .{ sys.expires, "Expires" },
     }) |p| if (p[0].len > 0 and !(c.tempurl and std.mem.eql(u8, p[1], "Content-Disposition"))) try list.append(c.a, .{ .name = p[1], .value = p[0] });
+    if (internal(info, delete_at_hdr)) |v| if (v.len > 0) try list.append(c.a, .{ .name = "X-Delete-At", .value = v });
     switch (r.kind) {
         .slo => try list.append(c.a, .{ .name = "X-Static-Large-Object", .value = "True" }),
         .dlo => try list.append(c.a, .{ .name = "X-Object-Manifest", .value = internal(info, dlo_hdr).? }),
@@ -267,7 +446,7 @@ fn contentDisposition(c: *Ctx) ConnError!?[]const u8 {
 
 fn get(c: *Ctx) ConnError!void {
     if (!c.allowed(if (c.method == .HEAD) .head_object else .get_object, c.container, c.object)) return c.denied();
-    const info = c.svc().head(c.a, c.container, c.object) catch |e| return c.failObj(e);
+    const info = headLive(c, c.container, c.object) catch |e| return c.failObj(e);
     const mm = c.q("multipart-manifest");
     if (mm != null and std.mem.eql(u8, mm.?, "get") and kindOf(info) == .slo) return getManifest(c, info);
 
@@ -451,15 +630,17 @@ fn put(c: *Ctx) ConnError!void {
     };
     if (c.header("etag")) |e| in.content_md5 = util.parseMd5Hex(e) orelse return c.fail(.unprocessable_entity, "Invalid Etag.");
     if (c.header("if-none-match")) |v| in.conditions.if_none_match = v;
-    var internal_buf: [1]object.Header = undefined;
+    var internals: std.ArrayList(object.Header) = .empty;
+    try applyExpiry(c, (try expiryInput(c)) orelse return, c.container, &internals);
     if (c.header("x-object-manifest")) |v| {
         if (c.tempurl) return c.fail(.bad_request, "Manifests are not allowed with a temp URL.");
         const dec = util.percentDecodeAlloc(c.a, v, false) catch return c.fail(.bad_request, "Invalid X-Object-Manifest.");
         if (splitManifest(dec) == null or dec.len > 1024 or !util.safeValue(dec)) return c.fail(.bad_request, "X-Object-Manifest must be <container>/<prefix>.");
-        internal_buf[0] = .{ .name = dlo_hdr, .value = dec };
-        in.internal = &internal_buf;
+        try internals.append(c.a, .{ .name = dlo_hdr, .value = dec });
     }
+    in.internal = internals.items;
     if (c.svc().headBucket(c.container)) |_| {} else |e| return c.failObj(e);
+    if (!try archiveCurrent(c, c.container, c.object)) return;
     var body_buf: [io_buf]u8 = undefined;
     const body = try c.req.readerExpectContinue(&body_buf);
     const info = c.svc().put(c.container, c.object, body, in) catch |e| return c.failObj(e);
@@ -519,13 +700,16 @@ fn sloPut(c: *Ctx) ConnError!void {
     const total = slo.totalBytes(stored);
     var out: std.Io.Writer.Allocating = .init(c.a);
     slo.renderStored(&out.writer, stored) catch return error.OutOfMemory;
-    const marker = [_]object.Header{.{ .name = slo_hdr, .value = try std.fmt.allocPrint(c.a, "{d} {s}", .{ total, &tag }) }};
+    var marker: std.ArrayList(object.Header) = .empty;
+    try marker.append(c.a, .{ .name = slo_hdr, .value = try std.fmt.allocPrint(c.a, "{d} {s}", .{ total, &tag }) });
+    try applyExpiry(c, (try expiryInput(c)) orelse return, c.container, &marker);
+    if (!try archiveCurrent(c, c.container, c.object)) return;
     var src: std.Io.Reader = .fixed(out.written());
     const info = c.svc().put(c.container, c.object, &src, .{
         .content_type = ci.content_type orelse "application/octet-stream",
         .metadata = ci.metadata,
         .system = ci.system,
-        .internal = &marker,
+        .internal = marker.items,
     }) catch |e| return c.failObj(e);
     return created(c, info, try std.fmt.allocPrint(c.a, "\"{s}\"", .{&tag}), &.{});
 }
@@ -534,10 +718,13 @@ fn sloPut(c: *Ctx) ConnError!void {
 
 fn post(c: *Ctx) ConnError!void {
     if (!c.allowed(.put_object, c.container, c.object)) return c.denied();
-    const info = c.svc().head(c.a, c.container, c.object) catch |e| return c.failObj(e);
+    const info = headLive(c, c.container, c.object) catch |e| return c.failObj(e);
     const ci = (try commonInput(c)) orelse return;
+    var internals: std.ArrayList(object.Header) = .empty;
+    try applyExpiry(c, (try expiryInput(c)) orelse return, c.container, &internals);
     _ = object.copy.copyObject(c.svc(), .{ .bucket = c.container, .key = c.object }, c.container, c.object, .{
         .put = .{
+            .internal = internals.items,
             .content_type = ci.content_type orelse info.content_type,
             .metadata = ci.metadata,
             .system = if (ci.has_system) ci.system else info.system,
@@ -564,8 +751,14 @@ fn copyVerb(c: *Ctx) ConnError!void {
 
 fn copyObj(c: *Ctx, sc: []const u8, so: []const u8, dc: []const u8, do: []const u8) ConnError!void {
     if (!c.allowed(.get_object, sc, so) or !c.allowed(.put_object, dc, do)) return c.denied();
-    const info = c.svc().head(c.a, sc, so) catch |e| return c.failObj(e);
+    const info = headLive(c, sc, so) catch |e| return c.failObj(e);
     const ci = (try commonInput(c)) orelse return;
+    // A copy does not inherit the source's expiry unless the request sets one.
+    var internals: std.ArrayList(object.Header) = .empty;
+    var exp = (try expiryInput(c)) orelse return;
+    if (exp == .keep and deleteAt(info) != null) exp = .clear;
+    try applyExpiry(c, exp, dc, &internals);
+    if (!try archiveCurrent(c, dc, do)) return;
     const fresh = if (c.header("x-fresh-metadata")) |v| std.ascii.eqlIgnoreCase(v, "true") else false;
     var md: std.ArrayList(object.Header) = .empty;
     if (!fresh) for (info.metadata) |m| {
@@ -580,6 +773,7 @@ fn copyObj(c: *Ctx, sc: []const u8, so: []const u8, dc: []const u8, do: []const 
         .content_type = ci.content_type orelse info.content_type,
         .metadata = md.items,
         .system = if (ci.has_system) ci.system else info.system,
+        .internal = internals.items,
     };
     const mm = c.q("multipart-manifest");
     const keep_manifest = mm != null and std.mem.eql(u8, mm.?, "get");
@@ -612,9 +806,10 @@ fn copyObj(c: *Ctx, sc: []const u8, so: []const u8, dc: []const u8, do: []const 
 
 fn delete(c: *Ctx) ConnError!void {
     if (!c.allowed(.delete_object, c.container, c.object)) return c.denied();
-    const info = c.svc().head(c.a, c.container, c.object) catch |e| return c.failObj(e);
+    const info = headLive(c, c.container, c.object) catch |e| return c.failObj(e);
     const mm = c.q("multipart-manifest");
     if (mm == null or !std.mem.eql(u8, mm.?, "delete") or kindOf(info) != .slo) {
+        if (versionsOf(c, c.container)) |v| return versionedDelete(c, v);
         c.svc().delete(c.container, c.object) catch |e| return c.failObj(e);
         return c.send(.no_content, "", null, &.{});
     }

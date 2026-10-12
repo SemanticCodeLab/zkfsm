@@ -41,6 +41,8 @@ pub const RawRoute = struct {
     /// Connections that open with these bytes (before TLS) belong to this route and
     /// are served by the RPC pool; the bytes are consumed.
     preamble: ?[]const u8 = null,
+    /// When set, decides the match instead of `prefix` (e.g. by signing scope).
+    accept: ?*const fn (ctx: *anyopaque, req: *const std.http.Server.Request) bool = null,
 };
 
 /// Readiness override (cluster quorum); default is a storage sync probe.
@@ -280,8 +282,11 @@ pub const Server = struct {
         return metrics.isReady(self.svc);
     }
 
-    fn rawRoute(self: *Server, target: []const u8) ?RawRoute {
-        for (self.raw_routes) |r| if (std.mem.startsWith(u8, target, r.prefix)) return r;
+    fn rawRoute(self: *Server, req: *const std.http.Server.Request) ?RawRoute {
+        for (self.raw_routes) |r| {
+            const hit = if (r.accept) |f| f(r.ctx, req) else std.mem.startsWith(u8, req.head.target, r.prefix);
+            if (hit) return r;
+        }
         return null;
     }
 
@@ -324,7 +329,11 @@ pub const Server = struct {
             in = &t.reader;
             out = &t.writer;
         }
-        var http = std.http.Server.init(in, out);
+        var cbuf: [4096]u8 = undefined;
+        var counting: Counting = .{ .inner = out, .interface = .{ .buffer = &cbuf, .vtable = &Counting.vtable } };
+        metrics.global.tx_pending = &counting.interface;
+        defer metrics.global.tx_pending = null;
+        var http = std.http.Server.init(in, &counting.interface);
         var client_cert: ?authz.ClientCert = null;
         if (secure) |t| if (t.peerIdentity()) |p| {
             client_cert = .{ .common_name = p.common_name, .not_after_s = p.not_after_s };
@@ -352,7 +361,7 @@ pub const Server = struct {
                 },
             };
             const keep_alive = req.head.keep_alive;
-            if (self.rawRoute(req.head.target)) |r| {
+            if (self.rawRoute(&req)) |r| {
                 r.serve(r.ctx, &req, arena.allocator()) catch return;
             } else if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;
@@ -365,6 +374,7 @@ pub const Server = struct {
             } else {
                 const t0 = metrics.global.counters.begin();
                 metrics.global.last_status = 200;
+                metrics.global.tx.reset();
                 const res = handler.handle(self.svc, .{ .auth = self.auth, .peer = conn.address, .extensions = self.extensions, .observers = self.observers, .routing = self.routing, .client_cert = client_cert }, &req, arena.allocator());
                 metrics.global.counters.end(t0, metrics.global.last_status);
                 res catch |e| {
@@ -517,6 +527,40 @@ fn bodyDone(r: *std.http.Reader) bool {
     }
     return false;
 }
+
+/// Buffered pass-through feeding written bytes to `metrics.global.tx`.
+const Counting = struct {
+    inner: *std.Io.Writer,
+    interface: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn push(self: *Counting, bytes: []const u8) std.Io.Writer.Error!void {
+        try self.inner.writeAll(bytes);
+        metrics.global.tx.feed(bytes);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Counting = @fieldParentPtr("interface", w);
+        try self.push(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.push(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.push(last);
+        return n + last.len * splat;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *Counting = @fieldParentPtr("interface", w);
+        try self.push(w.buffered());
+        w.end = 0;
+        try self.inner.flush();
+    }
+};
 
 fn now() u64 {
     return @intCast(@max(0, std.time.nanoTimestamp()));

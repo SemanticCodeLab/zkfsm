@@ -7,6 +7,7 @@ const remote = @import("remote.zig");
 const sign = @import("s3/sign.zig");
 const rhttp = @import("remote/http.zig");
 const xml = @import("remote/xml.zig");
+const creds = @import("creds.zig");
 
 const Error = iface.Error;
 const ObjectMeta = iface.ObjectMeta;
@@ -50,6 +51,12 @@ pub const Config = struct {
     service: []const u8 = "s3",
     /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
     ca_file: []const u8 = "",
+    /// Sent on every object write when set (tiers with a storage class).
+    storage_class: []const u8 = "",
+    /// Lowercase header carrying `storage_class` (GCS uses x-goog-storage-class).
+    storage_class_header: []const u8 = "x-amz-storage-class",
+    /// Short-lived credentials (role, bearer token) replacing `credentials`; borrowed.
+    source: ?*creds.Source = null,
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -153,6 +160,10 @@ pub const S3Client = struct {
         date: [16]u8 = undefined,
         auth_buf: [512]u8 = undefined,
         auth: []const u8 = "",
+        /// Filled from `Config.source` per request.
+        cred_buf: [6144]u8 = undefined,
+        creds: ?Credentials = null,
+        bearer: ?[]const u8 = null,
         headers: [max_headers]std.http.Header = undefined,
         n_headers: usize = 0,
     };
@@ -185,6 +196,14 @@ pub const S3Client = struct {
             .unsigned => sign.unsigned_payload,
         } else sign.empty_sha256;
         out.date = sign.amzDate(now_ns);
+        if (out.bearer) |bearer| {
+            out.auth = bearer;
+            if (op.headers.len > out.headers.len) return error.InvalidKey;
+            for (op.headers, 0..) |h, i| out.headers[i] = .{ .name = h.name, .value = h.value };
+            out.n_headers = op.headers.len;
+            return;
+        }
+        const cr = out.creds orelse self.cfg.credentials;
 
         var hs: [max_headers]sign.Header = undefined;
         var n: usize = 0;
@@ -194,7 +213,7 @@ pub const S3Client = struct {
         n += 1;
         hs[n] = .{ .name = "x-amz-date", .value = &out.date };
         n += 1;
-        if (self.cfg.credentials.session_token) |t| {
+        if (cr.session_token) |t| {
             hs[n] = .{ .name = "x-amz-security-token", .value = t };
             n += 1;
         }
@@ -208,7 +227,7 @@ pub const S3Client = struct {
                 return std.mem.lessThan(u8, a.name, b.name);
             }
         }.lt);
-        out.auth = sign.authorization(self.cfg.credentials, self.cfg.region, self.cfg.service, .{
+        out.auth = sign.authorization(cr, self.cfg.region, self.cfg.service, .{
             .method = @tagName(op.method),
             .canonical_uri = out.path,
             .canonical_query = out.query,
@@ -227,6 +246,15 @@ pub const S3Client = struct {
     const SendError = error{ Transient, OutOfMemory, InvalidKey };
 
     fn sendOnce(self: *S3Client, x: *rhttp.Exchange, op: Op, b: *Built) SendError!void {
+        b.creds = null;
+        b.bearer = null;
+        if (self.cfg.source) |src| {
+            if (src.isBearer()) {
+                b.bearer = src.authorization(&b.cred_buf) catch |e| return mapCred(e);
+            } else {
+                b.creds = src.signing(&b.cred_buf) catch |e| return mapCred(e);
+            }
+        }
         self.build(op, std.time.nanoTimestamp(), b) catch return error.InvalidKey;
         return x.start(&self.http, .{
             .method = op.method,
@@ -238,9 +266,17 @@ pub const S3Client = struct {
         });
     }
 
+    fn mapCred(e: creds.Error) SendError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.CredentialsUnavailable => error.Transient,
+        };
+    }
+
     /// Sends with retries; on return `x` holds a non-retryable response (caller deinits).
     fn call(self: *S3Client, x: *rhttp.Exchange, op: Op, b: *Built) Error!void {
         var attempt: u32 = 0;
+        var renewed = false;
         while (true) {
             self.sendOnce(x, op, b) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -250,6 +286,12 @@ pub const S3Client = struct {
                     if (self.cfg.retry.backoff(&attempt)) continue;
                     return error.IoFailed;
                 },
+            };
+            if (self.cfg.source) |src| if (!renewed and (x.info.status == .unauthorized or x.info.status == .forbidden)) {
+                renewed = true; // the cached token may have been revoked early
+                src.invalidate();
+                x.deinit();
+                continue;
             };
             if (!rhttp.retryableStatus(x.info.status)) return;
             log.debug("{s} HTTP {d}, attempt {d}", .{ @tagName(op.method), @intFromEnum(x.info.status), attempt + 1 });
@@ -406,10 +448,25 @@ pub const S3Client = struct {
         return if (if_absent) &if_none_match_star else &.{};
     }
 
+    /// Conditional and storage-class headers of an object write.
+    fn writeHeaders(self: *const S3Client, if_absent: bool, buf: *[2]sign.Header) []const sign.Header {
+        var n: usize = 0;
+        if (if_absent) {
+            buf[n] = if_none_match_star[0];
+            n += 1;
+        }
+        if (self.cfg.storage_class.len > 0) {
+            buf[n] = .{ .name = self.cfg.storage_class_header, .value = self.cfg.storage_class };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     fn putSingle(self: *S3Client, name: []const u8, body: []const u8, if_absent: bool) PutError!void {
         var b: Built = .{};
         var x: rhttp.Exchange = undefined;
-        try self.call(&x, .{ .method = .PUT, .key = name, .body = body, .headers = self.condHeaders(if_absent) }, &b);
+        var hb: [2]sign.Header = undefined;
+        try self.call(&x, .{ .method = .PUT, .key = name, .body = body, .headers = self.writeHeaders(if_absent, &hb) }, &b);
         defer x.deinit();
         if (x.info.status == .precondition_failed) return error.PreconditionFailed;
         if (x.info.status != .ok) return self.failX("PUT", &x);
@@ -440,7 +497,8 @@ pub const S3Client = struct {
     }
 
     fn createUpload(self: *S3Client, name: []const u8) Error![]u8 {
-        const r = try self.callSmall(.{ .method = .POST, .key = name, .params = &.{.{ .name = "uploads", .value = "" }} });
+        var hb: [2]sign.Header = undefined;
+        const r = try self.callSmall(.{ .method = .POST, .key = name, .params = &.{.{ .name = "uploads", .value = "" }}, .headers = self.writeHeaders(false, &hb) });
         defer self.gpa.free(r.body);
         if (r.status != .ok) return self.failure("CreateMultipartUpload", r.status, r.body);
         const raw = xml.find(r.body, "UploadId") orelse return error.IoFailed;

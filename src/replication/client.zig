@@ -2,6 +2,7 @@
 //! per call, small bodies in memory or streamed uploads, optional bandwidth cap.
 const std = @import("std");
 const sign = @import("../backend/s3/sign.zig");
+const core = @import("../core/root.zig");
 
 const Allocator = std.mem.Allocator;
 const http = std.http;
@@ -18,6 +19,7 @@ pub const Remote = struct {
 };
 
 pub const Param = sign.Param;
+pub const hdr_no_proxy = "x-minio-source-proxy-request";
 pub const Header = http.Header;
 
 /// Writes exactly `len` bytes of an upload body.
@@ -37,7 +39,40 @@ pub const Request = struct {
     headers: []const Header = &.{},
     body: Body = .none,
     content_type: ?[]const u8 = null,
+    /// Receives a 2xx response head and streams its body instead of buffering it.
+    sink: ?Sink = null,
 };
+
+/// `begin` gets the status, passthrough headers and length; it returns where the body goes.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, status: u16, headers: []const Header, len: ?u64) ?*std.Io.Writer,
+};
+
+/// Extra PEM CAs trusted for HTTPS targets and peers (`ZKFSM_REPLICATION_CA_FILE`).
+pub var ca_file: ?[]const u8 = null;
+
+/// An HTTP client trusting the system roots plus `ca_file`.
+pub fn newHttp(gpa: Allocator) http.Client {
+    var hc: http.Client = .{ .allocator = gpa };
+    const path = ca_file orelse return hc;
+    hc.ca_bundle.rescan(gpa) catch |e| std.log.warn("replication: system CAs not loaded: {t}", .{e});
+    hc.ca_bundle.addCertsFromFilePathAbsolute(gpa, path) catch |e| std.log.warn("replication: CA file {s} not loaded: {t}", .{ path, e });
+    hc.next_https_rescan_certs = false;
+    return hc;
+}
+
+/// Reads `ZKFSM_REPLICATION_CA_FILE` once at startup.
+pub fn loadCaFromEnv() void {
+    const v = std.posix.getenv("ZKFSM_REPLICATION_CA_FILE") orelse return;
+    if (v.len > 0) ca_file = v;
+}
+
+fn passthrough(name: []const u8) bool {
+    const keep = [_][]const u8{ "content-type", "content-length", "content-range", "etag", "last-modified", "accept-ranges", "cache-control", "content-encoding", "content-disposition", "content-language", "expires" };
+    for (keep) |k| if (std.ascii.eqlIgnoreCase(k, name)) return true;
+    return std.ascii.startsWithIgnoreCase(name, "x-amz-") and !std.ascii.eqlIgnoreCase(name, "x-amz-request-id") and !std.ascii.eqlIgnoreCase(name, "x-amz-id-2");
+}
 
 pub const Response = struct {
     status: u16,
@@ -67,7 +102,7 @@ pub const Response = struct {
 };
 
 /// Connection failures and source read failures; HTTP errors come back as a Response.
-pub const Error = error{ Unreachable, SourceFailed, InvalidEndpoint, OutOfMemory };
+pub const Error = error{ Unreachable, SourceFailed, SinkFailed, InvalidEndpoint, OutOfMemory };
 
 pub const max_response = 4 * 1024 * 1024;
 
@@ -104,6 +139,10 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
         .{ .name = "x-amz-date", .value = &date },
     });
     try extra.appendSlice(a, req.headers);
+    var tpb: [core.trace.header_len]u8 = undefined;
+    if (core.trace.outgoing(&tpb)) |tp| try extra.append(a, .{ .name = "traceparent", .value = try a.dupe(u8, tp) });
+    // Replication's own reads must see the peer's local state, never a proxied one.
+    if (req.method == .GET or req.method == .HEAD) try extra.append(a, .{ .name = hdr_no_proxy, .value = "true" });
     const uri: std.Uri = .{
         .scheme = if (r.secure) "https" else "http",
         .host = .{ .raw = hp.host },
@@ -130,12 +169,14 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
             hreq.transfer_encoding = .{ .content_length = 0 };
             var bw = hreq.sendBodyUnflushed(&.{}) catch |e| return lost(e, @src().line);
             bw.end() catch |e| return lost(e, @src().line);
+            flushTls(&hreq) catch |e| return lost(e, @src().line);
         } else hreq.sendBodiless() catch |e| return lost(e, @src().line),
         .bytes => |b| {
             hreq.transfer_encoding = .{ .content_length = b.len };
             var bw = hreq.sendBodyUnflushed(&send_buf) catch |e| return lost(e, @src().line);
             bw.writer.writeAll(b) catch |e| return lost(e, @src().line);
             bw.end() catch |e| return lost(e, @src().line);
+            flushTls(&hreq) catch |e| return lost(e, @src().line);
         },
         .stream => |s| {
             hreq.transfer_encoding = .{ .content_length = s.len };
@@ -144,19 +185,31 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
             s.write(s.ctx, &th.writer) catch |e| return if (e == error.SourceFailed) error.SourceFailed else lost(e, @src().line);
             th.writer.flush() catch |e| return lost(e, @src().line);
             bw.end() catch |e| return lost(e, @src().line);
+            flushTls(&hreq) catch |e| return lost(e, @src().line);
         },
     }
     var redirect_buf: [0]u8 = .{};
     var resp = hreq.receiveHead(&redirect_buf) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else lost(e, @src().line);
     var out: Response = .{ .status = @intFromEnum(resp.head.status) };
+    var keep: std.ArrayList(Header) = .empty;
     var it = resp.head.iterateHeaders();
     while (it.next()) |h| {
+        if (req.sink != null and passthrough(h.name) and !std.ascii.eqlIgnoreCase(h.name, "content-length"))
+            try keep.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try a.dupe(u8, std.mem.trim(u8, h.value, "\""));
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-version-id")) out.version_id = try a.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-delete-marker")) out.delete_marker = std.mem.eql(u8, h.value, "true");
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-replication-status")) out.replication_status = try a.dupe(u8, h.value);
     }
     const has_body = req.method != .HEAD and out.status >= 200 and out.status != 204 and out.status != 304;
+    if (req.sink) |sk| if (out.ok()) {
+        const w = sk.begin(sk.ctx, out.status, keep.items, resp.head.content_length) orelse return out;
+        if (!has_body) return out;
+        var tbuf: [64 * 1024]u8 = undefined;
+        const rd = hreq.reader.bodyReader(&tbuf, resp.head.transfer_encoding, resp.head.content_length);
+        _ = rd.streamRemaining(w) catch |e| return if (e == error.WriteFailed) error.SinkFailed else lost(e, @src().line);
+        return out;
+    };
     if (has_body) {
         var tbuf: [4096]u8 = undefined;
         const rd = hreq.reader.bodyReader(&tbuf, resp.head.transfer_encoding, resp.head.content_length);
@@ -165,6 +218,11 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
         _ = hreq.reader.bodyReader(&.{}, .none, 0).discardRemaining() catch {};
     }
     return out;
+}
+
+/// BodyWriter.end flushes only the TLS layer; push the records out to the socket too.
+fn flushTls(hreq: *http.Client.Request) std.Io.Writer.Error!void {
+    if (hreq.connection) |cn| try cn.flush();
 }
 
 /// Connection-level failure; the cause is logged at debug level.

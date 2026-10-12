@@ -78,7 +78,7 @@ pub fn parse(arena: std.mem.Allocator, doc: []const u8) ParseError![]Rule {
 }
 
 /// One '1'/'0' per rule: whether it used the legacy rule-level Prefix (echoed back as such).
-fn legacyMarks(arena: std.mem.Allocator, doc: []const u8, n: usize) error{OutOfMemory}!?[]const u8 {
+pub fn legacyMarks(arena: std.mem.Allocator, doc: []const u8, n: usize) error{OutOfMemory}!?[]const u8 {
     var top: xml_read.Scanner = .{ .s = doc };
     const root = (top.next("LifecycleConfiguration") catch return null) orelse return null;
     const out = try arena.alloc(u8, n);
@@ -134,26 +134,55 @@ fn parseRule(arena: std.mem.Allocator, body: []const u8) ParseError!Rule {
     if (try child(body, "AbortIncompleteMultipartUpload")) |e| {
         r.abort_upload_days = try int(u32, e, "DaysAfterInitiation") orelse return error.MalformedXML;
     }
-    if (try single(body, "Transition")) |e| {
-        r.transition_days = try int(u32, e, "Days");
-        if (try text(arena, e, "Date")) |d| r.transition_date_ns = core.time.parseIso8601(d) catch return error.InvalidArgument;
-        r.transition_tier = try storageClass(arena, e);
-    }
-    if (try single(body, "NoncurrentVersionTransition")) |e| {
-        r.noncurrent_transition_days = try int(u32, e, "NoncurrentDays") orelse return error.MalformedXML;
-        r.noncurrent_transition_newer = try int(u32, e, "NewerNoncurrentVersions");
-        r.noncurrent_transition_tier = try storageClass(arena, e);
-    }
+    try parseTransitions(arena, body, &r);
     object.lifecycle.validate(&.{r}) catch return error.InvalidArgument;
     return r;
 }
 
-/// One transition per kind and rule; more than one is not supported.
-fn single(body: []const u8, name: []const u8) ParseError!?[]const u8 {
+const Step = object.lifecycle.Step;
+const NcStep = object.lifecycle.NoncurrentStep;
+
+/// Every Transition and NoncurrentVersionTransition, ordered by days (or date).
+fn parseTransitions(arena: std.mem.Allocator, body: []const u8, r: *Rule) ParseError!void {
+    var steps: std.ArrayList(Step) = .empty;
     var sc: xml_read.Scanner = .{ .s = body };
-    const first = try sc.next(name) orelse return null;
-    if (try sc.next(name) != null) return error.NotImplemented;
-    return first;
+    while (try sc.next("Transition")) |e| {
+        var x: Step = .{ .days = try int(u32, e, "Days"), .tier = try storageClass(arena, e) };
+        if (try text(arena, e, "Date")) |d| x.date_ns = core.time.parseIso8601(d) catch return error.InvalidArgument;
+        try steps.append(arena, x);
+    }
+    var ncs: std.ArrayList(NcStep) = .empty;
+    sc = .{ .s = body };
+    while (try sc.next("NoncurrentVersionTransition")) |e| try ncs.append(arena, .{
+        .days = try int(u32, e, "NoncurrentDays") orelse return error.MalformedXML,
+        .newer = try int(u32, e, "NewerNoncurrentVersions"),
+        .tier = try storageClass(arena, e),
+    });
+    if (steps.items.len > object.lifecycle.max_steps + 1 or ncs.items.len > object.lifecycle.max_steps + 1) return error.InvalidArgument;
+    std.mem.sort(Step, steps.items, {}, struct {
+        fn lt(_: void, a: Step, b: Step) bool {
+            return if (a.days != null and b.days != null) a.days.? < b.days.? else (a.date_ns orelse 0) < (b.date_ns orelse 0);
+        }
+    }.lt);
+    std.mem.sort(NcStep, ncs.items, {}, struct {
+        fn lt(_: void, a: NcStep, b: NcStep) bool {
+            return a.days < b.days;
+        }
+    }.lt);
+    if (steps.items.len > 0) {
+        const f = steps.items[0];
+        r.transition_days = f.days;
+        r.transition_date_ns = f.date_ns;
+        r.transition_tier = f.tier;
+        r.more_transitions = steps.items[1..];
+    }
+    if (ncs.items.len > 0) {
+        const f = ncs.items[0];
+        r.noncurrent_transition_days = f.days;
+        r.noncurrent_transition_newer = f.newer;
+        r.noncurrent_transition_tier = f.tier;
+        r.more_noncurrent = ncs.items[1..];
+    }
 }
 
 fn storageClass(arena: std.mem.Allocator, e: []const u8) ParseError![]const u8 {
@@ -229,26 +258,32 @@ pub fn writeWith(w: *std.Io.Writer, rules: []const Rule, legacy: []const u8) std
             try xml.elemInt(w, "DaysAfterInitiation", d);
             try w.writeAll("</AbortIncompleteMultipartUpload>");
         }
-        if (r.transition_tier.len > 0) {
-            try w.writeAll("<Transition>");
-            if (r.transition_days) |d| try xml.elemInt(w, "Days", d);
-            if (r.transition_date_ns) |d| {
-                var tb: [24]u8 = undefined;
-                try xml.elem(w, "Date", core.time.iso8601(d, &tb));
-            }
-            try xml.elem(w, "StorageClass", r.transition_tier);
-            try w.writeAll("</Transition>");
-        }
-        if (r.noncurrent_transition_days) |d| {
-            try w.writeAll("<NoncurrentVersionTransition>");
-            try xml.elemInt(w, "NoncurrentDays", d);
-            if (r.noncurrent_transition_newer) |n| try xml.elemInt(w, "NewerNoncurrentVersions", n);
-            try xml.elem(w, "StorageClass", r.noncurrent_transition_tier);
-            try w.writeAll("</NoncurrentVersionTransition>");
-        }
+        if (r.transition_tier.len > 0) try writeStep(w, .{ .days = r.transition_days, .date_ns = r.transition_date_ns, .tier = r.transition_tier });
+        for (r.more_transitions) |x| try writeStep(w, x);
+        if (r.noncurrent_transition_days) |d| try writeNcStep(w, .{ .days = d, .newer = r.noncurrent_transition_newer, .tier = r.noncurrent_transition_tier });
+        for (r.more_noncurrent) |x| try writeNcStep(w, x);
         try w.writeAll("</Rule>");
     }
     try xml.close(w, "LifecycleConfiguration");
+}
+
+fn writeStep(w: *std.Io.Writer, x: Step) std.Io.Writer.Error!void {
+    try w.writeAll("<Transition>");
+    if (x.days) |d| try xml.elemInt(w, "Days", d);
+    if (x.date_ns) |d| {
+        var tb: [24]u8 = undefined;
+        try xml.elem(w, "Date", core.time.iso8601(d, &tb));
+    }
+    try xml.elem(w, "StorageClass", x.tier);
+    try w.writeAll("</Transition>");
+}
+
+fn writeNcStep(w: *std.Io.Writer, x: NcStep) std.Io.Writer.Error!void {
+    try w.writeAll("<NoncurrentVersionTransition>");
+    try xml.elemInt(w, "NoncurrentDays", x.days);
+    if (x.newer) |n| try xml.elemInt(w, "NewerNoncurrentVersions", n);
+    try xml.elem(w, "StorageClass", x.tier);
+    try w.writeAll("</NoncurrentVersionTransition>");
 }
 
 fn writeFilter(w: *std.Io.Writer, f: object.lifecycle.Filter) std.Io.Writer.Error!void {
@@ -317,7 +352,14 @@ test "lifecycle xml parse and write" {
     try std.testing.expectEqualStrings("COLD", (try parse(a, tw.written()))[0].noncurrent_transition_tier);
     const two = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>A</StorageClass></Transition>" ++
         "<Transition><Days>2</Days><StorageClass>B</StorageClass></Transition></Rule></LifecycleConfiguration>";
-    try std.testing.expectError(error.NotImplemented, parse(a, two));
+    const chained = try parse(a, two);
+    try std.testing.expectEqualStrings("B", chained[0].more_transitions[0].tier);
+    var cw: std.Io.Writer.Allocating = .init(a);
+    try write(&cw.writer, chained);
+    try std.testing.expectEqual(@as(?u32, 2), (try parse(a, cw.written()))[0].more_transitions[0].days);
+    const dup = "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days><StorageClass>A</StorageClass></Transition>" ++
+        "<Transition><Days>1</Days><StorageClass>B</StorageClass></Transition></Rule></LifecycleConfiguration>";
+    try std.testing.expectError(error.InvalidArgument, parse(a, dup));
     try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><Days>1</Days></Transition></Rule></LifecycleConfiguration>"));
     try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration></LifecycleConfiguration>"));
     try std.testing.expectError(error.MalformedXML, parse(a, "<LifecycleConfiguration><Rule><Status>On</Status></Rule></LifecycleConfiguration>"));

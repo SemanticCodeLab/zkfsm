@@ -1,0 +1,134 @@
+.ops-charts {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+.ops-chart {
+  margin: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.ops-chart-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.ops-chart-title {
+  font-weight: 600;
+}
+.ops-legend {
+  list-style: none;
+  display: flex;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ops-legend li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ops-legend strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.ops-swatch {
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.ops-swatch.c1 { background: var(--chart-1); }
+.ops-swatch.c2 { background: var(--chart-2); }
+.ops-swatch.c3 { background: var(--chart-3); }
+.ops-swatch.c4 { background: var(--chart-4); }
+.ops-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+.ops-line.c1 { stroke: var(--chart-1); }
+.ops-line.c2 { stroke: var(--chart-2); }
+.ops-line.c3 { stroke: var(--chart-3); }
+.ops-line.c4 { stroke: var(--chart-4); }
+.chart .ops-grid {
+  stroke-dasharray: 2 4;
+}
+.ops-tiles {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  margin-bottom: 16px;
+}
+.ops-tiles .card {
+  margin-bottom: 0;
+}
+.ops-tiles .progress {
+  margin-top: 8px;
+}
+.ops-cell-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 160px;
+}
+.ops-cell-bar .progress {
+  flex: 1;
+}
+.ops-cell-bar span {
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ops-note-body {
+  margin-top: 4px;
+  color: var(--muted);
+}
+.ops-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.ops-toolbar .field {
+  margin-bottom: 0;
+  min-width: 220px;
+}
+.ops-scroll {
+  max-height: 420px;
+  overflow: auto;
+}
+.ops-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.ops-radio {
+  display: flex;
+  gap: 16px;
+  border: 0;
+  padding: 0;
+  margin: 0 0 12px;
+}
+.ops-radio legend {
+  padding: 0;
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+.ops-radio label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.ops-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}

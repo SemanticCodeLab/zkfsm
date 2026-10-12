@@ -104,7 +104,7 @@ pub fn local(o: *Ops, a: Allocator) error{OutOfMemory}!Report {
                 .healing = d.fresh.load(.acquire),
             });
         }
-        const st = &s.healer.stats;
+        const st = &s.healer.ring;
         const passes = st.passes.load(.acquire);
         sc.entries += st.entries.load(.monotonic);
         sc.keys_checked += st.keys_checked.load(.monotonic);
@@ -114,12 +114,12 @@ pub fn local(o: *Ops, a: Allocator) error{OutOfMemory}!Report {
             if (sc.running_since_ms == 0 or since < sc.running_since_ms) sc.running_since_ms = since;
             try active.append(a, try std.fmt.allocPrint(a, "pool {d} set {d}", .{ s.pool + 1, s.set + 1 }));
         }
-        if (best == null or passes > best.?.stats.passes.load(.acquire)) best = s.healer;
+        if (best == null or passes > best.?.ring.passes.load(.acquire)) best = s.healer;
         sc.passes = @max(sc.passes, passes);
     }
     if (best) |h| {
-        var buf: [heal.stats.ring_len]i64 = undefined;
-        sc.completed_ms = try a.dupe(i64, h.stats.completed(&buf));
+        var buf: [heal.pass_ring.ring_len]i64 = undefined;
+        sc.completed_ms = try a.dupe(i64, h.ring.completed(&buf));
     }
     sc.active = active.items;
     var r: Report = .{

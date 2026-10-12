@@ -18,6 +18,8 @@ tests/s3/run.sh            # S3 conformance across client SDKs and tools (see Co
 tests/remote_backend.sh    # remote S3/Azure backends against local containers
 tests/tls.sh               # TLS 1.3 interop: openssl, curl, S3 CLI, mc, python; fuzzing
 tests/replication.sh       # bucket and site replication across three deployments (set MC)
+tests/batch.sh             # mc batch replicate/keyrotate/expire jobs, cancel, resume (set MC)
+tests/observe.sh           # OTLP export, metrics v3, mc admin trace/logs, access logs (set MC)
 ```
 
 ## Run
@@ -41,6 +43,31 @@ path; requests outside it get `404 NoSuchBucket`. `--health-prefix`,
 endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
 3600 s, 0 disables). Containers: `Dockerfile`,
 `deploy/compose/`, and the Helm chart in `helm/zkfsm`.
+
+### Web console
+
+The server embeds a web console, served on `--console-address` (default `:9001`, or
+`$ZKFSM_CONSOLE_ADDRESS`; `off` disables it; authenticated mode only). Log in with an
+access key and secret, an LDAP account, or an OpenID provider; the browser holds only an
+HttpOnly `SameSite=Strict` session cookie, and the console signs S3 and admin calls
+server-side with temporary credentials. Pages are served under a strict
+Content-Security-Policy; state-changing calls need a same-origin request header.
+`--console-session` sets the session lifetime (900-43200 s) and `--console-s3-url` the
+public S3 URL used in share links.
+
+It covers the dashboard (capacity, drives, heal state, live metrics), buckets and their
+settings (versioning, Object Lock, quota, lifecycle with tier transitions, policy, tags,
+replication, encryption, CORS, website, notifications), the object browser (multipart
+upload with progress, versions, share links, preview, tags, retention and legal hold),
+users, groups, access keys, policies, OpenID/LDAP settings, tenants, tiers, site
+replication, S3 Tables (table buckets, namespaces, tables, schema and snapshots),
+notification, audit and lambda targets, batch jobs, KMS keys (create, rotate, enable,
+disable, tags, delete, re-key, key manifest), monitoring and server settings.
+
+The bundle is prebuilt in `console/dist` and embedded at compile time, so `zig build`
+needs no Node. To change it: `cd console && npm ci && npm run build` (TypeScript and
+Preact; `npm test` for unit tests). `tests/console.sh` checks the console API with curl
+and runs the unit and Playwright suites when `console/node_modules` exists.
 
 ### TLS
 
@@ -247,8 +274,30 @@ minute; restore expiry and the usage scan run every 10 minutes (both follow
 
 Federated STS actions turn an external identity into temporary credentials
 whose rights are a list of canned or stored policies (still narrowed by an
-optional session `Policy`). The session token carries the policy names and the
-tenant, so no per-session server state exists; every node accepts the tokens.
+optional session `Policy`). The session token carries the policy names, the
+tenant, the provider, its issue time, and an optional `TokenRevokeType`, so every
+node accepts it without a lookup; the IAM store keeps only session metadata (for
+listings) and revocation cut-offs.
+
+- **Console login** (authorization code with PKCE S256 and nonce), unauthenticated:
+  `GET /minio/admin/v3/oidc/providers`, `GET .../oidc/authorize/<name>[?redirect_after=/path]`
+  (302 to the IdP's `authorization_endpoint`; the PKCE verifier, nonce, and
+  redirect URI travel encrypted in `state`, bound to the browser by a cookie, valid
+  10 minutes), and `GET .../oidc/callback/<name>?code=..&state=..`, which exchanges
+  the code at the `token_endpoint` (client secret via HTTP Basic), validates the
+  id_token like `AssumeRoleWithWebIdentity` plus the nonce, and returns STS
+  credentials as JSON (or a 302 to `redirect_after` with them in the fragment).
+  The redirect URI is the provider's `redirect_uri` when set (a console that
+  forwards `code` and `state` to the callback), else the callback URL itself
+  (set `redirect_uri` behind TLS-terminating proxies without `X-Forwarded-Proto`).
+- **Revocation**: `POST /minio/admin/v3/revoke-tokens/<builtin|ldap|openid|tls>?user=U&fullRevoke=true`
+  or `&tokenRevokeType=T` (204) rejects every session of `U` from that provider
+  issued so far (all of them, or those requested with that `TokenRevokeType`).
+  Without `user` a caller revokes its own sessions; other users need
+  `admin:RemoveServiceAccount`.
+- **Listing**: `mc idp ldap accesskey ls ALIAS [--all] [DN...]` and
+  `mc idp openid accesskey ls ALIAS[:CFG] [--all] [USER...]` (admin
+  `idp/ldap|openid/list-access-keys-bulk`) list live STS keys per user.
 
 - **OpenID Connect** (`AssumeRoleWithWebIdentity`, `AssumeRoleWithClientGrants`):
   providers are added with `mc idp openid add ALIAS [NAME] config_url=...
@@ -305,6 +354,15 @@ cluster node sees the same value. An overwrite in an unversioned bucket only
 needs room for the difference. `get-bucket-quota` also reports `usage` and
 `objects`.
 
+Rate limits: `set-bucket-quota` also takes `requests` (requests per second) and
+`rate` (bytes per second, uploads and downloads); tenants get the same with
+`PUT /minio/admin/v3/tenant/set-quota?name=T&requests=N&rate=B` (0 clears),
+applied to every bucket the tenant owns and to its identities. Each node meters
+with a token bucket holding one second of burst; a request past the limit gets
+`SlowDown` (HTTP 503). Bytes may go into debt (a large transfer is let through,
+later requests wait). The body of `set-bucket-quota` replaces the whole quota
+configuration, so `mc quota set --size` clears rate limits.
+
 ### Multi-tenancy
 
 Users already isolate through policies; tenants add a hard boundary on top,
@@ -329,7 +387,9 @@ project-scoped buckets other servers get from Keystone).
   (only when it has no users or buckets), `GET .../tenant/list` (users,
   buckets, and usage per tenant), `PUT .../tenant/set-status?name=T&status=enabled|disabled`,
   `PUT .../tenant/assign-user?name=T&accessKey=U` (empty `name` makes the
-  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`.
+  user global), `PUT .../tenant/assign-bucket?name=T&bucket=B`,
+  `PUT .../tenant/set-quota?name=T&requests=N&rate=B`. The MinIO client has no
+  tenant commands, so these are native routes.
 
 ### Replication
 
@@ -370,6 +430,15 @@ pushed to peers with versioning, object lock, policy, lifecycle, tags, encryptio
 CORS; IAM admin changes are replayed on peers; existing buckets, objects, and IAM go
 out on join. STS session tokens validate across sites only when root credentials match.
 
+### Batch jobs
+
+`mc batch generate|start|list|status|describe|cancel` run `replicate` (local to remote,
+remote to local, or local to local; version ids, times, tags and delete markers kept),
+`keyrotate` (SSE-S3/SSE-KMS objects resealed under a new key, version ids kept) and
+`expire` (rules by type, name, age, size, tags, metadata, `purge.retainVersions`) jobs
+in the background. Progress is checkpointed, so jobs resume after a restart; failed
+passes retry per `retry`, and `notify` receives the final status. Single-node mode only.
+
 ### Bucket notifications and audit logging
 
 Targets are configured at runtime with `mc admin config set` (stored cluster-wide,
@@ -408,6 +477,70 @@ mc watch z/photos --events put
 - `/metrics` carries `zkfsm_notify_target_*` and `zkfsm_audit_target_*` per target
   (sent, failed, dropped, queue length, online). In a cluster each node publishes the
   events of the requests it serves from its own queue.
+
+### Observability
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 zkfsm --data /data --otel-sample-ratio 0.1
+mc admin trace z --call s3 --call storage --errors       # live request tracing
+mc admin logs z --last 20                                # server log stream
+mc admin prometheus generate z --api-version v3          # scrape config with a bearer token
+```
+
+- OpenTelemetry over OTLP/HTTP (protobuf): a span per S3, admin, and gateway
+  (FTP, SFTP, WebDAV, Swift) request, with child spans for storage operations,
+  internode RPC (the `traceparent` travels with the call, so remote nodes continue
+  the trace), KMS (data keys and key management), remote tiers, lifecycle passes,
+  replication (forwarded to the target), and Object Lambda webhook calls (which get
+  the `traceparent` too). Table catalog requests, batch job passes, and scanner and
+  heal passes are root spans. Incoming W3C `traceparent` headers are honored; their sampled flag wins
+  over `--otel-sample-ratio` / `OTEL_TRACES_SAMPLER[_ARG]`. Logs (info and above, with
+  trace ids) and every v3 metric are exported too. Standard variables apply:
+  `OTEL_EXPORTER_OTLP_[<SIGNAL>_]ENDPOINT`, `_HEADERS`, `OTEL_SERVICE_NAME`,
+  `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_<SIGNAL>_EXPORTER=none`, `OTEL_BSP_*`,
+  `OTEL_METRIC_EXPORT_INTERVAL`; flags `--otel-endpoint`, `--otel-headers`,
+  `--otel-signals`, `--otel-service-name`. An `https://` collector is verified
+  against the system roots or `--otel-ca-file` (`OTEL_EXPORTER_OTLP_CERTIFICATE`);
+  `--otel-client-cert` / `--otel-client-key` (`OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
+  `_CLIENT_KEY`) present a client certificate; TLS 1.2 and 1.3 are spoken.
+- Metrics v3 under `/minio/metrics/v3` with the MinIO hierarchy (`api/requests`,
+  `system/{drive,memory,cpu,process,network/internode}`, `debug/go`,
+  `cluster/{health,usage/objects,usage/buckets,erasure-set,iam,config}`, `ilm`,
+  `audit`, `logger/webhook`, `replication`, `notification`, `scanner`, and per bucket
+  `bucket/{api,replication}/<bucket>`); any path serves the groups below it. API
+  latency is both a MinIO `ttfb_seconds_distribution` and a Prometheus histogram.
+  Scrapes need the JWT from `mc admin prometheus generate` (a key allowed
+  `admin:Prometheus`) unless `MINIO_PROMETHEUS_AUTH_TYPE=public`. The root path also
+  carries the `zkfsm_*` subsystem families (replication, notification targets, KMS).
+  `/metrics` and `/minio/v2/metrics/cluster` are unchanged.
+- `mc admin trace` streams S3/admin calls with HTTP detail and, by `--call`, storage,
+  internode, KMS, ILM (tier), replication, batch job, scanner, healing, and gateway
+  events, with `--errors` and
+  `--response-duration` filters; in a cluster any node streams every node's events.
+  `mc admin logs` replays recent server log lines and follows new ones.
+- Server access logs: PutBucketLogging now delivers records in the S3 server access
+  log format to the target bucket (`SimplePrefix` or `PartitionedPrefix` keys) every
+  `--access-log-interval` seconds (default 300). Records are journaled per node under
+  `<drive>/.zkfsm/accesslog` and fsynced each second, so a crash loses nothing that
+  was journaled; batch object names are deterministic, so redelivery after a crash
+  replaces rather than duplicates. The target must grant the
+  `logging.s3.amazonaws.com` service `s3:PutObject` (bucket policy) or LogDelivery
+  WRITE (ACL), or share the source bucket's owner and tenant; an explicit Deny drops
+  the records (`zkfsm_access_log_denied_total`).
+
+### Object Lambda
+
+`GET /bucket/key?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook` runs the object
+through a webhook function, as MinIO does. Functions come from
+`MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on` plus `..._ENDPOINT_<id>` / `..._AUTH_TOKEN_<id>`
+(or `ZKFSM_LAMBDA_WEBHOOK_...`), or `mc admin config set lambda_webhook:<id> endpoint=...`.
+The caller needs `s3:GetObject`; the webhook gets the MinIO event JSON with a presigned
+`inputS3Url` (signed with the caller's key) and its reply is streamed back, with
+`x-amz-fwd-header-*` and `x-amz-fwd-status` / `-error-code` / `-error-message` mapped.
+An https webhook can demand a client certificate: set `client_cert` / `client_key`
+(`..._CLIENT_CERT_<id>` / `..._CLIENT_KEY_<id>`), and optionally `tls_ca_file`,
+`tls_server_name`, `tls_min_version` (1.2 or 1.3) and `tls_skip_verify`; unreadable
+files are refused when configured. Tested by `tests/lambda.sh`.
 
 ### Server-side encryption and KMS
 
@@ -474,6 +607,24 @@ functions (`SUBSTRING`, `TRIM`, `UPPER`, `LOWER`, `CHAR_LENGTH`, `EXTRACT`,
 as event-stream `Records`, `Progress`, `Stats` and `End` frames, CSV or JSON.
 `tests/select.sh` checks every case against DuckDB.
 
+### S3 Tables and Iceberg REST catalog
+
+A table bucket is an ordinary bucket enabled for catalog use. The S3 Tables
+API (signing name `s3tables`, e.g. the boto3 `s3tables` client) covers
+table buckets (create/get/list/delete, bucket policy), namespaces, tables,
+`GetTableMetadataLocation` and `UpdateTableMetadataLocation` with
+`versionToken` compare-and-swap, and `RenameTable`. The Iceberg REST catalog
+is served at `/iceberg/v1` (alias `/_iceberg/v1`); the warehouse (bucket name
+or table bucket ARN) becomes the URL prefix. It supports config, namespace
+CRUD and properties, table list/create (including staged create)/load/
+exists/register/rename/drop (with purge) and commits with all standard
+requirements and updates; a commit writes a new metadata file and swaps the
+table pointer atomically, answering `409 CommitFailedException` on conflict.
+Clients sign with SigV4 (`s3tables` or `s3`) and write data files with plain
+S3. Catalog state lives under the reserved `.zkfsm-tables/` prefix, which S3
+requests cannot reach. Format v2 only; no views or multi-table transactions.
+`tests/tables.sh` drives it with curl, PyIceberg and boto3.
+
 ### Protocol gateways
 
 FTP/FTPS, SFTP, WebDAV, and OpenStack Swift serve the same namespace as S3, each on
@@ -488,17 +639,45 @@ zkfsm --data /data --tls-cert cert.pem --tls-key key.pem \
   --sftp :2222 --webdav :8443 --swift :8080
 ```
 
-- FTP: RFC 959/3659 incl. MLSD/MLST, REST resume, APPE, RNFR/RNTO, SIZE/MDTM, PASV/EPSV;
+- FTP: RFC 959/3659 incl. MLSD/MLST, REST resume for RETR and STOR, APPE, RNFR/RNTO,
+  SIZE/MDTM, PASV/EPSV and active mode (PORT/EPRT, only back to the control peer);
   explicit (AUTH TLS) and implicit FTPS on the TLS certificate.
-- SFTP: own SSH-2 (curve25519-sha256, mlkem768x25519-sha256; ssh-ed25519, rsa-sha2-256/512;
-  chacha20-poly1305, aes256/128-gcm; strict kex), password or `--sftp-authorized-keys`.
+- SFTP: own SSH-2 (curve25519-sha256, mlkem768x25519-sha256; ssh-ed25519,
+  ecdsa-sha2-nistp256, rsa-sha2-256/512 host and user keys; chacha20-poly1305,
+  aes256/128-gcm; strict kex), password or `--sftp-authorized-keys`. Uploads stream
+  as multipart parts. In a cluster the generated host key is shared by all nodes.
 - WebDAV: RFC 4918 class 1 and 2 (PROPFIND, MKCOL, COPY, MOVE, LOCK/UNLOCK), Basic auth
-  over HTTPS.
+  over HTTPS. Locks are stored with the bucket, so every node of a cluster honours them.
 - Swift: account/container/object API, json/xml/plain listings, DLO and SLO, temp URLs,
-  `/info`; tempauth at `/auth/v1.0` and Keystone v3 tokens (`--swift-keystone`, projects
-  mapped to IAM keys with `--swift-keystone-map`).
+  `/info`; container ACLs (`X-Container-Read`/`-Write`: `.r:` referrers, `.rlistings`,
+  `account:user`), object expiry (`X-Delete-At`/`-After`, swept every
+  `--swift-expirer-interval`), and `X-Versions-Location` / `X-History-Location`.
+  Auth is tempauth at `/auth/v1.0` and Keystone v3 tokens (`--swift-keystone`): projects
+  map to IAM keys with `--swift-keystone-map`, roles to IAM policies with
+  `--swift-keystone-role-map ROLE=POLICY[,POLICY]` (mapped roles take precedence).
+  Tempauth tokens and account metadata are valid on every node of a cluster.
 
 `zkfsm --help` lists every gateway flag.
+
+### Migrating from MinIO
+
+`zkfsm migrate` imports a MinIO deployment, keeping version ids, modification times,
+delete markers, user metadata, tags, retention and legal hold, and bucket configurations
+(versioning, Object Lock, policy, tagging, lifecycle, encryption, notification, quota):
+
+```sh
+# offline, from the drives of a stopped deployment (erasure-coded, checksums verified,
+# missing drives read through parity); also imports users, groups, and policies
+ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=secret123 \
+  zkfsm migrate --from-minio '/mnt/minio{1...4}' --to /data{1...4} --verify
+# online, from a running server
+ZKFSM_MIGRATE_ACCESS_KEY=... ZKFSM_MIGRATE_SECRET_KEY=... \
+  zkfsm migrate --from-s3 http://minio:9000 --to /data --verify
+```
+
+Progress is checkpointed in the destination, so an interrupted run resumes. Encrypted,
+compressed, and tiered objects are skipped offline (the online pull reads them through
+the server). `tests/migrate.sh` runs both paths against a real server.
 
 ## Compatibility
 
@@ -548,6 +727,7 @@ Pre-1.0. Working today and covered by tests:
   certificate federation; tenants; hard bucket quotas; SSE-S3, SSE-KMS and
   SSE-C with static, Vault, cloud KMS-API, and local key backends.
 - **S3 Select**: SQL over CSV, JSON and Parquet.
+- **S3 Tables**: table buckets and an Iceberg REST catalog (PyIceberg tested).
 - **Storage**: local drives with atomic writes; multiple drives with
   replica:2/3 or Reed-Solomon EC:4+2/8+4/12+4; per-chunk CRC32C bitrot
   detection; background scan and heal; remote S3, GCS and Azure backends and
@@ -562,5 +742,5 @@ Verified clients: standard S3 command-line clients (including 200 MB
 multipart over EC:4+2) and the MinIO client (`mc cp`, `mirror`, `rm`, `share`).
 
 Not yet: bucket
-notifications, bucket access log delivery, TLS termination
+notifications, TLS termination
 (run behind a proxy).

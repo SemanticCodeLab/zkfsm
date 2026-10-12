@@ -10,6 +10,7 @@ const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const ops = @import("ops/root.zig");
 const pools = @import("pools/root.zig");
+const lambda = @import("lambda/root.zig");
 
 const Ctx = s3.handler.Ctx;
 const ConnError = s3.handler.ConnError;
@@ -27,6 +28,8 @@ pub const Bridge = struct {
     ops: ?*ops.Ops = null,
     /// Pool decommission and rebalance (cluster mode).
     pools: ?*pools.Manager = null,
+    /// Object Lambda targets (config-kv for lambda_webhook).
+    lambda: ?*lambda.Registry = null,
 
     pub fn extension(self: *Bridge) s3.Extension {
         return .{ .name = "admin", .ctx = self, .route = route, .before_authz = true };
@@ -39,6 +42,7 @@ pub const Bridge = struct {
             try respond(c, try admin.api.fail(c.arena, .not_implemented, "NotImplemented", "The admin API requires authenticated mode."));
             return true;
         };
+        if (try oidcLogin(self, c, store, target)) return true;
         if ((c.req.head.content_length orelse 0) > admin.api.max_body) {
             try respond(c, try admin.api.fail(c.arena, .payload_too_large, "EntityTooLarge", "Request body is too large."));
             return true;
@@ -68,6 +72,7 @@ pub const Bridge = struct {
                 .tenant = try c.arena.dupe(u8, s3.tenancy.callerTenant(self.auth, c.auth, &tbuf) orelse ""),
             },
             .now_s = now_s,
+            .kdf = if (pbkdf2Requested(c)) .pbkdf2_aes_gcm else .argon2id_aes_gcm,
         };
         if (self.events) |n| if (try events.admin.handle(n, c.arena, store, req)) |res| {
             try respond(c, res);
@@ -88,6 +93,10 @@ pub const Bridge = struct {
                 return true;
             }
         }
+        if (self.lambda) |l| if (try lambda.admin.handle(l, c.arena, store, req)) |res| {
+            try respond(c, res);
+            return true;
+        };
         if (self.repl) |r| if (try replication.admin.handle(r, c.arena, store, req)) |res| {
             try respond(c, res);
             return true;
@@ -98,6 +107,50 @@ pub const Bridge = struct {
         return true;
     }
 };
+
+/// Unauthenticated console login routes (`/oidc/...`); false for other operations.
+fn oidcLogin(self: *Bridge, c: *Ctx, store: *iam.Store, target: admin.api.Target) ConnError!bool {
+    if (!std.mem.startsWith(u8, target.op, "/oidc/")) return false;
+    var proto: []const u8 = "http";
+    var cookie: []const u8 = "";
+    for (c.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-proto") and std.mem.eql(u8, h.value, "https")) proto = "https";
+        if (std.ascii.eqlIgnoreCase(h.name, "cookie")) cookie = h.value;
+    }
+    const prefix = if (std.mem.startsWith(u8, c.target, self.prefix)) self.prefix else admin.api.native_prefix;
+    const env: admin.oidc.Env = .{
+        .fed = self.auth.federation,
+        .issuer = if (self.auth.sts) |*i| i else null,
+        .store = store,
+        .prefix = prefix,
+        .origin = try std.fmt.allocPrint(c.arena, "{s}://{s}", .{ proto, c.host orelse "localhost" }),
+    };
+    const req: admin.oidc.Request = .{ .op = target.op, .query = target.query, .cookie = cookie, .now_s = std.time.timestamp() };
+    const res = try admin.oidc.handle(c.arena, env, req) orelse return false;
+    if (c.method != .GET) {
+        try respond(c, try admin.api.fail(c.arena, .method_not_allowed, "MethodNotAllowed", "Login routes take GET."));
+        return true;
+    }
+    metrics.global.last_status = @intFromEnum(res.status);
+    var hs: [5]std.http.Header = undefined;
+    var n: usize = 0;
+    hs[n] = .{ .name = "content-type", .value = res.content_type };
+    n += 1;
+    hs[n] = .{ .name = "x-amz-request-id", .value = &c.request_id };
+    n += 1;
+    hs[n] = .{ .name = "cache-control", .value = "no-store" };
+    n += 1;
+    if (res.location) |l| {
+        hs[n] = .{ .name = "location", .value = l };
+        n += 1;
+    }
+    if (res.set_cookie) |sc| {
+        hs[n] = .{ .name = "set-cookie", .value = sc };
+        n += 1;
+    }
+    try c.req.respond(res.body, .{ .status = res.status, .extra_headers = hs[0..n] });
+    return true;
+}
 
 /// Reads exactly the declared body and checks its signed hash; null when an
 /// error response was already sent. Admin clients send plain, not chunk-signed, bodies.
@@ -141,6 +194,14 @@ fn readBody(c: *Ctx) ConnError!?[]const u8 {
         }
     }
     return body;
+}
+
+/// Header the web console sends: sealed responses use the cheap PBKDF2 derivation.
+pub const kdf_header = "x-zkfsm-admin-kdf";
+
+fn pbkdf2Requested(c: *Ctx) bool {
+    for (c.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, kdf_header)) return std.ascii.eqlIgnoreCase(h.value, "pbkdf2");
+    return false;
 }
 
 fn denied(c: *Ctx) ConnError!bool {

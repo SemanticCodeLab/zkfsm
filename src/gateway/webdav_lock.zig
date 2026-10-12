@@ -1,6 +1,8 @@
-//! In-memory WebDAV write locks: bounded table, expiry, opaquelocktoken UUIDs.
-//! Locks live only in this process; a restart drops them (clients re-lock).
+//! WebDAV write locks: bounded tables, expiry, opaquelocktoken UUIDs. `Store`
+//! keeps each bucket's locks in a bucket document of the object layer, so every
+//! node of a cluster (and a restarted server) sees the same locks.
 const std = @import("std");
+const object = @import("../object/root.zig");
 
 pub const max_locks = 1024;
 pub const max_path = 1024;
@@ -41,7 +43,7 @@ pub const Request = struct {
     timeout_s: u32 = default_timeout_s,
 };
 
-pub const Error = error{ Locked, Full, TooLong, NoMatch };
+pub const Error = error{ Locked, Full, TooLong, NoMatch, Storage };
 
 /// True when `p` is `root` or lies below it.
 pub fn within(root: []const u8, p: []const u8) bool {
@@ -65,24 +67,19 @@ fn has(tokens: []const []const u8, t: []const u8) bool {
     return false;
 }
 
-pub const Table = struct {
-    mu: std.Thread.Mutex = .{},
-    locks: [max_locks]Lock = [_]Lock{.{}} ** max_locks,
-
-    fn expire(t: *Table, now: i64) void {
-        for (&t.locks) |*l| if (l.used and l.expires_s <= now) {
+/// Lock operations over a slice of slots (`used` marks live ones).
+const Slots = struct {
+    fn expire(ls: []Lock, now: i64) void {
+        for (ls) |*l| if (l.used and l.expires_s <= now) {
             l.used = false;
         };
     }
 
-    /// Grants a new lock or fails with Locked on conflict.
-    pub fn acquire(t: *Table, r: Request, now: i64) Error!Lock {
+    fn acquire(ls: []Lock, r: Request, now: i64) Error!Lock {
         if (r.path.len > max_path) return error.TooLong;
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
+        expire(ls, now);
         var free: ?*Lock = null;
-        for (&t.locks) |*l| {
+        for (ls) |*l| {
             if (!l.used) {
                 if (free == null) free = l;
                 continue;
@@ -103,12 +100,9 @@ pub const Table = struct {
         return l.*;
     }
 
-    /// Extends a lock on `p` whose token was submitted.
-    pub fn refresh(t: *Table, p: []const u8, tokens: []const []const u8, timeout_s: u32, now: i64) Error!Lock {
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
-        for (&t.locks) |*l| if (l.used and covers(l, p) and has(tokens, &l.token)) {
+    fn refresh(ls: []Lock, p: []const u8, tokens: []const []const u8, timeout_s: u32, now: i64) Error!Lock {
+        expire(ls, now);
+        for (ls) |*l| if (l.used and covers(l, p) and has(tokens, &l.token)) {
             l.timeout_s = @min(timeout_s, max_timeout_s);
             l.expires_s = now + l.timeout_s;
             return l.*;
@@ -116,28 +110,22 @@ pub const Table = struct {
         return error.NoMatch;
     }
 
-    pub fn release(t: *Table, p: []const u8, token: []const u8, now: i64) Error!void {
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
-        for (&t.locks) |*l| if (l.used and covers(l, p) and std.mem.eql(u8, &l.token, token)) {
+    fn release(ls: []Lock, p: []const u8, token: []const u8, now: i64) Error!void {
+        expire(ls, now);
+        for (ls) |*l| if (l.used and covers(l, p) and std.mem.eql(u8, &l.token, token)) {
             l.used = false;
             return;
         };
         return error.NoMatch;
     }
 
-    /// Path of a lock that blocks writing `p` without the submitted tokens, else null.
-    /// Holding any shared lock on the resource satisfies the other shared locks.
-    pub fn blocker(t: *Table, p: []const u8, recursive: bool, tokens: []const []const u8, now: i64, buf: []u8) ?[]const u8 {
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
+    fn blocker(ls: []Lock, p: []const u8, recursive: bool, tokens: []const []const u8, now: i64, buf: []u8) ?[]const u8 {
+        expire(ls, now);
         var shared_ok = false;
-        for (&t.locks) |*l| if (l.used and l.scope == .shared and covers(l, p) and has(tokens, &l.token)) {
+        for (ls) |*l| if (l.used and l.scope == .shared and covers(l, p) and has(tokens, &l.token)) {
             shared_ok = true;
         };
-        for (&t.locks) |*l| {
+        for (ls) |*l| {
             if (!l.used or !affects(l, p, recursive) or has(tokens, &l.token)) continue;
             if (l.scope == .shared and shared_ok and covers(l, p)) continue;
             const n = @min(buf.len, l.path_len);
@@ -147,37 +135,271 @@ pub const Table = struct {
         return null;
     }
 
-    /// True when `token` names a live lock covering `p`.
-    pub fn valid(t: *Table, p: []const u8, token: []const u8, now: i64) bool {
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
-        for (&t.locks) |*l| if (l.used and covers(l, p) and std.mem.eql(u8, &l.token, token)) return true;
+    fn valid(ls: []Lock, p: []const u8, token: []const u8, now: i64) bool {
+        expire(ls, now);
+        for (ls) |*l| if (l.used and covers(l, p) and std.mem.eql(u8, &l.token, token)) return true;
         return false;
     }
 
-    /// Copies the live locks covering `p` into `out`; returns how many.
-    pub fn discover(t: *Table, p: []const u8, now: i64, out: []Lock) usize {
-        t.mu.lock();
-        defer t.mu.unlock();
-        t.expire(now);
+    fn discover(ls: []Lock, p: []const u8, now: i64, out: []Lock) usize {
+        expire(ls, now);
         var n: usize = 0;
-        for (&t.locks) |*l| if (l.used and covers(l, p) and n < out.len) {
+        for (ls) |*l| if (l.used and covers(l, p) and n < out.len) {
             out[n] = l.*;
             n += 1;
         };
         return n;
     }
 
+    /// True when any lock was dropped.
+    fn dropUnder(ls: []Lock, p: []const u8) bool {
+        var any = false;
+        for (ls) |*l| if (l.used and within(p, l.path())) {
+            l.used = false;
+            any = true;
+        };
+        return any;
+    }
+};
+
+/// One process-local table.
+pub const Table = struct {
+    mu: std.Thread.Mutex = .{},
+    locks: [max_locks]Lock = [_]Lock{.{}} ** max_locks,
+
+    /// Grants a new lock or fails with Locked on conflict.
+    pub fn acquire(t: *Table, r: Request, now: i64) Error!Lock {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.acquire(&t.locks, r, now);
+    }
+
+    /// Extends a lock on `p` whose token was submitted.
+    pub fn refresh(t: *Table, p: []const u8, tokens: []const []const u8, timeout_s: u32, now: i64) Error!Lock {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.refresh(&t.locks, p, tokens, timeout_s, now);
+    }
+
+    pub fn release(t: *Table, p: []const u8, token: []const u8, now: i64) Error!void {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.release(&t.locks, p, token, now);
+    }
+
+    /// Path of a lock that blocks writing `p` without the submitted tokens, else null.
+    /// Holding any shared lock on the resource satisfies the other shared locks.
+    pub fn blocker(t: *Table, p: []const u8, recursive: bool, tokens: []const []const u8, now: i64, buf: []u8) ?[]const u8 {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.blocker(&t.locks, p, recursive, tokens, now, buf);
+    }
+
+    /// True when `token` names a live lock covering `p`.
+    pub fn valid(t: *Table, p: []const u8, token: []const u8, now: i64) bool {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.valid(&t.locks, p, token, now);
+    }
+
+    /// Copies the live locks covering `p` into `out`; returns how many.
+    pub fn discover(t: *Table, p: []const u8, now: i64, out: []Lock) usize {
+        t.mu.lock();
+        defer t.mu.unlock();
+        return Slots.discover(&t.locks, p, now, out);
+    }
+
     /// Drops every lock rooted at or below `p` (after DELETE or MOVE).
     pub fn dropUnder(t: *Table, p: []const u8) void {
         t.mu.lock();
         defer t.mu.unlock();
-        for (&t.locks) |*l| if (l.used and within(p, l.path())) {
-            l.used = false;
-        };
+        _ = Slots.dropUnder(&t.locks, p);
     }
 };
+
+/// Shared locks: per bucket, a document in the object layer guarded by a
+/// cluster lock. Locks on "/" itself stay in the local table.
+pub const Store = struct {
+    gpa: std.mem.Allocator,
+    svc: *object.ObjectService,
+    local: Table = .{},
+
+    const kind = object.bucket_meta.Kind.webdav_locks;
+
+    fn bucketOf(p: []const u8) ?[]const u8 {
+        const t = std.mem.trimLeft(u8, p, "/");
+        if (t.len == 0) return null;
+        return t[0 .. std.mem.indexOfScalar(u8, t, '/') orelse t.len];
+    }
+
+    /// Live locks of `bucket` plus `spare` free slots, in `arena`.
+    fn load(s: *Store, arena: std.mem.Allocator, bucket: []const u8, now: i64, spare: usize) Error![]Lock {
+        const doc = object.bucket_meta.get(s.svc, arena, bucket, kind) catch |e| switch (e) {
+            error.NoSuchBucket, error.InvalidBucketName => null,
+            error.OutOfMemory => return error.Full,
+            else => return error.Storage,
+        };
+        return decode(arena, doc orelse "", now, spare) catch error.Storage;
+    }
+
+    fn save(s: *Store, arena: std.mem.Allocator, bucket: []const u8, ls: []const Lock) Error!void {
+        const doc = encode(arena, ls) catch return error.Full;
+        object.bucket_meta.set(s.svc, bucket, kind, doc) catch return error.Storage;
+    }
+
+    /// Runs `op` on the bucket's locks under the cluster lock and stores the result.
+    fn mutate(s: *Store, bucket: []const u8, now: i64, spare: usize, ctx: anytype, comptime op: anytype) @TypeOf(op(ctx, @as([]Lock, &.{}))) {
+        s.local.mu.lock();
+        defer s.local.mu.unlock();
+        const held = s.svc.clusterLock("davlock", bucket, "") catch return error.Storage;
+        defer s.svc.clusterUnlock(held);
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const ls = try s.load(arena.allocator(), bucket, now, spare);
+        const out = try op(ctx, ls);
+        try s.save(arena.allocator(), bucket, ls);
+        return out;
+    }
+
+    pub fn acquire(s: *Store, r: Request, now: i64) Error!Lock {
+        const b = bucketOf(r.path) orelse return s.local.acquire(r, now);
+        const C = struct {
+            r: Request,
+            now: i64,
+            fn f(c: @This(), ls: []Lock) Error!Lock {
+                return Slots.acquire(ls, c.r, c.now);
+            }
+        };
+        return s.mutate(b, now, 1, C{ .r = r, .now = now }, C.f);
+    }
+
+    pub fn refresh(s: *Store, p: []const u8, tokens: []const []const u8, timeout_s: u32, now: i64) Error!Lock {
+        const b = bucketOf(p) orelse return s.local.refresh(p, tokens, timeout_s, now);
+        const C = struct {
+            p: []const u8,
+            tokens: []const []const u8,
+            t: u32,
+            now: i64,
+            fn f(c: @This(), ls: []Lock) Error!Lock {
+                return Slots.refresh(ls, c.p, c.tokens, c.t, c.now);
+            }
+        };
+        return s.mutate(b, now, 0, C{ .p = p, .tokens = tokens, .t = timeout_s, .now = now }, C.f);
+    }
+
+    pub fn release(s: *Store, p: []const u8, token: []const u8, now: i64) Error!void {
+        const b = bucketOf(p) orelse return s.local.release(p, token, now);
+        const C = struct {
+            p: []const u8,
+            token: []const u8,
+            now: i64,
+            fn f(c: @This(), ls: []Lock) Error!void {
+                return Slots.release(ls, c.p, c.token, c.now);
+            }
+        };
+        return s.mutate(b, now, 0, C{ .p = p, .token = token, .now = now }, C.f);
+    }
+
+    /// As `Table.blocker`; an unreadable lock document blocks (fails closed).
+    pub fn blocker(s: *Store, p: []const u8, recursive: bool, tokens: []const []const u8, now: i64, buf: []u8) ?[]const u8 {
+        if (s.local.blocker(p, recursive, tokens, now, buf)) |l| return l;
+        const b = bucketOf(p) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const ls = s.load(arena.allocator(), b, now, 0) catch {
+            const n = @min(buf.len, p.len);
+            @memcpy(buf[0..n], p[0..n]);
+            return buf[0..n];
+        };
+        return Slots.blocker(ls, p, recursive, tokens, now, buf);
+    }
+
+    pub fn valid(s: *Store, p: []const u8, token: []const u8, now: i64) bool {
+        if (s.local.valid(p, token, now)) return true;
+        const b = bucketOf(p) orelse return false;
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const ls = s.load(arena.allocator(), b, now, 0) catch return false;
+        return Slots.valid(ls, p, token, now);
+    }
+
+    pub fn discover(s: *Store, p: []const u8, now: i64, out: []Lock) usize {
+        const n = s.local.discover(p, now, out);
+        const b = bucketOf(p) orelse return n;
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const ls = s.load(arena.allocator(), b, now, 0) catch return n;
+        return n + Slots.discover(ls, p, now, out[n..]);
+    }
+
+    /// Drops every lock rooted at or below `p` (after DELETE or MOVE); best effort.
+    pub fn dropUnder(s: *Store, p: []const u8) void {
+        s.local.dropUnder(p);
+        const b = bucketOf(p) orelse return;
+        const C = struct {
+            p: []const u8,
+            fn f(c: @This(), ls: []Lock) Error!void {
+                if (!Slots.dropUnder(ls, c.p)) return error.NoMatch;
+            }
+        };
+        s.mutate(b, std.time.timestamp(), 0, C{ .p = p }, C.f) catch {};
+    }
+};
+
+const doc_version: u8 = 1;
+
+/// Live locks as a compact binary document.
+fn encode(arena: std.mem.Allocator, ls: []const Lock) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, doc_version);
+    for (ls) |*l| if (l.used) {
+        try out.appendSlice(arena, &l.token);
+        var hdr: [2 + 1 + 2 + 4 + 8]u8 = undefined;
+        std.mem.writeInt(u16, hdr[0..2], l.path_len, .little);
+        hdr[2] = @as(u8, @intFromBool(l.infinite)) | @as(u8, @intFromBool(l.scope == .shared)) << 1 | @as(u8, @intFromBool(l.owner_href)) << 2;
+        std.mem.writeInt(u16, hdr[3..5], l.owner_len, .little);
+        std.mem.writeInt(u32, hdr[5..9], l.timeout_s, .little);
+        std.mem.writeInt(i64, hdr[9..17], l.expires_s, .little);
+        try out.appendSlice(arena, &hdr);
+        try out.appendSlice(arena, l.path());
+        try out.appendSlice(arena, l.owner());
+    };
+    return if (out.items.len == 1) "" else out.items;
+}
+
+/// Unexpired locks of a document plus `spare` free slots (bounded by max_locks).
+fn decode(arena: std.mem.Allocator, doc: []const u8, now: i64, spare: usize) error{ OutOfMemory, Corrupt }![]Lock {
+    var list: std.ArrayList(Lock) = .empty;
+    if (doc.len > 0) {
+        if (doc[0] != doc_version) return error.Corrupt;
+        var i: usize = 1;
+        while (i < doc.len) {
+            if (doc.len - i < token_len + 17) return error.Corrupt;
+            var l: Lock = .{ .used = true };
+            @memcpy(&l.token, doc[i..][0..token_len]);
+            const h = doc[i + token_len ..][0..17];
+            const pl = std.mem.readInt(u16, h[0..2], .little);
+            const ol = std.mem.readInt(u16, h[3..5], .little);
+            if (pl > max_path or ol > max_owner) return error.Corrupt;
+            l.infinite = h[2] & 1 != 0;
+            l.scope = if (h[2] & 2 != 0) .shared else .exclusive;
+            l.owner_href = h[2] & 4 != 0;
+            l.timeout_s = std.mem.readInt(u32, h[5..9], .little);
+            l.expires_s = std.mem.readInt(i64, h[9..17], .little);
+            i += token_len + 17;
+            if (doc.len - i < @as(usize, pl) + ol) return error.Corrupt;
+            @memcpy(l.path_buf[0..pl], doc[i..][0..pl]);
+            l.path_len = pl;
+            @memcpy(l.owner_buf[0..ol], doc[i + pl ..][0..ol]);
+            l.owner_len = ol;
+            i += @as(usize, pl) + ol;
+            if (l.expires_s > now and list.items.len < max_locks) try list.append(arena, l);
+        }
+    }
+    const room = @min(spare, max_locks -| list.items.len);
+    try list.appendNTimes(arena, .{}, room);
+    return list.items;
+}
 
 fn newToken(out: *[token_len]u8) void {
     var b: [16]u8 = undefined;
@@ -243,6 +465,24 @@ test "lock table is bounded" {
     for (0..max_locks) |i| _ = try t.acquire(.{ .path = try std.fmt.bufPrint(&pb, "/b/{d}", .{i}) }, 0);
     try std.testing.expectError(error.Full, t.acquire(.{ .path = "/b/x" }, 0));
     _ = try t.acquire(.{ .path = "/b/x" }, default_timeout_s + 1);
+}
+
+test "lock documents round trip and drop expired" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ls = try decode(a, "", 0, 3);
+    const x = try Slots.acquire(ls, .{ .path = "/b/x", .owner = "me", .owner_href = true, .timeout_s = 10 }, 100);
+    _ = try Slots.acquire(ls, .{ .path = "/b/y", .scope = .shared, .infinite = false, .timeout_s = 1000 }, 100);
+    const doc = try encode(a, ls);
+    const back = try decode(a, doc, 105, 0);
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+    try std.testing.expectEqualSlices(u8, &x.token, &back[0].token);
+    try std.testing.expectEqualStrings("me", back[0].owner());
+    try std.testing.expect(back[0].owner_href and back[0].infinite and back[1].scope == .shared and !back[1].infinite);
+    try std.testing.expectEqual(@as(usize, 1), (try decode(a, doc, 200, 0)).len);
+    try std.testing.expectError(error.Corrupt, decode(a, doc[0 .. doc.len - 1], 0, 0));
+    try std.testing.expectError(error.Corrupt, decode(a, "\x09", 0, 0));
 }
 
 test "timeout header" {
