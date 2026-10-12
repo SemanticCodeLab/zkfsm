@@ -112,6 +112,26 @@ test("create policy and user", async ({ page }) => {
   await expect(page.getByRole("navigation", { name: "Main" })).toBeVisible();
 });
 
+test("every page and bucket tab renders without errors", async ({ page }) => {
+  const problems: string[] = [];
+  page.on("console", (m) => {
+    // 4xx probes of optional features are expected; script and CSP errors are not.
+    if (m.type() === "error" && !/Failed to load resource/.test(m.text())) problems.push(m.text());
+  });
+  page.on("pageerror", (e) => problems.push(String(e)));
+  await login(page);
+  const routes = ["/", "/buckets", `/browser/${bucket}`, "/tables", "/tiers", "/site-replication", "/iam/users", "/iam/groups", "/iam/access-keys", "/iam/policies", "/iam/identity", "/iam/tenants", "/monitoring", "/monitoring?tab=heal", "/monitoring?tab=pools", "/events", "/events?tab=audit", "/events?tab=lambda", "/batch", "/kms", "/settings"];
+  for (const t of ["summary", "versioning", "lock", "quota", "lifecycle", "policy", "tags", "replication", "encryption", "cors", "website", "events"]) routes.push(`/buckets/${bucket}?tab=${t}`);
+  for (const r of routes) {
+    await page.goto(`/#${r}`);
+    await expect(page.locator("#main h1").first()).toBeVisible();
+    await expect(page.locator("#main .loading")).toHaveCount(0);
+    expect(await page.locator("#main .notice-error").allTextContents(), `errors on ${r}`).toEqual([]);
+    await page.screenshot({ path: join(shots, "pages", `${r.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "dashboard"}.png`), fullPage: true });
+  }
+  expect(problems).toEqual([]);
+});
+
 test("multipart upload shows progress and stores the object", async ({ page }) => {
   await login(page);
   await page.goto(`/#/browser/${bucket}`);
