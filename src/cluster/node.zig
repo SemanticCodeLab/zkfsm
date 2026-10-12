@@ -111,6 +111,8 @@ pub const Node = struct {
     router_pools: []router_mod.Pool = &.{},
     /// Drives are open: peers may do I/O here.
     drives_open: std.atomic.Value(bool) = .init(false),
+    /// Random per process: tells peers a restart from an uninterrupted run.
+    boot_id: u64 = 0,
     /// This node is writing a pool's formats: peers must not judge the pool yet.
     formatting: std.atomic.Value(bool) = .init(false),
     /// S3 service is up (the server's gate).
@@ -158,6 +160,7 @@ pub const Node = struct {
             .topo = undefined,
             .rpc = undefined,
             .guard = .{ .gpa = gpa },
+            .boot_id = std.crypto.random.int(u64) | 1,
             .secret = cfg.secret,
             .root_fp = cfg.root_fp,
             .topo_fp = undefined,
@@ -357,7 +360,7 @@ pub const Node = struct {
         }
     }
 
-    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, formatting: bool = false, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
+    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, formatting: bool = false, boot: u64 = 0, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
 
     /// Asks a peer who it is; once our drives are open the call also tells the peer
     /// to count us online at once rather than at its next heartbeat.
@@ -397,6 +400,8 @@ pub const Node = struct {
                 h.drives = std.mem.eql(u8, v, "1");
             } else if (std.mem.eql(u8, k, "formatting")) {
                 h.formatting = std.mem.eql(u8, v, "1");
+            } else if (std.mem.eql(u8, k, "boot")) {
+                h.boot = std.fmt.parseInt(u64, v, 10) catch 0;
             } else if (std.mem.eql(u8, k, "jepoch")) {
                 h.jepoch = std.fmt.parseInt(u64, v, 10) catch 0;
             } else if (std.mem.eql(u8, k, "jseq")) {
@@ -1112,8 +1117,8 @@ pub const Node = struct {
                 continue;
             }
             // A backup entry covers its owner dying before the blob's time. An owner
-            // that has been online ever since deleted it itself.
-            if (item.owner) |o| if (!all and o.node < n.topo.nodes.len and n.rpc.isOnline(o.node) and n.rpc.upCount(o.node) == o.ups) continue;
+            // that is still the same process deleted it itself.
+            if (item.owner) |o| if (!all and o.boot != 0 and o.node < n.topo.nodes.len and n.rpc.isOnline(o.node) and n.rpc.bootOf(o.node) == o.boot) continue;
             n.storage().delete(placement.dataKey(item.id)) catch {};
         }
     }
@@ -1228,7 +1233,7 @@ pub const Node = struct {
         var mark: ?wire.Mark = null;
         while (it.next() catch null) |note| switch (note) {
             .mark => |m| mark = m,
-            .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, if (from < n.topo.nodes.len) .{ .node = from, .ups = n.rpc.upCount(from) } else .{ .node = from, .ups = 0 }),
+            .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, .{ .node = from, .boot = if (from < n.topo.nodes.len) n.rpc.bootOf(from) else 0 }),
             .pools => if (n.pools_hook) |h| h.func(h.ctx),
             .iam => if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.warn("iam reload failed: {t}", .{e}),
             .change => |c| {
@@ -1257,6 +1262,7 @@ pub const Node = struct {
                     if (e != error.Busy) nn.rpc.markDown(node, "no answer to probes", true);
                     return;
                 };
+                nn.rpc.heardBoot(node, h.boot);
                 nn.rpc.setOnline(node, h.drives);
                 if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, std.time.milliTimestamp())) nn.sync_ev.set();
             }
@@ -1401,7 +1407,7 @@ const Gc = struct {
 
     /// `owner` set: a peer's blob, kept in case that peer dies before deleting it.
     const Item = struct { id: core.ObjectId, due_ns: i128, owner: ?Owner = null };
-    const Owner = struct { node: u16, ups: u32 };
+    const Owner = struct { node: u16, boot: u64 };
     const cap = 1 << 20;
 
     fn deinit(g: *Gc, gpa: std.mem.Allocator) void {
