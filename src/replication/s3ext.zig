@@ -162,12 +162,13 @@ fn proxyRead(r: *engine.Replicator, c: *Ctx) ConnError!bool {
     var version: ?core.VersionId = null;
     const vparam = try handler.param(c, "versionId");
     if (vparam) |v| version = ov.parseVersionId(v) catch return false;
+    // Cheap cached check first, so unreplicated buckets pay no extra lookup.
+    const dests = r.proxyDests(c.arena, c.route.bucket) catch return false;
+    if (dests.len == 0) return false;
     if (ov.headVersion(c.svc, c.arena, c.route.bucket, c.route.key, version)) |_| return false else |e| switch (e) {
         error.NoSuchKey, error.NoSuchVersion => {},
         else => return false,
     }
-    const dests = r.proxyDests(c.arena, c.route.bucket) catch return false;
-    if (dests.len == 0) return false;
     var hs: std.ArrayList(client.Header) = .empty;
     if (c.range) |rg| try hs.append(c.arena, .{ .name = "range", .value = rg });
     var q: std.ArrayList(client.Param) = .empty;
