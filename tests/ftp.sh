@@ -122,6 +122,41 @@ check "rnto without rnfr" "503" "$(raw "USER $AK" "PASS $SK" "RNTO x" | sed -n 4
 check "help" "214" "$(raw "HELP" | tail -1 | cut -c1-3)"
 check "auth tls" "234" "$(raw "AUTH TLS" | sed -n 2p | cut -c1-3)"
 
+# ---- active mode (PORT / EPRT) with bounce protection ----
+check "curl active PORT download" "$MD5" "$("${C[@]}" -P 127.0.0.1 --disable-eprt "$FTP/cbkt/dir/obj.bin" | md5sum | cut -d' ' -f1)"
+check "curl active EPRT download" "$MD5" "$("${C[@]}" -P 127.0.0.1 "$FTP/cbkt/dir/obj.bin" | md5sum | cut -d' ' -f1)"
+check "curl active upload" 0 "$("${C[@]}" -P 127.0.0.1 -T obj.bin "$FTP/cbkt/active.bin"; echo $?)"
+check "s3 sees active upload" "$MD5" "$(s3 "$EP/cbkt/active.bin" | md5sum | cut -d' ' -f1)"
+check "curl active list" 1 "$("${C[@]}" -P 127.0.0.1 -l "$FTP/cbkt/" | tr -d '\r' | grep -cx active.bin)"
+check "bounce PORT other host" "504" "$(raw "USER $AK" "PASS $SK" "PORT 10,1,2,3,40,1" | sed -n 4p | cut -c1-3)"
+check "bounce EPRT other host" "504" "$(raw "USER $AK" "PASS $SK" "EPRT |1|192.0.2.7|10241|" | sed -n 4p | cut -c1-3)"
+check "bounce PORT privileged port" "504" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0,1,0,25" | sed -n 4p | cut -c1-3)"
+check "PORT syntax error" "501" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0" | sed -n 4p | cut -c1-3)"
+check "EPRT unknown family" "501" "$(raw "USER $AK" "PASS $SK" "EPRT |9|x|1|" | sed -n 4p | cut -c1-3)"
+check "PORT own host ok" "200" "$(raw "USER $AK" "PASS $SK" "PORT 127,0,0,1,40,1" | sed -n 4p | cut -c1-3)"
+
+# ---- REST + STOR resumes an upload (small prefix in memory, large via part copy) ----
+head -c 7000000 /dev/urandom >rs.bin
+for split in 100000 6000000; do
+  "$PY" - "$FTPP" "$AK" "$SK" "$split" <<'PYEOF'
+import ftplib, io, sys
+port, ak, sk, cut = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+data = open("rs.bin", "rb").read()
+f = ftplib.FTP(); f.connect("127.0.0.1", port); f.login(ak, sk)
+f.storbinary("STOR /cbkt/rs.bin", io.BytesIO(data[:cut]))
+f.storbinary("STOR /cbkt/rs.bin", io.BytesIO(data[cut - 1000:]), rest=cut - 1000)
+f.set_pasv(False)
+f.storbinary("STOR /cbkt/rs-act.bin", io.BytesIO(data[:cut]))
+f.storbinary("STOR /cbkt/rs-act.bin", io.BytesIO(data[cut:]), rest=cut)
+f.quit()
+PYEOF
+  check "rest+stor resume at $split" "$(md5sum rs.bin | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs.bin" | md5sum | cut -d' ' -f1)"
+  check "rest+stor active at $split" "$(md5sum rs.bin | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs-act.bin" | md5sum | cut -d' ' -f1)"
+done
+check "rest beyond end refused" "554" "$(raw "USER $AK" "PASS $SK" "REST 99999999" "STOR /cbkt/rs.bin" | sed -n 5p | cut -c1-3)"
+check "appe large streams" 0 "$("${C[@]}" -a -T rs.bin "$FTP/cbkt/rs-act.bin"; echo $?)"
+check "appe result" "$( (cat rs.bin rs.bin) | md5sum | cut -d' ' -f1)" "$(s3 "$EP/cbkt/rs-act.bin" | md5sum | cut -d' ' -f1)"
+
 # ---- python ftplib ----
 head -c 52428800 /dev/urandom >big.bin
 for mode in plain explicit implicit; do

@@ -275,19 +275,13 @@ pub const Transport = struct {
         return error.Protocol;
     }
 
-    fn hasEd(t: *const Transport) bool {
-        for (t.opts.host_keys) |*k| if (k.* == .ed25519) return true;
-        return false;
-    }
-
-    fn hasRsa(t: *const Transport) bool {
-        for (t.opts.host_keys) |*k| if (k.* == .rsa) return true;
-        return false;
+    fn hostAlgs(t: *const Transport) keys.HostAlgs {
+        return keys.HostAlgs.of(t.opts.host_keys);
     }
 
     fn sendKexInit(t: *Transport) Error!void {
         var w = wire.Writer.init(&t.our_kexinit);
-        kex.writeKexInit(&w, t.hasEd(), t.hasRsa(), t.session_id == null) catch return error.Protocol;
+        kex.writeKexInit(&w, t.hostAlgs(), t.session_id == null) catch return error.Protocol;
         t.our_kexinit_len = w.len;
         t.kexinit_sent = true;
         try t.writePacket(w.written());
@@ -332,7 +326,7 @@ pub const Transport = struct {
         const i_c = try t.gpa.dupe(u8, client_kexinit);
         defer t.gpa.free(i_c);
         if (!t.kexinit_sent) try t.sendKexInit();
-        const n = kex.negotiate(i_c, t.hasEd(), t.hasRsa(), first) catch |e| return switch (e) {
+        const n = kex.negotiate(i_c, t.hostAlgs(), first) catch |e| return switch (e) {
             error.NoCommonAlgorithm => error.NoCommonAlgorithm,
             error.BadMessage => error.Protocol,
         };

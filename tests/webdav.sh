@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # WebDAV gateway end to end: curl (methods, locks, auth), a python client, rclone,
 # and S3 visibility of what WebDAV wrote. HTTPS with a per-run self-signed cert.
-# Env: RCLONE=path, WEBDAV_PYTHON=python with webdavclient3, TMPDIR for scratch.
+# Env: RCLONE=path, WEBDAV_PYTHON=python with webdavclient3, TMPDIR for scratch,
+# ZKFSM_GW_CLUSTER=1 to run against a 4-node cluster (locks checked across nodes).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 PIDS=()
-cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$WORK"; }
+cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; gw_cluster_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 pass=0
 fail=0
@@ -24,6 +27,7 @@ PY="${WEBDAV_PYTHON:-python3}"
 
 (cd "$ROOT" && zig build)
 BIN="$ROOT/zig-out/bin/zkfsm"
+gw_build "$WORK/rs"
 
 cd "$WORK"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout key.pem -out cert.pem -days 2 \
@@ -37,10 +41,21 @@ start() { # name, args...; waits for the webdav listener
   echo "server did not start:"; cat "$WORK/$name.log"; exit 1
 }
 
-S3P="$(freeport)"
-DP="$(freeport)"
-start main --data "$WORK/data" --listen "127.0.0.1:$S3P" --webdav "127.0.0.1:$DP" --tls-cert cert.pem --tls-key key.pem
+if [[ $GW_CLUSTER == 1 ]]; then
+  DPS=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  dav_node() { echo "--webdav 127.0.0.1:${DPS[$1]}"; }
+  gw_tls "$WORK/tls"
+  gw_cluster_start "$WORK" "webdav.*listening" "$WORK/tls" dav_node
+  S3P="${GW_S3P[1]}"; DP="${DPS[1]}"; DP2="${DPS[3]}"
+  echo "cluster mode: 4 nodes, webdav on ${DPS[*]:1}"
+else
+  S3P="$(freeport)"
+  DP="$(freeport)"
+  start main --data "$WORK/data" --listen "127.0.0.1:$S3P" --webdav "127.0.0.1:$DP" --tls-cert cert.pem --tls-key key.pem
+  DP2="$DP"
+fi
 DAV="https://127.0.0.1:$DP"
+DAV2="https://127.0.0.1:$DP2"
 S3="https://127.0.0.1:$S3P"
 c=(-s -k -u "$AK:$SK")
 code() { curl "${c[@]}" -o /dev/null -w '%{http_code}' "$@"; }
@@ -156,6 +171,20 @@ check "second shared lock" 200 "$(code -X LOCK -H 'Depth: infinity' --data "$SLI
 check "exclusive over shared 423" 423 "$(code -X LOCK --data "$LI" "$DAV/davb/dir3/obj.bin")"
 check "put in shared-locked dir 423" 423 "$(code -T obj.bin "$DAV/davb/dir3/new.bin")"
 
+# ---- locks are shared state: taken on one node, enforced on another ----
+check "cross-node lock" 200 "$(code -D lock2.h -X LOCK --data "$LI" "$DAV/davb/moved.bin")"
+TOK2="$(tr -d '\r' <lock2.h | awk 'tolower($1)=="lock-token:" {print $2}')"
+check "cross-node put without token 423" 423 "$(code -T obj.bin "$DAV2/davb/moved.bin")"
+check "cross-node conflicting lock 423" 423 "$(code -X LOCK --data "$LI" "$DAV2/davb/moved.bin")"
+check "cross-node lockdiscovery" 1 "$(curl "${c[@]}" -X PROPFIND -H 'Depth: 0' "$DAV2/davb/moved.bin" | grep -c "<D:href>${TOK2:1:-1}</D:href>")"
+check "cross-node put with token" 204 "$(code -T obj.bin -H "If: ($TOK2)" "$DAV2/davb/moved.bin")"
+check "cross-node refresh" 1 "$(curl "${c[@]}" -X LOCK -H "If: ($TOK2)" -H 'Timeout: Second-90' "$DAV2/davb/moved.bin" | grep -c 'Second-90')"
+check "cross-node unlock" 204 "$(code -X UNLOCK -H "Lock-Token: $TOK2" "$DAV2/davb/moved.bin")"
+check "put after cross-node unlock" 204 "$(code -T obj.bin "$DAV/davb/moved.bin")"
+check "lock expiry" 200 "$(code -X LOCK -H 'Timeout: Second-1' --data "$LI" "$DAV/davb/moved.bin")"
+sleep 2
+check "expired lock no longer blocks" 204 "$(code -T obj.bin "$DAV2/davb/moved.bin")"
+
 # ---- DELETE ----
 check "delete file 204" 204 "$(code -X DELETE "$DAV/davb/moved.bin")"
 check "delete missing 404" 404 "$(code -X DELETE "$DAV/davb/moved.bin")"
@@ -235,6 +264,9 @@ check "prefixed href" 1 "$(curl "${c[@]}" -X PROPFIND -H 'Depth: 1' "http://127.
 check "keep-alive reuse" 2 "$(curl "${c[@]}" -v -X PROPFIND -H 'Depth: 0' "http://127.0.0.1:$D2/dav/pbkt" "http://127.0.0.1:$D2/dav/pbkt" 2>&1 | grep -c '< HTTP/1.1 207')"
 check "garbage request survives" 201 "$(printf 'BAD<> / HTTP/1.1\r\n\r\n' | timeout 5 python3 -c 'import socket,sys;s=socket.create_connection(("127.0.0.1",int(sys.argv[1])));s.sendall(sys.stdin.buffer.read());s.recv(100)' "$D2"; code -X MKCOL "http://127.0.0.1:$D2/dav/pbkt2")"
 check "server alive" 0 "$(kill -0 "${PIDS[0]}"; echo $?)"
+if [[ $GW_CLUSTER == 1 ]]; then
+  check "cluster nodes alive" "0 0 0 0" "$(for i in 1 2 3 4; do kill -0 "${GW_PIDS[$i]}"; echo -n "$? "; done | xargs)"
+fi
 
 echo "passed $pass, failed $fail"
 [[ $fail -eq 0 ]]

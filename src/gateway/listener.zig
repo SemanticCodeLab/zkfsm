@@ -71,7 +71,7 @@ pub const Listener = struct {
                 continue;
             }
             setTimeouts(conn.stream.handle, self.idle_timeout_s);
-            const t = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, runConn, .{ self, conn }) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, runConn, .{ self, conn }) catch {
                 _ = self.active.fetchSub(1, .seq_cst);
                 conn.stream.close();
                 continue;

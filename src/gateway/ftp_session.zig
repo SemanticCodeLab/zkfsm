@@ -27,8 +27,6 @@ const data_accept_ms = 20_000;
 const max_list_entries = 200_000;
 const list_page = 1000;
 const max_stat_entries = 1000;
-/// APPE rewrites the object, so old + new bytes are spooled in memory up to this.
-pub const max_append_spool = 64 * 1024 * 1024;
 const max_login_failures = 3;
 const max_user = 256;
 
@@ -85,6 +83,8 @@ pub const Session = struct {
     rnfr_buf: [fs.max_path]u8 = undefined,
     rnfr_len: ?usize = null,
     pasv: ?std.net.Server = null,
+    /// PORT/EPRT target; always the control peer's host.
+    active: ?std.net.Address = null,
     quit: bool = false,
 
     fn cwd(s: *const Session) []const u8 {
@@ -240,7 +240,7 @@ pub const Session = struct {
             .STRU => if (std.ascii.eqlIgnoreCase(cmd.arg, "F")) s.reply(200, "Structure set to F.") else s.reply(504, "Only file structure is supported."),
             .PASV => s.cmdPasv(false, cmd.arg),
             .EPSV => s.cmdPasv(true, cmd.arg),
-            .PORT, .EPRT => s.reply(502, "Active mode is not supported; use PASV or EPSV."),
+            .PORT, .EPRT => s.cmdPort(verb == .EPRT, cmd.arg),
             .LIST => s.cmdList(arena, cmd.arg, .list),
             .NLST => s.cmdList(arena, cmd.arg, .nlst),
             .MLSD => s.cmdList(arena, cmd.arg, .mlsd),
@@ -251,7 +251,7 @@ pub const Session = struct {
                     s.reply(501, "Invalid restart offset.");
                     return;
                 };
-                s.replyFmt(350, "Restarting at {d}. Send RETR to resume.", .{s.rest});
+                s.replyFmt(350, "Restarting at {d}. Send RETR or STOR to resume.", .{s.rest});
             },
             .STOR => s.cmdStor(arena, cmd.arg, false),
             .APPE => s.cmdStor(arena, cmd.arg, true),
@@ -275,7 +275,7 @@ pub const Session = struct {
             .STAT => s.cmdStat(arena, cmd.arg),
             .HELP => {
                 s.out.writeAll("214-Commands recognized:\r\n" ++
-                    " USER PASS SYST FEAT OPTS PWD CWD CDUP TYPE MODE STRU PASV EPSV\r\n" ++
+                    " USER PASS SYST FEAT OPTS PWD CWD CDUP TYPE MODE STRU PASV EPSV PORT EPRT\r\n" ++
                     " LIST NLST MLSD MLST RETR REST STOR APPE DELE MKD RMD RNFR RNTO\r\n" ++
                     " SIZE MDTM NOOP QUIT ABOR STAT HELP AUTH PBSZ PROT\r\n" ++
                     "214 Help OK.\r\n") catch {};
@@ -464,6 +464,39 @@ pub const Session = struct {
     fn dropPassive(s: *Session) void {
         if (s.pasv) |*p| p.deinit();
         s.pasv = null;
+        s.active = null;
+    }
+
+    /// Active mode. Bounce protection: only the control peer's host, ports >= 1024.
+    fn cmdPort(s: *Session, extended: bool, arg: []const u8) void {
+        s.dropPassive();
+        const addr = (if (extended) proto.parseEprt(arg) else proto.parsePort(arg)) catch
+            return s.reply(501, "Syntax error in parameters.");
+        if (!proto.sameHost(addr, s.peer) or addr.getPort() < 1024) {
+            std.log.warn("ftp: refused {s} to {f} (control peer {f})", .{ if (extended) "EPRT" else "PORT", addr, s.peer });
+            return s.reply(504, "Data connection only to the control peer, port 1024 or above.");
+        }
+        s.active = addr;
+        s.replyFmt(200, "{s} command successful.", .{if (extended) "EPRT" else "PORT"});
+    }
+
+    fn connectActive(addr: std.net.Address) DataError!std.net.Stream {
+        const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP) catch return error.Failed;
+        errdefer posix.close(fd);
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |e| switch (e) {
+            error.WouldBlock => {
+                var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                const n = posix.poll(&fds, data_accept_ms) catch return error.Failed;
+                if (n == 0) return error.Timeout;
+                posix.getsockoptError(fd) catch return error.Failed;
+            },
+            else => return error.Failed,
+        };
+        const fl = posix.fcntl(fd, posix.F.GETFL, 0) catch return error.Failed;
+        var o: posix.O = @bitCast(@as(u32, @truncate(fl)));
+        o.NONBLOCK = false;
+        _ = posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(o))) catch return error.Failed;
+        return .{ .handle = fd };
     }
 
     fn cmdPasv(s: *Session, extended: bool, arg: []const u8) void {
@@ -504,6 +537,10 @@ pub const Session = struct {
 
     /// Accepts the client's data connection (only from the control peer's host).
     fn openData(s: *Session) DataError!*Data {
+        if (s.active) |addr| {
+            s.active = null;
+            return s.wrapData(.{ .stream = try connectActive(addr), .address = addr });
+        }
         var srv = s.pasv orelse return error.NoPassive;
         s.pasv = null;
         defer srv.deinit();
@@ -519,6 +556,10 @@ pub const Session = struct {
             std.log.warn("ftp: rejected data connection from {f} (control peer {f})", .{ c.address, s.peer });
             c.stream.close();
         };
+        return s.wrapData(conn);
+    }
+
+    fn wrapData(s: *Session, conn: std.net.Server.Connection) DataError!*Data {
         listener.setTimeouts(conn.stream.handle, s.env.idle_timeout_s);
         const d = s.gpa.create(Data) catch {
             conn.stream.close();
@@ -548,8 +589,8 @@ pub const Session = struct {
             s.reply(521, "Data protection required (PROT P).");
             return null;
         }
-        if (s.pasv == null) {
-            s.reply(425, "Use PASV or EPSV first.");
+        if (s.pasv == null and s.active == null) {
+            s.reply(425, "Use PASV, EPSV, PORT or EPRT first.");
             return null;
         }
         s.replyFmt(150, "Opening {s} data connection.", .{if (s.prot_p) "TLS" else "BINARY"});
@@ -585,50 +626,41 @@ pub const Session = struct {
         s.reply(226, "Transfer complete.");
     }
 
+    /// STOR, REST+STOR (keep the first `rest` bytes) and APPE; all stream.
     fn cmdStor(s: *Session, arena: std.mem.Allocator, arg: []const u8, append: bool) void {
         if (arg.len == 0) return s.reply(501, "Missing path.");
-        if (s.rest != 0) return s.reply(504, "REST with STOR is not supported; use APPE.");
         const path = s.resolve(arena, arg) orelse return;
         const f = s.view();
-        var spool: std.ArrayList(u8) = .empty;
-        defer spool.deinit(s.gpa);
-        if (append) {
+        var keep: u64 = s.rest;
+        if (append or keep > 0) {
             if (f.stat(arena, path)) |st| {
                 if (st.kind != .file) return s.reply(550, "Is a directory.");
-                if (st.size > max_append_spool) return s.reply(504, "APPE is limited to files up to 64 MiB.");
-                const info = f.openRead(arena, path) catch |e| return s.replyFs(e);
-                var aw: Writer.Allocating = .fromArrayList(s.gpa, &spool);
-                f.read(info, null, &aw.writer) catch |e| {
-                    spool = aw.toArrayList();
-                    return s.replyFs(e);
-                };
-                spool = aw.toArrayList();
-            } else |e| if (e != error.NotFound) return s.replyFs(e);
-        }
-        const d = s.beginTransfer() orelse return;
-        if (append) {
-            d.reader().appendRemaining(s.gpa, &spool, .limited(max_append_spool - spool.items.len + 1)) catch |e| {
-                d.finish(false);
-                return switch (e) {
-                    error.StreamTooLong => s.reply(552, "APPE result exceeds 64 MiB."),
-                    error.OutOfMemory => s.reply(451, "Out of memory."),
-                    error.ReadFailed => s.reply(426, "Connection closed; transfer aborted."),
-                };
-            };
-            if (spool.items.len > max_append_spool) {
-                d.finish(false);
-                return s.reply(552, "APPE result exceeds 64 MiB.");
+                if (append) keep = st.size;
+                if (keep > st.size) return s.reply(554, "Restart offset beyond end of file.");
+            } else |e| {
+                if (e != error.NotFound or keep > 0 and !append) return s.replyFs(e);
+                keep = 0;
             }
+        }
+        if (keep == 0) {
+            const d = s.beginTransfer() orelse return;
+            _ = f.write(path, d.reader(), null, "application/octet-stream") catch |e| {
+                d.finish(false);
+                return s.replyFs(e);
+            };
             d.finish(true);
-            var src: Reader = .fixed(spool.items);
-            _ = f.write(path, &src, spool.items.len, "application/octet-stream") catch |e| return s.replyFs(e);
             return s.reply(226, "Transfer complete.");
         }
-        _ = f.write(path, d.reader(), null, "application/octet-stream") catch |e| {
+        var up = fs.Upload.begin(f, s.gpa, path) catch |e| return s.replyFs(e);
+        defer up.deinit();
+        up.copyPrefix(arena, keep) catch |e| return s.replyFs(e);
+        const d = s.beginTransfer() orelse return;
+        up.pump(d.reader()) catch |e| {
             d.finish(false);
             return s.replyFs(e);
         };
         d.finish(true);
+        up.finish() catch |e| return s.replyFs(e);
         s.reply(226, "Transfer complete.");
     }
 

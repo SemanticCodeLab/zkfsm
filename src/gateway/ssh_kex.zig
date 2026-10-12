@@ -52,7 +52,7 @@ pub const Negotiated = struct {
 };
 
 /// Our KEXINIT payload for the given host key algorithms.
-pub fn writeKexInit(w: *wire.Writer, has_ed25519: bool, has_rsa: bool, first: bool) wire.EncodeError!void {
+pub fn writeKexInit(w: *wire.Writer, host: keys.HostAlgs, first: bool) wire.EncodeError!void {
     try w.byte(msg_kexinit);
     var cookie: [16]u8 = undefined;
     std.crypto.random.bytes(&cookie);
@@ -67,14 +67,11 @@ pub fn writeKexInit(w: *wire.Writer, has_ed25519: bool, has_rsa: bool, first: bo
     w.endString(k);
     const h = try w.beginString();
     var n: usize = 0;
-    if (has_ed25519) {
-        try w.bytes("ssh-ed25519");
-        n += 1;
-    }
-    if (has_rsa) {
+    for (host_order) |a| if (host.allow(a)) {
         if (n > 0) try w.byte(',');
-        try w.bytes("rsa-sha2-512,rsa-sha2-256");
-    }
+        try w.bytes(a.name());
+        n += 1;
+    };
     w.endString(h);
     for (0..2) |_| {
         const c = try w.beginString();
@@ -140,20 +137,13 @@ const AllowAll = struct {
     }
 };
 
-const HostAllow = struct {
-    ed: bool,
-    rsa: bool,
-    fn allow(h: HostAllow, a: keys.SigAlg) bool {
-        return if (a == .ssh_ed25519) h.ed else h.rsa;
-    }
-};
+const host_order = [_]keys.SigAlg{ .ssh_ed25519, .ecdsa_nistp256, .rsa_sha2_512, .rsa_sha2_256 };
 
 /// Picks algorithms from the client's KEXINIT (client preference wins, RFC 4253 7.1).
-pub fn negotiate(client_kexinit: []const u8, has_ed25519: bool, has_rsa: bool, first: bool) NegotiateError!Negotiated {
+pub fn negotiate(client_kexinit: []const u8, has: keys.HostAlgs, first: bool) NegotiateError!Negotiated {
     const l = try parseLists(client_kexinit);
-    const host_order = [_]keys.SigAlg{ .ssh_ed25519, .rsa_sha2_512, .rsa_sha2_256 };
     const kex = firstMatch(KexAlgo, l.kex, &kex_order, AllowAll{}) orelse return error.NoCommonAlgorithm;
-    const host = firstMatch(keys.SigAlg, l.host, &host_order, HostAllow{ .ed = has_ed25519, .rsa = has_rsa }) orelse return error.NoCommonAlgorithm;
+    const host = firstMatch(keys.SigAlg, l.host, &host_order, has) orelse return error.NoCommonAlgorithm;
     const enc_cs = firstMatch(cipher.Algo, l.enc_cs, &cipher.supported, AllowAll{}) orelse return error.NoCommonAlgorithm;
     const enc_sc = firstMatch(cipher.Algo, l.enc_sc, &cipher.supported, AllowAll{}) orelse return error.NoCommonAlgorithm;
     if (!wire.hasName(l.comp_cs, "none") or !wire.hasName(l.comp_sc, "none")) return error.NoCommonAlgorithm;
@@ -317,36 +307,38 @@ fn testClientKexInit(buf: []u8, kex: []const u8, host: []const u8, enc: []const 
 test "negotiation follows client preference within our set" {
     var buf: [512]u8 = undefined;
     const ki = try testClientKexInit(&buf, "sntrup761x25519-sha512,curve25519-sha256,ext-info-c," ++ strict_c, "ecdsa-sha2-nistp256,rsa-sha2-256,ssh-ed25519", "aes256-gcm@openssh.com,chacha20-poly1305@openssh.com", false);
-    const n = try negotiate(ki, true, true, true);
+    const n = try negotiate(ki, .{ .ed = true, .rsa = true }, true);
     try std.testing.expectEqual(KexAlgo.curve25519_sha256, n.kex);
     try std.testing.expectEqual(keys.SigAlg.rsa_sha2_256, n.host);
     try std.testing.expectEqual(cipher.Algo.aes256_gcm, n.enc_cs);
     try std.testing.expect(n.strict and n.ext_info and !n.skip_guess);
-    const no_rsa = try negotiate(ki, true, false, false);
+    const ec = try negotiate(ki, .{ .ed = true, .ecdsa = true }, false);
+    try std.testing.expectEqual(keys.SigAlg.ecdsa_nistp256, ec.host);
+    const no_rsa = try negotiate(ki, .{ .ed = true }, false);
     try std.testing.expectEqual(keys.SigAlg.ssh_ed25519, no_rsa.host);
     try std.testing.expect(!no_rsa.strict);
 }
 
 test "negotiation failures and wrong guesses" {
     var buf: [512]u8 = undefined;
-    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "diffie-hellman-group14-sha1", "ssh-ed25519", "aes128-ctr,aes256-gcm@openssh.com", false), true, false, true));
-    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "curve25519-sha256", "ssh-ed25519", "aes128-ctr", false), true, false, true));
-    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "curve25519-sha256", "rsa-sha2-256", "aes128-gcm@openssh.com", false), true, false, true));
-    const g = try negotiate(try testClientKexInit(&buf, "ecdh-sha2-nistp256,mlkem768x25519-sha256", "ssh-ed25519", "aes128-gcm@openssh.com", true), true, false, true);
+    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "diffie-hellman-group14-sha1", "ssh-ed25519", "aes128-ctr,aes256-gcm@openssh.com", false), .{ .ed = true }, true));
+    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "curve25519-sha256", "ssh-ed25519", "aes128-ctr", false), .{ .ed = true }, true));
+    try std.testing.expectError(error.NoCommonAlgorithm, negotiate(try testClientKexInit(&buf, "curve25519-sha256", "rsa-sha2-256", "aes128-gcm@openssh.com", false), .{ .ed = true }, true));
+    const g = try negotiate(try testClientKexInit(&buf, "ecdh-sha2-nistp256,mlkem768x25519-sha256", "ssh-ed25519", "aes128-gcm@openssh.com", true), .{ .ed = true }, true);
     try std.testing.expect(g.skip_guess);
-    try std.testing.expectError(error.BadMessage, negotiate(buf[0..10], true, false, true));
+    try std.testing.expectError(error.BadMessage, negotiate(buf[0..10], .{ .ed = true }, true));
 }
 
 test "our kexinit parses and offers strict kex only first" {
     var buf: [1024]u8 = undefined;
     var w = wire.Writer.init(&buf);
-    try writeKexInit(&w, true, false, true);
+    try writeKexInit(&w, .{ .ed = true }, true);
     const l = try parseLists(w.written());
     try std.testing.expect(wire.hasName(l.kex, strict_s));
     try std.testing.expect(wire.hasName(l.kex, "mlkem768x25519-sha256"));
     try std.testing.expectEqualStrings("ssh-ed25519", l.host);
     w = wire.Writer.init(&buf);
-    try writeKexInit(&w, true, true, false);
+    try writeKexInit(&w, .{ .ed = true, .rsa = true }, false);
     const l2 = try parseLists(w.written());
     try std.testing.expect(!wire.hasName(l2.kex, strict_s));
     try std.testing.expectEqualStrings("ssh-ed25519,rsa-sha2-512,rsa-sha2-256", l2.host);

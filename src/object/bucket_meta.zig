@@ -20,6 +20,8 @@ pub const Kind = enum(u8) {
     request_payment = 8,
     location = 9,
     lifecycle_legacy = 10,
+    /// WebDAV gateway lock table (gateway-encoded).
+    webdav_locks = 11,
 };
 
 pub const max_doc_bytes = 64 * 1024;
