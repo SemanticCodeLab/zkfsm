@@ -15,6 +15,9 @@ pub const tt = struct {
     pub const internal: u64 = 1 << 3;
     pub const scanner: u64 = 1 << 4;
     pub const healing: u64 = 1 << 6;
+    pub const batch_replication: u64 = 1 << 7;
+    pub const batch_keyrotation: u64 = 1 << 8;
+    pub const batch_expire: u64 = 1 << 9;
     pub const replication_resync: u64 = 1 << 11;
     pub const ftp: u64 = 1 << 13;
     pub const ilm: u64 = 1 << 14;
@@ -34,6 +37,9 @@ pub fn bitOf(t: core.trace.Type) u64 {
         .scanner => tt.scanner,
         .healing => tt.healing,
         .os => tt.os,
+        .batch_replication => tt.batch_replication,
+        .batch_keyrotation => tt.batch_keyrotation,
+        .batch_expire => tt.batch_expire,
     };
 }
 

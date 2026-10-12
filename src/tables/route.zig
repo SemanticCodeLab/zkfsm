@@ -112,6 +112,11 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
     var in = try s3.sigv4.Input.fromRequest(arena, req);
     const method = req.head.method;
+    const is_ice = icebergRest(req.head.target) != null;
+    var sp = core.trace.root(if (is_ice) "tables.iceberg" else "tables.control", .server, .s3, .{ .traceparent = in.header("traceparent") });
+    defer sp.end();
+    sp.str("http.request.method", @tagName(method));
+    sp.str("path", in.target[0 .. std.mem.indexOfScalar(u8, in.target, '?') orelse in.target.len]);
     if (req.head.content_length) |n| if (n > max_body) return reject(req, .payload_too_large, "request body too large\n");
     var buf: [16 * 1024]u8 = undefined;
     const reader = try req.readerExpectContinue(&buf);

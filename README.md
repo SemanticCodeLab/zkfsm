@@ -430,14 +430,18 @@ mc admin prometheus generate z --api-version v3          # scrape config with a 
 - OpenTelemetry over OTLP/HTTP (protobuf): a span per S3, admin, and gateway
   (FTP, SFTP, WebDAV, Swift) request, with child spans for storage operations,
   internode RPC (the `traceparent` travels with the call, so remote nodes continue
-  the trace), KMS, remote tiers, lifecycle passes, and replication (forwarded to the
-  target). Incoming W3C `traceparent` headers are honored; their sampled flag wins
+  the trace), KMS (data keys and key management), remote tiers, lifecycle passes,
+  replication (forwarded to the target), and Object Lambda webhook calls (which get
+  the `traceparent` too). Table catalog requests and batch job passes are root spans. Incoming W3C `traceparent` headers are honored; their sampled flag wins
   over `--otel-sample-ratio` / `OTEL_TRACES_SAMPLER[_ARG]`. Logs (info and above, with
   trace ids) and every v3 metric are exported too. Standard variables apply:
   `OTEL_EXPORTER_OTLP_[<SIGNAL>_]ENDPOINT`, `_HEADERS`, `OTEL_SERVICE_NAME`,
   `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_<SIGNAL>_EXPORTER=none`, `OTEL_BSP_*`,
   `OTEL_METRIC_EXPORT_INTERVAL`; flags `--otel-endpoint`, `--otel-headers`,
-  `--otel-signals`, `--otel-service-name`.
+  `--otel-signals`, `--otel-service-name`. An `https://` collector is verified
+  against the system roots or `--otel-ca-file` (`OTEL_EXPORTER_OTLP_CERTIFICATE`);
+  `--otel-client-cert` / `--otel-client-key` (`OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
+  `_CLIENT_KEY`) present a client certificate; TLS 1.2 and 1.3 are spoken.
 - Metrics v3 under `/minio/metrics/v3` with the MinIO hierarchy (`api/requests`,
   `system/{drive,memory,cpu,process,network/internode}`, `debug/go`,
   `cluster/{health,usage/objects,usage/buckets,erasure-set,iam,config}`, `ilm`,
@@ -445,10 +449,11 @@ mc admin prometheus generate z --api-version v3          # scrape config with a 
   `bucket/{api,replication}/<bucket>`); any path serves the groups below it. API
   latency is both a MinIO `ttfb_seconds_distribution` and a Prometheus histogram.
   Scrapes need the JWT from `mc admin prometheus generate` (a key allowed
-  `admin:Prometheus`) unless `MINIO_PROMETHEUS_AUTH_TYPE=public`. `/metrics` and
-  `/minio/v2/metrics/cluster` are unchanged.
+  `admin:Prometheus`) unless `MINIO_PROMETHEUS_AUTH_TYPE=public`. The root path also
+  carries the `zkfsm_*` subsystem families (replication, notification targets, KMS).
+  `/metrics` and `/minio/v2/metrics/cluster` are unchanged.
 - `mc admin trace` streams S3/admin calls with HTTP detail and, by `--call`, storage,
-  internode, KMS, ILM (tier), replication, and gateway events, with `--errors` and
+  internode, KMS, ILM (tier), replication, batch job, and gateway events, with `--errors` and
   `--response-duration` filters; in a cluster any node streams every node's events.
   `mc admin logs` replays recent server log lines and follows new ones.
 - Server access logs: PutBucketLogging now delivers records in the S3 server access

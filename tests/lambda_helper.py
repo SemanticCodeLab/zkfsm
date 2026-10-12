@@ -63,6 +63,8 @@ class H(BaseHTTPRequestHandler):
             f.write(raw)
         with open(os.path.join(LOG, "auth"), "w") as f:
             f.write(self.headers.get("Authorization", ""))
+        with open(os.path.join(LOG, "traceparent"), "w") as f:
+            f.write(self.headers.get("traceparent", ""))
         if TLS:
             cn = ""
             for rdn in (self.connection.getpeercert() or {}).get("subject", ()):

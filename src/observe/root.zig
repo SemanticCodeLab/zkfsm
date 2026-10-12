@@ -487,9 +487,10 @@ fn traceFilter(a: Allocator, q: []const u8) error{ OutOfMemory, Invalid }!hub.Fi
     var f: hub.Filter = .{ .mask = 0 };
     const tt = hub.tt;
     const flags = .{
-        .{ "s3", tt.s3 },           .{ "internal", tt.internal },                     .{ "storage", tt.storage }, .{ "os", tt.os },
-        .{ "scanner", tt.scanner }, .{ "healing", tt.healing },                       .{ "ftp", tt.ftp },         .{ "ilm", tt.ilm },
-        .{ "kms", tt.kms },         .{ "replication-resync", tt.replication_resync },
+        .{ "s3", tt.s3 },                     .{ "internal", tt.internal },                     .{ "storage", tt.storage },                     .{ "os", tt.os },
+        .{ "scanner", tt.scanner },           .{ "healing", tt.healing },                       .{ "ftp", tt.ftp },                             .{ "ilm", tt.ilm },
+        .{ "kms", tt.kms },                   .{ "replication-resync", tt.replication_resync }, .{ "batch-replication", tt.batch_replication }, .{ "batch-keyrotation", tt.batch_keyrotation },
+        .{ "batch-expire", tt.batch_expire },
     };
     inline for (flags) |fl| if (try admin.api.queryParam(a, q, fl[0])) |v| {
         if (std.mem.eql(u8, v, "true")) f.mask |= fl[1];

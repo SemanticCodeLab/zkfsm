@@ -3,7 +3,7 @@
 const std = @import("std");
 
 /// What a span covers; live trace subscribers filter on it.
-pub const Type = enum(u5) { s3, admin, gateway, storage, internal, kms, ilm, replication, scanner, healing, os };
+pub const Type = enum(u5) { s3, admin, gateway, storage, internal, kms, ilm, replication, scanner, healing, os, batch_replication, batch_keyrotation, batch_expire };
 /// OTLP SpanKind numbering.
 pub const Kind = enum(u3) { internal = 1, server = 2, client = 3, producer = 4, consumer = 5 };
 

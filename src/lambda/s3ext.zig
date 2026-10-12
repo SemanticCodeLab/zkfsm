@@ -1,6 +1,7 @@
 //! GET object with `?lambdaArn=...`: presigns the plain GetObject, posts the event
 //! to the lambda webhook and streams its reply back (x-amz-fwd-* mapping).
 const std = @import("std");
+const core = @import("../core/root.zig");
 const backend = @import("../backend/root.zig");
 const object = @import("../object/root.zig");
 const metrics = @import("../metrics/root.zig");
@@ -117,12 +118,20 @@ fn serve(self: *Registry, c: *Ctx, arn: []const u8) ConnError!void {
         .principal = c.auth.principal,
         .access_key = c.auth.access_key,
     });
-    const r = client.post(self.gpa, a, ep, auth, body, self.client) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unreachable => return failCode(c, 500, "InternalError", "The lambda target could not be reached.", &.{}),
-        error.BadResponse => return failCode(c, 500, "InternalError", "The lambda target sent a malformed response.", &.{}),
+    var sp = core.trace.child("lambda.invoke", .client, .internal);
+    sp.str("path", ep.path);
+    sp.str("server.address", ep.host);
+    defer sp.end();
+    const r = client.post(self.gpa, a, ep, auth, body, self.client) catch |e| {
+        sp.fail(@errorName(e));
+        switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unreachable => return failCode(c, 500, "InternalError", "The lambda target could not be reached.", &.{}),
+            error.BadResponse => return failCode(c, 500, "InternalError", "The lambda target sent a malformed response.", &.{}),
+        }
     };
     defer r.close();
+    sp.int("http.response.status_code", r.status);
     const fwd = try event.forwardHeaders(a, r.headers);
     switch (event.outcome(r.status, r.headers)) {
         .fail => |f| return failCode(c, f.status, f.code, f.message, fwd),

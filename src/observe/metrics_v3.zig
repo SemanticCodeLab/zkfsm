@@ -504,6 +504,8 @@ fn zkfsmExtras(src: *Sources, _: std.mem.Allocator, w: *Writer) WError!void {
         }
     }
     if (src.access_log) |f| try f(src.access_log_ctx.?, w);
+    // Subsystem families (replication, notification targets, KMS) as on /metrics.
+    for (metrics.global.extra) |x| if (x) |r| try r.func(r.ctx, w);
 }
 
 test "group selection by path prefix" {

@@ -77,6 +77,11 @@ PY
 }
 has_spans() { [[ "$(spans "$1")" -ge "${2:-1}" ]]; }
 
+WH="$(freeport)"
+python3 "$ROOT/tests/lambda_helper.py" "$WH" "$WORK/hook" &
+PIDS+=($!)
+mkdir -p "$WORK/hook"
+export MINIO_LAMBDA_WEBHOOK_ENABLE_up=on MINIO_LAMBDA_WEBHOOK_ENDPOINT_up="http://127.0.0.1:$WH/upper"
 start --kms-backend local --kms-dir "$WORK/kms" --ftp "127.0.0.1:$FPORT"
 "$MC" alias set z "$EP" "$AK" "$SK" >/dev/null
 echo "hello observability" >"$WORK/f.txt"
@@ -122,6 +127,43 @@ f.quit()
 PY
 wait_for 5 has_spans "s['name']=='ftp.NLST'"
 check "FTP gateway commands are root spans" yes "$(yes_no has_spans "s['name']=='ftp.CWD' and s['parent']=='' and s['kind']==2 and s['attrs'].get('path')=='/obs'")"
+
+echo "--- spans of KMS management, object lambda, tables, batch jobs"
+"$MC" admin kms key create z obs-key >/dev/null 2>&1 || true
+"$MC" admin kms key status z obs-key >/dev/null 2>&1 || true
+wait_for 5 has_spans "s['name']=='kms.KeyStatus'"
+check "KMS management calls are spans" yes "$(yes_no has_spans "s['name']=='kms.KeyStatus' and s['kind']==3 and s['parent']!=''")"
+LTID=33333333333333333333333333333333
+check "lambda GET with traceparent" 200 "$(curl -s -o "$WORK/lambda.out" -w '%{http_code}' "${sig[@]}" -H "traceparent: 00-$LTID-$PSID-01" "$EP/obs/a.txt?lambdaArn=arn:minio:s3-object-lambda::up:webhook")"
+check "lambda transformed the object" "HELLO OBSERVABILITY" "$(cat "$WORK/lambda.out")"
+wait_for 5 has_spans "s['trace_id']=='$LTID' and s['name']=='lambda.invoke'"
+check "lambda webhook call is a client span" yes "$(yes_no has_spans "s['trace_id']=='$LTID' and s['name']=='lambda.invoke' and s['kind']==3 and s['attrs'].get('http.response.status_code')==200")"
+check "webhook received the traceparent" "00-$LTID-" "$(cut -c1-36 "$WORK/hook/traceparent" 2>/dev/null)"
+check "webhook traceparent names the lambda span" 1 "$(spans "s['name']=='lambda.invoke' and s['span_id']=='$(cut -d- -f3 "$WORK/hook/traceparent" 2>/dev/null)'")"
+ITID=44444444444444444444444444444444
+curl -s -o /dev/null "${sig[@]}" -H "traceparent: 00-$ITID-$PSID-01" "$EP/iceberg/v1/config?warehouse=nope"
+wait_for 5 has_spans "s['trace_id']=='$ITID'"
+check "table catalog requests are spans" yes "$(yes_no has_spans "s['trace_id']=='$ITID' and s['name']=='tables.iceberg' and s['parent']=='$PSID' and s['attrs'].get('path')=='/iceberg/v1/config'")"
+"$MC" mb z/exp >/dev/null
+"$MC" cp -q "$WORK/f.txt" z/exp/old.log >/dev/null
+printf 'expire:\n  apiVersion: v1\n  bucket: exp\n  rules:\n    - type: object\n      name: "*.log"\n' >"$WORK/exp.yaml"
+"$MC" admin trace z --call batch-expiration --json >"$WORK/trace-batch.json" 2>&1 &
+TBP=$!
+sleep 1
+check "batch job accepted" 0 "$("$MC" batch start z "$WORK/exp.yaml" >/dev/null 2>&1; echo $?)"
+wait_for 10 has_spans "s['name']=='batch.expire'"
+check "batch pass is a root span" yes "$(yes_no has_spans "s['name']=='batch.expire' and s['parent']=='' and s['attrs'].get('batch.attempt')==0")"
+check "batch storage work under the pass" yes "$(python3 - "$OTLP/spans.jsonl" <<'PY2'
+import json, sys
+sp = [json.loads(l) for l in open(sys.argv[1])]
+ids = {s["span_id"] for s in sp if s["name"] == "batch.expire"}
+print("yes" if any(s["name"].startswith("storage.") and s["parent"] in ids for s in sp) else "no")
+PY2
+)"
+sleep 0.5
+kill "$TBP" 2>/dev/null || true
+wait "$TBP" 2>/dev/null || true
+check "trace --call batch-expiration streams the pass" yes "$(yes_no grep -q '"batch.expire"' "$WORK/trace-batch.json")"
 
 echo "--- OTLP logs and metrics"
 logs_has() { grep -q "$1" "$OTLP/logs.jsonl" 2>/dev/null; }
@@ -193,6 +235,52 @@ stop
 check "shutdown does not wait on a hung collector" yes "$([[ $(( $(date +%s) - T0 )) -lt 10 ]] && echo yes || echo no)"
 start --otel-sample-ratio 1
 
+echo "--- OTLP over HTTPS: CA file and client certificate"
+stop
+PKI="$WORK/pki"
+mkdir -p "$PKI"
+printf '[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n[srv]\nbasicConstraints=CA:FALSE\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n[cli]\nbasicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n' >"$PKI/ext.cnf"
+openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null | openssl pkcs8 -topk8 -nocrypt -out "$PKI/ca.key"
+openssl req -x509 -new -key "$PKI/ca.key" -subj "/CN=obs-ca" -days 2 -out "$PKI/ca.pem" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+for c in "server localhost srv" "client zkfsm-otel cli"; do
+  set -- $c
+  openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null | openssl pkcs8 -topk8 -nocrypt -out "$PKI/$1.key"
+  openssl req -new -key "$PKI/$1.key" -subj "/CN=$2" -out "$PKI/$1.csr" 2>/dev/null
+  openssl x509 -req -in "$PKI/$1.csr" -CA "$PKI/ca.pem" -CAkey "$PKI/ca.key" -CAcreateserial -days 2 -extfile "$PKI/ext.cnf" -extensions "$3" -out "$PKI/$1.pem" 2>/dev/null
+done
+set --
+SPORT="$(freeport)"
+python3 "$ROOT/tests/otlp_receiver.py" "$SPORT" "$WORK/otlps" "$PKI/server.pem" "$PKI/server.key" "$PKI/ca.pem" 2>/dev/null &
+PIDS+=($!)
+sleep 0.5
+PLAIN="$OTLP"
+OTLP="$WORK/otlps"
+OTEL_EP="https://localhost:$SPORT" OTEL_EXPORTER_OTLP_CERTIFICATE="$PKI/ca.pem" OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE="$PKI/client.pem" \
+  OTEL_EXPORTER_OTLP_CLIENT_KEY="$PKI/client.key" start
+STID=55555555555555555555555555555555
+curl -s -o /dev/null "${sig[@]}" -H "traceparent: 00-$STID-$PSID-01" "$EP/obs/a.txt"
+wait_for 8 has_spans "s['trace_id']=='$STID'"
+check "spans exported over mutual TLS" yes "$(yes_no has_spans "s['trace_id']=='$STID' and s['name']=='s3.GetObject'")"
+check "export headers over TLS" yes "$(yes_no has_spans "s['headers'].get('x-tenant')=='t1'")"
+wait_for 8 grep -q minio_api_requests_total "$OTLP/metrics.jsonl"
+check "metrics exported over mutual TLS" yes "$(yes_no grep -q minio_api_requests_total "$OTLP/metrics.jsonl")"
+stop
+: >"$OTLP/spans.jsonl"
+OTEL_EP="https://localhost:$SPORT" OTEL_EXPORTER_OTLP_CERTIFICATE="$PKI/ca.pem" start
+curl -s -o /dev/null "${sig[@]}" -H "traceparent: 00-$STID-$PSID-01" "$EP/obs/a.txt"
+otlp_failed() { curl -s "$EP/metrics" -o /dev/null; "$MC" admin prometheus metrics z --api-version v3 2>/dev/null | grep -qE '^zkfsm_otlp_failed_total\{signal="traces"\} [1-9]'; }
+check "export without a client certificate fails and is counted" yes "$(yes_no wait_for 8 otlp_failed)"
+check "collector got nothing without a client certificate" 0 "$(spans "True")"
+stop
+OTEL_EP="https://localhost:$SPORT" start
+curl -s -o /dev/null "${sig[@]}" -H "traceparent: 00-$STID-$PSID-01" "$EP/obs/a.txt"
+check "untrusted collector certificate is refused" yes "$(yes_no wait_for 8 otlp_failed)"
+stop
+check "unreadable CA file refused at startup" 2 "$(OTEL_EXPORTER_OTLP_ENDPOINT="https://localhost:$SPORT" ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/x" --listen 127.0.0.1:1 --otel-ca-file "$WORK/nope.pem" >/dev/null 2>&1; echo $?)"
+check "client certificate without a key refused" 2 "$(OTEL_EXPORTER_OTLP_ENDPOINT="https://localhost:$SPORT" ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/x" --listen 127.0.0.1:1 --otel-client-cert "$PKI/client.pem" >/dev/null 2>&1; echo $?)"
+OTLP="$PLAIN"
+start --otel-sample-ratio 1
+
 echo "--- metrics v3"
 "$MC" cat z/obs/a.txt >/dev/null
 v3() { "$MC" admin prometheus metrics z "$@" --api-version v3 2>&1; }
@@ -203,6 +291,7 @@ check "v3 per-bucket api" yes "$(yes_no grep -q 'minio_bucket_api_total{bucket="
 check "v3 system drive" yes "$(yes_no grep -q "minio_system_drive_total_bytes{drive=\"$WORK/d1\"" <<<"$(v3 system)")"
 check "v3 system memory/cpu/process" 3 "$(v3 system | grep -cE '^minio_system_(memory_total|cpu_load|process_resident_memory_bytes)\{')"
 check "v3 cluster usage" yes "$(yes_no grep -q 'minio_cluster_usage_buckets_objects_count{bucket="obs"} 2' <<<"$(v3 cluster)")"
+check "v3 root carries the KMS families" yes "$(yes_no grep -q '^zkfsm_kms_requests_total' <<<"$("$MC" admin prometheus metrics z --api-version v3)")"
 check "v3 cluster health" yes "$(yes_no grep -q '^minio_cluster_health_drives_online_count 1' <<<"$(v3 cluster)")"
 for g in ilm replication notification scanner audit logger debug; do
   check "v3 group $g" 0 "$("$MC" admin prometheus metrics z "$g" --api-version v3 >/dev/null 2>&1; echo $?)"

@@ -197,22 +197,32 @@ pub const Kms = struct {
         return e;
     }
     pub fn listKeys(k: Kms, gpa: std.mem.Allocator) Error![]KeyInfo {
-        return k.vtable.listKeys(k.ptr, gpa);
+        var sp = k.span("kms.ListKeys", "");
+        defer sp.end();
+        return k.vtable.listKeys(k.ptr, gpa) catch |e| failed(&sp, e);
     }
     pub fn keyStatus(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!KeyInfo {
-        return k.vtable.keyStatus(k.ptr, gpa, key_id);
+        var sp = k.span("kms.KeyStatus", key_id);
+        defer sp.end();
+        return k.vtable.keyStatus(k.ptr, gpa, key_id) catch |e| failed(&sp, e);
     }
     pub fn rotateKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!KeyInfo {
-        return k.vtable.rotateKey(k.ptr, gpa, key_id);
+        var sp = k.span("kms.RotateKey", key_id);
+        defer sp.end();
+        return k.vtable.rotateKey(k.ptr, gpa, key_id) catch |e| failed(&sp, e);
     }
     pub fn setKeyState(k: Kms, gpa: std.mem.Allocator, key_id: []const u8, state: KeyState) Error!void {
         const f = k.vtable.setKeyState orelse return error.Unsupported;
         if (state != .enabled and state != .disabled) return error.InvalidArgument;
-        return f(k.ptr, gpa, key_id, state);
+        var sp = k.span("kms.SetKeyState", key_id);
+        defer sp.end();
+        return f(k.ptr, gpa, key_id, state) catch |e| failed(&sp, e);
     }
     pub fn deleteKey(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error!void {
         const f = k.vtable.deleteKey orelse return error.Unsupported;
-        return f(k.ptr, gpa, key_id);
+        var sp = k.span("kms.DeleteKey", key_id);
+        defer sp.end();
+        return f(k.ptr, gpa, key_id) catch |e| failed(&sp, e);
     }
     pub fn keyTags(k: Kms, gpa: std.mem.Allocator, key_id: []const u8) Error![]Tag {
         const f = k.vtable.keyTags orelse return error.Unsupported;

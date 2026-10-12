@@ -1,6 +1,7 @@
 //! POSTs a lambda event to a webhook and exposes the response head and a body
 //! reader (content-length, chunked, or close-delimited).
 const std = @import("std");
+const core = @import("../core/root.zig");
 const net = @import("../events/net.zig");
 const config = @import("config.zig");
 
@@ -51,9 +52,11 @@ pub fn post(gpa: Allocator, arena: Allocator, ep: config.Endpoint, auth: ?[]cons
     };
     var owned = true;
     defer if (owned) c.close();
+    var tp_buf: [core.trace.header_len]u8 = undefined;
     const w = c.writer();
     w.print("POST {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zkfsm\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ ep.path, ep.host_header, body.len }) catch return error.Unreachable;
     if (auth) |v| w.print("Authorization: {s}\r\n", .{v}) catch return error.Unreachable;
+    if (core.trace.outgoing(&tp_buf)) |tp| w.print("traceparent: {s}\r\n", .{tp}) catch return error.Unreachable;
     w.writeAll("\r\n") catch return error.Unreachable;
     w.writeAll(body) catch return error.Unreachable;
     c.flush() catch return error.Unreachable;

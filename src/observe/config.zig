@@ -1,6 +1,7 @@
 //! Observability settings: `--otel-*` / `--access-log-*` flags over the standard
 //! OTEL_* environment, then ZKFSM_* fallbacks.
 const std = @import("std");
+const tls = @import("../tls/root.zig");
 const otlp = @import("otlp.zig");
 
 pub const usage =
@@ -13,6 +14,10 @@ pub const usage =
     \\  --otel-signals LIST     traces,logs,metrics subset to export (default: all;
     \\                          $OTEL_{TRACES,LOGS,METRICS}_EXPORTER=none disables one)
     \\  --otel-service-name N   service.name (default: $OTEL_SERVICE_NAME, else zkfsm)
+    \\  --otel-ca-file PEM      CA bundle for an https collector (or $OTEL_EXPORTER_OTLP_CERTIFICATE)
+    \\  --otel-client-cert PEM  client certificate and key for a collector that asks for one
+    \\  --otel-client-key PEM   (or $OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE / _CLIENT_KEY)
+    \\  --otel-tls-skip-verify on   do not verify the collector certificate (or $ZKFSM_OTEL_TLS_SKIP_VERIFY)
     \\  --access-log-interval S seconds between server access log deliveries (default: 300,
     \\                          or $ZKFSM_ACCESS_LOG_INTERVAL)
     \\  metrics v3 at /minio/metrics/v3 need a bearer JWT (mc admin prometheus generate)
@@ -26,6 +31,10 @@ pub const Flags = struct {
     headers: ?[]const u8 = null,
     signals: ?[]const u8 = null,
     service_name: ?[]const u8 = null,
+    ca_file: ?[]const u8 = null,
+    client_cert: ?[]const u8 = null,
+    client_key: ?[]const u8 = null,
+    skip_verify: ?bool = null,
     access_log_interval_s: ?u32 = null,
 
     pub fn isFlag(flag: []const u8) bool {
@@ -49,6 +58,14 @@ pub const Flags = struct {
         } else if (std.mem.eql(u8, flag, "--otel-service-name")) {
             if (value.len == 0) return false;
             f.service_name = value;
+        } else if (std.mem.eql(u8, flag, "--otel-ca-file")) {
+            f.ca_file = value;
+        } else if (std.mem.eql(u8, flag, "--otel-client-cert")) {
+            f.client_cert = value;
+        } else if (std.mem.eql(u8, flag, "--otel-client-key")) {
+            f.client_key = value;
+        } else if (std.mem.eql(u8, flag, "--otel-tls-skip-verify")) {
+            f.skip_verify = if (std.mem.eql(u8, value, "on")) true else if (std.mem.eql(u8, value, "off")) false else return false;
         } else if (std.mem.eql(u8, flag, "--access-log-interval")) {
             const v = std.fmt.parseInt(u32, value, 10) catch return false;
             if (v == 0) return false;
@@ -102,6 +119,10 @@ pub fn resolve(a: std.mem.Allocator, f: Flags, env: *const std.process.EnvMap, i
     }
     if (!any) return s;
     cfg.headers = try parseHeaders(a, f.headers orelse env.get("OTEL_EXPORTER_OTLP_HEADERS") orelse "");
+    if (cfg.headers.len > otlp.max_headers) return error.BadConfig;
+    for (cfg.headers) |h| {
+        if (h.name.len == 0 or std.mem.indexOfAny(u8, h.name, "\r\n: ") != null or std.mem.indexOfAny(u8, h.value, "\r\n") != null) return error.BadConfig;
+    }
     var res: std.ArrayList([2][]const u8) = .empty;
     try res.append(a, .{ "service.name", f.service_name orelse env.get("OTEL_SERVICE_NAME") orelse "zkfsm" });
     try res.append(a, .{ "service.version", "0.1.0" });
@@ -121,6 +142,13 @@ pub fn resolve(a: std.mem.Allocator, f: Flags, env: *const std.process.EnvMap, i
             @field(cfg, e[1]) = n;
         }
     }
+    cfg.tls = .{
+        .ca_file = f.ca_file orelse env.get("OTEL_EXPORTER_OTLP_CERTIFICATE") orelse "",
+        .client_cert_file = f.client_cert orelse env.get("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE") orelse "",
+        .client_key_file = f.client_key orelse env.get("OTEL_EXPORTER_OTLP_CLIENT_KEY") orelse "",
+        .skip_verify = f.skip_verify orelse (isTrue(env.get("ZKFSM_OTEL_TLS_SKIP_VERIFY")) or std.mem.eql(u8, env.get("ZKFSM_OTEL_TLS_SKIP_VERIFY") orelse "", "on")),
+    };
+    cfg.tls.check(a) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.BadConfig;
     s.otlp = cfg;
     return s;
 }

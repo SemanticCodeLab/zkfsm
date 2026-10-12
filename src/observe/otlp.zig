@@ -2,12 +2,15 @@
 //! one background thread that POSTs to `<endpoint>/v1/{traces,logs,metrics}`.
 const std = @import("std");
 const core = @import("../core/root.zig");
+const tls = @import("../tls/root.zig");
 const proto = @import("proto.zig");
 
 const trace = core.trace;
 const Allocator = std.mem.Allocator;
 
 pub const Signal = enum { traces, logs, metrics };
+/// Export headers beyond this many are ignored.
+pub const max_headers = 32;
 
 pub const Config = struct {
     /// Per-signal full URLs; null disables the signal.
@@ -22,6 +25,8 @@ pub const Config = struct {
     max_batch: u32 = 512,
     metrics_interval_ms: u32 = 60000,
     timeout_ms: u32 = 10000,
+    /// CA file, client certificate, and verification for https:// endpoints.
+    tls: tls.TlsOptions = .{},
 };
 
 /// A finished span copied out of the request's memory.
@@ -503,8 +508,6 @@ pub const Exporter = struct {
 
     fn loop(e: *Exporter) void {
         defer e.done.set();
-        var client: std.http.Client = .{ .allocator = e.gpa };
-        defer client.deinit();
         var next_metrics: i128 = std.time.nanoTimestamp() + @as(i128, e.cfg.metrics_interval_ms) * std.time.ns_per_ms;
         while (true) {
             var spans: []*SpanRec = &.{};
@@ -528,19 +531,19 @@ pub const Exporter = struct {
                 }
             }
             if (spans.len > 0) {
-                e.sendSpans(&client, spans);
+                e.sendSpans(spans);
                 for (spans) |s| s.destroy(e.gpa);
                 e.gpa.free(spans);
             }
             if (logs.len > 0) {
-                e.sendLogs(&client, logs);
+                e.sendLogs(logs);
                 for (logs) |l| e.gpa.free(l.msg);
                 e.gpa.free(logs);
             }
             const now = std.time.nanoTimestamp();
             if (e.metrics != null and e.cfg.metrics_url != null and (now >= next_metrics or stopping)) {
                 next_metrics = now + @as(i128, e.cfg.metrics_interval_ms) * std.time.ns_per_ms;
-                e.sendMetrics(&client);
+                e.sendMetrics();
             }
             if (stopping) {
                 e.mutex.lock();
@@ -551,46 +554,54 @@ pub const Exporter = struct {
         }
     }
 
-    fn sendSpans(e: *Exporter, client: *std.http.Client, spans: []const *SpanRec) void {
+    fn sendSpans(e: *Exporter, spans: []const *SpanRec) void {
         const body = encodeSpans(e.gpa, e.cfg.resource, spans) catch return;
         defer e.gpa.free(body);
-        e.post(client, .traces, e.cfg.traces_url.?, body, spans.len);
+        e.post(.traces, e.cfg.traces_url.?, body, spans.len);
     }
 
-    fn sendLogs(e: *Exporter, client: *std.http.Client, logs: []const LogRec) void {
+    fn sendLogs(e: *Exporter, logs: []const LogRec) void {
         const body = encodeLogs(e.gpa, e.cfg.resource, logs) catch return;
         defer e.gpa.free(body);
-        e.post(client, .logs, e.cfg.logs_url.?, body, logs.len);
+        e.post(.logs, e.cfg.logs_url.?, body, logs.len);
     }
 
-    fn sendMetrics(e: *Exporter, client: *std.http.Client) void {
+    fn sendMetrics(e: *Exporter) void {
         const r = e.metrics.?;
         const text = r.func(r.ctx, e.gpa) catch return;
         defer e.gpa.free(text);
         const body = encodeMetrics(e.gpa, e.cfg.resource, text, e.started_ns, nanos(std.time.nanoTimestamp())) catch return;
         defer e.gpa.free(body);
-        e.post(client, .metrics, e.cfg.metrics_url.?, body, 1);
+        e.post(.metrics, e.cfg.metrics_url.?, body, 1);
     }
 
-    fn post(e: *Exporter, client: *std.http.Client, sig: Signal, url: []const u8, body: []const u8, n: usize) void {
+    /// One request per connection; connect and I/O are bounded by the export timeout.
+    fn post(e: *Exporter, sig: Signal, url: []const u8, body: []const u8, n: usize) void {
         const i = @intFromEnum(sig);
-        const res = client.fetch(.{
-            .location = .{ .url = url },
+        var hs: [max_headers + 1]std.http.Header = undefined;
+        hs[0] = .{ .name = "Content-Type", .value = "application/x-protobuf" };
+        const extra = e.cfg.headers[0..@min(e.cfg.headers.len, max_headers)];
+        @memcpy(hs[1..][0..extra.len], extra);
+        var res = tls.https.send(e.gpa, .{
             .method = .POST,
-            .payload = body,
-            .keep_alive = true,
-            .headers = .{ .content_type = .{ .override = "application/x-protobuf" } },
-            .extra_headers = e.cfg.headers,
+            .url = url,
+            .headers = hs[0 .. extra.len + 1],
+            .body = body,
+            .tls = e.cfg.tls,
+            .connect_timeout_ms = @min(e.cfg.timeout_ms, 5000),
+            .io_timeout_ms = e.cfg.timeout_ms,
+            .max_body = 64 << 10,
         }) catch |err| {
             _ = e.stats.failed[i].fetchAdd(n, .monotonic);
             std.log.scoped(.otlp).debug("export {t} to {s} failed: {t}", .{ sig, url, err });
             return;
         };
-        if (@intFromEnum(res.status) / 100 == 2) {
+        defer res.deinit(e.gpa);
+        if (res.status / 100 == 2) {
             _ = e.stats.exported[i].fetchAdd(n, .monotonic);
         } else {
             _ = e.stats.failed[i].fetchAdd(n, .monotonic);
-            std.log.scoped(.otlp).debug("export {t} to {s}: HTTP {d}", .{ sig, url, @intFromEnum(res.status) });
+            std.log.scoped(.otlp).debug("export {t} to {s}: HTTP {d}", .{ sig, url, res.status });
         }
     }
 };

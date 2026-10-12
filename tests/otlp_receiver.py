@@ -197,4 +197,12 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     OUT = sys.argv[2]
     os.makedirs(OUT, exist_ok=True)
-    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+    srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+    if len(sys.argv) > 5:  # CERT KEY CLIENT_CA: HTTPS that demands a client certificate
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(sys.argv[3], sys.argv[4])
+        ctx.load_verify_locations(sys.argv[5])
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()

@@ -67,6 +67,17 @@ pub const Run = struct {
     pub fn pass(r: *Run) void {
         const from = r.job.gpa.dupe(u8, r.job.checkpoint.items) catch return r.fatal("out of memory");
         defer r.job.gpa.free(from);
+        var sp = switch (r.spec.body) {
+            .replicate => core.trace.root("batch.replicate", .internal, .batch_replication, .{}),
+            .keyrotate => core.trace.root("batch.keyrotate", .internal, .batch_keyrotation, .{}),
+            .expire => core.trace.root("batch.expire", .internal, .batch_expire, .{}),
+        };
+        sp.str("path", &r.job.id);
+        sp.int("batch.attempt", r.attempt);
+        defer {
+            if (r.failures) sp.fail("pass had failures");
+            sp.end();
+        }
         switch (r.spec.body) {
             .replicate => |rep| if (rep.source.isLocal()) {
                 walk.keys(r.env.svc, r.job.gpa, rep.source.bucket, rep.source.prefix, from, r, replicateKey) catch |e| r.fatal(@errorName(e));
