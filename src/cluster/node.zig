@@ -111,6 +111,8 @@ pub const Node = struct {
     router_pools: []router_mod.Pool = &.{},
     /// Drives are open: peers may do I/O here.
     drives_open: std.atomic.Value(bool) = .init(false),
+    /// This node is writing a pool's formats: peers must not judge the pool yet.
+    formatting: std.atomic.Value(bool) = .init(false),
     /// S3 service is up (the server's gate).
     open: std.atomic.Value(bool) = .init(false),
     svc: std.atomic.Value(?*object.ObjectService) = .init(null),
@@ -355,7 +357,7 @@ pub const Node = struct {
         }
     }
 
-    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
+    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, formatting: bool = false, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
 
     /// Asks a peer who it is; once our drives are open the call also tells the peer
     /// to count us online at once rather than at its next heartbeat.
@@ -393,6 +395,8 @@ pub const Node = struct {
                 h.ready = std.mem.eql(u8, v, "1");
             } else if (std.mem.eql(u8, k, "drives")) {
                 h.drives = std.mem.eql(u8, v, "1");
+            } else if (std.mem.eql(u8, k, "formatting")) {
+                h.formatting = std.mem.eql(u8, v, "1");
             } else if (std.mem.eql(u8, k, "jepoch")) {
                 h.jepoch = std.fmt.parseInt(u64, v, 10) catch 0;
             } else if (std.mem.eql(u8, k, "jseq")) {
@@ -490,7 +494,20 @@ pub const Node = struct {
             const any = for (s) |e| {
                 if (e == .fmt) break true;
             } else false;
-            if (any) continue;
+            if (any) {
+                // Formatted drives next to empty ones: a replaced drive, or a pool whose
+                // formats are being written right now. Only its formatter can tell.
+                const partial = for (s) |e| {
+                    if (e == .none) break true;
+                } else false;
+                const owner = n.topo.pools[p].endpoints[0].node;
+                if (partial and owner != n.topo.local) {
+                    if (n.hello(owner)) |h| {
+                        if (h.formatting) return false;
+                    } else |_| {}
+                }
+                continue;
+            }
             complete = false;
             // An appended pool: its first endpoint's owner formats it when all are reachable.
             const reachable = for (s) |e| {
@@ -648,6 +665,8 @@ pub const Node = struct {
         defer layout.freeSets(n.gpa, sets);
         const fp = topology.poolFingerprint(n.topo.pools[p], size, n.profile);
         std.log.info("cluster: formatting pool {d}: {d} set(s) of {d} drives, {s}", .{ p + 1, sets.len, size, n.profile.name() });
+        n.formatting.store(true, .release);
+        defer n.formatting.store(false, .release);
         for (sets, 0..) |members, si| for (members, 0..) |ep, idx| {
             if (s[ep] != .none) continue;
             const f: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = @intCast(idx), .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
@@ -975,6 +994,7 @@ pub const Node = struct {
             s.healer.start(time_ns(n.cfg.scan_interval_s)) catch std.log.err("cluster: healer not started", .{});
         };
         n.spawn(refreshLoop);
+        n.spawn(gcLoop);
         n.spawn(spaceLoop);
         n.spawn(syncLoop);
         n.jopen.store(n.journal.lastAppended().stable, .release);
@@ -1077,13 +1097,22 @@ pub const Node = struct {
         var fresh: std.ArrayListUnmanaged(core.ObjectId) = .empty;
         defer fresh.deinit(n.gpa);
         n.gc.take(n.gpa, core.time.nowNs(), all, &due, &fresh);
-        for (due.items) |id| n.storage().delete(placement.dataKey(id)) catch {};
-        if (fresh.items.len == 0 or all) return;
-        const next = n.successor() orelse return;
-        const notes = n.gpa.alloc(wire.Note, fresh.items.len) catch return;
-        defer n.gpa.free(notes);
-        for (fresh.items, notes) |id, *o| o.* = .{ .garbage = id.bytes };
-        n.sendNotes(next, notes);
+        // The backup hears of new ids before a long run of deletes, not after it.
+        if (fresh.items.len > 0 and !all) if (n.successor()) |next| {
+            if (n.gpa.alloc(wire.Note, fresh.items.len)) |notes| {
+                defer n.gpa.free(notes);
+                for (fresh.items, notes) |id, *o| o.* = .{ .garbage = id.bytes };
+                n.sendNotes(next, notes);
+            } else |_| {}
+        };
+        for (due.items) |id| {
+            if (!all and n.stop_ev.isSet()) {
+                // Shutting down: hand the rest back; the final pass deletes them.
+                _ = n.gc.add(n.gpa, id, 0, false);
+                continue;
+            }
+            n.storage().delete(placement.dataKey(id)) catch {};
+        }
     }
 
     fn successor(n: *Node) ?u16 {
@@ -1220,8 +1249,9 @@ pub const Node = struct {
                 if (node == nn.topo.local) return;
                 // A peer still bootstrapping cannot serve drive I/O yet.
                 const h = nn.hello(node) catch |e| {
-                    // Every connection busy means the peer is up and working.
-                    if (e != error.Busy) nn.rpc.setOnline(node, false);
+                    // Every connection busy means the peer is up and working; so does an
+                    // answer to any other call a moment ago (a loaded peer is slow to probe).
+                    if (e != error.Busy and !nn.rpc.answeredWithin(node, probe_grace_ms)) nn.rpc.markDown(node, "no answer to probes");
                     return;
                 };
                 nn.rpc.setOnline(node, h.drives);
@@ -1245,7 +1275,15 @@ pub const Node = struct {
                 n.journal.expireStuck(std.time.milliTimestamp());
                 n.journal.sync(false);
             }
-            if (n.drives_open.load(.acquire)) n.collectGarbage(false);
+            n.stop_ev.timedWait(heartbeat_ns) catch {};
+        }
+    }
+
+    /// Deferred blob deletion on its own thread: a long backlog (a bulk delete) must
+    /// not hold up heartbeats and lease sweeps.
+    fn gcLoop(n: *Node) void {
+        while (!n.stop_ev.isSet()) {
+            n.collectGarbage(false);
             n.stop_ev.timedWait(heartbeat_ns) catch {};
         }
     }
@@ -1346,6 +1384,8 @@ fn statCapacity(le: *LocalEp) void {
 }
 
 const heartbeat_ns = std.time.ns_per_s;
+/// A peer that answered a call this recently is alive even if a probe timed out.
+const probe_grace_ms = 3000;
 /// Replaced blobs outlive their record this long (reads that resolved it finish).
 const gc_grace_ns: i128 = 10 * std.time.ns_per_s;
 /// A peer deletes our garbage after this, in case we could not.

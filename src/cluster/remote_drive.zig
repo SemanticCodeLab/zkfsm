@@ -259,7 +259,7 @@ const RemoteWrite = struct {
     fn flushData(w: *RemoteWrite) Error!void {
         if (w.len == 0) return;
         wire.dataHeader(w.buf[0..wire.data_header_len], @intCast(w.len));
-        w.call.writeChunk(w.buf[0 .. wire.data_header_len + w.len]) catch return error.IoFailed;
+        w.call.writeChunk(w.buf[0 .. wire.data_header_len + w.len]) catch return w.refused();
         w.len = 0;
     }
 
@@ -282,7 +282,7 @@ const RemoteWrite = struct {
         try w.flushData();
         var fb: [wire.patch_header_len + wire.max_patch]u8 = undefined;
         const frame = wire.patchFrame(&fb, bytes, off);
-        w.call.writeChunk(frame) catch return error.IoFailed;
+        w.call.writeChunk(frame) catch return w.refused();
     }
 
     fn commit(ctx: *anyopaque, key: PhysicalKey) Error!void {
@@ -290,9 +290,14 @@ const RemoteWrite = struct {
         defer w.destroy();
         try w.flushData();
         var fb: [wire.commit_frame_len]u8 = undefined;
-        w.call.writeChunk(wire.commitFrame(&fb, key)) catch return error.IoFailed;
+        w.call.writeChunk(wire.commitFrame(&fb, key)) catch return w.refused();
         w.call.finish() catch return error.IoFailed;
         if (!w.call.ok()) return mapStatus(w.call.status);
+    }
+
+    /// Why a chunk could not be sent: the owner's status when it answered one.
+    fn refused(w: *const RemoteWrite) Error {
+        return if (w.call.status != 0) mapStatus(w.call.status) else error.IoFailed;
     }
 
     fn abort(ctx: *anyopaque) void {

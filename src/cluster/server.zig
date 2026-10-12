@@ -182,8 +182,10 @@ fn hello(n: *Node, req: *Request, arena: std.mem.Allocator) RawError!void {
     const open = n.open.load(.acquire);
     var ob: [32]u8 = undefined;
     const jopen = if (open) std.fmt.bufPrint(&ob, "jopen {d}\n", .{n.jopen.load(.acquire)}) catch unreachable else "";
-    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\njepoch {d}\njseq {d}\n{s}", .{
-        n.topo.local, &topo, &root, @intFromBool(open), @intFromBool(n.drives_open.load(.acquire)), head.epoch, head.stable, jopen,
+    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\nformatting {d}\njepoch {d}\njseq {d}\n{s}", .{
+        n.topo.local,                               &topo,                                     &root,      @intFromBool(open),
+        @intFromBool(n.drives_open.load(.acquire)), @intFromBool(n.formatting.load(.acquire)), head.epoch, head.stable,
+        jopen,
     });
     try req.respond(body, .{});
 }

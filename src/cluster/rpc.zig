@@ -30,7 +30,6 @@ pub const Opts = struct {
     probe: bool = false,
 };
 
-const max_idle_per_peer = 16;
 /// Longest wait for a free connection slot before a call fails with Busy.
 const slot_wait_ms = 5000;
 /// Pooled connections idle longer than this are dropped (servers close them at 30 s).
@@ -38,6 +37,9 @@ const max_idle_ns: i128 = 15 * std.time.ns_per_s;
 const io_buf = 64 * 1024;
 const max_head = 16 * 1024;
 const connect_timeout_ms = 3000;
+const resolve_ttl_ns: i128 = 30 * std.time.ns_per_s;
+/// How long a refused stream waits for the peer's status line.
+const refusal_wait_ms = 1000;
 /// Probes (heartbeats, bootstrap) may open this many connections past the cap.
 const probe_extra = 16;
 
@@ -93,6 +95,15 @@ pub const Peer = struct {
     /// Open connections, idle or in use; at most `Rpc.peer_cap` (probes may exceed it).
     conns: usize = 0,
     freed: std.Thread.Condition = .{},
+    /// Resolved addresses, reused for `resolve_ttl_ns`: a busy node dials often and
+    /// a slow resolver must not look like a dead peer.
+    /// When the peer last answered a call (ms since the epoch); 0 before the first.
+    last_answer_ms: std.atomic.Value(i64) = .init(0),
+    addrs: [max_addrs]std.net.Address = undefined,
+    addr_count: usize = 0,
+    resolved_ns: i128 = 0,
+
+    const max_addrs = 4;
 };
 
 /// Called on every online/offline transition of a peer.
@@ -110,7 +121,8 @@ pub const Rpc = struct {
     ca: ?std.crypto.Certificate.Bundle = null,
     peers: []Peer,
     on_change: ?OnChange = null,
-    /// Connection cap per peer; the peer's RPC pool is sized from it.
+    /// Connection cap per peer; the peer's RPC pool is sized from it. Idle connections
+    /// are kept up to the same number: a busy node reuses them instead of dialing.
     peer_cap: usize,
 
     pub fn init(gpa: std.mem.Allocator, topo: *const topology.Topology, secret: auth.Secret) Error!Rpc {
@@ -138,14 +150,29 @@ pub const Rpc = struct {
         if (self.ca) |*b| b.deinit(self.gpa);
     }
 
+    /// True when the peer answered some call within the last `ms` milliseconds.
+    pub fn answeredWithin(self: *Rpc, node: u16, ms: i64) bool {
+        const t = self.peers[node].last_answer_ms.load(.monotonic);
+        return t != 0 and std.time.milliTimestamp() - t <= ms;
+    }
+
     pub fn isOnline(self: *Rpc, node: u16) bool {
         return node == self.self_node or self.peers[node].online.load(.acquire);
     }
 
     pub fn setOnline(self: *Rpc, node: u16, up: bool) void {
+        self.setState(node, up, "its drives are not open");
+    }
+
+    /// Takes a peer out of use; `why` goes to the log.
+    pub fn markDown(self: *Rpc, node: u16, why: []const u8) void {
+        self.setState(node, false, why);
+    }
+
+    fn setState(self: *Rpc, node: u16, up: bool, why: []const u8) void {
         const p = &self.peers[node];
         if (p.online.swap(up, .acq_rel) == up) return;
-        if (up) std.log.info("node {s} is online", .{p.name}) else std.log.warn("node {s} is offline", .{p.name});
+        if (up) std.log.info("node {s} is online", .{p.name}) else std.log.warn("node {s} is offline ({s})", .{ p.name, why });
         if (!up) self.dropIdle(p);
         if (self.on_change) |cb| cb.func(cb.ctx, node, up);
     }
@@ -209,20 +236,61 @@ pub const Rpc = struct {
     fn putIdle(self: *Rpc, p: *Peer, c: *Conn) void {
         p.mutex.lock();
         defer p.mutex.unlock();
-        if (p.idle.items.len >= max_idle_per_peer) return self.discardLocked(p, c);
+        if (p.idle.items.len >= self.peer_cap) return self.discardLocked(p, c);
         c.idle_since = std.time.nanoTimestamp();
         p.idle.append(self.gpa, c) catch self.discardLocked(p, c);
     }
 
-    fn connect(self: *Rpc, p: *Peer) Error!*Conn {
-        const list = std.net.getAddressList(self.gpa, p.host, p.port) catch return error.Transport;
-        defer list.deinit();
-        var stream: ?std.net.Stream = null;
-        for (list.addrs) |addr| {
-            stream = connectTimeout(addr, connect_timeout_ms) catch continue;
-            break;
+    /// The peer's addresses: cached ones while fresh, else a new lookup (a failed
+    /// lookup falls back to the last known addresses).
+    fn addresses(self: *Rpc, p: *Peer, out: *[Peer.max_addrs]std.net.Address, refresh: bool) usize {
+        const now = std.time.nanoTimestamp();
+        {
+            p.mutex.lock();
+            defer p.mutex.unlock();
+            if (!refresh and p.addr_count > 0 and now - p.resolved_ns < resolve_ttl_ns) {
+                @memcpy(out[0..p.addr_count], p.addrs[0..p.addr_count]);
+                return p.addr_count;
+            }
         }
-        const s = stream orelse return error.Transport;
+        const list = std.net.getAddressList(self.gpa, p.host, p.port) catch {
+            p.mutex.lock();
+            defer p.mutex.unlock();
+            @memcpy(out[0..p.addr_count], p.addrs[0..p.addr_count]);
+            return p.addr_count;
+        };
+        defer list.deinit();
+        const n = @min(list.addrs.len, Peer.max_addrs);
+        @memcpy(out[0..n], list.addrs[0..n]);
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        if (n > 0) {
+            @memcpy(p.addrs[0..n], out[0..n]);
+            p.addr_count = n;
+            p.resolved_ns = now;
+        }
+        return n;
+    }
+
+    /// Dials the cached addresses; when none answers, looks the peer up again and
+    /// dials whatever is new (it may have moved).
+    fn dial(self: *Rpc, p: *Peer) ?std.net.Stream {
+        var old: [Peer.max_addrs]std.net.Address = undefined;
+        const n_old = self.addresses(p, &old, false);
+        for (old[0..n_old]) |addr| return connectTimeout(addr, connect_timeout_ms) catch continue;
+        var new: [Peer.max_addrs]std.net.Address = undefined;
+        const n_new = self.addresses(p, &new, true);
+        for (new[0..n_new]) |addr| {
+            const known = for (old[0..n_old]) |o| {
+                if (o.eql(addr)) break true;
+            } else false;
+            if (!known) return connectTimeout(addr, connect_timeout_ms) catch continue;
+        }
+        return null;
+    }
+
+    fn connect(self: *Rpc, p: *Peer) Error!*Conn {
+        const s = self.dial(p) orelse return error.Transport;
         errdefer s.close();
         const c = try self.gpa.create(Conn);
         errdefer self.gpa.destroy(c);
@@ -264,6 +332,7 @@ pub const Rpc = struct {
     };
 
     /// Starts a call. With a byte body the response head is already read on return.
+    /// A failed probe leaves the peer's state to the caller (a loaded peer answers late).
     /// A reused connection that fails is retried once on a fresh one.
     pub fn call(self: *Rpc, node: u16, op: []const u8, query: []const u8, body: Body, opts: Opts) Error!Call {
         const p = &self.peers[node];
@@ -276,7 +345,7 @@ pub const Rpc = struct {
                 try self.reserve(p, opts.probe);
                 break :blk self.connect(p) catch |e| {
                     self.unreserve(p);
-                    if (e == error.Transport) self.setOnline(node, false);
+                    if (e == error.Transport and !opts.probe) self.markDown(node, "cannot connect");
                     return e;
                 };
             };
@@ -285,14 +354,14 @@ pub const Rpc = struct {
             c.sendHead(op, query, body) catch |e| {
                 c.abandon();
                 if (e == error.Transport and reused and attempt == 0) continue;
-                if (e == error.Transport) self.setOnline(node, false);
+                if (e == error.Transport and !opts.probe) self.markDown(node, "request not sent");
                 return e;
             };
             if (body == .stream) return c;
             c.receiveHead() catch |e| {
                 c.abandon();
                 if (e == error.Transport and reused and attempt == 0) continue;
-                if (e == error.Transport) self.setOnline(node, false);
+                if (e == error.Transport and !opts.probe) self.markDown(node, "no answer to a call");
                 return e;
             };
             return c;
@@ -396,14 +465,20 @@ pub const Call = struct {
         w.writeAll("0\r\n\r\n") catch return c.fail();
         c.conn.flush() catch return c.fail();
         c.receiveHead() catch |e| {
-            if (e == error.Transport) c.rpc.setOnline(c.peer.node, false);
+            if (e == error.Transport) c.rpc.markDown(c.peer.node, "no answer to a streamed write");
             return e;
         };
     }
 
+    /// A streamed body could not be sent. A peer that refused it with a status (drive
+    /// full, still starting) has answered and stays online; `status` then says why.
     fn fail(c: *Call) Error {
         c.keep = false;
-        c.rpc.setOnline(c.peer.node, false);
+        c.conn.setTimeout(refusal_wait_ms);
+        if (c.status == 0) c.receiveHead() catch {
+            c.status = 0;
+            c.rpc.markDown(c.peer.node, "streamed write broken");
+        };
         return error.Transport;
     }
 
@@ -443,6 +518,7 @@ pub const Call = struct {
             }
         }
         if (!have_len) return error.BadResponse;
+        c.peer.last_answer_ms.store(std.time.milliTimestamp(), .monotonic);
     }
 
     /// Reads the whole body (at most `limit` bytes) into memory.
