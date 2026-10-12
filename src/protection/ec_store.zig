@@ -500,7 +500,9 @@ pub const ErasureStore = struct {
         defer s.close();
         const h = s.header orelse {
             // Every shard missing means the object was deleted meanwhile.
-            if (s.missing < n) rep.lost = true;
+            if (s.missing < n) {
+                if (self.clustered() and s.offline > 0) rep.pending = true else rep.lost = true;
+            }
             return rep;
         };
         const lay = Layout.init(h.size, h.block_size, k) catch return .{ .lost = true };
@@ -553,10 +555,11 @@ pub const ErasureStore = struct {
                     return .{ .purged = true };
                 },
                 // A write in flight or a recent delete: purged once old enough.
-                .young => return .{},
+                .young => return .{ .pending = true },
                 .no => {},
             }
-            rep.lost = true;
+            // With a drive away the missing shards may simply be out of reach.
+            if (self.clustered() and s.offline > 0) rep.pending = true else rep.lost = true;
             return rep;
         }
         // Pass 2: rebuild bad shards block by block.
@@ -838,7 +841,7 @@ test "cluster set: old shards below k are purged as leftovers, unless a drive wa
     // Young fragments may belong to a write in flight: neither purged nor lost.
     try Fx.leave(be, tmp.dir, key, pl, rel, 3, null);
     const young = store.healKey(key);
-    try testing.expect(!young.purged and !young.lost);
+    try testing.expect(!young.purged and !young.lost and young.pending);
     // Old ones with a replaced drive in the set are reported as loss and kept.
     try Fx.leave(be, tmp.dir, key, pl, rel, 3, old_ns);
     set.drives[pl[5]].fresh.store(true, .release);

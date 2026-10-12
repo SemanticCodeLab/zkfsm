@@ -18,6 +18,8 @@ pub const Report = struct {
     keys_lost: u64 = 0,
     /// Leftovers of missed deletes or failed writes that were removed.
     keys_purged: u64 = 0,
+    /// Unreadable for now but not lost: shards out of reach, or leftovers in grace.
+    keys_pending: u64 = 0,
     temps_removed: u64 = 0,
 
     /// True when every placed replica is present and verified.
@@ -57,6 +59,7 @@ pub const HealExecutor = struct {
                 report.replicas_repaired += r.repaired;
                 report.replicas_unrepaired += r.unrepaired;
                 report.keys_purged += @intFromBool(r.purged);
+                report.keys_pending += @intFromBool(r.pending);
                 if (r.lost) {
                     std.log.err("{t} {s}: no healthy replica left", .{ k.space, &k.hex });
                     report.keys_lost += 1;

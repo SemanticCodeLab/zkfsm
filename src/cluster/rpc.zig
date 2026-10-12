@@ -470,7 +470,7 @@ pub const Call = struct {
         var nb: [8]u8 = undefined;
         const node = std.fmt.bufPrint(&nb, "{d}", .{c.rpc.self_node}) catch unreachable;
         var timeb: [24]u8 = undefined;
-        const time = std.fmt.bufPrint(&timeb, "{d}", .{std.time.milliTimestamp()}) catch unreachable;
+        const time = std.fmt.bufPrint(&timeb, "{d}", .{auth.nowMs()}) catch unreachable;
         const nonce = auth.newNonce();
         const digest = if (body == .bytes) auth.bodyDigest(body.bytes) else undefined;
         const btag: []const u8 = if (body == .bytes) &digest else auth.body_stream;

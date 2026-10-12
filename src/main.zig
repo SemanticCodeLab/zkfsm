@@ -587,6 +587,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var sse_route: sse.Sse = .{ .gpa = gpa };
     sse_route.attach(kms_holder);
     metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
+    metrics.global.extra[2] = .{ .ctx = node, .func = cluster.Node.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
     var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
     var tables_route = tables.Tables.init(&svc, auth);

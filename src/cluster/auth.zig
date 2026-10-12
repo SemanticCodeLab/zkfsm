@@ -6,8 +6,23 @@ const HmacSha256 = @import("../core/hwhash.zig").HmacSha256;
 
 pub const Secret = [32]u8;
 
-/// Requests older or newer than this (clock skew included) are refused.
-pub const window_ms: i64 = 60 * std.time.ms_per_s;
+/// Requests older or newer than this (clock skew included) are refused; the same
+/// 15 minutes S3 signatures allow.
+pub const window_ms: i64 = 15 * 60 * std.time.ms_per_s;
+
+/// Added to this node's clock for signing and checking node-to-node requests.
+/// Set from ZKFSM_TEST_CLOCK_SKEW_S at start, for tests of skewed clocks only.
+pub var clock_offset_ms: i64 = 0;
+
+pub fn nowMs() i64 {
+    return std.time.milliTimestamp() + clock_offset_ms;
+}
+
+/// How far `time` (a request's timestamp header) is from `now_ms`, in seconds.
+pub fn skewSeconds(time: []const u8, now_ms: i64) ?u64 {
+    const t = std.fmt.parseInt(i64, time, 10) catch return null;
+    return @abs(now_ms - t) / std.time.ms_per_s;
+}
 /// Nonces kept at most; beyond it, requests are refused until old ones expire.
 pub const max_nonces = 1 << 20;
 

@@ -111,6 +111,10 @@ pub const Node = struct {
     router_pools: []router_mod.Pool = &.{},
     /// Drives are open: peers may do I/O here.
     drives_open: std.atomic.Value(bool) = .init(false),
+    /// Requests refused for a clock difference beyond the window (served, and sent).
+    clock_rejects: std.atomic.Value(u64) = .init(0),
+    clock_refused: std.atomic.Value(u64) = .init(0),
+    clock_log_ms: std.atomic.Value(i64) = .init(0),
     /// Random per process: tells peers a restart from an uninterrupted run.
     boot_id: u64 = 0,
     /// This node is writing a pool's formats: peers must not judge the pool yet.
@@ -153,6 +157,7 @@ pub const Node = struct {
     pub fn create(gpa: std.mem.Allocator, cfg: Config) Error!*Node {
         const n = try gpa.create(Node);
         errdefer gpa.destroy(n);
+        if (std.posix.getenv("ZKFSM_TEST_CLOCK_SKEW_S")) |v| auth.clock_offset_ms = (std.fmt.parseInt(i64, v, 10) catch 0) * std.time.ms_per_s;
         n.* = .{
             .gpa = gpa,
             .arena_state = .init(gpa),
@@ -334,6 +339,23 @@ pub const Node = struct {
         std.log.info("cluster: deployment {s}, protection {s}, {d} set(s)", .{ &std.fmt.bytesToHex(n.deployment, .lower), n.profile.name(), n.setCount() });
     }
 
+    /// True at most once every ten seconds per `last`: keeps a repeating error readable.
+    pub fn logNow(n: *Node, last: *std.atomic.Value(i64)) bool {
+        _ = n;
+        const now = std.time.milliTimestamp();
+        const prev = last.load(.monotonic);
+        if (now - prev < 10_000) return false;
+        return last.cmpxchgStrong(prev, now, .monotonic, .monotonic) == null;
+    }
+
+    /// Prometheus lines for node-to-node health.
+    pub fn renderMetrics(ctx: *anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const n: *Node = @ptrCast(@alignCast(ctx));
+        try w.writeAll("# HELP zkfsm_cluster_rpc_clock_skew_rejected_total Node-to-node requests refused because the sender's clock is outside the allowed window.\n# TYPE zkfsm_cluster_rpc_clock_skew_rejected_total counter\n");
+        try w.print("zkfsm_cluster_rpc_clock_skew_rejected_total{{direction=\"received\"}} {d}\n", .{n.clock_rejects.load(.monotonic)});
+        try w.print("zkfsm_cluster_rpc_clock_skew_rejected_total{{direction=\"sent\"}} {d}\n", .{n.clock_refused.load(.monotonic)});
+    }
+
     fn setCount(n: *const Node) usize {
         var c: usize = 0;
         for (n.pools) |p| c += p.sets.len;
@@ -372,6 +394,12 @@ pub const Node = struct {
             return error.Unreachable;
         };
         defer c.deinit();
+        if (c.status == 401 and std.mem.eql(u8, c.meta.err(), "Expired")) {
+            // Not a credential problem, and time sync may still fix it: keep trying.
+            _ = n.clock_refused.fetchAdd(1, .monotonic);
+            if (n.logNow(&n.clock_log_ms)) std.log.err("cluster: node {s} refused our requests: our clocks differ by more than {d} s; synchronize the clocks", .{ n.topo.nodes[node].name, @divTrunc(auth.window_ms, 1000) });
+            return error.Unreachable;
+        }
         if (c.status == 401) {
             std.log.err("cluster: node {s} rejected our requests: cluster secret or root credentials differ", .{n.topo.nodes[node].name});
             return error.CredentialMismatch;

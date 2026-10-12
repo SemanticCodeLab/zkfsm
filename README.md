@@ -106,7 +106,12 @@ zkfsm heal --data /mnt/disk{1...4}     # one scan/heal pass, exit 0 when fully r
 - Healing runs in the background every `--scan-interval` seconds (0 disables):
   the scanner walks each drive with a bounded rate, the planner orders drive
   reformat, repairs of missing replicas, checksum scrubs, and removal of temp
-  files older than an hour left by interrupted writes.
+  files older than an hour left by interrupted writes. Between passes each node
+  checks its drives every few seconds: one that lost its format or its
+  directories is healed at once as a replacement, and a node that becomes a
+  set's heal leader starts a pass right away. Keys that cannot be read while a
+  drive is away, or leftovers of a delete a node missed, are reported as
+  `pending`, not `lost`.
 
 ```sh
 mc alias set z http://localhost:9000 admin change-me-please
@@ -160,6 +165,9 @@ zkfsm --data http://127.0.0.1:{9001...9004}/srv/d{1...4} --listen 127.0.0.1:9001
   bucket creation/deletion, bucket configuration, and IAM changes take a
   lock granted by a majority of nodes (30 s leases refreshed every 10 s,
   unlocks retried, leases of crashed holders expire).
+- **Clocks**: node-to-node requests are refused when the sender's clock is more
+  than 15 minutes off. Both sides log the difference, the node stays not ready,
+  and `zkfsm_cluster_rpc_clock_skew_rejected_total` counts the refusals.
 - **Shared state**: the bucket catalog, bucket configuration (versioning,
   lock, policy, lifecycle, tags), object records, and the IAM store live in
   the cluster store's system namespace. Nodes mirror changes through

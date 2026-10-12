@@ -27,6 +27,9 @@ pub const KeyReport = struct {
     lost: bool = false,
     /// Leftovers of a missed delete or a failed write were removed.
     purged: bool = false,
+    /// Too few shards to read, but not known lost: a drive that may hold the rest is
+    /// unreachable, or they are leftovers still inside their grace.
+    pending: bool = false,
 };
 
 const stripe_count = 64;

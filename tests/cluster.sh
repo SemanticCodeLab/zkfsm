@@ -288,6 +288,36 @@ cli 2 s3 cp --no-progress s3://clu/multi "$WORK/got" >/dev/null
 check "replaced node serves reads" "$(md5 "$WORK/obj/multi")" "$(md5 "$WORK/got")"
 check "replaced node lists the bucket" "$(listing 1)" "$(listing 2)"
 
+# ---- drive contents removed under a running node: it notices and heals, no restart ----
+rm -rf "$WORK"/n3/d*/data/* "$WORK"/n3/d*/record/*
+if wait_redundant $((NOBJ + 33)) 90; then r=yes; else r=no; fi
+check "contents removed under a running node are rebuilt" yes "$r"
+check "the node noticed on its own" yes "$(grep -q 'contents removed' "$WORK/n3.log" && echo yes || echo no)"
+cget 3 multi "$WORK/got" >/dev/null
+check "and serves reads" "$(md5 "$WORK/obj/multi")" "$(md5 "$WORK/got")"
+
+# ---- a node whose clock is 20 minutes off: refused with a clock error, not a credential one ----
+kill "${PIDS[4]}"
+wait "${PIDS[4]}" 2>/dev/null || true
+cred0=$(cat "$WORK"/n*.log | grep -c 'credentials differ' || true)
+ZKFSM_TEST_CLOCK_SKEW_S=1200 ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" "${POOLS[@]}" --listen "127.0.0.1:${PORT[4]}" \
+  --node-address "127.0.0.1:${PORT[4]}" --protection EC:4+2 --scan-interval 20 >>"$WORK/n4.log" 2>&1 &
+PIDS[4]=$!
+for _ in $(seq 100); do grep -q 'clocks differ' "$WORK/n4.log" && break; sleep 0.1; done
+check "skewed node says its clock is off" yes "$(grep -q 'clocks differ by more than 900 s' "$WORK/n4.log" && echo yes || echo no)"
+check "skewed node is not ready" 503 "$(ready 4)"
+check "peers name the clock too" yes "$(grep -q 'its clock differs from ours by 1[12][0-9][0-9] s' "$WORK/n1.log" && echo yes || echo no)"
+check "nobody blames the credentials" "$cred0" "$(cat "$WORK"/n*.log | grep -c 'credentials differ' || true)"
+check "refusals are counted" yes "$(curl -s "$(ep 1)/metrics" | grep -qE '^zkfsm_cluster_rpc_clock_skew_rejected_total\{direction="received"\} [1-9]' && echo yes || echo no)"
+kill "${PIDS[4]}"
+wait "${PIDS[4]}" 2>/dev/null || true
+start 4
+wait_ready 4 60
+if wait_redundant $((NOBJ + 33)) 120; then r=yes; else r=no; fi
+check "cluster whole again after the skewed node rejoined" yes "$r"
+# Leftovers of deletes a node missed and shards out of reach are pending, never "lost".
+check "no heal pass reported lost data" 0 "$(cat "$WORK"/n*.log | grep -cE 'no healthy replica left|lost=[1-9]' || true)"
+
 # ---- restart with a second pool appended ----
 for i in 1 2 3 4; do kill "${PIDS[$i]}"; done
 for i in 1 2 3 4; do wait "${PIDS[$i]}" 2>/dev/null || true; PIDS[$i]=0; done

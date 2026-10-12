@@ -29,6 +29,11 @@ pub const Healer = struct {
     /// Cluster sets: whether this node verifies keys now (the set's heal leader, or
     /// it holds a fresh drive). Null: always.
     leader: ?Leader = null,
+    /// Fan-out directories last counted on each local drive; fewer means its contents
+    /// were removed under the running node.
+    seen_dirs: [placement.max_drives]u32 = @splat(0),
+    was_leader: bool = false,
+    watch_tick: u32 = 0,
     /// Pass counters and completion times for the admin views.
     ring: pass_ring.Stats = .{},
     /// Last finished pass, for status pages.
@@ -141,6 +146,38 @@ pub const Healer = struct {
         if (got.keys.len > 0) std.log.info("heal: {d} key(s) written degraded, {d} replica(s) repaired", .{ got.keys.len, fixed });
     }
 
+    /// Cheap checks between passes, so damage and a new heal leader do not wait for the
+    /// scan interval: a local drive that lost its format or its directories is treated
+    /// as a replacement and healed now; a node that became the set's leader walks now.
+    pub fn watch(self: *Healer) void {
+        if (self.leader) |l| {
+            const now = l.func(l.ctx, self.drives);
+            if (now and !self.was_leader) self.wake();
+            self.was_leader = now;
+        }
+        self.watch_tick +%= 1;
+        if (self.watch_tick % watch_every != 0) return;
+        for (self.drives.drives, 0..) |*d, i| {
+            if (!self.drives.isLocal(i)) continue;
+            if (self.drives.probe(i) == .unformatted) {
+                self.wake();
+                continue;
+            }
+            const h = self.drives.acquire(i) orelse continue;
+            defer self.drives.release(i);
+            const count = switch (h) {
+                .local => |lb| fanoutDirs(lb.root),
+                .ext => continue,
+            };
+            if (count < self.seen_dirs[i]) {
+                std.log.warn("drive {s}: {d} of {d} directories are gone (contents removed); healing it as a replacement", .{ d.path, self.seen_dirs[i] - count, self.seen_dirs[i] });
+                d.fresh.store(true, .release);
+                self.wake();
+            }
+            self.seen_dirs[i] = count;
+        }
+    }
+
     fn hasFresh(self: *Healer) bool {
         for (self.drives.drives) |*d| if (d.fresh.load(.acquire)) return true;
         return false;
@@ -177,6 +214,7 @@ pub const Healer = struct {
                 var waited: u64 = 0;
                 while (waited < limit and !self.wake_flag.load(.acquire)) : (waited += wake_step_ns) {
                     self.healDegraded();
+                    self.watch();
                     self.stop_ev.timedWait(@min(wake_step_ns, limit - waited)) catch {};
                     if (self.stop_ev.isSet()) return;
                 }
@@ -194,6 +232,20 @@ pub const Healer = struct {
 };
 
 const wake_step_ns = std.time.ns_per_s;
+/// Drives are checked every this many wake steps.
+const watch_every = 5;
+
+/// First-level directories under the key spaces; they are only ever added.
+fn fanoutDirs(root: std.fs.Dir) u32 {
+    var n: u32 = 0;
+    for ([_][]const u8{ "data", "record" }) |sub| {
+        var d = root.openDir(sub, .{ .iterate = true }) catch continue;
+        defer d.close();
+        var it = d.iterate();
+        while (it.next() catch null) |e| n += @intFromBool(e.kind == .directory);
+    }
+    return n;
+}
 const fresh_retry_ns = 30 * std.time.ns_per_s;
 
 /// Process-wide pass counters (all erasure sets of this node), read by metrics.
@@ -209,8 +261,8 @@ pub const stats = struct {
 
 pub fn logReport(r: Report) void {
     std.log.info(
-        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} purged={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
-        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.keys_purged, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
+        "heal: scanned={d} checked={d} repaired={d} unrepaired={d} lost={d} pending={d} purged={d} temps={d} drives reinit={d} quarantined={d} restored={d}",
+        .{ r.entries_scanned, r.keys_checked, r.replicas_repaired, r.replicas_unrepaired, r.keys_lost, r.keys_pending, r.keys_purged, r.temps_removed, r.drives_reinit, r.drives_quarantined, r.drives_restored },
     );
 }
 
@@ -284,4 +336,41 @@ test {
     _ = planner;
     _ = executor;
     _ = pass_ring;
+}
+
+test "watch: a drive that lost its directories under the node is healed as a replacement" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [3][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [3][]const u8 = undefined;
+    var nb: [4]u8 = undefined;
+    for (0..3) |i| {
+        const name = try std.fmt.bufPrint(&nb, "d{d}", .{i});
+        try tmp.dir.makePath(name);
+        paths[i] = try tmp.dir.realpath(name, &bufs[i]);
+    }
+    var set = try placement.DriveSet.open(gpa, &paths, .{ .replica = 3 });
+    defer set.deinit();
+    var stores: protection.Stores = .{};
+    const strat = try protection.Strategy.init(gpa, &set, &stores);
+    defer strat.deinit();
+    const b = strat.backend();
+    const key: iface.PhysicalKey = .{ .space = .data, .hex = "ab00000000000000000000000000cafe".* };
+    var src: std.Io.Reader = .fixed("payload");
+    _ = try b.put(key, &src, .{});
+
+    var h = Healer.init(gpa, &set, strat, .{ .rate_per_sec = 0 });
+    h.watch_tick = watch_every - 1;
+    h.watch();
+    try std.testing.expect(!h.wake_flag.load(.acquire));
+    // Everything under one drive's data directory goes away while it stays formatted.
+    try tmp.dir.deleteTree("d1/data/ab");
+    h.watch_tick = watch_every - 1;
+    h.watch();
+    try std.testing.expect(h.wake_flag.load(.acquire));
+    try std.testing.expect(set.drives[1].fresh.load(.acquire));
+    const r = try h.runOnce();
+    try std.testing.expectEqual(@as(u64, 1), r.replicas_repaired);
+    try std.testing.expect(!set.drives[1].fresh.load(.acquire));
 }

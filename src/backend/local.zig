@@ -15,6 +15,8 @@ pub const LocalBackend = struct {
     /// When set, kept equal to the bytes stored under the key spaces (commits add,
     /// replacements and deletes subtract), so free space needs no directory walk.
     usage: ?*std.atomic.Value(u64) = null,
+    /// Directory fsyncs done (commits and new fan-out directories); for tests.
+    dir_syncs: std.atomic.Value(u64) = .init(0),
 
     pub const capabilities: iface.Capabilities = .{
         .atomic_rename = true,
@@ -93,18 +95,31 @@ pub const LocalBackend = struct {
         const grow = if (self.usage != null) self.sizeAt(tmp) else 0;
         const shrink = if (self.usage != null) self.sizeAt(final) else 0;
         // The fan-out directory usually exists: create it only when the rename says no.
+        var made = false;
         self.root.rename(tmp, final) catch |e| switch (e) {
             error.FileNotFound => {
                 self.root.makePath(dir) catch |me| return mapFs(me);
+                made = true;
                 self.root.rename(tmp, final) catch |re| return mapFs(re);
             },
             else => return mapFs(e),
         };
         self.account(grow, shrink);
+        try self.syncDir(dir);
+        // New fan-out directories are entries of their parents: make those durable too.
+        if (made) {
+            var up = std.fs.path.dirname(dir);
+            while (up) |u| : (up = std.fs.path.dirname(u)) try self.syncDir(u);
+            try self.syncDir(".");
+        }
+    }
+
+    fn syncDir(self: *LocalBackend, path: []const u8) Error!void {
         // A plain openDir yields an O_PATH fd, which fsync rejects.
-        var d = self.root.openDir(dir, .{ .iterate = true }) catch |e| return mapFs(e);
+        var d = self.root.openDir(path, .{ .iterate = true }) catch |e| return mapFs(e);
         defer d.close();
         std.posix.fsync(d.fd) catch |e| return mapFs(e);
+        _ = self.dir_syncs.fetchAdd(1, .monotonic);
     }
 
     fn sizeAt(self: *LocalBackend, path: []const u8) u64 {
@@ -447,4 +462,23 @@ test "usage follows commits, replacements, and deletes" {
     try b.delete(key);
     try b.deleteRecord(rk);
     try std.testing.expectEqual(@as(u64, 0), used.load(.monotonic));
+}
+
+test "a new fan-out directory is synced in its parents, an existing one is not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var lb = try LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+    defer lb.close();
+    const b = lb.backend();
+    // Same fan-out directory (data/ab/cd), two keys.
+    const k1: PhysicalKey = .{ .space = .data, .hex = "abcd0000000000000000000000000001".* };
+    const k2: PhysicalKey = .{ .space = .data, .hex = "abcd0000000000000000000000000002".* };
+    var r1: std.Io.Reader = .fixed("one");
+    _ = try b.put(k1, &r1, .{});
+    // Leaf, data/ab, data, and the drive root.
+    try std.testing.expectEqual(@as(u64, 4), lb.dir_syncs.load(.monotonic));
+    var r2: std.Io.Reader = .fixed("two");
+    _ = try b.put(k2, &r2, .{});
+    try std.testing.expectEqual(@as(u64, 5), lb.dir_syncs.load(.monotonic));
 }

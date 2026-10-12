@@ -73,8 +73,12 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
         if (std.ascii.eqlIgnoreCase(hd.name, auth.header_body)) h.body = hd.value;
         if (std.ascii.eqlIgnoreCase(hd.name, auth.header_sig)) sig = hd.value;
     }
-    n.guard.verify(n.secret, h, sig, std.time.milliTimestamp()) catch |e| {
-        if (e != error.Replayed) std.log.warn("rpc: rejected request from {s}: {t}", .{ h.node, e });
+    const now_ms = auth.nowMs();
+    n.guard.verify(n.secret, h, sig, now_ms) catch |e| {
+        if (e == error.Expired) {
+            _ = n.clock_rejects.fetchAdd(1, .monotonic);
+            if (n.logNow(&n.clock_log_ms)) std.log.err("rpc: refused node {s}: its clock differs from ours by {d} s (limit {d} s); synchronize the clocks", .{ h.node, auth.skewSeconds(h.time, now_ms) orelse 0, @divTrunc(auth.window_ms, 1000) });
+        } else if (e != error.Replayed) std.log.warn("rpc: rejected request from {s}: {t}", .{ h.node, e });
         return fail(req, if (e == error.Busy) .service_unavailable else .unauthorized, @errorName(e));
     };
     const path = req.head.target[rpc.prefix.len..];
