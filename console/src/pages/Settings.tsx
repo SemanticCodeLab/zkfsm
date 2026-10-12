@@ -131,6 +131,21 @@ function AboutCard() {
   );
 }
 
+function MigrationCard() {
+  return (
+    <Card title="Migrating from MinIO">
+      <p>
+        Importing a MinIO deployment is done with the command line, not the console. Run <span class="mono">zkfsm migrate</span> on the server host:
+      </p>
+      <pre class="mono">{`# offline, from the drives of a stopped deployment
+zkfsm migrate --from-minio '/mnt/minio{1...4}' --to /data{1...4} --verify
+# online, from a running server
+zkfsm migrate --from-s3 http://minio:9000 --to /data --verify`}</pre>
+      <p class="hint">Versions, metadata, tags, retention and bucket configurations are kept; an interrupted run resumes from its checkpoint.</p>
+    </Card>
+  );
+}
+
 export function Settings() {
   return (
     <>
@@ -140,6 +155,7 @@ export function Settings() {
         <SessionCard />
       </div>
       <ConfigCard />
+      <MigrationCard />
       <AboutCard />
     </>
   );

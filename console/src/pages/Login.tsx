@@ -52,7 +52,7 @@ export function Login({ onLogin }: { onLogin: (s: Session) => void }) {
           <div class="sso">
             <div class="or">or</div>
             {methods.openid.map((p) => (
-              <a key={p.name} class="btn btn-default" href={session.openidStart(p.name)}>
+              <a key={p.name} class="btn btn-default" href={p.href || session.openidStart(p.name)}>
                 Log in with {p.label || p.name}
               </a>
             ))}

@@ -25,7 +25,8 @@ export interface Session {
 export interface LoginMethods {
   password: boolean;
   ldap?: boolean;
-  openid: { name: string; label: string }[];
+  /** `href` starts the login; `flow` says whether the server or the console runs it. */
+  openid: { name: string; label: string; href?: string; flow?: "server" | "console" }[];
 }
 
 let onUnauthorized: () => void = () => {};
@@ -70,7 +71,9 @@ async function errorFrom(res: Response): Promise<ApiError> {
     try {
       const j = JSON.parse(text);
       code = j.Code || j.code || code;
-      msg = j.Message || j.message || j.error || msg;
+      const nested = j.error && typeof j.error === "object" ? j.error : null;
+      code = nested?.type || code;
+      msg = j.Message || j.message || nested?.message || (typeof j.error === "string" ? j.error : "") || msg;
     } catch {
       /* plain text */
     }

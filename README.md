@@ -43,6 +43,31 @@ endpoints. `--lifecycle-interval` sets the lifecycle pass period (default
 3600 s, 0 disables). Containers: `Dockerfile`,
 `deploy/compose/`, and the Helm chart in `helm/zkfsm`.
 
+### Web console
+
+The server embeds a web console, served on `--console-address` (default `:9001`, or
+`$ZKFSM_CONSOLE_ADDRESS`; `off` disables it; authenticated mode only). Log in with an
+access key and secret, an LDAP account, or an OpenID provider; the browser holds only an
+HttpOnly `SameSite=Strict` session cookie, and the console signs S3 and admin calls
+server-side with temporary credentials. Pages are served under a strict
+Content-Security-Policy; state-changing calls need a same-origin request header.
+`--console-session` sets the session lifetime (900-43200 s) and `--console-s3-url` the
+public S3 URL used in share links.
+
+It covers the dashboard (capacity, drives, heal state, live metrics), buckets and their
+settings (versioning, Object Lock, quota, lifecycle with tier transitions, policy, tags,
+replication, encryption, CORS, website, notifications), the object browser (multipart
+upload with progress, versions, share links, preview, tags, retention and legal hold),
+users, groups, access keys, policies, OpenID/LDAP settings, tenants, tiers, site
+replication, S3 Tables (table buckets, namespaces, tables, schema and snapshots),
+notification, audit and lambda targets, batch jobs, KMS keys (create, rotate, enable,
+disable, tags, delete, re-key, key manifest), monitoring and server settings.
+
+The bundle is prebuilt in `console/dist` and embedded at compile time, so `zig build`
+needs no Node. To change it: `cd console && npm ci && npm run build` (TypeScript and
+Preact; `npm test` for unit tests). `tests/console.sh` checks the console API with curl
+and runs the unit and Playwright suites when `console/node_modules` exists.
+
 ### TLS
 
 ```sh

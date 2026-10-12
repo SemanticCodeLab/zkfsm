@@ -69,6 +69,11 @@ export function arnFor(region: string, id: string, arnType: string): string {
   return arnType ? `arn:minio:sqs:${region}:${id}:${arnType}` : "";
 }
 
+/** ARN a GET passes as `lambdaArn` to run an object through a webhook function. */
+export function lambdaArn(id: string): string {
+  return `arn:minio:s3-object-lambda::${id === DEFAULT_ID ? "" : id}:webhook`;
+}
+
 export const validId = (id: string) => /^[A-Za-z0-9_.-]{1,64}$/.test(id);
 
 /** Target kinds the server supports (src/events/kinds.zig). */

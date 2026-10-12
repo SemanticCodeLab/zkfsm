@@ -41,7 +41,7 @@ C=(-s -b "$JAR" -H "x-console-csrf: 1")
 
 (cd "$ROOT" && zig build)
 ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=adminsecret "$ROOT/zig-out/bin/zkfsm" --data "$DATA" --listen "127.0.0.1:$PORT" \
-  --console-address "127.0.0.1:$CPORT" --console-session 3600 2>"$WORK/server.log" &
+  --console-address "127.0.0.1:$CPORT" --console-session 3600 --kms-backend local --kms-dir "$WORK/keys" 2>"$WORK/server.log" &
 PID=$!
 for _ in $(seq 50); do curl -s -o /dev/null "$CON/" && break; sleep 0.1; done
 
@@ -110,6 +110,25 @@ contains "cluster usage" '"buckets":1' "$CL"
 contains "metrics" "zkfsm_requests_total" "$(curl "${C[@]}" "$API/metrics")"
 check "heal trigger" 202 "$(status "${C[@]}" -X POST "$API/heal")"
 
+# --- S3 Tables mount (signed for the s3tables service), batch, KMS, lambda config
+check "tables needs session" 401 "$(status "$API/tables/buckets")"
+check "tables put needs csrf" 403 "$(status -b "$JAR" -X PUT -d '{"name":"contb"}' "$API/tables/buckets")"
+contains "create table bucket" ':bucket/contb' "$(curl "${C[@]}" -X PUT -H 'content-type: application/json' -d '{"name":"contb"}' "$API/tables/buckets")"
+contains "list table buckets" '"name":"contb"' "$(curl "${C[@]}" "$API/tables/buckets")"
+check "create namespace" 200 "$(status "${C[@]}" -X PUT -H 'content-type: application/json' -d '{"namespace":["ns1"]}' "$API/tables/namespaces/contb")"
+contains "create table" 'tableARN' "$(curl "${C[@]}" -X PUT -H 'content-type: application/json' -d '{"name":"t1","format":"ICEBERG","metadata":{"iceberg":{"schema":{"fields":[{"name":"id","type":"long","required":true}]}}}}' "$API/tables/tables/contb/ns1")"
+contains "iceberg catalog via proxy" '"format-version":2' "$(curl "${C[@]}" "$API/s3/iceberg/v1/contb/namespaces/ns1/tables/t1")"
+check "delete table" 204 "$(status "${C[@]}" -X DELETE "$API/tables/tables/contb/ns1/t1")"
+check "delete namespace" 204 "$(status "${C[@]}" -X DELETE "$API/tables/namespaces/contb/ns1")"
+check "delete table bucket" 204 "$(status "${C[@]}" -X DELETE "$API/tables/buckets/contb")"
+contains "batch job types" '"expire"' "$(curl "${C[@]}" "$API/s3/minio/admin/v3/list-supported-job-types")"
+contains "batch template" 'apiVersion: v1' "$(curl "${C[@]}" "$API/s3/minio/admin/v3/generate-job?jobType=expire")"
+check "kms create key" 200 "$(status "${C[@]}" -X POST "$API/s3/minio/kms/v1/key/create?key-id=conkey")"
+contains "kms key state" '"state":"disabled"' "$(curl "${C[@]}" -X POST "$API/s3/minio/kms/v1/key/disable?key-id=conkey")"
+contains "kms backend" '"backend":"local"' "$(curl "${C[@]}" "$API/s3/minio/kms/v1/config")"
+check "lambda target set" 200 "$(status "${C[@]}" -X PUT -H 'x-console-encrypt: 1' -d 'lambda_webhook:confn enable=on endpoint=http://127.0.0.1:9/fn' "$API/s3/minio/admin/v3/set-config-kv")"
+contains "lambda target read" 'lambda_webhook:confn enable=on' "$(curl "${C[@]}" "$API/s3/minio/admin/v3/get-config-kv?key=lambda_webhook")"
+
 # --- share links
 URL="$(curl "${C[@]}" "$API/presign?bucket=con&key=dir%20a/h%2B1.txt&expires=600" | python3 -c 'import sys,json;print(json.load(sys.stdin)["url"])')"
 check "presigned get" "hello console" "$(curl -s "$URL")"
@@ -136,7 +155,23 @@ for _ in $(seq 100); do [[ -s "$WORK/idp.port" ]] && break; sleep 0.1; done
 IDP="http://127.0.0.1:$(cat "$WORK/idp.port")"
 curl -s -c "$JAR" -H 'x-console-csrf: 1' -d '{"accessKey":"admin","secretKey":"adminsecret"}' "$API/login" >/dev/null
 check "add openid provider" 200 "$(status "${C[@]}" -X PUT -H 'x-console-encrypt: 1' --data-binary "config_url=$IDP/.well-known/openid-configuration client_id=zkfsm-console claim_name=policy display_name=Corp" "$API/s3/minio/admin/v3/idp-config/openid/corp")"
-contains "login offers provider" '"label":"Corp"' "$(curl -s "$API/login/methods")"
+METHODS="$(curl -s "$API/login/methods")"
+contains "login offers provider" '"label":"Corp"' "$METHODS"
+if [[ "$METHODS" == *'"flow":"server"'* ]]; then
+  # The server has its own login routes: the console passes them through.
+  contains "server flow link" '"href":"/minio/admin/v3/oidc/authorize/corp"' "$METHODS"
+  SJ="$WORK/sso"
+  SLOC="$(curl -s -c "$SJ" -D - -o /dev/null "$CON/minio/admin/v3/oidc/authorize/corp" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')"
+  contains "server flow redirects to provider" "$IDP/auth?" "$SLOC"
+  contains "server flow returns to the console" "redirect_uri=http%3A%2F%2F127.0.0.1%3A$CPORT%2Fminio%2Fadmin%2Fv3%2Foidc%2Fcallback%2Fcorp" "$SLOC"
+  SCB="$(header location "$SLOC")"
+  check "server flow callback starts session" 303 "$(curl -s -o /dev/null -w '%{http_code}' -b "$SJ" -c "$SJ" "$SCB")"
+  contains "server flow session" '"provider":"openid:corp"' "$(curl -s -b "$SJ" "$API/session")"
+  check "server flow needs the binding cookie" "/?error=" "$(header location "$SCB" | cut -c1-8)"
+else
+  contains "console flow link" '"href":"/api/v1/oidc/start?provider=corp"' "$METHODS"
+  check "server flow absent" "/?error=" "$(header location "$CON/minio/admin/v3/oidc/authorize/corp" | cut -c1-8)"
+fi
 LOC="$(header location "$API/oidc/start?provider=corp")"
 contains "redirect to provider" "$IDP/auth?response_type=code&client_id=zkfsm-console" "$LOC"
 contains "redirect has state" "&state=" "$LOC"

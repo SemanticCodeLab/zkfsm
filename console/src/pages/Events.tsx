@@ -2,11 +2,14 @@ import { useState } from "preact/hooks";
 import { cluster } from "../lib/api";
 import { navigate, useRoute } from "../lib/router";
 import { Badge, Button, Card, Confirm, Empty, Loading, Modal, PageHeader, Select, Tabs, TextInput, Toggle, toast, toastError, useAsync } from "../components/ui";
-import { arnFor, DEFAULT_ID, enabled, formatLine, get, isPlaceholder, isSecretKey, KvEntry, targetKey, targetKinds, validId } from "./ops/configkv";
-import { auditSubsystems, delConfig, getConfig, helpConfig, notifySubsystems, setConfig } from "./ops/configApi";
+import { arnFor, DEFAULT_ID, lambdaArn, enabled, formatLine, get, isPlaceholder, isSecretKey, KvEntry, targetKey, targetKinds, validId } from "./ops/configkv";
+import { auditSubsystems, delConfig, getConfig, helpConfig, lambdaSubsystems, notifySubsystems, setConfig } from "./ops/configApi";
 import { isUnavailable } from "./ops/common";
 import "./ops/ops.css";
 
+type Mode = "notify" | "audit" | "lambda";
+const subsOf = (m: Mode) => (m === "audit" ? auditSubsystems : m === "lambda" ? lambdaSubsystems : notifySubsystems);
+const nounOf = (m: Mode) => (m === "audit" ? "audit target" : m === "lambda" ? "lambda target" : "notification target");
 const kindOf = (subsys: string) => targetKinds.find((k) => subsys.endsWith(`_${k.type}`))!;
 const summaryKeys = ["endpoint", "brokers", "url", "address", "host", "nsqd_address", "server", "topic", "exchange", "index", "table", "key"];
 
@@ -31,8 +34,9 @@ async function loadAll(subs: string[]): Promise<{ subsys: string; entries: KvEnt
   );
 }
 
-function TargetForm({ audit, existing, onClose, onDone }: { audit: boolean; existing?: KvEntry; onClose: () => void; onDone: () => void }) {
-  const subs = audit ? auditSubsystems : notifySubsystems;
+function TargetForm({ mode, existing, onClose, onDone }: { mode: Mode; existing?: KvEntry; onClose: () => void; onDone: () => void }) {
+  const audit = mode === "audit";
+  const subs = subsOf(mode);
   const [subsys, setSubsys] = useState(existing?.subsys ?? subs[0]);
   const [id, setId] = useState(existing ? (existing.id === DEFAULT_ID ? "" : existing.id) : "");
   const [on, setOn] = useState(existing ? enabled(existing) : true);
@@ -58,7 +62,7 @@ function TargetForm({ audit, existing, onClose, onDone }: { audit: boolean; exis
   return (
     <Modal
       wide
-      title={existing ? `Edit ${targetKey(existing.subsys, existing.id)}` : audit ? "Add audit target" : "Add notification target"}
+      title={existing ? `Edit ${targetKey(existing.subsys, existing.id)}` : `Add ${nounOf(mode)}`}
       onClose={onClose}
       footer={
         <>
@@ -75,7 +79,7 @@ function TargetForm({ audit, existing, onClose, onDone }: { audit: boolean; exis
         ) : (
           <Select label="Type" value={subsys} onChange={(v) => (setSubsys(v), setVals({}))} options={subs.map((s) => [s, kindOf(s).label] as [string, string])} />
         )}
-        <TextInput label="Identifier" value={id} onInput={setId} error={idErr} readOnly={!!existing} hint={audit ? "Optional name for this target." : "Part of the ARN used in bucket notification rules."} />
+        <TextInput label="Identifier" value={id} onInput={setId} error={idErr} readOnly={!!existing} hint={audit ? "Optional name for this target." : mode === "lambda" ? "Part of the ARN passed as lambdaArn." : "Part of the ARN used in bucket notification rules."} />
       </div>
       <Toggle label="Enabled" checked={on} onChange={setOn} />
       <Loading state={help}>
@@ -102,9 +106,11 @@ function TargetForm({ audit, existing, onClose, onDone }: { audit: boolean; exis
   );
 }
 
-function TargetsTab({ audit }: { audit: boolean }) {
-  const subs = audit ? auditSubsystems : notifySubsystems;
-  const data = useAsync(() => loadAll(subs), [audit]);
+function TargetsTab({ mode }: { mode: Mode }) {
+  const audit = mode === "audit";
+  const lambda = mode === "lambda";
+  const subs = subsOf(mode);
+  const data = useAsync(() => loadAll(subs), [mode]);
   const info = useAsync(() => cluster.info());
   const [form, setForm] = useState<{ existing?: KvEntry } | null>(null);
   const [removing, setRemoving] = useState<KvEntry | null>(null);
@@ -113,19 +119,25 @@ function TargetsTab({ audit }: { audit: boolean }) {
   const failed = (data.data ?? []).filter((g) => g.error);
   return (
     <Card
-      title={audit ? "Audit targets" : "Notification targets"}
+      title={audit ? "Audit targets" : lambda ? "Lambda targets" : "Notification targets"}
       actions={
         <>
           <Button small onClick={data.reload}>
             Refresh
           </Button>
           <Button small variant="primary" onClick={() => setForm({})}>
-            {audit ? "Add audit target" : "Add target"}
+            {audit ? "Add audit target" : lambda ? "Add lambda target" : "Add target"}
           </Button>
         </>
       }
     >
-      <p class="hint">{audit ? "Every API request is logged to each enabled audit target." : "Buckets send events to these targets through notification rules that reference the target ARN."}</p>
+      <p class="hint">
+        {audit
+          ? "Every API request is logged to each enabled audit target."
+          : lambda
+            ? "A GET with ?lambdaArn=<ARN> sends the object through the webhook function and returns its reply."
+            : "Buckets send events to these targets through notification rules that reference the target ARN."}
+      </p>
       <Loading state={data}>
         {() =>
           rows.length ? (
@@ -153,7 +165,7 @@ function TargetsTab({ audit }: { audit: boolean }) {
                         <Badge kind={enabled(e) ? "ok" : "default"}>{enabled(e) ? "enabled" : "disabled"}</Badge>
                       </td>
                       <td class="ops-mono">{summary(e)}</td>
-                      {!audit && <td class="ops-mono">{arnFor(region, e.id, k.arn)}</td>}
+                      {!audit && <td class="ops-mono">{lambda ? lambdaArn(e.id) : arnFor(region, e.id, k.arn)}</td>}
                       <td>
                         <div class="actions">
                           <Button small onClick={() => setForm({ existing: e })}>
@@ -170,7 +182,7 @@ function TargetsTab({ audit }: { audit: boolean }) {
               </tbody>
             </table>
           ) : (
-            <Empty>No {audit ? "audit" : "notification"} targets configured.</Empty>
+            <Empty>No {nounOf(mode)}s configured.</Empty>
           )
         }
       </Loading>
@@ -179,13 +191,13 @@ function TargetsTab({ audit }: { audit: boolean }) {
           Could not read {failed.map((g) => g.subsys).join(", ")}: {failed[0].error}
         </div>
       )}
-      {form && <TargetForm audit={audit} existing={form.existing} onClose={() => setForm(null)} onDone={data.reload} />}
+      {form && <TargetForm mode={mode} existing={form.existing} onClose={() => setForm(null)} onDone={data.reload} />}
       {removing && (
         <Confirm
           title="Remove target"
           message={
             <>
-              Remove <strong>{targetKey(removing.subsys, removing.id)}</strong>?{!audit && " Notification rules that reference its ARN stop delivering."}
+              Remove <strong>{targetKey(removing.subsys, removing.id)}</strong>?{mode === "notify" && " Notification rules that reference its ARN stop delivering."}
             </>
           }
           confirmLabel="Remove"
@@ -201,20 +213,21 @@ function TargetsTab({ audit }: { audit: boolean }) {
   );
 }
 
-const tabs: [string, string][] = [
+const tabs: [Mode, string][] = [
   ["notify", "Notification targets"],
   ["audit", "Audit targets"],
+  ["lambda", "Lambda targets"],
 ];
 
 export function Events() {
   const route = useRoute();
-  const tab = route.params.get("tab") === "audit" ? "audit" : "notify";
+  const tab = tabs.find(([k]) => k === route.params.get("tab"))?.[0] ?? "notify";
   return (
     <>
       <PageHeader title="Events" />
       <Tabs tabs={tabs} active={tab} onChange={(k) => navigate("/events", { tab: k })} />
-      <div role="tabpanel" aria-label={tab === "audit" ? "Audit targets" : "Notification targets"}>
-        <TargetsTab key={tab} audit={tab === "audit"} />
+      <div role="tabpanel" aria-label={tabs.find(([k]) => k === tab)![1]}>
+        <TargetsTab key={tab} mode={tab} />
       </div>
     </>
   );

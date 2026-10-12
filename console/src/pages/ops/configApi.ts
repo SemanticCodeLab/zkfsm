@@ -18,6 +18,8 @@ export interface SubsysHelp {
 export const notifySubsystems = ["webhook", "kafka", "amqp", "mqtt", "nats", "nsq", "redis", "postgres", "mysql", "elasticsearch", "pulsar"].map((t) => `notify_${t}`);
 export const auditSubsystems = ["webhook", "kafka", "amqp", "mqtt", "nats", "nsq", "redis", "postgres", "mysql", "elasticsearch", "pulsar"].map((t) => `audit_${t}`);
 
+export const lambdaSubsystems = ["lambda_webhook"];
+
 export const getConfigText = (key: string) => s3Text(`${ADMIN}/get-config-kv`, { query: { key } });
 export const getConfig = async (key: string): Promise<KvEntry[]> => parseConfig(await getConfigText(key));
 export const helpConfig = (subSys: string) => admin<SubsysHelp>("/help-config-kv", { query: { subSys } });

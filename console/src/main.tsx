@@ -20,6 +20,8 @@ import { Kms } from "./pages/Kms";
 import { SiteReplication } from "./pages/SiteReplication";
 import { Tiers } from "./pages/Tiers";
 import { Events } from "./pages/Events";
+import { Batch } from "./pages/Batch";
+import { Tables } from "./pages/Tables";
 import { Settings } from "./pages/Settings";
 import { applyTheme, getTheme, onThemeChange, setTheme, Theme } from "./lib/theme";
 
@@ -27,6 +29,7 @@ const nav: { section?: string; path: string; label: string }[] = [
   { path: "/", label: "Dashboard" },
   { section: "Storage", path: "/buckets", label: "Buckets" },
   { path: "/browser", label: "Object Browser" },
+  { path: "/tables", label: "Tables" },
   { path: "/tiers", label: "Tiers" },
   { path: "/site-replication", label: "Site Replication" },
   { section: "Identity", path: "/iam/users", label: "Users" },
@@ -37,6 +40,7 @@ const nav: { section?: string; path: string; label: string }[] = [
   { path: "/iam/tenants", label: "Tenants" },
   { section: "Operations", path: "/monitoring", label: "Monitoring" },
   { path: "/events", label: "Events" },
+  { path: "/batch", label: "Batch Jobs" },
   { path: "/kms", label: "KMS Keys" },
   { path: "/settings", label: "Settings" },
 ];
@@ -76,6 +80,10 @@ function Page({ segs }: { segs: string[] }) {
       return <Tiers />;
     case "events":
       return <Events />;
+    case "batch":
+      return <Batch />;
+    case "tables":
+      return <Tables bucket={b} />;
     case "settings":
       return <Settings />;
   }
