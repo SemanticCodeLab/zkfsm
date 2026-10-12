@@ -55,6 +55,11 @@ wait_for() {
 }
 stat_of() { curl -s "$MOCK/stats" | jget "d['$1']"; }
 restore_req() { curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data "<RestoreRequest><Days>$3</Days></RestoreRequest>" "$HOT/$1/$2?restore"; }
+# tier_add_raw JSON: PUT an encrypted tier config (fields the MinIO client cannot set).
+tier_add_raw() {
+  printf '%s' "$1" | python3 "$ROOT/tests/madmin_encrypt.py" "$SK" >"$WORK/tier.enc"
+  curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X PUT --data-binary @"$WORK/tier.enc" "$HOT/minio/admin/v3/tier"
+}
 wait_up() { for _ in $(seq 100); do curl -s -o /dev/null "$1/" && return 0; sleep 0.1; done; return 1; }
 # put_and_check BUCKET TIER: an object transitions to TIER and reads back intact.
 put_and_check() {
@@ -131,7 +136,10 @@ check "x-amz-storage-class sent" 1 "$(curl -s "$MOCK/stats" | jget "int('STANDAR
 
 # ---- GCS service account (JWT bearer grant) ----
 check "gcs tier with bad key file refused" 1 "$(ok "$MC" ilm tier add gcs hot BADG --credentials-file "$WORK/obj.bin" --bucket gcsb)"
-check "gcs service-account tier add" 0 "$(ok "$MC" ilm tier add gcs hot GSA --credentials-file "$WORK/sa.json" --bucket gcsb --prefix g/ --storage-class NEARLINE)"
+check "gcs service-account tier add (mc)" 0 "$(ok "$MC" ilm tier add gcs hot GSAMC --credentials-file "$WORK/sa.json" --bucket gcsb --prefix mc/)"
+# The MinIO client drops --storage-class for GCS, so this tier goes in through the admin route.
+check "gcs service-account tier add" 204 "$(tier_add_raw "{\"Version\":\"v1\",\"Type\":\"gcs\",\"Name\":\"GSA\",\"GCS\":{\"Creds\":\"$(base64 -w0 "$WORK/sa.json")\",\"Bucket\":\"gcsb\",\"Prefix\":\"g/\",\"StorageClass\":\"NEARLINE\"}}")"
+check "tier ls gcs storage class" NEARLINE "$("$MC" ilm tier ls hot --json | jget '[t for t in d["tiers"] if t["Name"]=="GSA"][0]["GCS"]["StorageClass"]')"
 check "gcs token issued" 1 "$(( $(stat_of gcs_tokens) >= 1 ))"
 check "gcs requests use bearer tokens" 1 "$(( $(stat_of bearer_requests) >= 1 ))"
 check "tier ls redacts gcs creds" REDACTED "$("$MC" ilm tier ls hot --json | jget '[t for t in d["tiers"] if t["Name"]=="GSA"][0]["GCS"]["Creds"]')"
@@ -157,12 +165,12 @@ curl -s -X POST "$MOCK/delay?s=0" >/dev/null
 # ---- S3 role: web identity token exchanged at the remote's STS ----
 check "remote role provider" 0 "$(ok "$MC" idp openid add rem rw "config_url=$IDP/.well-known/openid-configuration" client_id=zkfsm role_policy=readwrite)"
 curl -s "$IDP/token?sub=tier-node&ttl=7200" >"$WORK/wi.token"
-check "role tier add (web identity)" 0 "$(ok "$MC" ilm tier add s3 hot ROLE --endpoint "$REM" --use-aws-role --aws-role-arn arn:zkfsm:iam:::role/rw --aws-web-identity-file "$WORK/wi.token" --bucket rolebkt --prefix r/)"
-check "tier ls shows role" True "$("$MC" ilm tier ls hot --json | jget '[t for t in d["tiers"] if t["Name"]=="ROLE"][0]["S3"].get("AWSRole")')"
+check "role tier add (web identity)" 0 "$(ok "$MC" ilm tier add s3 hot ROLE --endpoint "$REM" --aws-role-arn arn:zkfsm:iam:::role/rw --aws-web-identity-file "$WORK/wi.token" --bucket rolebkt --prefix r/)"
+check "tier ls shows role" arn:zkfsm:iam:::role/rw "$("$MC" ilm tier ls hot --json | jget '[t for t in d["tiers"] if t["Name"]=="ROLE"][0]["S3"].get("AWSRoleARN")')"
 put_and_check roledata ROLE
 check "role tier wrote to the remote" 1 "$("$MC" ls --recursive rem/rolebkt/r/ | wc -l | tr -d ' ')"
 echo bogus >"$WORK/bad.token"
-check "role tier with a bad token refused" 1 "$(ok "$MC" ilm tier add s3 hot BADROLE --endpoint "$REM" --use-aws-role --aws-role-arn arn:zkfsm:iam:::role/rw --aws-web-identity-file "$WORK/bad.token" --bucket rolebkt --prefix bad/)"
+check "role tier with a bad token refused" 1 "$(ok "$MC" ilm tier add s3 hot BADROLE --endpoint "$REM" --aws-role-arn arn:zkfsm:iam:::role/rw --aws-web-identity-file "$WORK/bad.token" --bucket rolebkt --prefix bad/)"
 
 # ---- S3 role: instance-metadata credential endpoint ----
 check "role tier add (metadata endpoint)" 0 "$(ok "$MC" ilm tier add s3 hot IMDS --endpoint "$REM" --use-aws-role --bucket imdsbkt)"
@@ -198,12 +206,14 @@ if [[ -n "$AZ" ]]; then
   check "azurite container (oauth)" 201 "$(azc azk)"
   azc azsp >/dev/null
   AZKEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-  check "azure shared-key tier with access tier" 0 "$(ok "$MC" ilm tier add azure hot AZK --endpoint "$AZ" --account-name devstoreaccount1 --account-key "$AZKEY" --bucket azk --storage-class Cool)"
+  azc azmc >/dev/null
+  check "azure shared-key tier (mc)" 0 "$(ok "$MC" ilm tier add azure hot AZMC --endpoint "$AZ" --account-name devstoreaccount1 --account-key "$AZKEY" --bucket azmc)"
+  check "azure shared-key tier with access tier" 204 "$(tier_add_raw "{\"Version\":\"v1\",\"Type\":\"azure\",\"Name\":\"AZK\",\"Azure\":{\"Endpoint\":\"$AZ\",\"AccountName\":\"devstoreaccount1\",\"AccountKey\":\"$AZKEY\",\"Bucket\":\"azk\",\"StorageClass\":\"Cool\"}}")"
   put_and_check azkdata AZK
   check "x-ms-access-tier applied" Cool "$(curl -sk -H "Authorization: Bearer $aztok" -H "x-ms-version: 2021-08-06" "$AZ/azk?restype=container&comp=list" | python3 -c 'import re,sys; m=re.findall(r"<AccessTier>([^<]*)</AccessTier>", sys.stdin.read()); print(m[0] if m else "")')"
   check "azure service principal wrong secret refused" 1 "$(ok "$MC" ilm tier add azure hot AZBAD --endpoint "$AZ" --account-name devstoreaccount1 --az-sp-tenant-id test-tenant --az-sp-client-id zkfsm-client --az-sp-client-secret wrong --bucket azsp)"
   check "azure service principal tier add" 0 "$(ok "$MC" ilm tier add azure hot AZSP --endpoint "$AZ" --account-name devstoreaccount1 --az-sp-tenant-id test-tenant --az-sp-client-id zkfsm-client --az-sp-client-secret zkfsm-client-secret --bucket azsp --prefix sp/)"
-  check "tier ls service principal" "test-tenant REDACTED" "$("$MC" ilm tier ls hot --json | jget '" ".join([t["Azure"]["SPAuth"]["TenantID"], t["Azure"]["SPAuth"]["ClientSecret"]] for t in d["tiers"] if t["Name"]=="AZSP"][0])')"
+  check "tier ls service principal" "test-tenant REDACTED" "$("$MC" ilm tier ls hot --json | jget '[t["Azure"]["SPAuth"]["TenantID"] + " " + t["Azure"]["SPAuth"]["ClientSecret"] for t in d["tiers"] if t["Name"]=="AZSP"][0]')"
   check "azure token issued" 1 "$(( $(stat_of az_tokens) >= 1 ))"
   put_and_check azspdata AZSP
   "$MC" rm hot/azspdata/obj >/dev/null

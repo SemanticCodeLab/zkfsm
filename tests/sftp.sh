@@ -78,8 +78,13 @@ sftpb() { # batchfile, extra ssh options...
 # Generated host key: persisted 0600 in the state directory, stable across restarts.
 start
 KEYFILE="$DATA/.zkfsm/sftp_host_ed25519_key"
-check "host key generated" "600" "$(stat -c %a "$KEYFILE" 2>/dev/null)"
 FP1=$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)
+if [[ $GW_CLUSTER == 1 ]]; then
+  # No per-node state directory: the generated key is shared by all nodes.
+  check "host key shared across nodes" "$FP1" "$(ssh-keyscan -t ed25519 -p "${SPS[3]}" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
+else
+  check "host key generated" "600" "$(stat -c %a "$KEYFILE" 2>/dev/null)"
+fi
 stop
 start
 check "host key stable" "$FP1" "$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)"

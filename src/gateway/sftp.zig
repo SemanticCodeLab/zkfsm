@@ -3,6 +3,7 @@
 const std = @import("std");
 const posix = std.posix;
 const root = @import("root.zig");
+const object = @import("../object/root.zig");
 const listener_mod = @import("listener.zig");
 const fs_mod = @import("fs.zig");
 const wire = @import("ssh_wire.zig");
@@ -123,10 +124,35 @@ pub const Server = struct {
             s.host_key_count += 1;
         }
         if (s.host_key_count > 0) return;
-        s.host_keys[0] = .{ .ed25519 = try persistentEd25519(gpa, s.deps.state_dir) };
+        s.host_keys[0] = .{ .ed25519 = if (s.deps.state_dir == null) sharedEd25519(gpa, s.deps.access.svc) else try persistentEd25519(gpa, s.deps.state_dir) };
         s.host_key_count = 1;
     }
 };
+
+/// Cluster nodes have no private state directory: the generated host key is one
+/// shared document, so clients see the same key on every node and after restarts.
+fn sharedEd25519(gpa: std.mem.Allocator, svc: *object.ObjectService) std.crypto.sign.Ed25519.KeyPair {
+    const Ed = std.crypto.sign.Ed25519;
+    const doc = "sftp-host-ed25519";
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        if (object.bucket_meta.getNamed(svc, arena, doc) catch null) |text| {
+            var k = keys.loadHostKey(gpa, text) catch break;
+            if (k == .ed25519) return k.ed25519;
+            k.deinit(gpa);
+            break;
+        }
+        var buf: [1024]u8 = undefined;
+        const text = keys.encodeOpenSsh(Ed.KeyPair.generate(), &buf) catch break;
+        // Written under a cluster lock; read back so racing nodes agree on one key.
+        object.bucket_meta.setNamed(svc, doc, text) catch break;
+    }
+    std.log.warn("sftp: host key could not be shared; using an ephemeral one", .{});
+    return Ed.KeyPair.generate();
+}
 
 fn persistentEd25519(gpa: std.mem.Allocator, state_dir: ?[]const u8) root.StartError!std.crypto.sign.Ed25519.KeyPair {
     const Ed = std.crypto.sign.Ed25519;

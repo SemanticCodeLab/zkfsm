@@ -171,7 +171,8 @@ fn add(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry,
         .s3, .minio => {
             cfg.access_key = str(s, "AccessKey");
             cfg.secret_key = str(s, "SecretKey");
-            if (isTrue(s, "AWSRole")) {
+            // Role credentials: the node's own (AWSRole) or a web identity token for a role.
+            if (isTrue(s, "AWSRole") or str(s, "AWSRoleARN").len > 0 or str(s, "AWSRoleWebIdentityTokenFile").len > 0) {
                 cfg.auth = .role;
                 cfg.role_arn = str(s, "AWSRoleARN");
                 cfg.token_file = str(s, "AWSRoleWebIdentityTokenFile");
@@ -223,7 +224,7 @@ fn writeList(js: *std.json.Stringify, cfgs: []const Config) std.Io.Writer.Error!
         switch (c.kind) {
             .s3, .minio => if (c.auth == .role) {
                 try js.objectField("AWSRole");
-                try js.write(true);
+                try js.write(c.token_file.len == 0);
                 try optField(js, "AWSRoleARN", c.role_arn);
                 try optField(js, "AWSRoleWebIdentityTokenFile", c.token_file);
             } else {

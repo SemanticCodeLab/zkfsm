@@ -148,7 +148,10 @@ pub const Exchange = struct {
             .extra_headers = o.headers,
         }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Transient,
+            else => blk: {
+                std.log.scoped(.remote).debug("cannot connect to {s}: {t}", .{ o.host, e });
+                break :blk error.Transient;
+            },
         };
         // A failed exchange must not return its (possibly dead) connection to the pool.
         errdefer {
@@ -161,6 +164,8 @@ pub const Exchange = struct {
             var bw = x.req.sendBodyUnflushed(&.{}) catch return error.Transient;
             bw.writer.writeAll(b) catch return error.Transient;
             bw.end() catch return error.Transient;
+            // Over TLS, end() leaves the last records in the socket writer's buffer.
+            if (x.req.connection) |c| c.flush() catch return error.Transient;
         } else {
             x.req.sendBodiless() catch return error.Transient;
         }
