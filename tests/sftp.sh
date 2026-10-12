@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SFTP gateway end-to-end: OpenSSH sftp over every cipher, kex and host key
 # algorithm, a 100 MB round trip, reget/reput, paramiko checks, S3 visibility.
+# ZKFSM_GW_CLUSTER=1 runs against a 4-node cluster: SFTP on node 1, S3 checks on node 2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${ZKFSM_SFTP_PYTHON:-python3}"
@@ -13,7 +14,9 @@ SK=sftp-secret-key-123
 WORK="$(mktemp -d)"
 DATA="$WORK/data"
 PID=""
-cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; gw_cluster_stop; rm -rf "$WORK"; }
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 trap cleanup EXIT
 
 pass=0
@@ -29,14 +32,28 @@ s3() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$@"; }
 (cd "$ROOT" && zig build -Doptimize=ReleaseSafe -p "$WORK/out")
 BIN="$WORK/out/bin/zkfsm"
 
-start() { # extra flags...
-  ZKFSM_ACCESS_KEY=$AK ZKFSM_SECRET_KEY=$SK "$BIN" --data "$DATA" --listen "127.0.0.1:$PORT" \
-    --sftp "127.0.0.1:$SPORT" --sftp-authorized-keys "$WORK/authorized" "$@" 2>>"$WORK/server.log" &
-  PID=$!
-  for _ in $(seq 50); do curl -s -o /dev/null "$EP/" && return 0; sleep 0.1; done
-  echo "server did not start:"; cat "$WORK/server.log"; exit 1
-}
-stop() { kill "$PID"; wait "$PID" 2>/dev/null || true; PID=""; }
+LOG="$WORK/server.log"
+if [[ $GW_CLUSTER == 1 ]]; then
+  SPS=(0 "$SPORT" "$(freeport)" "$(freeport)" "$(freeport)")
+  sftp_node() { echo "--sftp 127.0.0.1:${SPS[$1]}"; }
+  LOG="$WORK/node1.log"
+  DATA="$WORK/n1/d1"
+  start() { # extra flags...
+    gw_cluster_start "$WORK" "sftp listening" "" sftp_node --sftp-authorized-keys "$WORK/authorized" "$@"
+    PID="${GW_PIDS[1]}"
+    EP="http://127.0.0.1:${GW_S3P[2]}"
+  }
+  stop() { gw_cluster_stop; PID=""; }
+else
+  start() { # extra flags...
+    ZKFSM_ACCESS_KEY=$AK ZKFSM_SECRET_KEY=$SK "$BIN" --data "$DATA" --listen "127.0.0.1:$PORT" \
+      --sftp "127.0.0.1:$SPORT" --sftp-authorized-keys "$WORK/authorized" "$@" 2>>"$LOG" &
+    PID=$!
+    for _ in $(seq 50); do curl -s -o /dev/null "$EP/" && return 0; sleep 0.1; done
+    echo "server did not start:"; cat "$LOG"; exit 1
+  }
+  stop() { kill "$PID"; wait "$PID" 2>/dev/null || true; PID=""; }
+fi
 
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/id"
 echo "$AK $(cut -d' ' -f1,2 "$WORK/id.pub") test" > "$WORK/authorized"
@@ -62,10 +79,10 @@ sftpb() { # batchfile, extra ssh options...
 start
 KEYFILE="$DATA/.zkfsm/sftp_host_ed25519_key"
 check "host key generated" "600" "$(stat -c %a "$KEYFILE" 2>/dev/null)"
-FP1=$(grep -o 'SHA256:[^ ]*' "$WORK/server.log" | tail -1)
+FP1=$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)
 stop
 start
-check "host key stable" "$FP1" "$(grep -o 'SHA256:[^ ]*' "$WORK/server.log" | tail -1)"
+check "host key stable" "$FP1" "$(grep -o 'SHA256:[^ ]*' "$LOG" | tail -1)"
 check "fingerprint matches client view" "$FP1" "$(ssh-keyscan -t ed25519 -p "$SPORT" 127.0.0.1 2>/dev/null | ssh-keygen -lf - | awk '{print $2}')"
 stop
 

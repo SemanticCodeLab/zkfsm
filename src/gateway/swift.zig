@@ -108,7 +108,7 @@ pub const Server = struct {
         errdefer deps.gpa.destroy(self);
         const ks: ?*keystone.Keystone = if (cfg.keystone.url != null) try keystone.Keystone.create(deps.gpa, cfg.keystone) else null;
         errdefer if (ks) |k| k.destroy();
-        var accounts = try meta.AccountStore.init(deps.gpa, deps.state_dir);
+        var accounts = try meta.AccountStore.init(deps.gpa, deps.access.svc, deps.state_dir);
         errdefer accounts.deinit();
         const use_tls = deps.tls != null and !cfg.insecure;
         self.* = .{
@@ -120,7 +120,7 @@ pub const Server = struct {
                 .prefix = cfg.prefix,
                 .tempauth = cfg.tempauth,
                 .token_ttl_s = cfg.token_ttl_s,
-                .secret = tokenSecret(deps.state_dir),
+                .secret = tokenSecret(deps.access, deps.state_dir),
                 .ks = ks,
                 .accounts = accounts,
             },
@@ -220,9 +220,14 @@ fn bodyDone(r: *std.http.Reader) bool {
     return false;
 }
 
-/// Tempauth signing key: persisted under the state dir so tokens survive restarts.
-fn tokenSecret(state_dir: ?[]const u8) [32]u8 {
+/// Tempauth signing key: derived from the root secret (the same on every node of a
+/// cluster), else persisted under the state dir so tokens survive restarts.
+fn tokenSecret(access: root.Access, state_dir: ?[]const u8) [32]u8 {
     var key: [32]u8 = undefined;
+    if (access.iam) |st| if (st.opts.root_secret.len > 0) {
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&key, "zkfsm swift tempauth v1", st.opts.root_secret);
+        return key;
+    };
     std.crypto.random.bytes(&key);
     const dir = state_dir orelse return key;
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -232,6 +237,7 @@ fn tokenSecret(state_dir: ?[]const u8) [32]u8 {
         defer f.close();
         if ((f.readAll(&existing) catch 0) == 32) return existing;
     } else |_| {}
+    std.fs.cwd().makePath(std.fs.path.dirname(path) orelse return key) catch return key;
     const f = std.fs.cwd().createFile(path, .{ .mode = 0o600 }) catch return key;
     defer f.close();
     f.writeAll(&key) catch {};

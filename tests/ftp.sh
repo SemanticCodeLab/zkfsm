@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # FTP / FTPS gateway end to end: curl (ftp://, explicit --ssl-reqd, implicit ftps://)
 # and python ftplib (FTP, FTP_TLS, implicit), checked against the S3 API.
+# ZKFSM_GW_CLUSTER=1 runs against a 4-node cluster: FTP on node 1, S3 checks on node 2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRATCH="${ZKFSM_FTP_SCRATCH:-${TMPDIR:-/tmp}}"
 mkdir -p "$SCRATCH"
 WORK="$(mktemp -d "$SCRATCH/zkfsm-ftp.XXXXXX")"
 PID=""
-cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() { [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true; gw_cluster_stop; rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 pass=0
 fail=0
@@ -24,6 +27,7 @@ PY="${PYTHON:-python3}"
 
 (cd "$ROOT" && zig build)
 BIN="$ROOT/zig-out/bin/zkfsm"
+gw_build "$WORK/rs"
 
 cd "$WORK"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.crt -days 2 \
@@ -31,12 +35,23 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls
 
 S3P=$(freeport); FTPP=$(freeport); FTPSP=$(freeport)
 PLO=$(( (RANDOM % 2000) + 40000 )); PHI=$((PLO + 40))
+if [[ $GW_CLUSTER == 1 ]]; then
+  FPS=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  FSS=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  ftp_node() { echo "--ftp 127.0.0.1:${FPS[$1]} --ftps 127.0.0.1:${FSS[$1]} --ftp-passive-ports $((PLO + ($1 - 1) * 50))-$((PLO + ($1 - 1) * 50 + 40))"; }
+  gw_tls "$WORK/tls"
+  cp "$WORK/tls/chain.crt" tls.crt; cp "$WORK/tls/leaf.key" tls.key
+  gw_cluster_start "$WORK" "ftps listening" "$WORK/tls" ftp_node
+  S3P="${GW_S3P[2]}"; FTPP="${FPS[1]}"; FTPSP="${FSS[1]}"
+  echo "cluster mode: 4 nodes, ftp on node 1, s3 on node 2"
+else
 ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$WORK/data" --listen "127.0.0.1:$S3P" \
   --tls-cert tls.crt --tls-key tls.key --ftp "127.0.0.1:$FTPP" --ftps "127.0.0.1:$FTPSP" \
   --ftp-passive-ports "$PLO-$PHI" 2>"$WORK/server.log" &
 PID=$!
 for _ in $(seq 300); do grep -q "ftps listening" "$WORK/server.log" 2>/dev/null && break; sleep 0.1; done
 grep -q "ftps listening" "$WORK/server.log" || { echo "server did not start:"; cat "$WORK/server.log"; exit 1; }
+fi
 
 EP="https://127.0.0.1:$S3P"
 s3() { curl -sk --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$@"; }

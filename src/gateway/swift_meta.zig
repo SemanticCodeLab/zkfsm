@@ -1,6 +1,6 @@
 //! Swift account and container metadata. Account metadata (incl. temp URL keys)
-//! lives in one small file per account under `<state_dir>/swift` (memory only
-//! without a state dir); container metadata is stored as reserved bucket tags.
+//! is one named document per account in the object layer, shared by every node;
+//! container metadata and settings are stored as reserved bucket tags.
 const std = @import("std");
 const object = @import("../object/root.zig");
 const util = @import("swift_util.zig");
@@ -81,17 +81,16 @@ pub const Account = struct { meta: []Meta, owner: ?[]const u8 };
 
 pub const AccountStore = struct {
     gpa: std.mem.Allocator,
-    /// `<state_dir>/swift`, or null for memory only.
+    /// Null keeps accounts in memory only (tests).
+    svc: ?*object.ObjectService = null,
+    /// `<state_dir>/swift`: read-only fallback for records written by older versions.
     dir: ?[]const u8 = null,
     mutex: std.Thread.Mutex = .{},
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator, state_dir: ?[]const u8) error{OutOfMemory}!AccountStore {
-        var s: AccountStore = .{ .gpa = gpa };
-        if (state_dir) |d| {
-            s.dir = try std.fs.path.join(gpa, &.{ d, "swift" });
-            std.fs.cwd().makePath(s.dir.?) catch {};
-        }
+    pub fn init(gpa: std.mem.Allocator, svc: ?*object.ObjectService, state_dir: ?[]const u8) error{OutOfMemory}!AccountStore {
+        var s: AccountStore = .{ .gpa = gpa, .svc = svc };
+        if (state_dir) |d| s.dir = try std.fs.path.join(gpa, &.{ d, "swift" });
         return s;
     }
 
@@ -105,30 +104,28 @@ pub const AccountStore = struct {
         if (s.dir) |d| s.gpa.free(d);
     }
 
-    fn fileName(buf: []u8, account: []const u8) []const u8 {
-        var w: std.Io.Writer = .fixed(buf);
-        w.print("acct-{x}", .{account}) catch return "";
-        return w.buffered();
+    fn docName(buf: []u8, account: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "swift-account/{s}", .{account}) catch "";
     }
 
-    /// Encoded record (copied into `a`), loading it from disk on first use.
-    fn loadLocked(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error![]const u8 {
-        if (s.map.get(account)) |v| return a.dupe(u8, v);
+    fn legacy(s: *AccountStore, a: std.mem.Allocator, account: []const u8) []const u8 {
         const dir = s.dir orelse return "";
         var nb: [2 * util_max_account + 8]u8 = undefined;
-        const name = fileName(&nb, account);
-        var d = std.fs.cwd().openDir(dir, .{}) catch return error.Storage;
+        const name = std.fmt.bufPrint(&nb, "acct-{x}", .{account}) catch return "";
+        var d = std.fs.cwd().openDir(dir, .{}) catch return "";
         defer d.close();
-        const bytes = d.readFileAlloc(s.gpa, name, max_total * 3) catch |e| return switch (e) {
-            error.FileNotFound => "",
+        return d.readFileAlloc(a, name, max_total * 3) catch "";
+    }
+
+    /// Encoded record in `a`: the shared document, else a legacy file, else empty.
+    fn loadLocked(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error![]const u8 {
+        const svc = s.svc orelse return if (s.map.get(account)) |v| a.dupe(u8, v) else "";
+        var nb: [util_max_account + 16]u8 = undefined;
+        const doc = object.bucket_meta.getNamed(svc, a, docName(&nb, account)) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Storage,
         };
-        errdefer s.gpa.free(bytes);
-        const key = try s.gpa.dupe(u8, account);
-        errdefer s.gpa.free(key);
-        try s.map.put(s.gpa, key, bytes);
-        return a.dupe(u8, bytes);
+        return doc orelse s.legacy(a, account);
     }
 
     pub fn get(s: *AccountStore, a: std.mem.Allocator, account: []const u8) Error!Account {
@@ -154,14 +151,15 @@ pub const AccountStore = struct {
         const merged = try merge(a, cur.meta, changes);
         var w: std.Io.Writer.Allocating = .init(a);
         encode(&w.writer, merged, owner) catch return error.OutOfMemory;
+        if (s.svc) |svc| {
+            var nb: [util_max_account + 16]u8 = undefined;
+            return object.bucket_meta.setNamed(svc, docName(&nb, account), w.written()) catch |e| switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Storage,
+            };
+        }
         const bytes = try s.gpa.dupe(u8, w.written());
         errdefer s.gpa.free(bytes);
-        if (s.dir) |dir| {
-            var nb: [2 * util_max_account + 8]u8 = undefined;
-            var d = std.fs.cwd().openDir(dir, .{}) catch return error.Storage;
-            defer d.close();
-            d.writeFile(.{ .sub_path = fileName(&nb, account), .data = bytes }) catch return error.Storage;
-        }
         if (s.map.getPtr(account)) |v| {
             s.gpa.free(v.*);
             v.* = bytes;
@@ -258,21 +256,13 @@ test "metadata from headers and merge" {
     try std.testing.expectError(error.BadMetadata, fromHeaders(a, &.{.{ .name = "X-Container-Meta-a", .value = "v" ** 300 }}, "x-container-meta-", 100));
 }
 
-test "account store persists" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &pbuf);
+test "account store merges updates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    {
-        var s = try AccountStore.init(std.testing.allocator, dir);
-        defer s.deinit();
-        try s.update("AUTH_t", &.{.{ .name = "temp-url-key", .value = "k1" }}, "alice");
-        try s.update("AUTH_t", &.{.{ .name = "color", .value = "red" }}, "alice");
-    }
-    var s = try AccountStore.init(std.testing.allocator, dir);
+    var s = try AccountStore.init(std.testing.allocator, null, null);
     defer s.deinit();
+    try s.update("AUTH_t", &.{.{ .name = "temp-url-key", .value = "k1" }}, "alice");
+    try s.update("AUTH_t", &.{.{ .name = "color", .value = "red" }}, "alice");
     const acct = try s.get(arena.allocator(), "AUTH_t");
     try std.testing.expectEqualStrings("k1", find(acct.meta, "temp-url-key").?);
     try std.testing.expectEqualStrings("red", find(acct.meta, "color").?);

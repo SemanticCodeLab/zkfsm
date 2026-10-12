@@ -38,7 +38,8 @@ gw_cluster_start() {
     scheme=https
     tlsargs=(--tls-cert "$tlsdir/chain.crt" --tls-key "$tlsdir/leaf.key" --cluster-ca "$tlsdir/ca.crt")
   fi
-  GW_S3P=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
+  # Ports are kept across restarts of the same cluster.
+  [[ ${#GW_S3P[@]} -eq 5 ]] || GW_S3P=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
   GW_PIDS=(0 0 0 0 0)
   local eps=() i
   for i in 1 2 3 4; do eps+=("$scheme://localhost:${GW_S3P[$i]}$work/n$i/d{1...4}"); done

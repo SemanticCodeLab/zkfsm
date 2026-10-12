@@ -2,6 +2,7 @@
 # Swift gateway end to end: python-swiftclient against tempauth and a Keystone v3
 # mock, curl for formats, errors, temp URLs, and S3 visibility of the same objects.
 # Needs: swift (python-swiftclient + keystoneclient), mc, curl, python3.
+# ZKFSM_GW_CLUSTER=1 runs against a 4-node cluster: Swift on node 1, S3 checks on node 2.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SWIFT="${SWIFT:-$(command -v swift || true)}"
@@ -20,10 +21,13 @@ export MC_CONFIG_DIR="$WORK/mc"
 cleanup() {
   [[ -n "$PID" ]] && kill "$PID" 2>/dev/null || true
   [[ -n "$MPID" ]] && kill "$MPID" 2>/dev/null || true
+  gw_cluster_stop
   rm -rf "$DATA" "$WORK"
 }
 trap cleanup EXIT
 
+# shellcheck source=tests/gw_cluster.sh
+source "$ROOT/tests/gw_cluster.sh"
 pass=0
 fail=0
 check() { # name expected actual
@@ -41,11 +45,22 @@ jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
 (cd "$ROOT" && zig build)
 BIN="$ROOT/zig-out/bin/zkfsm"
+gw_build "$WORK/rs"
 python3 "$ROOT/tests/swift_keystone_mock.py" "$KSPORT" "$SW" 2>"$WORK/mock.log" &
 MPID=$!
 KSFLAGS=(--swift-keystone "$KSURL/v3" --swift-keystone-user svc --swift-keystone-password svcpass
   --swift-keystone-project service --swift-keystone-map aaaa1111="$AK" --swift-keystone-map beta=rouser
   --swift-keystone-role-map operator=readwrite --swift-keystone-role-map reader=readonly --swift-expirer-interval 1)
+if [[ $GW_CLUSTER == 1 ]]; then
+  WPS=(0 "$SWPORT" "$(freeport)" "$(freeport)" "$(freeport)")
+  swift_node() { echo "--swift 127.0.0.1:${WPS[$1]}"; }
+  start() {
+    gw_cluster_start "$WORK" "swift listening" "" swift_node "$@"
+    PID="${GW_PIDS[1]}"
+    EP="http://127.0.0.1:${GW_S3P[2]}"
+  }
+  stop() { gw_cluster_stop; PID=""; }
+else
 start() {
   ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" "$BIN" --data "$DATA" --listen "127.0.0.1:$S3PORT" \
     --swift "127.0.0.1:$SWPORT" "$@" 2>>"$WORK/server.log" &
@@ -54,6 +69,7 @@ start() {
   echo "server did not start:"; cat "$WORK/server.log"; exit 1
 }
 stop() { kill "$PID"; wait "$PID" 2>/dev/null || true; PID=""; }
+fi
 start "${KSFLAGS[@]}"
 
 # ---- info and tempauth ----

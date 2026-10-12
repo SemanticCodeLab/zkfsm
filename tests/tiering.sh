@@ -296,6 +296,8 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     if ! docker image inspect "$image" >/dev/null 2>&1; then
       alt="${image#quay.io/}"
       if [[ "$alt" != "$image" ]] && docker image inspect "$alt" >/dev/null 2>&1; then image="$alt"
+      elif [[ "$tname" == MINIO ]] && docker image inspect "${ZKFSM_MINIO_IMAGE:-pgsty/minio:latest}" >/dev/null 2>&1; then
+        image="${ZKFSM_MINIO_IMAGE:-pgsty/minio:latest}" # a MinIO build under another name
       else echo "skip $tname: image $image not present"; continue; fi
     fi
     if [[ "$tname" == MINIO ]]; then port="$(docker_tier minio "$image" "$e1" "$e2" -- server /data)" || continue
