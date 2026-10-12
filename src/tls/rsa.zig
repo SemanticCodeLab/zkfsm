@@ -58,6 +58,33 @@ pub const PrivateKey = struct {
         return sig;
     }
 
+    /// RSASSA-PKCS1-v1_5 (RFC 8017 8.2), for TLS 1.2 peers that do not offer PSS.
+    pub fn signPkcs1(k: PrivateKey, comptime Hash: type, msg: []const u8, out: *[max_bytes]u8) Error![]const u8 {
+        const prefix: []const u8 = switch (Hash) {
+            std.crypto.hash.sha2.Sha256 => &.{ 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 },
+            std.crypto.hash.sha2.Sha384 => &.{ 0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30 },
+            std.crypto.hash.sha2.Sha512 => &.{ 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 },
+            else => @compileError("unsupported hash"),
+        };
+        var mh: [Hash.digest_length]u8 = undefined;
+        Hash.hash(msg, &mh, .{});
+        const k_len = k.modulusLen();
+        const t_len = prefix.len + mh.len;
+        if (k_len < t_len + 11) return error.BadKey;
+        var em_buf: [max_bytes]u8 = undefined;
+        const em = em_buf[0..k_len];
+        em[0] = 0;
+        em[1] = 1;
+        @memset(em[2 .. k_len - t_len - 1], 0xff);
+        em[k_len - t_len - 1] = 0;
+        @memcpy(em[k_len - t_len ..][0..prefix.len], prefix);
+        @memcpy(em[k_len - mh.len ..], &mh);
+        const sig = out[0..k_len];
+        try k.privateOp(em, sig);
+        try k.checkPublic(sig, em);
+        return sig;
+    }
+
     fn privateOp(k: PrivateKey, em: []const u8, sig: []u8) Error!void {
         const n = M.fromBytes(k.n, .big) catch return error.BadKey;
         var p = M.fromBytes(k.p, .big) catch return error.BadKey;

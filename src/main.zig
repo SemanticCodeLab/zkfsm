@@ -16,12 +16,17 @@ const gateway = @import("gateway/root.zig");
 const replication = @import("replication/root.zig");
 const events = @import("events/root.zig");
 const sse = @import("sse/root.zig");
+const tables = @import("tables/root.zig");
+const lambda = @import("lambda/root.zig");
+const batch = @import("batch/root.zig");
+const migrate = @import("migrate/root.zig");
 const observe = @import("observe/root.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info, .logFn = observe.logs.logFn };
 
 const usage =
-    \\usage: zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
+    \\usage: zkfsm migrate ... (import a source deployment; zkfsm migrate --help)
+    \\       zkfsm [heal] [--data DIR...] [--listen HOST:PORT] [--protection P] [--scan-interval S] [--anonymous]
     \\             [--domain D]... [--path-prefix P] [--health-prefix P] [--metrics-path P] [--no-minio-compat]
     \\             [--lifecycle-interval S]
     \\  heal             run one scan/heal pass over the drives and exit
@@ -46,6 +51,7 @@ const usage =
     \\  --tls-cert FILE  PEM certificate chain, leaf first (or $ZKFSM_TLS_CERT); enables HTTPS
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
+    \\  --tls-min-version V   lowest TLS version accepted: 1.2 (default) or 1.3
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -71,6 +77,8 @@ const usage =
     \\             / ZKFSM_NOTIFY_... env (ENABLE=on); audit via audit_webhook / audit_kafka, or
     \\             ZKFSM_AUDIT_CONSOLE=on and ZKFSM_AUDIT_FILE=path; region from ZKFSM_REGION / MINIO_REGION;
     \\             queues under ZKFSM_EVENTS_DIR (default: <first drive>/.zkfsm/events)
+    \\lambda: GET ?lambdaArn=arn:minio:s3-object-lambda::<id>:webhook via MINIO_LAMBDA_WEBHOOK_ENABLE_<id>=on and
+    \\             ..._ENDPOINT_<id> / _AUTH_TOKEN_<id> (or ZKFSM_LAMBDA_WEBHOOK_...), or mc admin config set lambda_webhook:<id>
     \\credentials: ZKFSM_ACCESS_KEY / ZKFSM_SECRET_KEY (or MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
     \\
 ;
@@ -106,6 +114,7 @@ const Config = struct {
     identity_openid: ?[]const u8 = null,
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
+    tls_min_version: tls.Version = .tls12,
     kms: sse.setup.Flags = .{},
     obs: observe.config.Flags = .{},
 };
@@ -179,6 +188,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.identity_openid = args[i];
         } else if (std.mem.eql(u8, a, "--tls-client-ca")) {
             cfg.tls_client_ca = args[i];
+        } else if (std.mem.eql(u8, a, "--tls-min-version")) {
+            cfg.tls_min_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -279,6 +290,7 @@ pub fn run(opts: Options) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = std.process.argsAlloc(arena) catch return 1;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "migrate")) return migrate.main(gpa, args[1..]);
     const env_data = std.process.getEnvVarOwned(arena, "ZKFSM_DATA") catch null;
 
     var cfg = parseArgs(arena, args, env_data, opts) catch |e| {
@@ -414,13 +426,20 @@ pub fn run(opts: Options) u8 {
     obs.sources.notifier = &notif;
     obs_hook.set(obs);
     const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(&kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    var tables_route = tables.Tables.init(&svc, auth);
+    var batch_mgr = batch.Manager.init(gpa, .{ .svc = &svc, .sse = &sse_route });
+    batch_mgr.start();
+    var batch_api: batch.Api = .{ .m = &batch_mgr, .prefix = admin_prefix, .store = auth.iam };
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), batch_api.extension(), kms_admin.extension(), bridge.extension(), lambda_reg.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
-    const single_routes = [_]s3.server.RawRoute{obs_hook.rawRoute()};
+    const single_routes = [_]s3.server.RawRoute{ obs_hook.rawRoute(), tables_route.route() };
     var tls_ctx: tls.Context = undefined;
     const tls_paths = tlsPaths(arena, cfg) catch {
         std.log.err("--tls-cert and --tls-key must be set together", .{});
@@ -431,6 +450,7 @@ pub fn run(opts: Options) u8 {
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -476,7 +496,7 @@ pub fn run(opts: Options) u8 {
 
 /// Cluster mode: the RPC route is served before bootstrap so peers can negotiate
 /// the layout; S3 requests wait behind the gate until storage and IAM are up.
-fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *const sse.setup.Holder) u8 {
+fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, creds: ?s3.sigv4.Credentials, addr: std.net.Address, opts: Options, kms_holder: *sse.setup.Holder) u8 {
     if (cfg.heal_only) {
         std.log.err("heal runs continuously on cluster nodes; the one-shot heal command is for local drives", .{});
         return 2;
@@ -542,11 +562,15 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var obs: ?*observe.Observe = null;
     defer if (obs) |o| o.destroy();
     const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
-    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif };
-    var sse_route: sse.Sse = .{ .gpa = gpa, .kms = kms_holder.handle, .default_key = kms_holder.default_key };
+    var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
+    var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg };
+    var sse_route: sse.Sse = .{ .gpa = gpa };
+    sse_route.attach(kms_holder);
+    metrics.global.extra[3] = .{ .ctx = &sse_route, .func = sse.Sse.renderMetrics };
     var select_route: sse.SelectApi = .{ .gpa = gpa, .sse = &sse_route };
-    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam, .backend_name = cfg.kms.backend.text(), .key_store = kms_holder.key_store };
-    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), bridge.extension(), kms_admin.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension() };
+    var kms_admin: sse.KmsAdmin = .{ .sse = &sse_route, .store = auth.iam };
+    var tables_route = tables.Tables.init(&svc, auth);
+    const builtin_ext = [_]s3.Extension{ obs_hook.extension(), kms_admin.extension(), bridge.extension(), lambda_reg.extension(), ev_ext.extension(), repl_ext.extension(), select_route.extension(), sse_route.extension(), tables_route.guard() };
     const extensions = std.mem.concat(arena, s3.Extension, &.{ &builtin_ext, opts.extensions }) catch return 1;
     var tls_ctx: tls.Context = undefined;
     if (tls_paths) |tp| {
@@ -554,6 +578,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             std.log.err("cannot load TLS certificate {s} / key {s}: {t}", .{ tp[0], tp[1], e });
             return 2;
         };
+        tls_ctx.min_version = cfg.tls_min_version;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -561,7 +586,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
     }
     defer if (tls_paths != null) tls_ctx.deinit();
-    const routes = [_]s3.server.RawRoute{ cluster.server.route(node), obs_hook.rawRoute() };
+    const routes = [_]s3.server.RawRoute{ cluster.server.route(node), obs_hook.rawRoute(), tables_route.route() };
     var server: s3.Server = .{
         .gpa = gpa,
         .svc = &svc,
@@ -700,6 +725,20 @@ fn eventOptions(arena: std.mem.Allocator, cfg: Config, drive: []const u8, addr: 
         .endpoint = try std.fmt.allocPrint(arena, "{s}://{s}", .{ scheme, host }),
         .env_targets = targets,
     };
+}
+
+/// Object Lambda targets from the environment; invalid ones stop startup.
+fn lambdaRegistry(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, svc: *object.ObjectService) error{ BadArgs, OutOfMemory }!lambda.Registry {
+    var env = std.process.getEnvMap(arena) catch return error.OutOfMemory;
+    const targets = try lambda.config.fromEnv(arena, &env);
+    for (targets) |t| _ = lambda.config.check(arena, t) catch {
+        std.log.err("lambda_webhook:{s} from the environment: need an http(s) endpoint and readable TLS files (client cert with key)", .{t.id});
+        return error.BadArgs;
+    };
+    var reg = lambda.Registry.init(gpa, svc, targets);
+    reg.region = env.get("ZKFSM_REGION") orelse env.get("MINIO_REGION") orelse env.get("MINIO_SITE_REGION") orelse "";
+    if ((tlsPaths(arena, cfg) catch null) != null) reg.scheme = "https";
+    return reg;
 }
 
 var events_ext: cluster.node.Ext = undefined;
@@ -1075,6 +1114,10 @@ test {
     _ = events;
     _ = sse;
     _ = observe;
+    _ = tables;
+    _ = lambda;
+    _ = batch;
     _ = @import("kms/root.zig");
     _ = @import("select/root.zig");
+    _ = migrate;
 }

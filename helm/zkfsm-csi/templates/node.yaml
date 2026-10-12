@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zkfsm-csi.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zkfsm-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: node
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "zkfsm-csi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: {{ include "zkfsm-csi.fullname" . }}-node
+      # hostPID lets the plugin read the host mount table (/proc/1/mountinfo)
+      hostPID: true
+      priorityClassName: {{ .Values.node.priorityClassName }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.registrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ include "zkfsm-csi.pluginDir" . }}/csi.sock
+            - --v=2
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: zkfsm-csi
+          image: {{ include "zkfsm-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - node
+            - --endpoint=unix:///csi/csi.sock
+            - --node-id=$(NODE_NAME)
+            - --state-dir={{ .Values.stateDir }}
+            - --mountinfo=/proc/1/mountinfo
+            - --min-drive-size={{ int64 .Values.minDriveSize }}
+            {{- if .Values.driveGlob }}
+            - --drive-glob={{ .Values.driveGlob }}
+            {{- end }}
+            {{- if .Values.driveDir }}
+            - --drive-dir={{ .Values.driveDir }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: {{ .Values.kubeletDir }}
+              mountPropagation: Bidirectional
+            - name: state-dir
+              mountPath: {{ .Values.stateDir }}
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            {{- if .Values.driveDir }}
+            - name: drive-dir
+              mountPath: {{ .Values.driveDir }}
+              mountPropagation: Bidirectional
+            {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ include "zkfsm-csi.pluginDir" . }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}
+            type: Directory
+        - name: state-dir
+          hostPath:
+            path: {{ .Values.stateDir }}
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        {{- if .Values.driveDir }}
+        - name: drive-dir
+          hostPath:
+            path: {{ .Values.driveDir }}
+            type: DirectoryOrCreate
+        {{- end }}

@@ -4,7 +4,7 @@ const std = @import("std");
 const target = @import("target.zig");
 const net = @import("net.zig");
 
-pub const keys = [_][]const u8{ "nsqd_address", "topic", "tls", "tls_skip_verify", "queue_dir", "queue_limit", "comment" };
+pub const keys = [_][]const u8{ "nsqd_address", "topic", "tls", "tls_skip_verify", "client_cert", "client_key", "tls_ca_file", "tls_server_name", "tls_min_version", "queue_dir", "queue_limit", "comment" };
 
 pub const magic = "  V2";
 /// Largest response frame accepted; nsqd replies are tiny.
@@ -55,6 +55,8 @@ const Nsq = struct {
     host: []const u8,
     port: u16,
     topic: []const u8,
+    arena: std.heap.ArenaAllocator,
+    tls: ?net.TlsOptions = null,
     conn: ?*net.Conn = null,
 
     fn drop(self: *Nsq) void {
@@ -70,6 +72,7 @@ const Nsq = struct {
             };
             self.conn = c;
             c.writer().writeAll(magic) catch return error.Unreachable;
+            if (self.tls) |t| try upgrade(c, self.host, t);
         }
         const c = self.conn.?;
         writePub(c.writer(), self.topic, msg.body) catch |e| return switch (e) {
@@ -113,11 +116,39 @@ const Nsq = struct {
         self.drop();
         self.gpa.free(self.host);
         self.gpa.free(self.topic);
+        self.arena.deinit();
         self.gpa.destroy(self);
     }
 
     const vtable: target.Client.VTable = .{ .send = send, .deinit = deinit };
 };
+
+pub const identify_tls = "{\"tls_v1\":true,\"feature_negotiation\":true,\"user_agent\":\"zkfsm\"}";
+
+/// IDENTIFY with tls_v1, then TLS from the next byte, then nsqd's OK (over TLS).
+fn upgrade(c: *net.Conn, host: []const u8, t: net.TlsOptions) target.SendError!void {
+    const w = c.writer();
+    w.writeAll("IDENTIFY\n") catch return error.Unreachable;
+    w.writeInt(u32, identify_tls.len, .big) catch return error.Unreachable;
+    w.writeAll(identify_tls) catch return error.Unreachable;
+    c.flush() catch return error.Unreachable;
+    const f = readFrame(c.reader()) catch return error.Unreachable;
+    if (f.kind != .response or !tlsAccepted(f.data)) return error.Rejected;
+    // Bytes buffered past the reply would bypass TLS.
+    if (c.reader().bufferedLen() != 0) return error.Unreachable;
+    c.startTls(host, t) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Unreachable;
+    const ok = readFrame(c.reader()) catch return error.Unreachable;
+    if (ok.kind != .response or !std.mem.eql(u8, ok.data, "OK")) return error.Unreachable;
+}
+
+/// True when the IDENTIFY reply (JSON with feature negotiation) enables tls_v1.
+pub fn tlsAccepted(data: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const R = struct { tls_v1: bool = false };
+    const p = std.json.parseFromSliceLeaky(R, fba.allocator(), data, .{ .ignore_unknown_fields = true }) catch return false;
+    return p.tls_v1;
+}
 
 /// Validates settings and builds a client; the connection opens on first send.
 pub fn create(gpa: std.mem.Allocator, s: target.Settings) target.InitError!target.Client {
@@ -125,14 +156,15 @@ pub fn create(gpa: std.mem.Allocator, s: target.Settings) target.InitError!targe
     if (hp[0].len == 0 or hp[1] == 0) return error.InvalidConfig;
     const topic = s.get("topic");
     if (!validTopic(topic)) return error.InvalidConfig;
-    // TLS needs the IDENTIFY tls_v1 upgrade, which is not implemented yet.
-    if (s.flag("tls")) return error.InvalidConfig;
     _ = try s.int(u64, "queue_limit", 0);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const tls: ?net.TlsOptions = if (s.flag("tls")) try net.tlsOptions(arena.allocator(), s, .{}) else null;
     const self = try gpa.create(Nsq);
     errdefer gpa.destroy(self);
     const host = try gpa.dupe(u8, hp[0]);
     errdefer gpa.free(host);
-    self.* = .{ .gpa = gpa, .host = host, .port = hp[1], .topic = try gpa.dupe(u8, topic) };
+    self.* = .{ .gpa = gpa, .host = host, .port = hp[1], .topic = try gpa.dupe(u8, topic), .arena = arena, .tls = tls };
     return .{ .ctx = self, .vtable = &Nsq.vtable };
 }
 
@@ -152,6 +184,12 @@ test "topic validation and PUB encoding" {
     var w: std.Io.Writer = .fixed(&buf);
     try writePub(&w, "t", "hey");
     try testing.expectEqualStrings("PUB t\n\x00\x00\x00\x03hey", w.buffered());
+}
+
+test "identify reply parsing" {
+    try testing.expect(tlsAccepted("{\"max_rdy_count\":2500,\"tls_v1\":true,\"deflate\":false}"));
+    try testing.expect(!tlsAccepted("{\"tls_v1\":false}"));
+    try testing.expect(!tlsAccepted("OK"));
 }
 
 test "frame parsing" {
@@ -177,7 +215,7 @@ test "settings validation" {
         &.{.{ .key = "nsqd_address", .value = "h:4150" }},
         &.{ .{ .key = "nsqd_address", .value = "h:x" }, .{ .key = "topic", .value = "t" } },
         &.{ .{ .key = "nsqd_address", .value = "h" }, .{ .key = "topic", .value = "bad topic" } },
-        &.{ .{ .key = "nsqd_address", .value = "h" }, .{ .key = "topic", .value = "t" }, .{ .key = "tls", .value = "on" } },
+        &.{ .{ .key = "nsqd_address", .value = "h" }, .{ .key = "topic", .value = "t" }, .{ .key = "tls", .value = "on" }, .{ .key = "client_key", .value = "k.pem" } },
         &.{ .{ .key = "nsqd_address", .value = "h" }, .{ .key = "topic", .value = "t" }, .{ .key = "queue_limit", .value = "x" } },
     };
     for (bad) |kvs| try testing.expectError(error.InvalidConfig, create(gpa, .{ .kvs = kvs }));
