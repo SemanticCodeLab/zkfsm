@@ -18,6 +18,7 @@ pub const Config = struct {
     insecure: bool = false,
     token_ttl_s: u32 = 86400,
     keystone: keystone.Config = .{},
+    expirer_interval_s: u32 = 300,
 
     pub fn enabled(c: Config) bool {
         return c.listen != null;
@@ -37,6 +38,8 @@ pub const usage =
     \\  --swift-keystone-domain NAME     user and project domain (default Default)
     \\  --swift-keystone-admin-token T   fixed service token instead of user/password
     \\  --swift-keystone-map P=KEY       map Keystone project (id or name) to an IAM access key (repeatable)
+    \\  --swift-keystone-role-map R=POL  authorize tokens with Keystone role R by IAM policies POL[,POL] (repeatable)
+    \\  --swift-expirer-interval SECS    sweep for expired objects (X-Delete-At) every SECS (default 300, 0 off)
     \\
 ;
 
@@ -77,6 +80,10 @@ pub fn parseFlag(cfg: *Config, flag: []const u8, value: []const u8) root.FlagErr
         cfg.keystone.admin_token = value;
     } else if (eql(u8, flag, "--swift-keystone-map")) {
         try cfg.keystone.addMap(value);
+    } else if (eql(u8, flag, "--swift-keystone-role-map")) {
+        try cfg.keystone.addRoleMap(value);
+    } else if (eql(u8, flag, "--swift-expirer-interval")) {
+        cfg.expirer_interval_s = std.fmt.parseInt(u32, value, 10) catch return error.BadArgs;
     } else return false;
     return true;
 }
@@ -87,6 +94,8 @@ pub const Server = struct {
     state: handler.State,
     listener: listener_mod.Listener,
     host_buf: [64]u8 = undefined,
+    expirer: ?std.Thread = null,
+    expirer_interval_s: u32 = 0,
 
     pub fn start(deps: root.Deps, cfg: Config) root.StartError!*Server {
         const addr = cfg.listen orelse return error.BadConfig;
@@ -99,7 +108,7 @@ pub const Server = struct {
         errdefer deps.gpa.destroy(self);
         const ks: ?*keystone.Keystone = if (cfg.keystone.url != null) try keystone.Keystone.create(deps.gpa, cfg.keystone) else null;
         errdefer if (ks) |k| k.destroy();
-        var accounts = try meta.AccountStore.init(deps.gpa, deps.state_dir);
+        var accounts = try meta.AccountStore.init(deps.gpa, deps.access.svc, deps.state_dir);
         errdefer accounts.deinit();
         const use_tls = deps.tls != null and !cfg.insecure;
         self.* = .{
@@ -111,7 +120,7 @@ pub const Server = struct {
                 .prefix = cfg.prefix,
                 .tempauth = cfg.tempauth,
                 .token_ttl_s = cfg.token_ttl_s,
-                .secret = tokenSecret(deps.state_dir),
+                .secret = tokenSecret(deps.access, deps.state_dir),
                 .ks = ks,
                 .accounts = accounts,
             },
@@ -119,11 +128,14 @@ pub const Server = struct {
         };
         try self.listener.start(addr);
         self.state.host = std.fmt.bufPrint(&self.host_buf, "{f}", .{self.listener.bound}) catch "127.0.0.1";
+        self.expirer_interval_s = cfg.expirer_interval_s;
+        if (cfg.expirer_interval_s > 0) self.expirer = std.Thread.spawn(.{}, expireLoop, .{self}) catch null;
         return self;
     }
 
     pub fn stop(self: *Server) void {
         self.listener.stop(5);
+        if (self.expirer) |t| t.join();
         if (self.state.ks) |k| k.destroy();
         self.state.accounts.deinit();
         self.gpa.destroy(self);
@@ -132,6 +144,18 @@ pub const Server = struct {
     /// Bound address (useful with port 0).
     pub fn address(self: *const Server) std.net.Address {
         return self.listener.bound;
+    }
+
+    /// Removes objects past their X-Delete-At; reads and listings already hide them.
+    fn expireLoop(self: *Server) void {
+        var waited_ms: u64 = 0;
+        while (!self.listener.isStopping()) {
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+            waited_ms += 200;
+            if (waited_ms < @as(u64, self.expirer_interval_s) * 1000) continue;
+            waited_ms = 0;
+            @import("swift_object.zig").sweepExpired(self.state.access.svc, self.gpa, handler.usage_budget);
+        }
     }
 
     fn serve(ctx: *anyopaque, conn: std.net.Server.Connection) void {
@@ -196,9 +220,14 @@ fn bodyDone(r: *std.http.Reader) bool {
     return false;
 }
 
-/// Tempauth signing key: persisted under the state dir so tokens survive restarts.
-fn tokenSecret(state_dir: ?[]const u8) [32]u8 {
+/// Tempauth signing key: derived from the root secret (the same on every node of a
+/// cluster), else persisted under the state dir so tokens survive restarts.
+fn tokenSecret(access: root.Access, state_dir: ?[]const u8) [32]u8 {
     var key: [32]u8 = undefined;
+    if (access.iam) |st| if (st.opts.root_secret.len > 0) {
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&key, "zkfsm swift tempauth v1", st.opts.root_secret);
+        return key;
+    };
     std.crypto.random.bytes(&key);
     const dir = state_dir orelse return key;
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -208,6 +237,7 @@ fn tokenSecret(state_dir: ?[]const u8) [32]u8 {
         defer f.close();
         if ((f.readAll(&existing) catch 0) == 32) return existing;
     } else |_| {}
+    std.fs.cwd().makePath(std.fs.path.dirname(path) orelse return key) catch return key;
     const f = std.fs.cwd().createFile(path, .{ .mode = 0o600 }) catch return key;
     defer f.close();
     f.writeAll(&key) catch {};
@@ -241,4 +271,5 @@ test {
     _ = @import("swift_listing.zig");
     _ = @import("swift_slo.zig");
     _ = @import("swift_object.zig");
+    _ = @import("swift_acl.zig");
 }

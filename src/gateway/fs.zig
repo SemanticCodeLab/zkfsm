@@ -318,6 +318,138 @@ pub const Fs = struct {
 
 pub const Page = struct { entries: []Entry, next: ?[]const u8 };
 
+fn mapMp(e: object.multipart.Error) Error {
+    return switch (e) {
+        error.NoSuchUpload, error.InvalidPart, error.InvalidPartOrder, error.EntityTooSmall, error.InvalidPartNumber, error.InvalidRange => error.Storage,
+        else => |se| mapErr(se),
+    };
+}
+
+/// Streaming write of one file: bytes buffer up to `part_size`, then go out as
+/// multipart parts. A file that never fills a part is stored with one plain put.
+pub const Upload = struct {
+    f: Fs,
+    gpa: std.mem.Allocator,
+    bucket: []u8,
+    key: []u8,
+    id: ?object.multipart.UploadId = null,
+    refs: std.ArrayList(object.multipart.PartRef) = .empty,
+    buf: std.ArrayList(u8) = .empty,
+    /// Bytes already sent as parts; writes below this offset are refused.
+    flushed: u64 = 0,
+
+    pub const part_size: usize = 8 * 1024 * 1024;
+    pub const WriteError = Error || error{Unordered};
+
+    pub fn begin(f: Fs, gpa: std.mem.Allocator, path: []const u8) Error!Upload {
+        const l = split(path);
+        if (l.key.len == 0) return error.IsDir;
+        try f.check(.put_object, l.bucket, l.key);
+        f.svc().headBucket(l.bucket) catch |e| return mapErr(e);
+        const b = try gpa.dupe(u8, l.bucket);
+        errdefer gpa.free(b);
+        return .{ .f = f, .gpa = gpa, .bucket = b, .key = try gpa.dupe(u8, l.key) };
+    }
+
+    pub fn size(u: *const Upload) u64 {
+        return u.flushed + u.buf.items.len;
+    }
+
+    /// Writes `data` at `off`; gaps read as zeros. Offsets below the sent parts fail.
+    pub fn writeAt(u: *Upload, off: u64, data: []const u8) WriteError!void {
+        if (off < u.flushed) return error.Unordered;
+        while (u.size() < off) {
+            const room = part_size -| u.buf.items.len;
+            const n: usize = @intCast(@min(off - u.size(), @max(room, 1)));
+            try u.buf.appendNTimes(u.gpa, 0, n);
+            try u.maybeFlush();
+        }
+        const rel: usize = @intCast(off - u.flushed);
+        const over = @min(data.len, u.buf.items.len - rel);
+        @memcpy(u.buf.items[rel..][0..over], data[0..over]);
+        var rest = data[over..];
+        while (rest.len > 0) {
+            const n = @min(rest.len, @max(part_size -| u.buf.items.len, 1));
+            try u.buf.appendSlice(u.gpa, rest[0..n]);
+            rest = rest[n..];
+            try u.maybeFlush();
+        }
+    }
+
+    /// Sequential append from a stream until it ends.
+    pub fn pump(u: *Upload, src: *std.Io.Reader) Error!void {
+        while (true) {
+            try u.buf.ensureTotalCapacity(u.gpa, part_size);
+            const dst = u.buf.allocatedSlice()[u.buf.items.len..part_size];
+            const n = src.readSliceShort(dst) catch return error.ReadFailed;
+            u.buf.items.len += n;
+            if (u.buf.items.len >= part_size) try u.flushPart();
+            if (n < dst.len) return;
+        }
+    }
+
+    /// Seeds the file with the first `len` bytes of the object now at the path.
+    pub fn copyPrefix(u: *Upload, arena: std.mem.Allocator, len: u64) Error!void {
+        if (len == 0) return;
+        try u.f.check(.get_object, u.bucket, u.key);
+        if (len >= object.multipart.min_part_size) {
+            try u.startMp();
+            const src: object.copy.Source = .{ .bucket = u.bucket, .key = u.key };
+            const et = object.multipart.uploadPartCopy(u.f.svc(), u.bucket, u.key, u.id.?, 1, src, .{ .first = 0, .last = len - 1 }) catch |e| return mapMp(e);
+            try u.refs.append(u.gpa, .{ .number = 1, .md5 = et.md5 });
+            u.flushed = len;
+            return;
+        }
+        const info = u.f.svc().head(arena, u.bucket, u.key) catch |e| return mapErr(e);
+        if (len > info.size) return error.InvalidPath;
+        var aw: std.Io.Writer.Allocating = .fromArrayList(u.gpa, &u.buf);
+        defer u.buf = aw.toArrayList();
+        u.f.svc().read(info, .{ .offset = 0, .length = len }, &aw.writer) catch |e| return mapErr(e);
+    }
+
+    fn startMp(u: *Upload) Error!void {
+        if (u.id != null) return;
+        u.id = object.multipart.create(u.f.svc(), u.bucket, u.key, .{ .content_type = "application/octet-stream" }) catch |e| return mapMp(e);
+    }
+
+    fn maybeFlush(u: *Upload) Error!void {
+        if (u.buf.items.len >= part_size) try u.flushPart();
+    }
+
+    fn flushPart(u: *Upload) Error!void {
+        try u.startMp();
+        const n: u16 = @intCast(u.refs.items.len + 1);
+        if (n > object.multipart.max_part_number) return error.TooLarge;
+        var r: std.Io.Reader = .fixed(u.buf.items);
+        const et = object.multipart.uploadPart(u.f.svc(), u.bucket, u.key, u.id.?, n, &r, u.buf.items.len) catch |e| return mapMp(e);
+        try u.refs.append(u.gpa, .{ .number = n, .md5 = et.md5 });
+        u.flushed += u.buf.items.len;
+        u.buf.clearRetainingCapacity();
+    }
+
+    /// Commits the file. The Upload must still be released with `deinit`.
+    pub fn finish(u: *Upload) Error!void {
+        if (u.id == null) {
+            var r: std.Io.Reader = .fixed(u.buf.items);
+            _ = u.f.svc().put(u.bucket, u.key, &r, .{ .content_length = u.buf.items.len, .content_type = "application/octet-stream" }) catch |e| return mapErr(e);
+            return;
+        }
+        if (u.buf.items.len > 0) try u.flushPart();
+        _ = object.multipart.complete(u.f.svc(), u.bucket, u.key, u.id.?, u.refs.items) catch |e| return mapMp(e);
+        u.id = null;
+    }
+
+    /// Drops any started multipart upload and frees memory.
+    pub fn deinit(u: *Upload) void {
+        if (u.id) |id| object.multipart.abort(u.f.svc(), u.bucket, u.key, id) catch {};
+        u.refs.deinit(u.gpa);
+        u.buf.deinit(u.gpa);
+        u.gpa.free(u.bucket);
+        u.gpa.free(u.key);
+        u.* = undefined;
+    }
+};
+
 test "normalize and split" {
     var buf: [max_path]u8 = undefined;
     try std.testing.expectEqualStrings("/", try normalize(&buf, "/", ""));

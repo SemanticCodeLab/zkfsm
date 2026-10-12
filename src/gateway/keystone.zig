@@ -13,6 +13,9 @@ pub const cache_capacity = 1024;
 pub const io_timeout_s = 10;
 
 pub const MapEntry = struct { project: []const u8, access_key: []const u8 };
+pub const RoleEntry = struct { role: []const u8, policies: []const u8 };
+pub const max_roles = 8;
+pub const max_policies = 256;
 
 pub const Config = struct {
     url: ?[]const u8 = null,
@@ -23,6 +26,30 @@ pub const Config = struct {
     admin_token: ?[]const u8 = null,
     map: [max_map]MapEntry = undefined,
     map_len: u8 = 0,
+    roles: [max_map]RoleEntry = undefined,
+    roles_len: u8 = 0,
+
+    /// `ROLE=POLICY[,POLICY]`: tokens carrying ROLE are authorized by those IAM policies.
+    pub fn addRoleMap(c: *Config, spec: []const u8) error{BadArgs}!void {
+        const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadArgs;
+        if (eq == 0 or eq + 1 == spec.len or c.roles_len == max_map or spec.len - eq > max_policies / 2) return error.BadArgs;
+        c.roles[c.roles_len] = .{ .role = spec[0..eq], .policies = spec[eq + 1 ..] };
+        c.roles_len += 1;
+    }
+
+    /// Comma-separated policies of every mapped role in `info`; null when none maps.
+    pub fn rolePolicies(c: *const Config, info: *const Info, out: *[max_policies]u8) ?[]const u8 {
+        var w: std.Io.Writer = .fixed(out);
+        for (c.roles[0..c.roles_len]) |m| {
+            var i: u8 = 0;
+            while (i < info.roles_len) : (i += 1) if (std.ascii.eqlIgnoreCase(info.role(i), m.role)) {
+                if (w.end > 0) w.writeByte(',') catch return null;
+                w.writeAll(m.policies) catch return null;
+                break;
+            };
+        }
+        return if (w.end > 0) w.buffered() else null;
+    }
 
     /// IAM access key for a project, matched by id first, then by name.
     pub fn mapped(c: *const Config, project_id: []const u8, project_name: []const u8) ?[]const u8 {
@@ -51,7 +78,20 @@ pub const Info = struct {
     project_name_buf: [max_id]u8 = undefined,
     project_name_len: u8 = 0,
     expires_s: i64 = 0,
+    user_buf: [max_id]u8 = undefined,
+    user_len: u8 = 0,
+    role_bufs: [max_roles][max_role]u8 = undefined,
+    role_lens: [max_roles]u8 = @splat(0),
+    roles_len: u8 = 0,
 
+    pub const max_role = 48;
+
+    pub fn userName(i: *const Info) []const u8 {
+        return i.user_buf[0..i.user_len];
+    }
+    pub fn role(i: *const Info, n: u8) []const u8 {
+        return i.role_bufs[n][0..i.role_lens[n]];
+    }
     pub fn projectId(i: *const Info) []const u8 {
         return i.project_id_buf[0..i.project_id_len];
     }
@@ -96,6 +136,20 @@ pub fn parseToken(arena: std.mem.Allocator, body: []const u8) ParseError!Info {
     info.project_id_len = @intCast(id.len);
     @memcpy(info.project_name_buf[0..name.len], name);
     info.project_name_len = @intCast(name.len);
+    if (field(tok, "user")) |u| if (strField(u, "name")) |un| if (un.len <= max_id and util.safeValue(un)) {
+        @memcpy(info.user_buf[0..un.len], un);
+        info.user_len = @intCast(un.len);
+    };
+    if (field(tok, "roles")) |rv| switch (rv) {
+        .array => |arr| for (arr.items) |r| {
+            const rn = strField(r, "name") orelse continue;
+            if (rn.len == 0 or rn.len > Info.max_role or info.roles_len == max_roles) continue;
+            @memcpy(info.role_bufs[info.roles_len][0..rn.len], rn);
+            info.role_lens[info.roles_len] = @intCast(rn.len);
+            info.roles_len += 1;
+        },
+        else => {},
+    };
     return info;
 }
 
@@ -319,6 +373,16 @@ test "parse keystone token" {
     try std.testing.expectEqualStrings("8538a3f13f9541b28c2620eb19065e45", i.projectId());
     try std.testing.expectEqualStrings("demo", i.projectName());
     try std.testing.expectEqual(@as(i64, 1791289805), i.expires_s);
+    try std.testing.expectEqualStrings("alice", i.userName());
+    try std.testing.expectEqualStrings("member", i.role(0));
+    var cfg: Config = .{};
+    try cfg.addRoleMap("Member=readonly,diagnostics");
+    try cfg.addRoleMap("admin=consoleAdmin");
+    try std.testing.expectError(error.BadArgs, cfg.addRoleMap("norole"));
+    var pb: [max_policies]u8 = undefined;
+    try std.testing.expectEqualStrings("readonly,diagnostics", cfg.rolePolicies(&i, &pb).?);
+    var none: Info = .{};
+    try std.testing.expect(cfg.rolePolicies(&none, &pb) == null);
     try std.testing.expectError(error.BadResponse, parseToken(a, "{\"token\":{\"expires_at\":\"2026-10-06T12:30:05Z\"}}"));
     try std.testing.expectError(error.BadResponse, parseToken(a, "{\"token\":{\"expires_at\":\"x\",\"project\":{\"id\":\"p\"}}}"));
     try std.testing.expectError(error.BadResponse, parseToken(a, "{\"token\":{\"expires_at\":\"2026-10-06T12:30:05Z\",\"project\":{\"id\":\"../x\"}}}"));

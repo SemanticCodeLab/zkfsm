@@ -107,6 +107,44 @@ pub fn epsvReply(buf: []u8, port: u16) error{NoSpaceLeft}![]const u8 {
     return std.fmt.bufPrint(buf, "229 Entering Extended Passive Mode (|||{d}|)", .{port});
 }
 
+/// PORT h1,h2,h3,h4,p1,p2 (RFC 959).
+pub fn parsePort(arg: []const u8) error{Syntax}!std.net.Address {
+    var it = std.mem.splitScalar(u8, std.mem.trim(u8, arg, " "), ',');
+    var v: [6]u8 = undefined;
+    for (&v) |*b| b.* = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse return error.Syntax, " "), 10) catch return error.Syntax;
+    if (it.next() != null) return error.Syntax;
+    return std.net.Address.initIp4(v[0..4].*, @as(u16, v[4]) << 8 | v[5]);
+}
+
+/// EPRT |proto|addr|port| (RFC 2428); any printable delimiter.
+pub fn parseEprt(arg: []const u8) error{Syntax}!std.net.Address {
+    const a = std.mem.trim(u8, arg, " ");
+    if (a.len < 7 or a[0] < 33 or a[0] > 126) return error.Syntax;
+    var it = std.mem.splitScalar(u8, a[1..], a[0]);
+    const af = it.next() orelse return error.Syntax;
+    const host = it.next() orelse return error.Syntax;
+    const port = std.fmt.parseInt(u16, it.next() orelse return error.Syntax, 10) catch return error.Syntax;
+    const tail = it.next() orelse return error.Syntax;
+    if (tail.len != 0 or it.next() != null) return error.Syntax;
+    if (std.mem.eql(u8, af, "1")) return std.net.Address.parseIp4(host, port) catch error.Syntax;
+    if (std.mem.eql(u8, af, "2")) return std.net.Address.parseIp6(host, port) catch error.Syntax;
+    return error.Syntax;
+}
+
+test "parse PORT and EPRT" {
+    const p = try parsePort("127,0,0,1,4,1");
+    try std.testing.expectEqual(@as(u16, 1025), p.getPort());
+    try std.testing.expect(sameHost(p, try std.net.Address.parseIp4("127.0.0.1", 0)));
+    try std.testing.expectError(error.Syntax, parsePort("127,0,0,1,4"));
+    try std.testing.expectError(error.Syntax, parsePort("127,0,0,1,4,300"));
+    const e = try parseEprt("|1|10.0.0.2|6275|");
+    try std.testing.expectEqual(@as(u16, 6275), e.getPort());
+    const e6 = try parseEprt("!2!::1!21!");
+    try std.testing.expectEqual(@as(u16, 21), e6.getPort());
+    try std.testing.expectError(error.Syntax, parseEprt("|3|x|1|"));
+    try std.testing.expectError(error.Syntax, parseEprt("|1|10.0.0.2|99999|"));
+}
+
 /// IPv4 bytes of an address, if it is IPv4 (or IPv4-mapped IPv6).
 pub fn ip4Of(a: std.net.Address) ?[4]u8 {
     switch (a.any.family) {
@@ -206,7 +244,7 @@ pub fn writeQuoted(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 }
 
 pub const feat_lines = [_][]const u8{
-    "UTF8",                            "EPSV", "PASV", "SIZE", "MDTM", "REST STREAM",
+    "UTF8",                            "EPRT", "EPSV", "PASV", "SIZE", "MDTM", "REST STREAM",
     "MLST type*;size*;modify*;perm*;", "TVFS",
 };
 pub const feat_tls_lines = [_][]const u8{ "AUTH TLS", "PBSZ", "PROT" };

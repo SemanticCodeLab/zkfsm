@@ -150,12 +150,15 @@ check "GET after outage" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/data/b
 # ---- restore ----
 check "restore of local object refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>1</Days></RestoreRequest>' "$HOT/data/keep/local.txt?restore")"
 check "restore accepted" 202 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>8</Days></RestoreRequest>' "$HOT/data/big.bin?restore")"
-check "x-amz-restore header" 'ongoing-request="false"' "$(head_field big.bin Restore | cut -d, -f1)"
+restore_state() { head_field big.bin Restore | cut -d, -f1; }
+wait_for "x-amz-restore completes" 'ongoing-request="false"' restore_state
 check "restore again extends" 200 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>8</Days></RestoreRequest>' "$HOT/data/big.bin?restore")"
 stop_remote
 check "restored copy served while tier is down" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/data/big.bin | sha256sum)"
 start_remote
 check "mc ilm restore" 0 "$(ok "$MC" ilm restore --days 30 hot/data/logs/small.txt)"
+small_restored() { head_field logs/small.txt Restore | cut -d, -f1; }
+wait_for "mc ilm restore completes" 'ongoing-request="false"' small_restored
 wait_for "restored copy expires" "" head_field big.bin Restore
 check "storage class kept after expiry" WARM "$(sclass big.bin)"
 check "read-through after expiry" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/data/big.bin | sha256sum)"
@@ -290,7 +293,13 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
   for spec in "RUSTFS|rustfs/rustfs:latest|RUSTFS_ACCESS_KEY=dockeradmin|RUSTFS_SECRET_KEY=docker-secret-123" \
               "MINIO|quay.io/minio/minio:latest|MINIO_ROOT_USER=dockeradmin|MINIO_ROOT_PASSWORD=docker-secret-123"; do
     IFS='|' read -r tname image e1 e2 <<<"$spec"
-    docker image inspect "$image" >/dev/null 2>&1 || { echo "skip $tname: image $image not present"; continue; }
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      alt="${image#quay.io/}"
+      if [[ "$alt" != "$image" ]] && docker image inspect "$alt" >/dev/null 2>&1; then image="$alt"
+      elif [[ "$tname" == MINIO ]] && docker image inspect "${ZKFSM_MINIO_IMAGE:-pgsty/minio:latest}" >/dev/null 2>&1; then
+        image="${ZKFSM_MINIO_IMAGE:-pgsty/minio:latest}" # a MinIO build under another name
+      else echo "skip $tname: image $image not present"; continue; fi
+    fi
     if [[ "$tname" == MINIO ]]; then port="$(docker_tier minio "$image" "$e1" "$e2" -- server /data)" || continue
     else port="$(docker_tier rustfs "$image" "$e1" "$e2" -- )" || continue; fi
     "$MC" alias set "d$tname" "http://127.0.0.1:$port" dockeradmin docker-secret-123 >/dev/null 2>&1 || true

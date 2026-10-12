@@ -7,6 +7,7 @@ pub const remote = @import("remote.zig");
 pub const s3 = @import("s3.zig");
 pub const azure = @import("azure.zig");
 pub const gcs = @import("gcs.zig");
+pub const creds = @import("creds.zig");
 pub const nas = @import("nas.zig");
 pub const drive = @import("drive.zig");
 
@@ -117,6 +118,7 @@ test {
     _ = s3;
     _ = azure;
     _ = gcs;
+    _ = creds;
     _ = nas;
     _ = drive;
     _ = @import("s3/sign.zig");

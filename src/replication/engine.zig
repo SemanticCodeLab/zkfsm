@@ -11,6 +11,7 @@ const store = @import("store.zig");
 const stats_mod = @import("stats.zig");
 const site = @import("site.zig");
 const deliver = @import("deliver.zig");
+const admin_api = @import("../admin/root.zig").api;
 
 const Allocator = std.mem.Allocator;
 const Entry = queue.Entry;
@@ -30,6 +31,10 @@ pub const Options = struct {
     /// Full queue listing period when no local change woke the dispatcher.
     scan_interval_ns: u64 = 5 * ns_per_s,
     health_interval_ns: i128 = 15 * ns_per_s,
+    /// Period of the scan that requeues versions left PENDING without a queue entry.
+    recovery_interval_ns: i128 = 10 * 60 * ns_per_s,
+    /// Minimum spacing of counter saves.
+    stats_save_interval_ns: i128 = ns_per_s,
 };
 
 pub const Error = error{ NoSuchBucket, StorageFailed, OutOfMemory };
@@ -58,6 +63,10 @@ pub const Dest = struct {
     storage_class: []const u8 = "",
     /// Implicit site-replication peer (deployment id in `arn`).
     peer: ?[]const u8 = null,
+    /// Synchronous mode: the write waits for delivery.
+    sync: bool = false,
+    /// GET/HEAD of objects missing locally may be served from this destination.
+    proxy: bool = true,
 };
 
 pub const ResyncTarget = struct {
@@ -93,6 +102,13 @@ pub const Replicator = struct {
     next_due_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
     /// Site replication: how peers reach this deployment's admin and S3 API.
     site_ctx: site.Context = .{},
+    last_stats_save_ns: i128 = 0,
+    /// Owned copy published to server info.
+    deployment_id: ?[]const u8 = null,
+    last_recovery_ns: i128 = 0,
+    recovering: std.atomic.Value(bool) = .init(false),
+    /// Reset ids of canceled resyncs; their scans stop queueing. Under `resync_mutex`.
+    canceled: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(gpa: Allocator, svc: *object.ObjectService, opts: Options) Replicator {
         return .{ .gpa = gpa, .svc = svc, .opts = opts, .stats = .{ .gpa = gpa, .started_ns = std.time.nanoTimestamp() } };
@@ -108,6 +124,13 @@ pub const Replicator = struct {
             r.gpa.destroy(s);
         }
         r.stats.deinit();
+        if (r.deployment_id) |id| {
+            admin_api.deployment_id = "zkfsm";
+            r.gpa.free(id);
+        }
+        var it2 = r.canceled.keyIterator();
+        while (it2.next()) |k| r.gpa.free(k.*);
+        r.canceled.deinit(r.gpa);
     }
 
     fn freeCached(gpa: Allocator, c: *Cached) void {
@@ -120,6 +143,16 @@ pub const Replicator = struct {
     }
 
     pub fn start(r: *Replicator) std.Thread.SpawnError!void {
+        client.loadCaFromEnv();
+        if (std.posix.getenv("ZKFSM_REPLICATION_RECOVERY_INTERVAL")) |v| {
+            if (std.fmt.parseInt(u32, v, 10)) |secs| r.opts.recovery_interval_ns = @as(i128, secs) * ns_per_s else |_| {}
+        }
+        r.loadStats();
+        r.publishDeploymentId();
+        // Loads site state, which also installs the shared STS key.
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        _ = r.siteState(arena.allocator()) catch null;
         r.thread = try std.Thread.spawn(.{}, dispatchLoop, .{r});
     }
 
@@ -127,7 +160,47 @@ pub const Replicator = struct {
         r.stopping.store(true, .release);
         r.wake.set();
         if (r.thread) |t| t.join();
+        if (r.thread != null) r.saveStats();
         r.thread = null;
+    }
+
+    const stats_name = "replication-stats";
+
+    /// Server info reports the same id site replication uses.
+    fn publishDeploymentId(r: *Replicator) void {
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const tmp = site.deploymentId(r, arena.allocator()) catch return;
+        const id = r.gpa.dupe(u8, tmp) catch return;
+        r.deployment_id = id;
+        admin_api.deployment_id = id;
+    }
+
+    fn statsDirty(r: *Replicator) bool {
+        r.stats.mutex.lock();
+        defer r.stats.mutex.unlock();
+        return r.stats.dirty;
+    }
+
+    fn loadStats(r: *Replicator) void {
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const saved = (store.getJson(stats_mod.Stats.Saved, r.svc.store, arena.allocator(), store.key(.stats, stats_name)) catch null) orelse return;
+        r.stats.restore(saved);
+    }
+
+    /// Persists counters when they changed; only the delivering node saves.
+    fn saveStats(r: *Replicator) void {
+        if (!r.isLeader()) return;
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const saved = (r.stats.takeDirty(arena.allocator()) catch return) orelse return;
+        store.putJson(r.svc.store, r.gpa, store.key(.stats, stats_name), saved) catch |e| {
+            std.log.warn("replication: cannot save counters: {t}", .{e});
+            r.stats.mutex.lock();
+            r.stats.dirty = true;
+            r.stats.mutex.unlock();
+        };
     }
 
     // ---- configuration cache ----
@@ -185,6 +258,7 @@ pub const Replicator = struct {
         s.* = .{ .arena = .init(r.gpa), .loaded_ns = now, .state = null };
         s.state = site.load(r.svc.store, s.arena.allocator()) catch null;
         r.site_cache = s;
+        site.installStsKey(if (s.state) |st| st else null);
         return if (s.state) |*st| st else null;
     }
 
@@ -269,6 +343,28 @@ pub const Replicator = struct {
         return null;
     }
 
+    /// Destinations a read of a missing object may be proxied to.
+    pub fn proxyDests(r: *Replicator, a: Allocator, bucket: []const u8) (Error || object.Error)![]Dest {
+        const bid = try r.svc.bucketId(bucket);
+        r.mutex.lock();
+        defer r.mutex.unlock();
+        const c = try r.cachedLocked(bid, bucket);
+        var out: std.ArrayList(Dest) = .empty;
+        if (c.cfg) |cfg| for (cfg.rules) |rule| {
+            if (!rule.enabled) continue;
+            const t = findTarget(c.targets, rule.dest) orelse continue;
+            if (t.disable_proxy) continue;
+            for (out.items) |d| {
+                if (std.mem.eql(u8, d.arn, t.arn)) break;
+            } else try out.append(a, try explicitDest(a, t, rule));
+        };
+        if (r.siteLocked()) |st| if (st.enabled) for (st.peers) |p| {
+            if (std.mem.eql(u8, p.deployment_id, st.deployment_id)) continue;
+            try out.append(a, try peerDest(a, st.*, p, bucket));
+        };
+        return out.items;
+    }
+
     /// Every ARN this bucket replicates to (rule filters ignored).
     pub fn allArns(r: *Replicator, a: Allocator, bid: core.BucketId, bucket: []const u8) Error![]const []const u8 {
         r.mutex.lock();
@@ -340,7 +436,38 @@ pub const Replicator = struct {
             .delete_version => .delete_version,
             .metadata => .metadata,
         };
-        for (dests) |d| try r.enqueue(.{ .op = qop, .bucket = ev.bucket, .key = ev.key, .version = vid, .arn = d.arn });
+        for (dests) |d| {
+            const e: Entry = .{ .op = qop, .bucket = ev.bucket, .key = ev.key, .version = vid, .arn = d.arn };
+            if (!d.sync) {
+                try r.enqueue(e);
+                continue;
+            }
+            // Durable first; the deferred retry time keeps the dispatcher off it meanwhile.
+            var held = e;
+            held.next_ns = @intCast(std.time.nanoTimestamp() + 30 * ns_per_s);
+            try r.enqueue(held);
+            r.deliverNow(a, held);
+            // Lets the dispatcher save the new counters promptly.
+            r.wake.set();
+        }
+    }
+
+    /// Synchronous delivery in the writer's thread; failures stay queued for retry.
+    fn deliverNow(r: *Replicator, a: Allocator, e: Entry) void {
+        var hc = client.newHttp(r.gpa);
+        defer hc.deinit();
+        const k = e.recordKey(a) catch return;
+        switch (deliver.process(r, &hc, a, e)) {
+            .done, .drop => store.remove(r.svc.store, k) catch {},
+            .retry => {
+                if (!e.isSite()) deliver.markFailed(r, e);
+                var n = e;
+                n.attempts = 1;
+                n.next_ns = @intCast(std.time.nanoTimestamp());
+                store.putJson(r.svc.store, r.gpa, k, n) catch {};
+                r.wake.set();
+            },
+        }
     }
 
     /// Persists one work item and wakes the dispatcher.
@@ -368,6 +495,7 @@ pub const Replicator = struct {
                 const left = next_due - @as(i64, @intCast(std.time.nanoTimestamp()));
                 wait = @min(wait, @as(u64, @intCast(@max(left, 50 * std.time.ns_per_ms))));
             }
+            if (r.statsDirty()) wait = @min(wait, @as(u64, @intCast(r.opts.stats_save_interval_ns)));
             r.wake.timedWait(wait) catch {};
             r.wake.reset();
             if (r.stopping.load(.acquire)) break;
@@ -384,6 +512,14 @@ pub const Replicator = struct {
             if (now - r.last_health_ns >= r.opts.health_interval_ns) {
                 r.last_health_ns = now;
                 r.probeTargets();
+            }
+            if (now - r.last_stats_save_ns >= r.opts.stats_save_interval_ns) {
+                r.last_stats_save_ns = now;
+                r.saveStats();
+            }
+            if (r.last_recovery_ns == 0 or now - r.last_recovery_ns >= r.opts.recovery_interval_ns) {
+                r.last_recovery_ns = now;
+                r.startRecovery();
             }
         }
     }
@@ -440,7 +576,7 @@ pub const Replicator = struct {
 
     fn runLane(r: *Replicator, items: []const Item, progressed: *std.atomic.Value(usize)) void {
         if (items.len == 0) return;
-        var hc: std.http.Client = .{ .allocator = r.gpa };
+        var hc = client.newHttp(r.gpa);
         defer hc.deinit();
         for (items) |it| {
             if (r.stopping.load(.acquire)) return;
@@ -483,7 +619,7 @@ pub const Replicator = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const buckets = r.svc.listBuckets(a) catch return;
-        var hc: std.http.Client = .{ .allocator = r.gpa };
+        var hc = client.newHttp(r.gpa);
         defer hc.deinit();
         for (buckets) |b| {
             const bid = r.svc.bucketId(b.name) catch continue;
@@ -500,6 +636,83 @@ pub const Replicator = struct {
 
     fn try_path(a: Allocator, bucket: []const u8) []const u8 {
         return std.fmt.allocPrint(a, "/{s}", .{bucket}) catch "/";
+    }
+
+    // ---- crash recovery ----
+
+    fn startRecovery(r: *Replicator) void {
+        if (r.recovering.swap(true, .acq_rel)) return;
+        const t = std.Thread.spawn(.{}, recoveryThread, .{r}) catch {
+            r.recovering.store(false, .release);
+            return;
+        };
+        t.detach();
+    }
+
+    fn recoveryThread(r: *Replicator) void {
+        defer r.recovering.store(false, .release);
+        const n = r.recover() catch |e| {
+            std.log.warn("replication: recovery scan failed: {t}", .{e});
+            return;
+        };
+        if (n > 0) std.log.info("replication: recovery requeued {d} pending versions", .{n});
+    }
+
+    /// Requeues versions still PENDING or FAILED whose queue entries are gone
+    /// (e.g. a crash between commit and enqueue). Returns how many were queued.
+    pub fn recover(r: *Replicator) (Error || object.Error)!u64 {
+        var n: u64 = 0;
+        var top = std.heap.ArenaAllocator.init(r.gpa);
+        defer top.deinit();
+        const buckets = try r.svc.listBuckets(top.allocator());
+        for (buckets) |b| {
+            if (r.stopping.load(.acquire)) break;
+            const bid = r.svc.bucketId(b.name) catch continue;
+            if ((try r.allArns(top.allocator(), bid, b.name)).len == 0) continue;
+            n += try r.recoverBucket(b.name, bid);
+        }
+        return n;
+    }
+
+    fn recoverBucket(r: *Replicator, bucket: []const u8, bid: core.BucketId) (Error || object.Error)!u64 {
+        var n: u64 = 0;
+        var marker_buf: std.ArrayList(u8) = .empty;
+        defer marker_buf.deinit(r.gpa);
+        var vmarker: ?core.VersionId = null;
+        while (!r.stopping.load(.acquire)) {
+            var arena = std.heap.ArenaAllocator.init(r.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const res = try ov.listVersions(r.svc, a, bucket, .{ .key_marker = marker_buf.items, .version_id_marker = vmarker, .max_keys = 1000 });
+            for (res.entries) |ve| {
+                const info = ov.headVersion(r.svc, a, bucket, ve.key, ve.version) catch continue;
+                if (info.delete_marker) continue;
+                const st = object.replica.statusOf(info.internal) orelse continue;
+                if (st != .pending and st != .failed) continue;
+                const dests = blk: {
+                    r.mutex.lock();
+                    defer r.mutex.unlock();
+                    const c = try r.cachedLocked(bid, bucket);
+                    break :blk try r.destsLocked(a, c, ve.key, decodeTags(a, info.tags), .put, false);
+                };
+                var vb: [32]u8 = undefined;
+                const vid = ov.formatVersionId(ve.version, &vb);
+                for (dests) |d| {
+                    const queued = for ([_]queue.Op{ .put, .existing }) |op| {
+                        const e: Entry = .{ .op = op, .bucket = bucket, .key = ve.key, .version = vid, .arn = d.arn };
+                        if (try store.get(r.svc.store, a, try e.recordKey(a))) |_| break true;
+                    } else false;
+                    if (queued) continue;
+                    try r.enqueue(.{ .op = .put, .bucket = bucket, .key = ve.key, .version = vid, .arn = d.arn });
+                    n += 1;
+                }
+            }
+            if (!res.is_truncated) break;
+            marker_buf.clearRetainingCapacity();
+            try marker_buf.appendSlice(r.gpa, res.next_key_marker orelse break);
+            vmarker = res.next_version_id_marker;
+        }
+        return n;
     }
 
     // ---- existing objects and resync ----
@@ -541,6 +754,7 @@ pub const Replicator = struct {
             var arena = std.heap.ArenaAllocator.init(r.gpa);
             defer arena.deinit();
             const a = arena.allocator();
+            if (r.isCanceled(reset_id)) return n;
             const d = try r.destByArn(a, bid, bucket, arn) orelse return n;
             const res = try ov.listVersions(r.svc, a, bucket, .{ .key_marker = marker_buf.items, .version_id_marker = vmarker, .max_keys = 1000 });
             for (res.entries) |ve| {
@@ -568,6 +782,35 @@ pub const Replicator = struct {
             vmarker = res.next_version_id_marker;
         }
         return n;
+    }
+
+    /// Stops one resync: marks it Canceled and drops its queued work.
+    pub fn cancelResync(r: *Replicator, bucket: []const u8, arn: []const u8, reset_id: []const u8) void {
+        r.resync_mutex.lock();
+        if (r.canceled.count() > 256) {
+            var it = r.canceled.keyIterator();
+            while (it.next()) |k| r.gpa.free(k.*);
+            r.canceled.clearRetainingCapacity();
+        }
+        const id = r.gpa.dupe(u8, reset_id) catch null;
+        if (id) |x| r.canceled.put(r.gpa, x, {}) catch r.gpa.free(x);
+        r.resync_mutex.unlock();
+        r.updateResync(bucket, arn, reset_id, .{ .status = "Canceled" });
+        var arena = std.heap.ArenaAllocator.init(r.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const keys = store.list(r.svc.store, a, .queue) catch return;
+        for (keys) |k| {
+            const e = (store.getJson(Entry, r.svc.store, a, k) catch continue) orelse continue;
+            if (std.mem.eql(u8, e.resync_id, reset_id)) store.remove(r.svc.store, k) catch {};
+        }
+    }
+
+    fn isCanceled(r: *Replicator, reset_id: []const u8) bool {
+        if (reset_id.len == 0) return false;
+        r.resync_mutex.lock();
+        defer r.resync_mutex.unlock();
+        return r.canceled.contains(reset_id);
     }
 
     fn resyncKey(bid: core.BucketId) store.PhysicalKey {
@@ -676,6 +919,8 @@ fn explicitDest(a: Allocator, t: targets_mod.Target, rule: config.Rule) Allocato
         .remote = tc.remote(),
         .target_bucket = tc.target_bucket,
         .storage_class = if (rule.storage_class.len > 0) try a.dupe(u8, rule.storage_class) else tc.storage_class,
+        .sync = tc.sync,
+        .proxy = !tc.disable_proxy,
     };
 }
 
@@ -699,6 +944,7 @@ fn peerDest(a: Allocator, st: site.State, p: site.Peer, bucket: []const u8) Allo
         },
         .target_bucket = try a.dupe(u8, bucket),
         .peer = try a.dupe(u8, p.deployment_id),
+        .sync = p.sync,
     };
 }
 

@@ -47,6 +47,16 @@ pub const Endpoint = struct {
     }
 };
 
+/// Trusts the PEM bundle named by ZKFSM_TIER_CA_FILE in addition to the system roots.
+pub fn applyCaFile(client: *http.Client) void {
+    if (http.Client.disable_tls) return;
+    const path = std.posix.getenv("ZKFSM_TIER_CA_FILE") orelse return;
+    const gpa = client.allocator;
+    client.ca_bundle.rescan(gpa) catch |e| std.log.warn("system CA roots unavailable: {t}", .{e});
+    client.ca_bundle.addCertsFromFilePathAbsolute(gpa, path) catch |e| return std.log.warn("cannot load {s}: {t}", .{ path, e });
+    client.next_https_rescan_certs = false;
+}
+
 fn componentStr(c: std.Uri.Component) []const u8 {
     return switch (c) {
         .raw, .percent_encoded => |s| s,
@@ -55,8 +65,8 @@ fn componentStr(c: std.Uri.Component) []const u8 {
 
 /// Trusts `ca_file` (else $SSL_CERT_FILE) instead of the system roots when one is set.
 pub fn useCaFile(client: *http.Client, gpa: std.mem.Allocator, ca_file: []const u8) error{ InvalidConfig, OutOfMemory }!void {
-    const path = if (ca_file.len > 0) ca_file else std.posix.getenv("SSL_CERT_FILE") orelse return;
-    if (path.len == 0) return;
+    const path = if (ca_file.len > 0) ca_file else std.posix.getenv("SSL_CERT_FILE") orelse return applyCaFile(client);
+    if (path.len == 0) return applyCaFile(client);
     client.ca_bundle.addCertsFromFilePath(gpa, std.fs.cwd(), path) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidConfig;
     if (client.ca_bundle.map.count() == 0) return error.InvalidConfig;
     @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
@@ -138,7 +148,10 @@ pub const Exchange = struct {
             .extra_headers = o.headers,
         }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Transient,
+            else => blk: {
+                std.log.scoped(.remote).debug("cannot connect to {s}: {t}", .{ o.host, e });
+                break :blk error.Transient;
+            },
         };
         // A failed exchange must not return its (possibly dead) connection to the pool.
         errdefer {
@@ -151,6 +164,8 @@ pub const Exchange = struct {
             var bw = x.req.sendBodyUnflushed(&.{}) catch return error.Transient;
             bw.writer.writeAll(b) catch return error.Transient;
             bw.end() catch return error.Transient;
+            // Over TLS, end() leaves the last records in the socket writer's buffer.
+            if (x.req.connection) |c| c.flush() catch return error.Transient;
         } else {
             x.req.sendBodiless() catch return error.Transient;
         }
