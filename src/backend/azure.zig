@@ -6,6 +6,7 @@ const remote = @import("remote.zig");
 const rhttp = @import("remote/http.zig");
 const xml = @import("remote/xml.zig");
 const s3 = @import("s3.zig");
+const creds = @import("creds.zig");
 
 const Error = iface.Error;
 const ObjectMeta = iface.ObjectMeta;
@@ -35,6 +36,10 @@ pub const Config = struct {
     list_page_size: u16 = 5000,
     /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
     ca_file: []const u8 = "",
+    /// Access tier (Hot, Cool, Cold, Archive) set on every blob written.
+    access_tier: []const u8 = "",
+    /// Bearer tokens (service principal) instead of the account key; borrowed.
+    source: ?*creds.Source = null,
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -92,10 +97,12 @@ pub const AzureClient = struct {
         if (!validContainer(cfg.container) or cfg.account.len == 0) return error.InvalidConfig;
         if (cfg.prefix.len > 0 and cfg.prefix[cfg.prefix.len - 1] != '/') return error.InvalidConfig;
         if (cfg.block_size == 0 or cfg.block_size > max_block_size or cfg.list_page_size == 0) return error.InvalidConfig;
-        const n = b64.Decoder.calcSizeForSlice(cfg.key) catch return error.InvalidConfig;
-        if (n > self.key_buf.len) return error.InvalidConfig;
-        b64.Decoder.decode(self.key_buf[0..n], cfg.key) catch return error.InvalidConfig;
-        self.key_len = n;
+        if (cfg.source == null or cfg.key.len > 0) {
+            const n = b64.Decoder.calcSizeForSlice(cfg.key) catch return error.InvalidConfig;
+            if (n > self.key_buf.len) return error.InvalidConfig;
+            b64.Decoder.decode(self.key_buf[0..n], cfg.key) catch return error.InvalidConfig;
+            self.key_len = n;
+        }
         if (self.endpoint.tls) rhttp.useCaFile(&self.http, gpa, cfg.ca_file) catch |e| {
             self.http.deinit();
             return e;
@@ -167,6 +174,9 @@ pub const AzureClient = struct {
         date_buf: [29]u8 = undefined,
         auth_buf: [256]u8 = undefined,
         auth: []const u8 = "",
+        /// "Bearer <token>" from `Config.source`, when set.
+        bearer: ?[]const u8 = null,
+        cred_buf: [6144]u8 = undefined,
         headers: [max_ms + 3]std.http.Header = undefined,
         n_headers: usize = 0,
     };
@@ -216,14 +226,18 @@ pub const AzureClient = struct {
             }
         }.lt);
 
-        var sts_buf: [8192]u8 = undefined;
-        var sw: Writer = .fixed(&sts_buf);
-        stringToSign(&sw, @tagName(op.method), .{
-            .content_length = if (op.body) |b| b.len else 0,
-            .if_none_match = op.if_none_match,
-        }, ms[0..n], self.cfg.account, out.path, params) catch return error.InvalidKey;
-        const sig = sign(self.key_buf[0..self.key_len], sw.buffered());
-        out.auth = std.fmt.bufPrint(&out.auth_buf, "SharedKey {s}:{s}", .{ self.cfg.account, &sig }) catch return error.InvalidKey;
+        if (out.bearer) |bearer| {
+            out.auth = bearer;
+        } else {
+            var sts_buf: [8192]u8 = undefined;
+            var sw: Writer = .fixed(&sts_buf);
+            stringToSign(&sw, @tagName(op.method), .{
+                .content_length = if (op.body) |b| b.len else 0,
+                .if_none_match = op.if_none_match,
+            }, ms[0..n], self.cfg.account, out.path, params) catch return error.InvalidKey;
+            const sig = sign(self.key_buf[0..self.key_len], sw.buffered());
+            out.auth = std.fmt.bufPrint(&out.auth_buf, "SharedKey {s}:{s}", .{ self.cfg.account, &sig }) catch return error.InvalidKey;
+        }
 
         out.n_headers = 0;
         for (ms[0..n]) |h| {
@@ -239,6 +253,11 @@ pub const AzureClient = struct {
     const SendError = error{ Transient, OutOfMemory, InvalidKey };
 
     fn sendOnce(self: *AzureClient, x: *rhttp.Exchange, op: Op, b: *Built) SendError!void {
+        b.bearer = null;
+        if (self.cfg.source) |src| b.bearer = src.authorization(&b.cred_buf) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.CredentialsUnavailable => error.Transient,
+        };
         self.build(op, std.time.nanoTimestamp(), b) catch return error.InvalidKey;
         return x.start(&self.http, .{
             .method = op.method,
@@ -252,6 +271,7 @@ pub const AzureClient = struct {
 
     fn call(self: *AzureClient, x: *rhttp.Exchange, op: Op, b: *Built) Error!void {
         var attempt: u32 = 0;
+        var renewed = false;
         while (true) {
             self.sendOnce(x, op, b) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -260,6 +280,12 @@ pub const AzureClient = struct {
                     if (self.cfg.retry.backoff(&attempt)) continue;
                     return error.IoFailed;
                 },
+            };
+            if (self.cfg.source) |src| if (!renewed and (x.info.status == .unauthorized or x.info.status == .forbidden)) {
+                renewed = true;
+                src.invalidate();
+                x.deinit();
+                continue;
             };
             if (!rhttp.retryableStatus(x.info.status)) return;
             x.deinit();
@@ -395,6 +421,7 @@ pub const AzureClient = struct {
         }
         const cond: []const u8 = if (opts.if_absent) "*" else "";
         if (n < bs) {
+            var hb: [2]Header = undefined;
             var b: Built = .{};
             var x: rhttp.Exchange = undefined;
             try self.call(&x, .{
@@ -402,7 +429,7 @@ pub const AzureClient = struct {
                 .blob = name,
                 .body = buf[0..n],
                 .if_none_match = cond,
-                .ms_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+                .ms_headers = self.writeHeaders(&.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }}, &hb),
             }, &b);
             defer x.deinit();
             if (x.info.status == .precondition_failed or x.info.status == .conflict) return error.PreconditionFailed;
@@ -444,7 +471,19 @@ pub const AzureClient = struct {
         if (x.info.status != .created) return self.failX("PutBlock", &x);
     }
 
+    /// `base` plus x-ms-access-tier when configured.
+    fn writeHeaders(self: *const AzureClient, base: []const Header, buf: *[2]Header) []const Header {
+        @memcpy(buf[0..base.len], base);
+        var n = base.len;
+        if (self.cfg.access_tier.len > 0) {
+            buf[n] = .{ .name = "x-ms-access-tier", .value = self.cfg.access_tier };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     fn putBlockList(self: *AzureClient, name: []const u8, count: u32, cond: []const u8) PutError!void {
+        var hb: [2]Header = undefined;
         var doc: Writer.Allocating = .init(self.gpa);
         defer doc.deinit();
         const w = &doc.writer;
@@ -459,6 +498,7 @@ pub const AzureClient = struct {
             .blob = name,
             .params = &.{.{ .name = "comp", .value = "blocklist" }},
             .if_none_match = cond,
+            .ms_headers = self.writeHeaders(&.{}, &hb),
             .body = doc.written(),
         });
         defer self.gpa.free(r.body);

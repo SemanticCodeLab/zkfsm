@@ -47,6 +47,16 @@ pub const Endpoint = struct {
     }
 };
 
+/// Trusts the PEM bundle named by ZKFSM_TIER_CA_FILE in addition to the system roots.
+pub fn applyCaFile(client: *http.Client) void {
+    if (http.Client.disable_tls) return;
+    const path = std.posix.getenv("ZKFSM_TIER_CA_FILE") orelse return;
+    const gpa = client.allocator;
+    client.ca_bundle.rescan(gpa) catch |e| std.log.warn("system CA roots unavailable: {t}", .{e});
+    client.ca_bundle.addCertsFromFilePathAbsolute(gpa, path) catch |e| return std.log.warn("cannot load {s}: {t}", .{ path, e });
+    client.next_https_rescan_certs = false;
+}
+
 fn componentStr(c: std.Uri.Component) []const u8 {
     return switch (c) {
         .raw, .percent_encoded => |s| s,
