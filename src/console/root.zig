@@ -7,6 +7,7 @@ pub const sign = @import("sign.zig");
 pub const session = @import("session.zig");
 pub const upstream = @import("upstream.zig");
 pub const oidc = @import("oidc.zig");
+pub const sso = @import("sso.zig");
 const assets = @import("console_assets");
 
 const Allocator = std.mem.Allocator;
@@ -87,6 +88,7 @@ pub const Console = struct {
         const target = req.head.target;
         const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
         if (std.mem.startsWith(u8, path, "/api/")) return c.api(req, arena, path);
+        if (sso.match(c, path)) |op| return sso.serve(c, req, arena, op, std.time.timestamp());
         return serveStatic(req, path);
     }
 
@@ -111,7 +113,8 @@ pub const Console = struct {
             return jsonError(req, .unauthorized, "Unauthorized", "Log in to continue.");
         };
         if (std.mem.eql(u8, path, "/api/v1/session")) return respond(req, .ok, "application/json", try sessionJson(a, sess), &.{});
-        if (std.mem.startsWith(u8, path, "/api/v1/s3/") or std.mem.eql(u8, path, "/api/v1/s3")) return c.proxy(req, a, sess, now);
+        if (std.mem.startsWith(u8, path, "/api/v1/s3/") or std.mem.eql(u8, path, "/api/v1/s3")) return c.proxy(req, a, sess, now, "/api/v1/s3", "s3");
+        if (std.mem.startsWith(u8, path, "/api/v1/tables/")) return c.proxy(req, a, sess, now, "/api/v1/tables", "s3tables");
         if (std.mem.eql(u8, path, "/api/v1/cluster")) return c.cluster(req, a, sess, now);
         if (std.mem.eql(u8, path, "/api/v1/metrics")) return c.metrics(req, a, sess, now);
         if (std.mem.eql(u8, path, "/api/v1/presign")) return c.presign(req, a, sess, now);
@@ -125,15 +128,19 @@ pub const Console = struct {
     fn loginMethods(c: *Console, req: *Request, a: Allocator) ServeError!void {
         var out: Writer.Allocating = .init(a);
         var js: std.json.Stringify = .{ .writer = &out.writer };
-        const Provider = struct { name: []const u8, label: []const u8 };
+        const Provider = struct { name: []const u8, label: []const u8, href: []const u8, flow: []const u8 };
         var list: std.ArrayList(Provider) = .empty;
         var ldap = false;
+        // Prefer the server's own login flow when it has one (PKCE, nonce, browser binding).
+        const served = try sso.providers(c, a);
         if (c.cfg.iam) |st| {
             for (try iam.idp.effective(a, st, c.cfg.idp_env, .openid)) |e| {
                 const p = iam.idp.OpenId.from(e.name, e.settings);
                 if (!p.enabled or p.client_id.len == 0) continue;
                 const label = iam.idp.get(e.settings, "display_name") orelse if (std.mem.eql(u8, e.name, iam.idp.default_name)) "OpenID" else e.name;
-                try list.append(a, .{ .name = e.name, .label = label });
+                const on_server = sso.has(served, e.name);
+                const href = if (on_server) try sso.authorizeHref(c, a, e.name) else try oidc.startHref(a, e.name);
+                try list.append(a, .{ .name = e.name, .label = label, .href = href, .flow = if (on_server) "server" else "console" });
             }
             for (try iam.idp.effective(a, st, c.cfg.idp_env, .ldap)) |e| {
                 if (iam.idp.Ldap.from(e.settings).enabled) ldap = true;
@@ -248,10 +255,11 @@ pub const Console = struct {
         return under(path, c.cfg.admin_prefix) or under(path, "/zkfsm/admin") or under(path, "/minio/admin");
     }
 
-    fn proxy(c: *Console, req: *Request, a: Allocator, s: session.Session, now: i64) ServeError!void {
+    /// Forwards the request below `mount`, signed for `service` with the session.
+    fn proxy(c: *Console, req: *Request, a: Allocator, s: session.Session, now: i64, mount: []const u8, service: []const u8) ServeError!void {
         const target = req.head.target;
         const q = std.mem.indexOfScalar(u8, target, '?');
-        const raw_path = target["/api/v1/s3".len .. q orelse target.len];
+        const raw_path = target[mount.len .. q orelse target.len];
         const path = try sign.decode(a, if (raw_path.len == 0) "/" else raw_path, false);
         if (std.mem.indexOf(u8, path, "/../") != null or std.mem.endsWith(u8, path, "/..")) {
             try drain(req);
@@ -270,13 +278,13 @@ pub const Console = struct {
             if (forwardRequestHeader(h.name)) try fwd.append(a, .{ .name = try std.ascii.allocLowerString(a, h.name), .value = try a.dupe(u8, h.value) });
         }
         var body = try readBody(req, a, limits.max_body) orelse return jsonError(req, .payload_too_large, "EntityTooLarge", "Request body is too large; upload in parts.");
-        const admin = c.isAdminPath(path);
+        const admin = std.mem.eql(u8, service, "s3") and c.isAdminPath(path);
         if (admin) try fwd.append(a, .{ .name = "x-zkfsm-admin-kdf", .value = "pbkdf2" });
         if (encrypt and admin and body.len > 0) body = c.hooks.seal(a, s.secret_key, body) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Failed => return jsonError(req, .internal_server_error, "SealFailed", "Cannot encrypt the request."),
         };
-        const res = c.call(a, s, req.head.method, path, params.items, fwd.items, body, now) catch |e| switch (e) {
+        const res = c.callAs(a, s, service, req.head.method, path, params.items, fwd.items, body, now) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return jsonError(req, .bad_gateway, "Unavailable", "The storage server did not answer."),
         };
@@ -285,6 +293,10 @@ pub const Console = struct {
     }
 
     pub fn call(c: *Console, a: Allocator, s: session.Session, method: std.http.Method, path: []const u8, params: []const sign.Param, headers: []const Header, body: []const u8, now: i64) upstream.Error!*upstream.Response {
+        return c.callAs(a, s, "s3", method, path, params, headers, body, now);
+    }
+
+    fn callAs(c: *Console, a: Allocator, s: session.Session, service: []const u8, method: std.http.Method, path: []const u8, params: []const sign.Param, headers: []const Header, body: []const u8, now: i64) upstream.Error!*upstream.Response {
         var hb: [300]u8 = undefined;
         const hash = core_sha256Hex(body);
         const signed = try sign.sign(a, credsOf(s), .{
@@ -295,6 +307,7 @@ pub const Console = struct {
             .headers = headers,
             .payload_sha256_hex = try a.dupe(u8, &hash),
             .region = c.cfg.region,
+            .service = service,
         }, now);
         return upstream.send(a, c.cfg.upstream, method, signed.target, signed.headers, body);
     }

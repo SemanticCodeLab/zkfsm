@@ -77,6 +77,11 @@ pub const Response = struct {
 /// Sends one request (connection: close) and parses the response head.
 /// `target` is the encoded path and query. Free with `close`.
 pub fn send(a: Allocator, ep: Endpoint, method: std.http.Method, target: []const u8, headers: []const Header, body: []const u8) Error!*Response {
+    return sendAs(a, ep, null, method, target, headers, body);
+}
+
+/// `send` with the Host header the browser used (the server builds URLs from it).
+pub fn sendAs(a: Allocator, ep: Endpoint, host: ?[]const u8, method: std.http.Method, target: []const u8, headers: []const Header, body: []const u8) Error!*Response {
     const stream = std.net.tcpConnectToHost(a, ep.host, ep.port) catch return error.Unreachable;
     errdefer stream.close();
     const r = try a.create(Response);
@@ -86,7 +91,7 @@ pub fn send(a: Allocator, ep: Endpoint, method: std.http.Method, target: []const
     var sw = stream.writer(wbuf);
     const w = &sw.interface;
     var hb: [300]u8 = undefined;
-    writeHead(w, method, target, ep.authority(&hb), headers, body.len) catch return error.Unreachable;
+    writeHead(w, method, target, host orelse ep.authority(&hb), headers, body.len) catch return error.Unreachable;
     w.writeAll(body) catch return error.Unreachable;
     w.flush() catch return error.Unreachable;
     r.sr = stream.reader(rbuf);

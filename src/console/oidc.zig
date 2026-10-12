@@ -67,6 +67,14 @@ fn queryParams(a: Allocator, req: *Request) error{OutOfMemory}![]sign.Param {
     return sign.parseQuery(a, if (std.mem.indexOfScalar(u8, t, '?')) |i| t[i + 1 ..] else "");
 }
 
+/// Login link for the console's own code flow.
+pub fn startHref(a: Allocator, name: []const u8) error{OutOfMemory}![]const u8 {
+    var out: Writer.Allocating = .init(a);
+    out.writer.writeAll("/api/v1/oidc/start?provider=") catch return error.OutOfMemory;
+    root.formEncodeTo(&out.writer, name) catch return error.OutOfMemory;
+    return out.written();
+}
+
 /// GET /api/v1/oidc/start?provider=NAME: 303 to the provider's authorization endpoint.
 pub fn start(c: *Console, req: *Request, a: Allocator, now: i64) root.ServeError!void {
     try root.drain(req);
