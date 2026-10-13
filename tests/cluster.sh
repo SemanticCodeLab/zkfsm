@@ -328,6 +328,8 @@ for n in 1 2 3 4; do
   head -c $((n * 9000 + 5)) /dev/urandom >"$WORK/obj/pool$n"
   check "write after expansion via node $n" 200 "$(cput "$n" "pool$n" "$WORK/obj/pool$n")"
 done
+# A peer still counted as starting misses its shards; the healer adds them within seconds.
+for _ in $(seq 40); do [[ $(find "$WORK"/n*/p* -path '*/data/*' -type f | wc -l) == 24 ]] && break; sleep 0.5; done
 check "new writes land in the emptier pool" 24 "$(find "$WORK"/n*/p* -path '*/data/*' -type f | wc -l)"
 check "first pool untouched by new writes" "$before" "$(find "$WORK"/n*/d* -path '*/data/*' -type f | wc -l)"
 bad=0
