@@ -248,7 +248,9 @@ pub const Manager = struct {
 
     pub fn rebalanceStart(m: *Manager, a: std.mem.Allocator) Error![]const u8 {
         const Ctx = struct {
-            id: []const u8 = "",
+            // Kept here: the update's arena is gone by the time the id is returned.
+            buf: [36]u8 = undefined,
+            len: usize = 0,
             fn f(ctx: *anyopaque, mg: *Manager, ma: std.mem.Allocator, meta: *Meta) Error!void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 if (meta.draining() != null or meta.rebalance.status == .started) return error.Conflict;
@@ -259,15 +261,16 @@ pub const Manager = struct {
                 std.crypto.random.bytes(&idb);
                 const hex = std.fmt.bytesToHex(idb, .lower);
                 const id = try std.fmt.allocPrint(ma, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
-                self.id = id;
+                @memcpy(self.buf[0..id.len], id);
+                self.len = id.len;
                 const thr = if (std.posix.getenv("ZKFSM_REBALANCE_THRESHOLD")) |v| std.fmt.parseFloat(f64, v) catch 0.1 else 0.1;
                 meta.rebalance = .{ .id = id, .status = .started, .threshold = thr, .start_ns = @intCast(std.time.nanoTimestamp()) };
             }
         };
         var c: Ctx = .{};
         try m.update(.{ .ctx = &c, .func = Ctx.f });
-        std.log.info("pools: rebalance {s} started", .{c.id});
-        return a.dupe(u8, c.id);
+        std.log.info("pools: rebalance {s} started", .{c.buf[0..c.len]});
+        return a.dupe(u8, c.buf[0..c.len]);
     }
 
     pub fn rebalanceStop(m: *Manager) Error!void {

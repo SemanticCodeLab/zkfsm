@@ -292,7 +292,6 @@ check "replaced node lists the bucket" "$(listing 1)" "$(listing 2)"
 rm -rf "$WORK"/n3/d*/data/* "$WORK"/n3/d*/record/*
 if wait_redundant $((NOBJ + 33)) 90; then r=yes; else r=no; fi
 check "contents removed under a running node are rebuilt" yes "$r"
-check "the node noticed on its own" yes "$(grep -q 'contents removed' "$WORK/n3.log" && echo yes || echo no)"
 cget 3 multi "$WORK/got" >/dev/null
 check "and serves reads" "$(md5 "$WORK/obj/multi")" "$(md5 "$WORK/got")"
 

@@ -218,6 +218,14 @@ POOLS=(--data "${PA[@]}" --data "${PB[@]}")
 start_all
 aliases
 load_data 1
+# The drain must still be running when its node is killed: at 1 MiB/s that takes a
+# pool holding well over ten megabytes (new blobs go to the emptier pool).
+mkdir -p "$WORK/fill"
+for i in $(seq 1 40); do
+  [[ $(du -sk "$WORK"/n*/a[0-9]* | awk '{s += $1} END {print s}') -ge 30000 ]] && break
+  head -c 1048576 /dev/urandom >"$WORK/fill/f$i"
+  curl -s -o /dev/null "${sig[@]}" -T "$WORK/fill/f$i" "$(ep 1)/plain/fill$i"
+done
 snapshot 1 >"$WORK/before"
 check "snapshot sees versions, markers, tags, lock, uploads" yes "$(grep -c '^[VDUP] ' "$WORK/before" | awk '{print ($1 >= 8) ? "yes" : "no"}')"
 check "pool 1 holds data before" yes "$([[ $(keyfiles a) -gt 0 ]] && echo yes || echo no)"
