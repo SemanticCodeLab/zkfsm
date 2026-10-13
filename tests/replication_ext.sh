@@ -151,6 +151,10 @@ echo "== site replication with different root credentials"
 check "admin replicate add" 0 "$("$MC" admin replicate add s1 s2 >/dev/null && echo 0)"
 eventually "bucket on s2" 1 sh -c "'$MC' ls s2 | grep -c ' web/'"
 S2DEP="$("$MC" admin replicate info s1 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["deploymentID"] for s in d["sites"] if s["endpoint"].endswith(":'"$PS2"'")][0])')"
+# One deployment id: admin info reports the id site replication gave its peers.
+S1DEP="$("$MC" admin replicate info s1 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print([s["deploymentID"] for s in d["sites"] if s["endpoint"].endswith(":'"$PS1"'")][0])')"
+check "admin info and site replication agree on s1's id" "$S1DEP" "$("$MC" admin info s1 --json | jfield '["info"]["deploymentID"]')"
+check "admin info and site replication agree on s2's id" "$S2DEP" "$("$MC" admin info s2 --json | jfield '["info"]["deploymentID"]')"
 cli "$PS1" "$AK" "$SK" s3api put-bucket-website --bucket web --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"err.html"}}'
 cli "$PS1" "$AK" "$SK" s3api put-bucket-ownership-controls --bucket web --ownership-controls '{"Rules":[{"ObjectOwnership":"BucketOwnerPreferred"}]}'
 eventually "website config on peer" index.html sh -c "AWS_ACCESS_KEY_ID=$AK2 AWS_SECRET_ACCESS_KEY=$SK2 '$S3CLI_BIN' --endpoint-url http://127.0.0.1:$PS2 s3api get-bucket-website --bucket web | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"IndexDocument\"][\"Suffix\"])'"

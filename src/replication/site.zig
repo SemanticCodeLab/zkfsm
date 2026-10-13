@@ -55,6 +55,9 @@ pub const State = struct {
 /// Wiring set by the embedding binary.
 pub const Context = struct {
     iam: ?*iam.Store = null,
+    /// The deployment's format-level id (cluster deployment or drive set); it becomes
+    /// the site id unless an older random one is already stored.
+    format_id: ?[16]u8 = null,
 };
 
 const state_name = "site-replication";
@@ -68,10 +71,23 @@ pub fn save(r: *engine.Replicator, st: State) store.Error!void {
     r.invalidateSite();
 }
 
-/// This deployment's id, created on first use.
+/// The id admin info and site replication both report: the stored one (peers of an
+/// older deployment recorded it), else the format-level id. Null when neither exists.
+pub fn knownDeploymentId(r: *engine.Replicator, a: Allocator) store.Error!?[]const u8 {
+    if (try store.getJson([]const u8, r.svc.store, a, store.key(.deployment, "deployment-id"))) |id| return id;
+    const b = r.site_ctx.format_id orelse return null;
+    const h = std.fmt.bytesToHex(b, .lower);
+    return try std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}-{s}", .{ h[0..8], h[8..12], h[12..16], h[16..20], h[20..32] });
+}
+
+/// This deployment's id, stored on first use.
 pub fn deploymentId(r: *engine.Replicator, a: Allocator) store.Error![]const u8 {
     const k = store.key(.deployment, "deployment-id");
     if (try store.getJson([]const u8, r.svc.store, a, k)) |id| return id;
+    if (try knownDeploymentId(r, a)) |id| {
+        try store.putJson(r.svc.store, r.gpa, k, id);
+        return id;
+    }
     var b: [16]u8 = undefined;
     std.crypto.random.bytes(&b);
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -464,4 +480,48 @@ test "state helpers" {
     try std.testing.expectEqualStrings("arn:minio:replication::d2:bk", try peerArn(a, "d2", "bk"));
     const p = try sealPayload(a, st, "plain", false);
     try std.testing.expectEqualStrings("plain", unbase64(a, p).?);
+}
+
+test "one deployment id: the format id for a fresh deployment, a stored older id wins" {
+    const backend = @import("../backend/root.zig");
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fid: [16]u8 = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    const want = "01234567-89ab-cdef-0123-456789abcdef";
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        var lb = try backend.local.LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+        defer lb.close();
+        var svc = try object.ObjectService.init(gpa, lb.backend());
+        defer svc.deinit();
+        var r = engine.Replicator.init(gpa, &svc, .{});
+        defer r.deinit();
+        r.site_ctx.format_id = fid;
+        // Admin info asks without storing anything; site replication stores the same id.
+        try std.testing.expectEqualStrings(want, (try knownDeploymentId(&r, a)).?);
+        try std.testing.expectEqualStrings(want, try deploymentId(&r, a));
+        r.site_ctx.format_id = null;
+        try std.testing.expectEqualStrings(want, (try knownDeploymentId(&r, a)).?);
+    }
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        var lb = try backend.local.LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+        defer lb.close();
+        var svc = try object.ObjectService.init(gpa, lb.backend());
+        defer svc.deinit();
+        var r = engine.Replicator.init(gpa, &svc, .{});
+        defer r.deinit();
+        // A deployment from before: its random id is stored and peers know it.
+        const old = try deploymentId(&r, a);
+        try std.testing.expect(!std.mem.eql(u8, old, want));
+        r.site_ctx.format_id = fid;
+        try std.testing.expectEqualStrings(old, (try knownDeploymentId(&r, a)).?);
+        try std.testing.expectEqualStrings(old, try deploymentId(&r, a));
+    }
 }

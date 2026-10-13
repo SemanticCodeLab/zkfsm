@@ -57,6 +57,11 @@ pub const Reply = union(enum) {
     sent,
 };
 
+pub const SiteIdFn = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, a: Allocator) ?[]const u8,
+};
+
 pub const Ops = struct {
     gpa: Allocator,
     svc: *object.ObjectService,
@@ -68,6 +73,8 @@ pub const Ops = struct {
     /// Stopped on service restart/stop; set before serving.
     server: ?*s3.Server = null,
     pool_state: ?PoolStateFn = null,
+    /// The deployment id site replication uses, when it has one; admin info reports it.
+    site_id: ?SiteIdFn = null,
     heals: healseq.Registry = .{},
     restart: std.atomic.Value(bool) = .init(false),
 

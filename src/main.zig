@@ -417,6 +417,8 @@ pub fn run(opts: Options) u8 {
     warnShadowedBucket(&svc, arena, admin_prefix);
     var repl = replication.Replicator.init(gpa, &svc, .{});
     defer repl.deinit();
+    repl.site_ctx.format_id = drives.set.bytes;
+    var repl_ptr: ?*replication.Replicator = &repl;
     startReplication(&repl, &svc, auth.iam);
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
     const ev_opts = eventOptions(arena, cfg, cfg.data[0], addr) catch return 2;
@@ -435,7 +437,7 @@ pub fn run(opts: Options) u8 {
     obs.sources.notifier = &notif;
     obs_hook.set(obs);
     const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
-    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .endpoint = std.fmt.allocPrint(arena, "{s}:{d}", .{ cfg.host, cfg.port }) catch return 1, .local = .{ .drives = &drives, .strategy = strategy, .healer = &healer } };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .endpoint = std.fmt.allocPrint(arena, "{s}:{d}", .{ cfg.host, cfg.port }) catch return 1, .local = .{ .drives = &drives, .strategy = strategy, .healer = &healer }, .site_id = .{ .ctx = @ptrCast(&repl_ptr), .func = siteId } };
     var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg, .ops = &ops_ctx };
     var sse_route: sse.Sse = .{ .gpa = gpa };
@@ -571,6 +573,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     // Set up once the object service exists; requests wait behind the gate until then.
     var repl: replication.Replicator = undefined;
     var repl_ready = false;
+    var repl_ptr: ?*replication.Replicator = null;
     defer if (repl_ready) repl.deinit();
     var repl_ext: replication.s3ext.Ext = .{ .r = &repl };
     var notif: events.Notifier = undefined;
@@ -581,7 +584,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     var obs: ?*observe.Observe = null;
     defer if (obs) |o| o.destroy();
     const observers = [_]s3.Observer{ ev_ext.observer(), obs_hook.observer() };
-    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .node = node, .pool_state = .{ .ctx = &pool_mgr, .func = pools.Manager.poolState } };
+    var ops_ctx: ops.Ops = .{ .gpa = gpa, .svc = &svc, .started_s = std.time.timestamp(), .node = node, .pool_state = .{ .ctx = &pool_mgr, .func = pools.Manager.poolState }, .site_id = .{ .ctx = @ptrCast(&repl_ptr), .func = siteId } };
     var lambda_reg = lambdaRegistry(gpa, arena, cfg, &svc) catch return 2;
     var bridge: admin_http.Bridge = .{ .prefix = admin_prefix, .auth = auth, .svc = &svc, .started_s = std.time.timestamp(), .repl = &repl, .events = &notif, .lambda = &lambda_reg, .ops = &ops_ctx, .pools = &pool_mgr };
     var sse_route: sse.Sse = .{ .gpa = gpa };
@@ -666,6 +669,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             }
         }
         repl = replication.Replicator.init(gpa, &svc, .{ .leader = .{ .ctx = node, .func = clusterLeader } });
+        repl.site_ctx.format_id = node.deployment;
+        repl_ptr = &repl;
         repl_ready = true;
         startReplication(&repl, &svc, if (iam_ready) &iam_store else null);
         const ev_opts = eventOptions(arena, cfg, node.localPath() orelse ".", addr) catch break :blk 2;
@@ -726,6 +731,12 @@ fn serveThread(server: *s3.Server, addr: std.net.Address, node: *cluster.Node) v
     node.stop_ev.set();
 }
 
+/// One deployment id for admin info and site replication; null before replication is up.
+fn siteId(ctx: *anyopaque, a: std.mem.Allocator) ?[]const u8 {
+    const r = @as(*?*replication.Replicator, @ptrCast(@alignCast(ctx))).* orelse return null;
+    return replication.site.knownDeploymentId(r, a) catch null;
+}
+
 fn clusterLeader(ctx: *anyopaque) bool {
     const node: *cluster.Node = @ptrCast(@alignCast(ctx));
     return node.isLeader();
@@ -733,7 +744,7 @@ fn clusterLeader(ctx: *anyopaque) bool {
 
 /// Hooks the replication engine into the object service, metrics, and IAM.
 fn startReplication(repl: *replication.Replicator, svc: *object.ObjectService, iam_store: ?*iam.Store) void {
-    repl.site_ctx = .{ .iam = iam_store };
+    repl.site_ctx.iam = iam_store;
     svc.replication = repl.sink();
     metrics.global.extra[0] = .{ .ctx = &repl.stats, .func = replication.stats.Stats.render };
     repl.start() catch |e| std.log.warn("replication worker not started: {t}", .{e});

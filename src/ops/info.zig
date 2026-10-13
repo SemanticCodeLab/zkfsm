@@ -177,7 +177,10 @@ pub fn serverInfo(o: *Ops, c: *const Ctx) Error!Response {
     return c.json(.{
         .mode = mode(o),
         .region = c.env.region,
-        .deploymentID = try a.dupe(u8, fmt.uuid(&dep_buf, deploymentId(o))),
+        .deploymentID = blk: {
+            if (o.site_id) |h| if (h.func(h.ctx, a)) |id| break :blk id;
+            break :blk try a.dupe(u8, fmt.uuid(&dep_buf, deploymentId(o)));
+        },
         .buckets = Count{ .count = buckets },
         .objects = Count{ .count = objects },
         .usage = .{ .size = size },
