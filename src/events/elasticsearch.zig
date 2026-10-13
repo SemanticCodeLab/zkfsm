@@ -258,6 +258,9 @@ pub fn create(gpa: std.mem.Allocator, s: target.Settings) target.InitError!targe
     errdefer self.arena.deinit();
     const a = self.arena.allocator();
     self.url.host = try a.dupe(u8, url.host);
+    // The parsed userinfo points into the caller's settings text; `auth` holds the copy.
+    self.url.user = "";
+    self.url.password = "";
     self.index = try a.dupe(u8, index);
     var user: []const u8 = s.get("username");
     var pass: []const u8 = s.get("password");

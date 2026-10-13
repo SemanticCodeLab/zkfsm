@@ -291,7 +291,16 @@ if [[ "$BROKERS" == 1 ]] && command -v docker >/dev/null && docker info >/dev/nu
   eventually "redis events queue during the outage" 1 metric 'zkfsm_notify_target_queue_length{target_id="ns",target_name="notify_redis"}'
   run_c redis -p "$RP:6379" redis:7
   eventually "redis catches up after the outage" 1 sh -c "docker exec $R redis-cli HKEYS zkev:ns 2>/dev/null | grep -c obj3"
-  if docker image inspect mysql:8.4 >/dev/null 2>&1; then
+  # The broker app restarts in place: the durable queue survives, the earlier
+  # transient messages do not, so only the event sent during the outage is counted.
+  docker exec "zkev-amqp-$$" rabbitmqctl -q stop_app >/dev/null
+  echo k4 | "$MC" pipe z/brokers/obj4.txt >/dev/null
+  eventually "amqp events queue during the outage" 1 metric 'zkfsm_notify_target_queue_length{target_id="1",target_name="notify_amqp"}'
+  check "amqp target reported offline" 0 "$(metric 'zkfsm_notify_target_online{target_id="1",target_name="notify_amqp"}')"
+  docker exec "zkev-amqp-$$" rabbitmqctl -q start_app >/dev/null
+  eventually "amqp catches up after the outage" 1 sh -c "docker exec zkev-amqp-$$ rabbitmqctl -q list_queues name messages | awk '\$1==\"zkevq\" {print \$2}'"
+  eventually "amqp target back online" 1 metric 'zkfsm_notify_target_online{target_id="1",target_name="notify_amqp"}'
+  if docker image inspect mysql:8.4>/dev/null 2>&1; then
     echo "== mysql"
     YP="$(freeport)"
     run_c mysql --tmpfs /var/lib/mysql -e MYSQL_ROOT_PASSWORD=zkpass -e MYSQL_DATABASE=zkev -p "$YP:3306" mysql:8.4

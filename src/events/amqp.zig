@@ -111,20 +111,25 @@ pub const Url = struct {
     tls: bool,
 };
 
-/// Parses amqp[s]://user:pass@host:port/vhost; strings are allocated from `a`.
+// std.Uri components may alias the parsed text; the client outlives it.
+fn owned(a: std.mem.Allocator, c: std.Uri.Component) error{OutOfMemory}![]const u8 {
+    return a.dupe(u8, try c.toRawMaybeAlloc(a));
+}
+
+/// Parses amqp[s]://user:pass@host:port/vhost; every string is copied into `a`.
 pub fn parseUrl(a: std.mem.Allocator, text: []const u8) error{ InvalidConfig, OutOfMemory }!Url {
     const u = std.Uri.parse(text) catch return error.InvalidConfig;
     const tls = if (std.ascii.eqlIgnoreCase(u.scheme, "amqps")) true else if (std.ascii.eqlIgnoreCase(u.scheme, "amqp")) false else return error.InvalidConfig;
-    const host = u.getHostAlloc(a) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidConfig;
-    if (host.len == 0) return error.InvalidConfig;
-    var vhost = try u.path.toRawMaybeAlloc(a);
+    const host = try owned(a, u.host orelse return error.InvalidConfig);
+    if (host.len == 0 or host.len > std.Uri.host_name_max) return error.InvalidConfig;
+    var vhost = try owned(a, u.path);
     if (vhost.len > 0 and vhost[0] == '/') vhost = vhost[1..];
     if (vhost.len == 0) vhost = "/";
     const out: Url = .{
         .host = host,
         .port = u.port orelse if (tls) 5671 else 5672,
-        .user = if (u.user) |c| try c.toRawMaybeAlloc(a) else "guest",
-        .password = if (u.password) |c| try c.toRawMaybeAlloc(a) else "guest",
+        .user = if (u.user) |c| try owned(a, c) else "guest",
+        .password = if (u.password) |c| try owned(a, c) else "guest",
         .vhost = vhost,
         .tls = tls,
     };
@@ -458,6 +463,8 @@ const FakeBroker = struct {
     confirms: bool,
     ack_id: u16 = 80,
     close_on_declare: bool = false,
+    /// Hang up on the first connection right after the protocol header.
+    drop_first: bool = false,
     body: [16384]u8 = undefined,
     body_len: usize = 0,
     delivery_mode: u8 = 0,
@@ -485,6 +492,12 @@ const FakeBroker = struct {
     }
 
     fn serve(f: *FakeBroker) !void {
+        if (f.drop_first) {
+            const early = try f.srv.accept();
+            defer early.stream.close();
+            var hdr: [8]u8 = undefined;
+            if (try early.stream.readAtLeast(&hdr, 8) != 8) return error.Unexpected;
+        }
         const conn = try f.srv.accept();
         defer conn.stream.close();
         var rb: [8192]u8 = undefined;
@@ -593,6 +606,42 @@ test "unreachable broker" {
     const c = try create(testing.allocator, .{ .kvs = &.{.{ .key = "url", .value = "amqp://127.0.0.1:1/" }} });
     defer c.deinit();
     try testing.expectError(error.Unreachable, c.send(&.{ .body = "{}" }));
+}
+
+test "late broker: settings text freed, refused, dropped mid-handshake, then delivered" {
+    const gpa = testing.allocator;
+    var f: FakeBroker = .{ .srv = undefined, .confirms = true, .drop_first = true };
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    f.srv = try addr.listen(.{ .reuse_address = true });
+    const bound = f.srv.listen_address;
+    f.srv.deinit();
+
+    // The configuration text is released (and scribbled over) once the client exists.
+    const url = try std.fmt.allocPrint(gpa, "amqp://guest:guest@127.0.0.1:{d}/", .{bound.getPort()});
+    const c = create(gpa, .{ .kvs = &.{ .{ .key = "url", .value = url }, .{ .key = "exchange", .value = "ex" }, .{ .key = "exchange_type", .value = "fanout" }, .{ .key = "routing_key", .value = "rk" }, .{ .key = "publisher_confirms", .value = "on" } } }) catch |e| {
+        gpa.free(url);
+        return e;
+    };
+    defer c.deinit();
+    @memset(url, 'x');
+    gpa.free(url);
+
+    // Broker not up yet: the event stays with the caller.
+    try testing.expectError(error.Unreachable, c.send(&.{ .body = "{\"n\":1}" }));
+
+    f.srv = try bound.listen(.{ .reuse_address = true });
+    defer f.srv.deinit();
+    const t = try std.Thread.spawn(.{}, FakeBroker.run, .{&f});
+    // First connection dies in the handshake, the retry goes through.
+    const first = c.send(&.{ .body = "{\"n\":1}" });
+    const second = c.send(&.{ .body = "{\"n\":1}" });
+    // Unblock a broker still waiting in accept so a failed delivery fails the test.
+    for (0..2) |_| if (std.net.tcpConnectToAddress(bound)) |s| s.close() else |_| {};
+    t.join();
+    try testing.expectError(error.Unreachable, first);
+    try second;
+    try testing.expect(f.ok);
+    try testing.expectEqualStrings("{\"n\":1}", f.body[0..f.body_len]);
 }
 
 test "events live amqp" {
