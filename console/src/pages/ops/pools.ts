@@ -67,9 +67,10 @@ export function drainProgress(p: PoolStatus): number {
   return Math.min(1, Math.max(0, d.bytesDecommissioned / usedAtStart));
 }
 
-/** True while any pool rebalance is still moving data. */
+/** True while a rebalance runs; right after a start no pool has a status yet. */
 export function rebalanceRunning(r: RebalanceStatus | null): boolean {
-  return !!r && !isStopped(r) && r.pools.some((p) => p.status === "Started");
+  if (!r || isStopped(r)) return false;
+  return r.pools.some((p) => p.status === "Started") || r.pools.every((p) => !p.status);
 }
 
 function isStopped(r: RebalanceStatus): boolean {

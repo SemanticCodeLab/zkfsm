@@ -107,6 +107,7 @@ describe("pools", () => {
     const p = (status: string) => ({ id: 0, status, used: 0.5, progress: { objects: 1, versions: 1, bytes: 1, elapsed: 1, eta: 0 } });
     expect(rebalanceState(null)).toBe("not started");
     expect(rebalanceRunning({ ID: "x", stoppedAt: "0001-01-01T00:00:00Z", pools: [p("Started"), p("")] })).toBe(true);
+    expect(rebalanceRunning({ ID: "x", stoppedAt: "0001-01-01T00:00:00Z", pools: [p(""), p("")] })).toBe(true);
     expect(rebalanceState({ ID: "x", stoppedAt: "2026-10-14T10:00:00Z", pools: [p("Stopped")] })).toBe("stopped");
     expect(rebalanceState({ ID: "x", stoppedAt: "0001-01-01T00:00:00Z", pools: [p("Completed")] })).toBe("completed");
   });
