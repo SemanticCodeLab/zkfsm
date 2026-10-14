@@ -34,6 +34,8 @@ pub const Error = error{
     CredentialMismatch,
     DriveUnavailable,
     Stopped,
+    /// A membership update is applied but a new pool cannot open yet; call again.
+    NotReady,
     OutOfMemory,
 };
 
@@ -53,7 +55,23 @@ pub const Config = struct {
     scan_interval_s: u64 = 600,
     /// Seconds between catalog and IAM reloads (the backstop for missed notifications).
     refresh_s: u64 = 10,
+    /// Membership is managed at runtime (`applyMembership`): peers may briefly run
+    /// with other endpoint lists, so their fingerprints are not compared.
+    dynamic: bool = false,
 };
+
+/// A runtime membership update: every pool, in order (the current list as prefix).
+pub const Membership = struct {
+    /// Reported to peers in hello once nonzero (see `allApplied`).
+    epoch: u64,
+    /// Per pool, its endpoint arguments, as in `Config.pools`.
+    pools: []const []const []const u8,
+    /// The change is still settling: locks also need a majority of the previous voters.
+    settling: bool = false,
+};
+
+/// Peer-call channels: 0 is `Node.ext`, the rest are for embedding builds.
+pub const ext_channels = 4;
 
 /// A local endpoint and, once opened, the set slot it serves.
 pub const LocalEp = struct {
@@ -154,6 +172,15 @@ pub const Node = struct {
     /// Called when a peer announces a pool state change.
     pools_hook: ?Hook = null,
     pools_sync: ?SyncHook = null,
+    /// "ext" handlers for channels 1.. (`setExt`).
+    ext_more: [ext_channels - 1]std.atomic.Value(?*const Ext) = @splat(.init(null)),
+    /// Membership epoch applied here, and the last one each peer reported.
+    epoch: std.atomic.Value(u64) = .init(0),
+    peer_epochs: []std.atomic.Value(u64) = &.{},
+    member_mutex: std.Thread.Mutex = .{},
+    /// Lock voters after the last update (zero: never set), and the settling set.
+    voters: u256 = 0,
+    prev_voters: u256 = 0,
 
     /// Parses the topology and prepares RPC; nothing touches peers yet.
     pub fn create(gpa: std.mem.Allocator, cfg: Config) Error!*Node {
@@ -178,43 +205,62 @@ pub const Node = struct {
         };
         errdefer n.arena_state.deinit();
         const a = n.arena_state.allocator();
-        n.topo = topology.parse(a, cfg.pools, cfg.node_address, cfg.listen_host, cfg.listen_port) catch |e| {
+        const parsed = topology.parse(a, cfg.pools, cfg.node_address, cfg.listen_host, cfg.listen_port) catch |e| {
             std.log.err("cluster endpoints: {t}", .{e});
             return error.BadTopology;
         };
-        n.topo_fp = topoFingerprint(&n.topo);
-        if (n.topo.pools.len > router_mod.max_pools) {
+        if (parsed.pools.len > router_mod.max_pools) {
             std.log.err("cluster: at most {d} pools", .{router_mod.max_pools});
             return error.BadTopology;
         }
-        n.orig = try a.alloc(u32, n.topo.pools.len);
+        // Fixed capacity: `applyMembership` appends nodes and pools while others read.
+        n.topo = parsed;
+        n.topo.nodes = try capacity(a, topology.Node, parsed.nodes, topology.max_nodes);
+        n.topo.pools = try capacity(a, topology.Pool, parsed.pools, router_mod.max_pools);
+        n.topo_fp = topoFingerprint(&n.topo);
+        n.orig = (try a.alloc(u32, router_mod.max_pools))[0..n.topo.pools.len];
         for (n.orig, 0..) |*o, p| o.* = @intCast(p);
         n.rpc = rpc_mod.Rpc.init(gpa, &n.topo, cfg.secret) catch return error.OutOfMemory;
         errdefer n.rpc.deinit();
         if (n.topo.tls) try n.loadCa();
-        n.returned = try a.alloc(std.atomic.Value(bool), n.topo.nodes.len);
+        n.returned = try a.alloc(std.atomic.Value(bool), topology.max_nodes);
         for (n.returned) |*r| r.* = .init(false);
-        n.origins = try catchup.Origins.init(gpa, n.topo.nodes.len);
+        n.returned.len = n.topo.nodes.len;
+        n.peer_epochs = try a.alloc(std.atomic.Value(u64), topology.max_nodes);
+        for (n.peer_epochs) |*e| e.* = .init(0);
+        n.origins = try catchup.Origins.init(gpa, n.topo.nodes.len, topology.max_nodes);
         errdefer n.origins.deinit();
-        n.local_eps = try a.alloc([]?LocalEp, n.topo.pools.len);
-        n.remotes = try a.alloc([]?remote_drive.RemoteDrive, n.topo.pools.len);
-        for (n.topo.pools, 0..) |pool, p| {
-            n.local_eps[p] = try a.alloc(?LocalEp, pool.endpoints.len);
-            n.remotes[p] = try a.alloc(?remote_drive.RemoteDrive, pool.endpoints.len);
-            for (pool.endpoints, 0..) |ep, i| {
-                n.local_eps[p][i] = null;
-                n.remotes[p][i] = null;
-                if (n.topo.isLocal(ep)) {
-                    n.local_eps[p][i] = .{ .path = ep.path };
-                } else {
-                    n.remotes[p][i] = remote_drive.RemoteDrive.init(gpa, &n.rpc, ep.node, @intCast(p), @intCast(i));
-                }
-            }
-        }
+        n.local_eps = (try a.alloc([]?LocalEp, router_mod.max_pools))[0..n.topo.pools.len];
+        n.remotes = (try a.alloc([]?remote_drive.RemoteDrive, router_mod.max_pools))[0..n.topo.pools.len];
+        for (0..n.topo.pools.len) |p| try n.initEndpoints(p);
         n.locks = .{ .gpa = gpa, .rpc = &n.rpc, .table = &n.table };
         n.rpc.on_change = .{ .ctx = n, .func = onPeerChange };
         std.log.info("cluster: node {d} of {d} ({s}), {d} pool(s)", .{ n.topo.local + 1, n.topo.nodes.len, n.topo.nodes[n.topo.local].name, n.topo.pools.len });
         return n;
+    }
+
+    fn capacity(a: std.mem.Allocator, comptime T: type, items: []const T, cap: usize) Error![]T {
+        const buf = try a.alloc(T, @max(cap, items.len));
+        @memcpy(buf[0..items.len], items);
+        return buf[0..items.len];
+    }
+
+    fn initEndpoints(n: *Node, p: usize) Error!void {
+        const a = n.arena_state.allocator();
+        const pool = n.topo.pools.ptr[p];
+        const le = try a.alloc(?LocalEp, pool.endpoints.len);
+        const re = try a.alloc(?remote_drive.RemoteDrive, pool.endpoints.len);
+        for (pool.endpoints, 0..) |ep, i| {
+            le[i] = null;
+            re[i] = null;
+            if (n.topo.isLocal(ep)) {
+                le[i] = .{ .path = ep.path };
+            } else {
+                re[i] = remote_drive.RemoteDrive.init(n.gpa, &n.rpc, ep.node, @intCast(p), @intCast(i));
+            }
+        }
+        n.local_eps.ptr[p] = le;
+        n.remotes.ptr[p] = re;
     }
 
     fn loadCa(n: *Node) Error!void {
@@ -370,12 +416,12 @@ pub const Node = struct {
     fn checkPeers(n: *Node) Error!void {
         for (n.topo.nodes, 0..) |_, i| {
             const node: u16 = @intCast(i);
-            if (node == n.topo.local) continue;
+            if (node == n.topo.local or !n.isMember(i)) continue;
             const h = n.hello(node) catch |e| {
                 if (e == error.CredentialMismatch) return error.CredentialMismatch;
                 continue;
             };
-            if (!std.mem.eql(u8, &h.topo, &n.topo_fp)) {
+            if (!n.cfg.dynamic and !std.mem.eql(u8, &h.topo, &n.topo_fp)) {
                 std.log.err("cluster: node {s} runs with a different endpoint list", .{n.topo.nodes[i].name});
                 return error.LayoutMismatch;
             }
@@ -386,7 +432,7 @@ pub const Node = struct {
         }
     }
 
-    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, formatting: bool = false, boot: u64 = 0, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null };
+    const Hello = struct { topo: [16]u8, root: [16]u8, ready: bool, drives: bool, formatting: bool = false, boot: u64 = 0, jepoch: u64 = 0, jseq: u64 = 0, jopen: ?u64 = null, epoch: u64 = 0 };
 
     /// Asks a peer who it is; once our drives are open the call also tells the peer
     /// to count us online at once rather than at its next heartbeat.
@@ -438,6 +484,8 @@ pub const Node = struct {
                 h.jepoch = std.fmt.parseInt(u64, v, 10) catch 0;
             } else if (std.mem.eql(u8, k, "jseq")) {
                 h.jseq = std.fmt.parseInt(u64, v, 10) catch 0;
+            } else if (std.mem.eql(u8, k, "epoch")) {
+                h.epoch = std.fmt.parseInt(u64, v, 10) catch 0;
             } else if (std.mem.eql(u8, k, "jopen")) h.jopen = std.fmt.parseInt(u64, v, 10) catch null;
         }
         if (have != 3) return error.Unreachable;
@@ -731,79 +779,261 @@ pub const Node = struct {
     /// Verifies formats against the computed layout, then opens every set.
     fn openSets(n: *Node, seen: [][]Seen) Error!void {
         const a = n.arena_state.allocator();
-        n.pools = try a.alloc(PoolState, n.topo.pools.len);
         // Empty until opened, so a failed bootstrap stops and frees cleanly.
+        n.pools = (try a.alloc(PoolState, router_mod.max_pools))[0..n.topo.pools.len];
         for (n.pools) |*p| p.* = .{ .set_size = 0, .sets = &.{}, .backends = &.{} };
-        n.router_pools = try a.alloc(router_mod.Pool, n.topo.pools.len);
-        for (n.topo.pools, 0..) |pool, p| {
-            var size: usize = 0;
-            for (seen[p]) |e| if (e == .fmt) {
-                size = e.fmt.set_size;
-                break;
-            };
-            const fp = topology.poolFingerprint(pool, size, n.profile);
-            const sets = try n.assignment(p, size);
-            defer layout.freeSets(n.gpa, sets);
-            // Every reachable drive must sit exactly where the layout puts it.
-            for (sets, 0..) |members, si| for (members, 0..) |ep, idx| {
-                const f = switch (seen[p][ep]) {
-                    .fmt => |f| f,
-                    else => continue,
-                };
-                const ok = std.mem.eql(u8, &f.layout, &fp) and f.pool == n.orig[p] and f.set == si and f.index == idx and f.set_size == size and f.profile.eql(n.profile);
-                if (!ok) {
-                    std.log.err("cluster: drive {s} was formatted for a different layout (endpoint list, order, or protection changed)", .{pool.endpoints[ep].url});
-                    return error.LayoutMismatch;
-                }
-            };
-            const ps = &n.pools[p];
-            const set_states = try a.alloc(SetState, sets.len);
-            ps.* = .{ .set_size = size, .sets = set_states[0..0], .backends = try a.alloc(backend.StorageBackend, sets.len) };
-            for (sets, 0..) |members, si| {
-                const st = &set_states[si];
-                const ms = try a.alloc(placement.drives.Member, members.len);
-                st.endpoints = try a.dupe(u32, members);
-                for (members, ms) |ep, *m| {
-                    const e = pool.endpoints[ep];
-                    m.* = .{ .path = if (n.local_eps[p][ep]) |le| le.path else e.url, .node = e.node, .remote = if (n.remotes[p][ep]) |*rd| rd.ext() else null };
-                }
-                const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
-                st.drives = placement.DriveSet.openCluster(n.gpa, ms, tmpl, true) catch |e| {
-                    std.log.err("cluster: pool {d} set {d}: {t}", .{ p + 1, si + 1, e });
-                    return error.LayoutMismatch;
-                };
-                st.stores = .{};
-                st.strategy = protection.Strategy.init(n.gpa, &st.drives, &st.stores) catch {
-                    st.drives.deinit();
-                    return error.BadLayout;
-                };
-                st.healer = heal.Healer.init(n.gpa, &st.drives, st.strategy, .{});
-                st.healer.leader = .{ .ctx = n, .func = healLeader };
-                ps.backends[si] = st.strategy.backend();
-                ps.sets = set_states[0 .. si + 1];
-                for (members, 0..) |ep, idx| if (n.local_eps[p][ep]) |*le| {
-                    le.set = &st.drives;
-                    le.slot = @intCast(idx);
-                };
-            }
-            var seed: [8]u8 = undefined;
-            @memcpy(&seed, n.deployment[0..8]);
-            n.router_pools[p] = .{ .sets = ps.backends, .seed = std.mem.readInt(u64, &seed, .little) +% n.orig[p] };
-            if (n.retired & (@as(u64, 1) << @intCast(n.orig[p])) != 0) n.router_pools[p].mode = .init(.retired);
-        }
+        n.router_pools = (try a.alloc(router_mod.Pool, router_mod.max_pools))[0..n.topo.pools.len];
+        for (0..n.topo.pools.len) |p| try n.openPool(p, seen[p]);
         n.router = .{ .gpa = n.gpa, .pools = n.router_pools, .guard = .{ .ctx = n, .lock = guardLock, .unlock = unlockFn } };
+    }
+
+    /// Opens pool `p`'s sets and fills its router entry (not yet published).
+    fn openPool(n: *Node, p: usize, seen: []const Seen) Error!void {
+        const a = n.arena_state.allocator();
+        const pool = n.topo.pools[p];
+        var size: usize = 0;
+        for (seen) |e| if (e == .fmt) {
+            size = e.fmt.set_size;
+            break;
+        };
+        const fp = topology.poolFingerprint(pool, size, n.profile);
+        const sets = try n.assignment(p, size);
+        defer layout.freeSets(n.gpa, sets);
+        // Every reachable drive must sit exactly where the layout puts it.
+        for (sets, 0..) |members, si| for (members, 0..) |ep, idx| {
+            const f = switch (seen[ep]) {
+                .fmt => |f| f,
+                else => continue,
+            };
+            const ok = std.mem.eql(u8, &f.layout, &fp) and f.pool == n.orig[p] and f.set == si and f.index == idx and f.set_size == size and f.profile.eql(n.profile);
+            if (!ok) {
+                std.log.err("cluster: drive {s} was formatted for a different layout (endpoint list, order, or protection changed)", .{pool.endpoints[ep].url});
+                return error.LayoutMismatch;
+            }
+        };
+        const ps = &n.pools.ptr[p];
+        const set_states = try a.alloc(SetState, sets.len);
+        ps.* = .{ .set_size = size, .sets = set_states[0..0], .backends = try a.alloc(backend.StorageBackend, sets.len) };
+        for (sets, 0..) |members, si| {
+            const st = &set_states[si];
+            const ms = try a.alloc(placement.drives.Member, members.len);
+            st.endpoints = try a.dupe(u32, members);
+            for (members, ms) |ep, *m| {
+                const e = pool.endpoints[ep];
+                m.* = .{ .path = if (n.local_eps[p][ep]) |le| le.path else e.url, .node = e.node, .remote = if (n.remotes[p][ep]) |*rd| rd.ext() else null };
+            }
+            const tmpl: FormatV2 = .{ .deployment = n.deployment, .layout = fp, .pool = n.orig[p], .set = @intCast(si), .index = 0, .set_size = @intCast(size), .profile = n.profile, .retired = n.retired, .pools = n.pool_count };
+            st.drives = placement.DriveSet.openCluster(n.gpa, ms, tmpl, true) catch |e| {
+                std.log.err("cluster: pool {d} set {d}: {t}", .{ p + 1, si + 1, e });
+                return error.LayoutMismatch;
+            };
+            st.stores = .{};
+            st.strategy = protection.Strategy.init(n.gpa, &st.drives, &st.stores) catch {
+                st.drives.deinit();
+                return error.BadLayout;
+            };
+            st.healer = heal.Healer.init(n.gpa, &st.drives, st.strategy, .{});
+            st.healer.leader = .{ .ctx = n, .func = healLeader };
+            ps.backends[si] = st.strategy.backend();
+            ps.sets = set_states[0 .. si + 1];
+            for (members, 0..) |ep, idx| if (n.local_eps[p][ep]) |*le| {
+                le.set = &st.drives;
+                le.slot = @intCast(idx);
+            };
+        }
+        var seed: [8]u8 = undefined;
+        @memcpy(&seed, n.deployment[0..8]);
+        n.router_pools.ptr[p] = .{ .sets = ps.backends, .seed = std.mem.readInt(u64, &seed, .little) +% n.orig[p] };
+        if (n.retired & (@as(u64, 1) << @intCast(n.orig[p])) != 0) n.router_pools.ptr[p].mode = .init(.retired);
+    }
+
+    // ---- runtime membership (extension point) ----
+
+    /// Applies a membership update on a running node: appends new nodes and pools,
+    /// formats and opens new pools once their drives answer, and sets lock voters
+    /// (nodes with a drive in a pool that is not retired). Idempotent: call it again
+    /// after `error.NotReady`, or after pool modes change. Pool modes themselves stay
+    /// with the pools manager (decommission, rebalance).
+    pub fn applyMembership(n: *Node, m: Membership) Error!void {
+        if (!n.drives_open.load(.acquire)) return error.NotReady;
+        n.member_mutex.lock();
+        defer n.member_mutex.unlock();
+        if (m.pools.len < n.topo.pools.len or m.pools.len > router_mod.max_pools) return error.LayoutMismatch;
+        if (m.pools.len > n.topo.pools.len) try n.extend(m.pools);
+        // New pools open in order: the router only shows a prefix of the list.
+        var pending = false;
+        while (n.router.pools.len < n.topo.pools.len) {
+            n.tryOpenPool(n.router.pools.len) catch |e| switch (e) {
+                error.NotReady => {
+                    pending = true;
+                    break;
+                },
+                else => return e,
+            };
+        }
+        const old = if (n.voters == 0) allNodes(n.topo.nodes.len) else n.voters;
+        const cur = n.memberMask();
+        if (cur != old) n.prev_voters = old;
+        n.voters = cur;
+        if (!m.settling) n.prev_voters = 0;
+        n.markMembers();
+        n.locks.setVoters(n.voters, n.prev_voters);
+        n.epoch.store(m.epoch, .release);
+        if (pending) return error.NotReady;
+    }
+
+    /// Appends the nodes and pools `specs` adds to the live arrays.
+    fn extend(n: *Node, specs_in: []const []const []const u8) Error!void {
+        const a = n.arena_state.allocator();
+        const specs = try a.alloc([]const []const u8, specs_in.len);
+        for (specs_in, specs) |ps, *o| {
+            const eps = try a.alloc([]const u8, ps.len);
+            for (ps, eps) |e, *d| d.* = try a.dupe(u8, e);
+            o.* = eps;
+        }
+        const t = topology.parse(a, specs, n.topo.nodes[n.topo.local].name, n.cfg.listen_host, n.cfg.listen_port) catch |e| {
+            std.log.err("cluster: membership endpoints: {t}", .{e});
+            return error.BadTopology;
+        };
+        if (t.tls != n.topo.tls or t.local != n.topo.local) return error.LayoutMismatch;
+        for (n.topo.nodes, 0..) |old, i| if (!std.mem.eql(u8, old.name, t.nodes[i].name)) return error.LayoutMismatch;
+        for (n.topo.pools, 0..) |old, p| {
+            if (old.endpoints.len != t.pools[p].endpoints.len) return error.LayoutMismatch;
+            for (old.endpoints, t.pools[p].endpoints) |x, y| if (!std.mem.eql(u8, x.url, y.url)) return error.LayoutMismatch;
+        }
+        const nn = t.nodes.len;
+        @memcpy(n.topo.nodes.ptr[n.topo.nodes.len..nn], t.nodes[n.topo.nodes.len..]);
+        n.origins.grow(nn);
+        n.rpc.grow(t.nodes) catch return error.OutOfMemory;
+        @atomicStore(usize, &n.returned.len, nn, .release);
+        @atomicStore(usize, &n.topo.nodes.len, nn, .release);
+        const np = t.pools.len;
+        for (n.topo.pools.len..np) |p| {
+            n.topo.pools.ptr[p] = t.pools[p];
+            n.orig.ptr[p] = n.pool_count;
+            n.pool_count += 1;
+            try n.initEndpoints(p);
+            n.pools.ptr[p] = .{ .set_size = 0, .sets = &.{}, .backends = &.{} };
+        }
+        n.cfg.pools = specs;
+        @atomicStore(usize, &n.orig.len, np, .release);
+        @atomicStore(usize, &n.local_eps.len, np, .release);
+        @atomicStore(usize, &n.remotes.len, np, .release);
+        @atomicStore(usize, &n.pools.len, np, .release);
+        @atomicStore(usize, &n.topo.pools.len, np, .release);
+        n.topo_fp = topoFingerprint(&n.topo);
+        std.log.info("cluster: membership now {d} node(s), {d} pool(s)", .{ nn, np });
+    }
+
+    /// Formats a new pool (its first endpoint's owner does) or opens and publishes it.
+    fn tryOpenPool(n: *Node, p: usize) Error!void {
+        const seen = try n.gpa.alloc(Seen, n.topo.pools[p].endpoints.len);
+        defer n.gpa.free(seen);
+        for (seen, 0..) |*e, i| e.* = n.readFormat(p, i);
+        var formatted = false;
+        var partial = false;
+        var reachable = true;
+        for (seen) |e| switch (e) {
+            .fmt => |f| {
+                if (!std.mem.eql(u8, &f.deployment, &n.deployment)) return error.LayoutMismatch;
+                // The formatter numbered the pool; follow it.
+                n.orig[p] = f.pool;
+                n.pool_count = @max(n.pool_count, f.pool + 1);
+                formatted = true;
+            },
+            .none => partial = true,
+            .unknown => reachable = false,
+            .bad => return error.LayoutMismatch,
+        };
+        if (!formatted or (partial and n.formatter(p))) {
+            if (reachable and n.formatter(p)) try n.formatPool(p, seen);
+            return error.NotReady;
+        }
+        // The formatter may be writing formats right now.
+        const owner = n.topo.pools[p].endpoints[0].node;
+        if (partial and owner != n.topo.local) {
+            const h = n.hello(owner) catch return error.NotReady;
+            if (h.formatting) return error.NotReady;
+        }
+        try n.openPool(p, seen);
+        for (n.pools[p].sets) |*st| for (st.endpoints, 0..) |ep, slot| if (n.local_eps[p][ep]) |*le| {
+            measure(le);
+            st.drives.drives[slot].kind.local.usage = &le.used;
+        };
+        @atomicStore(usize, &n.router_pools.len, p + 1, .release);
+        n.router.publish(p + 1);
+        n.refreshSpace();
+        if (n.open.load(.acquire)) for (n.pools[p].sets) |*st| {
+            st.healer.start(time_ns(n.cfg.scan_interval_s)) catch std.log.err("cluster: healer not started", .{});
+        };
+        std.log.info("cluster: pool {d} open: {d} set(s)", .{ p + 1, n.pools[p].sets.len });
+    }
+
+    /// Nodes with a drive in a pool that is not retired.
+    fn memberMask(n: *const Node) u256 {
+        var m: u256 = 0;
+        for (n.topo.pools, 0..) |pool, p| {
+            if (p < n.router.pools.len and n.router.mode(p) == .retired) continue;
+            for (pool.endpoints) |e| m |= @as(u256, 1) << @intCast(e.node);
+        }
+        return m;
+    }
+
+    /// Voters and, while a change settles, the previous ones get heartbeats; others
+    /// are taken offline and left alone.
+    fn markMembers(n: *Node) void {
+        const m = n.voters | n.prev_voters;
+        for (n.rpc.peers, 0..) |*peer, i| {
+            const member = m & (@as(u256, 1) << @intCast(i)) != 0;
+            peer.member.store(member, .release);
+            if (!member and i != n.topo.local) n.rpc.setOnline(@intCast(i), false);
+        }
+    }
+
+    pub fn isMember(n: *const Node, node: usize) bool {
+        return node < n.rpc.peers.len and n.rpc.peers[node].member.load(.acquire);
+    }
+
+    /// True once this node and every reachable-member peer report `epoch` or later.
+    pub fn allApplied(n: *Node, epoch: u64) bool {
+        if (n.epoch.load(.acquire) < epoch) return false;
+        for (0..n.topo.nodes.len) |i| {
+            if (i == n.topo.local or !n.isMember(i)) continue;
+            if (!n.rpc.isOnline(@intCast(i)) or n.peer_epochs[i].load(.acquire) < epoch) return false;
+        }
+        return true;
+    }
+
+    /// Installs the handler for "ext" channel `channel` (0 is `ext`).
+    pub fn setExt(n: *Node, channel: u8, x: ?*const Ext) void {
+        std.debug.assert(channel < ext_channels);
+        if (channel == 0) return n.ext.store(x, .release);
+        n.ext_more[channel - 1].store(x, .release);
+    }
+
+    pub fn extHandler(n: *Node, channel: u8) ?*const Ext {
+        if (channel == 0) return n.ext.load(.acquire);
+        if (channel >= ext_channels) return null;
+        return n.ext_more[channel - 1].load(.acquire);
+    }
+
+    /// `extCall` on channel `channel` with a timeout.
+    pub fn extCallOn(n: *Node, channel: u8, peer: usize, arena: std.mem.Allocator, body: []const u8, limit: usize, timeout_ms: u32) ?[]u8 {
+        if (peer >= n.topo.nodes.len or peer == n.topo.local) return null;
+        const node: u16 = @intCast(peer);
+        if (!n.rpc.isOnline(node)) return null;
+        var qb: [8]u8 = undefined;
+        const q = if (channel == 0) "" else std.fmt.bufPrint(&qb, "c={d}", .{channel}) catch unreachable;
+        var c = n.rpc.call(node, "ext", q, .{ .bytes = body }, .{ .timeout_ms = timeout_ms }) catch return null;
+        defer c.deinit();
+        if (!c.ok()) return null;
+        return c.readAll(arena, limit) catch null;
     }
 
     /// Sends `body` to peer `peer`'s "ext" handler; null when the peer is this node,
     /// offline, or fails.
     pub fn extCall(n: *Node, peer: usize, arena: std.mem.Allocator, body: []const u8, limit: usize) ?[]u8 {
-        if (peer >= n.topo.nodes.len or peer == n.topo.local) return null;
-        const node: u16 = @intCast(peer);
-        if (!n.rpc.isOnline(node)) return null;
-        var c = n.rpc.call(node, "ext", "", .{ .bytes = body }, .{ .timeout_ms = 5000 }) catch return null;
-        defer c.deinit();
-        if (!c.ok()) return null;
-        return c.readAll(arena, limit) catch null;
+        return n.extCallOn(0, peer, arena, body, limit, 5000);
     }
 
     pub fn nodeCount(n: *const Node) usize {
@@ -1050,7 +1280,7 @@ pub const Node = struct {
     /// The lowest-numbered reachable node runs cluster-wide chores (lifecycle, sweeps).
     pub fn isLeader(n: *Node) bool {
         for (0..n.topo.nodes.len) |i| {
-            if (n.rpc.isOnline(@intCast(i))) return i == n.topo.local;
+            if (n.isMember(i) and n.rpc.isOnline(@intCast(i))) return i == n.topo.local;
         }
         return false;
     }
@@ -1327,7 +1557,7 @@ pub const Node = struct {
         const Each = struct {
             fn f(nn: *Node, i: usize) void {
                 const node: u16 = @intCast(i);
-                if (node == nn.topo.local) return;
+                if (node == nn.topo.local or !nn.isMember(i)) return;
                 // A peer still bootstrapping cannot serve drive I/O yet.
                 const h = nn.hello(node) catch |e| {
                     // Every connection busy means the peer is up and working.
@@ -1336,6 +1566,7 @@ pub const Node = struct {
                     return;
                 };
                 nn.rpc.heardBoot(node, h.boot);
+                nn.peer_epochs[i].store(h.epoch, .release);
                 nn.rpc.setOnline(node, h.drives);
                 if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, std.time.milliTimestamp())) nn.sync_ev.set();
             }
@@ -1539,6 +1770,11 @@ fn measure(le: *LocalEp) void {
     le.used.store(used, .monotonic);
 }
 
+fn allNodes(count: usize) u256 {
+    if (count >= topology.max_nodes) return std.math.maxInt(u256);
+    return (@as(u256, 1) << @intCast(count)) - 1;
+}
+
 fn topoFingerprint(t: *const topology.Topology) [16]u8 {
     var h = @import("../core/hwhash.zig").Sha256.init(.{});
     h.update("zkfsm-topology-v1\n");
@@ -1606,3 +1842,55 @@ pub const IamPersist = struct {
         _ = self.node.broadcast(&.{.iam});
     }
 };
+
+test "runtime membership: a pool appended to a running node opens; ext channels route" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    const p1 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/a{{1...2}}", .{root})};
+    const p2 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/b{{1...2}}", .{root})};
+    for ([_][]const u8{ "a1", "a2", "b1", "b2" }) |d| try tmp.dir.makeDir(d);
+    const one = [_][]const []const u8{&p1};
+    const two = [_][]const []const u8{ &p1, &p2 };
+    const n = try Node.create(gpa, .{ .pools = &one, .node_address = "127.0.0.1:1", .listen_host = "127.0.0.1", .listen_port = 1, .secret = @splat(7) });
+    defer n.destroy();
+    try n.bootstrap();
+    try std.testing.expectEqual(@as(usize, 1), n.router.pools.len);
+    // Not a prefix of the current layout.
+    try std.testing.expectError(error.LayoutMismatch, n.applyMembership(.{ .epoch = 1, .pools = &.{} }));
+    // First call formats the new pool, the next opens it.
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        n.applyMembership(.{ .epoch = 2, .pools = &two }) catch |e| {
+            try std.testing.expectEqual(error.NotReady, e);
+            try std.testing.expect(tries < 3);
+            continue;
+        };
+        break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n.router.pools.len);
+    try std.testing.expectEqual(@as(usize, 2), n.cfg.pools.len);
+    try std.testing.expectEqual(@as(u32, 1), n.poolIndex(1));
+    try std.testing.expect(n.allApplied(2) and !n.allApplied(3));
+    try std.testing.expect(n.isMember(0));
+    // Idempotent.
+    try n.applyMembership(.{ .epoch = 2, .pools = &two });
+
+    const Double = struct {
+        fn handle(_: *anyopaque, _: std.mem.Allocator, _: []const u8) error{OutOfMemory}![]const u8 {
+            return "x";
+        }
+    };
+    var dummy: u8 = 0;
+    const x: Ext = .{ .ctx = &dummy, .handle = Double.handle };
+    try std.testing.expect(n.extHandler(2) == null);
+    n.setExt(2, &x);
+    try std.testing.expectEqual(&x, n.extHandler(2).?);
+    try std.testing.expect(n.extHandler(0) == null and n.extHandler(ext_channels) == null);
+    // Calls to this node itself are refused.
+    try std.testing.expect(n.extCallOn(2, 0, a, "", 16, 100) == null);
+}

@@ -162,7 +162,7 @@ check "node 1 S3 workers saturated" 000 "$(curl -s -m 3 -o /dev/null -w '%{http_
 off0=$(grep -c "127.0.0.1:${PORT[1]} is offline" "$WORK/n2.log" || true)
 touch "$WORK/sat.mark"
 for k in 1 2 3 4 5 6; do
-  head -c $((k * 1000 + 3)) /dev/urandom >"$WORK/obj/sat$k"
+  head -c $((INLINE + k * 1000 + 3)) /dev/urandom >"$WORK/obj/sat$k" # blobs, not inline
   [[ "$(cput 2 "sat$k" "$WORK/obj/sat$k")" == 200 ]] || echo "put sat$k failed"
 done
 # Shard files written since the mark: all six of each object, some of them on node 1
@@ -369,7 +369,7 @@ for i in 1 2 3 4; do start "$i"; done
 for i in 1 2 3 4; do wait_ready "$i" 120; done
 before=$(find "$WORK"/n*/d* -path '*/data/*' -type f | wc -l)
 for n in 1 2 3 4; do
-  head -c $((n * 9000 + 5)) /dev/urandom >"$WORK/obj/pool$n"
+  head -c $((INLINE + n * 9000 + 5)) /dev/urandom >"$WORK/obj/pool$n"
   check "write after expansion via node $n" 200 "$(cput "$n" "pool$n" "$WORK/obj/pool$n")"
 done
 # A peer still counted as starting misses its shards; the healer adds them within seconds.
