@@ -220,13 +220,14 @@ fn formatGet(n: *Node, req: *Request, q: Query) RawError!void {
 /// Bootstrap: the formatting node writes identities onto every empty drive.
 fn formatPut(n: *Node, req: *Request, q: Query, body: []const u8) RawError!void {
     const d = n.endpoint(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
-    _ = placement.layout.FormatV2.parse(body) catch return fail(req, .bad_request, "format");
+    const want = placement.layout.FormatV2.parse(body) catch return fail(req, .bad_request, "format");
     var lb = LocalBackend.open(d.path) catch return fail(req, .internal_server_error, "open");
     defer lb.close();
     var buf: [placement.layout.format_max]u8 = undefined;
     if (lb.readFormat(&buf)) |cur| {
         if (std.mem.eql(u8, cur, body)) return req.respond("", .{});
-        return fail(req, .conflict, "formatted");
+        const have = placement.layout.FormatV2.parse(cur) catch return fail(req, .conflict, "formatted");
+        if (!want.isUpdateOf(have)) return fail(req, .conflict, "formatted");
     } else |e| if (e != error.NotFound) return fail(req, .internal_server_error, "io");
     lb.writeFormat(body) catch return fail(req, .internal_server_error, "io");
     try req.respond("", .{});

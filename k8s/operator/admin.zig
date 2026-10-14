@@ -63,6 +63,33 @@ pub const Client = struct {
         return .{ .status = @intFromEnum(res.status), .body = out.written() };
     }
 
+    /// One server's own view of the membership (admin info), dialed at `ip` so a
+    /// stale DNS answer cannot pick another pod; TLS still verifies `base`'s host.
+    pub fn view(c: *Client, a: A, base: []const u8, ip: []const u8) !?Membership {
+        const uri = try std.Uri.parse(base);
+        const name = uri.host.?.percent_encoded;
+        const port = uri.port.?;
+        const path = "/minio/admin/v3/info";
+        const signed = try sign(a, c.creds, c.region, .GET, try std.fmt.allocPrint(a, "{s}:{d}", .{ name, port }), path, "", "", std.time.timestamp());
+        const conn = try c.http.connectTcpOptions(.{ .host = ip, .port = port, .protocol = if (std.mem.eql(u8, uri.scheme, "https")) .tls else .plain, .proxied_host = name });
+        var req = try c.http.request(.GET, try std.Uri.parse(try std.fmt.allocPrint(a, "{s}{s}", .{ base, path })), .{
+            .connection = conn,
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "x-amz-date", .value = signed.date },
+                .{ .name = "x-amz-content-sha256", .value = signed.payload_hash },
+                .{ .name = "authorization", .value = signed.authorization },
+            },
+        });
+        defer req.deinit();
+        try req.sendBodiless();
+        var res = try req.receiveHead(&.{});
+        if (res.head.status != .ok) return null;
+        var tb: [256]u8 = undefined;
+        const body = try res.reader(&tb).allocRemaining(a, .limited(4 << 20));
+        return parseMembership(a, body);
+    }
+
     pub fn ready(c: *Client, a: A, base: []const u8) bool {
         const url = std.fmt.allocPrint(a, "{s}/health/ready", .{base}) catch return false;
         const res = c.http.fetch(.{ .location = .{ .url = url }, .method = .GET, .keep_alive = false }) catch return false;
@@ -164,6 +191,23 @@ pub fn sign(a: A, creds: Creds, region: []const u8, method: std.http.Method, hos
     };
 }
 
+/// Servers listed by admin info, and how many of them the answering server reached.
+pub const Membership = struct { servers: u32, online: u32 };
+
+pub fn parseMembership(a: A, body: []const u8) ?Membership {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return null;
+    if (v != .object) return null;
+    const list = v.object.get("servers") orelse return null;
+    if (list != .array) return null;
+    var m: Membership = .{ .servers = @intCast(list.array.items.len), .online = 0 };
+    for (list.array.items) |s| {
+        if (s != .object) continue;
+        const st = s.object.get("state") orelse continue;
+        if (st == .string and std.mem.eql(u8, st.string, "online")) m.online += 1;
+    }
+    return m;
+}
+
 /// Parsed decommission progress from /pools/status.
 pub const DecomProgress = struct { complete: bool, failed: bool, canceled: bool };
 
@@ -200,4 +244,14 @@ test "query encoding and decom parsing" {
     const p = parseDecom(a, "{\"id\":1,\"decommissionInfo\":{\"complete\":true}}").?;
     try std.testing.expect(p.complete and !p.failed);
     try std.testing.expect(parseDecom(a, "nope") == null);
+}
+
+test "membership parsing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const m = parseMembership(a, "{\"servers\":[{\"state\":\"online\"},{\"state\":\"offline\"},{\"state\":\"online\"}]}").?;
+    try std.testing.expectEqual(Membership{ .servers = 3, .online = 2 }, m);
+    try std.testing.expect(parseMembership(a, "{\"mode\":\"online\"}") == null);
+    try std.testing.expect(parseMembership(a, "<html>") == null);
 }
