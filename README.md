@@ -187,6 +187,33 @@ zkfsm --data http://127.0.0.1:{9001...9004}/srv/d{1...4} --listen 127.0.0.1:9001
   shards of interrupted writes after 15 minutes. A returning node triggers a
   pass right away.
 
+#### Cluster extension points
+
+Builds that embed zkfsm (`lib.zig`, `app.run(opts)`) can manage cluster
+membership at runtime through `app.Options.cluster` (`ClusterHooks`). With no
+hooks installed nothing changes: the endpoint list is fixed and the RPC wire
+format is the same.
+
+- `layout(ctx, arena, argv_pools) ?StartLayout`: startup pools replacing the
+  endpoint arguments (for example a stored or fetched membership). Returning
+  one marks the node dynamic: peers' endpoint-list fingerprints are not
+  compared, since nodes may briefly run with different lists.
+- `attach(ctx, node)`: the node is bootstrapped and about to serve.
+  `detach(ctx, node)`: the listener stopped, before the node stops.
+- `cluster.Node.applyMembership(.{ .epoch, .pools, .settling })`: the full pool
+  list with the current one as prefix. New nodes and pools are appended live;
+  a new pool is formatted by the owner of its first endpoint and opened by
+  every node once its drives answer (`error.NotReady` until then: call again).
+  Lock voters become the nodes with a drive in a pool that is not retired;
+  with `settling`, a lock also needs a majority of the previous voters. Pool
+  modes stay with the pools manager (decommission, rebalance); call again
+  after they change so departed nodes stop voting and getting heartbeats.
+- The membership epoch is reported to peers in `hello` once nonzero;
+  `node.allApplied(epoch)` is true when every reachable member reports it.
+- Peer calls: `node.setExt(channel, handler)` and
+  `node.extCallOn(channel, peer, ...)` on channels 1..3 (0 is the built-in
+  handler used by `extCall`).
+
 ### Users, policies, and temporary credentials
 
 `mc admin` manages users, groups, canned policies, and service accounts

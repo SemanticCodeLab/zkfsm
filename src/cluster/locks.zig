@@ -105,6 +105,8 @@ pub const Manager = struct {
     held: std.AutoHashMapUnmanaged(u64, Held) = .empty,
     stop_ev: std.Thread.ResetEvent = .{},
     thread: ?std.Thread = null,
+    /// Voter masks (current, previous); zero current means every peer votes.
+    voters: [2]u256 = .{ 0, 0 },
 
     const Held = struct { resource: []u8, granted: u256 };
 
@@ -124,15 +126,33 @@ pub const Manager = struct {
         return m.rpc.peers.len;
     }
 
-    fn quorum(m: *const Manager) usize {
-        return m.nodes() / 2 + 1;
+    /// Restricts lock voting to `cur`; while a membership change settles, a lock also
+    /// needs a majority of `prev` (zero: none). `cur` zero restores every-peer voting.
+    pub fn setVoters(m: *Manager, cur: u256, prev: u256) void {
+        m.mutex.lock();
+        defer m.mutex.unlock();
+        m.voters = .{ cur, prev };
+    }
+
+    fn voterSets(m: *Manager) [2]u256 {
+        m.mutex.lock();
+        defer m.mutex.unlock();
+        var v = m.voters;
+        if (v[0] == 0) v[0] = allNodes(m.nodes());
+        return v;
+    }
+
+    fn enough(m: *Manager, mask: u256) bool {
+        return jointMajority(mask, m.voterSets());
     }
 
     /// True while enough nodes are reachable to ever win a lock.
     pub fn haveQuorum(m: *Manager) bool {
-        var up: usize = 0;
-        for (0..m.nodes()) |i| up += @intFromBool(m.rpc.isOnline(@intCast(i)));
-        return up >= m.quorum();
+        var up: u256 = 0;
+        for (0..m.nodes()) |i| if (m.rpc.isOnline(@intCast(i))) {
+            up |= @as(u256, 1) << @intCast(i);
+        };
+        return m.enough(up);
     }
 
     /// Returns the lock uid; the caller passes it to `unlock`.
@@ -144,7 +164,7 @@ pub const Manager = struct {
         while (true) {
             if (!m.haveQuorum()) return error.NoQuorum;
             const granted = m.ask(resource, uid, "lock");
-            if (@popCount(granted) >= m.quorum()) {
+            if (m.enough(granted)) {
                 const copy = try m.gpa.dupe(u8, resource);
                 m.mutex.lock();
                 defer m.mutex.unlock();
@@ -184,9 +204,11 @@ pub const Manager = struct {
             op: []const u8,
             body: []const u8,
             now: i64,
+            want: u256,
             yes: [max_nodes]bool = @splat(false),
             fn f(c: *@This(), i: usize) void {
                 const node: u16 = @intCast(i);
+                if (c.want & (@as(u256, 1) << @intCast(i)) == 0) return;
                 c.yes[i] = if (node == c.m.rpc.self_node) blk: {
                     if (std.mem.eql(u8, c.op, "lock")) break :blk c.m.table.lock(c.resource, c.uid, c.now) catch false;
                     break :blk c.m.table.refresh(c.resource, c.uid, c.now);
@@ -197,7 +219,8 @@ pub const Manager = struct {
                 };
             }
         };
-        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp() };
+        const v = m.voterSets();
+        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp(), .want = v[0] | v[1] };
         fanout.run(m.nodes(), true, &each, Each.f);
         var granted: u256 = 0;
         for (0..m.nodes()) |i| if (each.yes[i]) {
@@ -257,7 +280,7 @@ pub const Manager = struct {
             }
             for (todo.items) |t| {
                 const ok = m.ask(t.resource, t.uid, "refresh");
-                if (@popCount(ok) >= m.quorum()) continue;
+                if (m.enough(ok)) continue;
                 // Released while the refresh was on its way: nothing was lost.
                 m.mutex.lock();
                 const still = m.held.contains(t.uid);
@@ -267,6 +290,31 @@ pub const Manager = struct {
         }
     }
 };
+
+fn allNodes(count: usize) u256 {
+    if (count >= max_nodes) return std.math.maxInt(u256);
+    return (@as(u256, 1) << @intCast(count)) - 1;
+}
+
+/// True when `mask` holds a majority of every non-empty voter set.
+pub fn jointMajority(mask: u256, sets: [2]u256) bool {
+    for (sets) |set| {
+        if (set == 0) continue;
+        if (@popCount(mask & set) < @popCount(set) / 2 + 1) return false;
+    }
+    return true;
+}
+
+test "joint voter majorities" {
+    const all3 = allNodes(3);
+    // Default: every peer votes, a plain majority.
+    try std.testing.expect(jointMajority(0b011, .{ all3, 0 }));
+    try std.testing.expect(!jointMajority(0b001, .{ all3, 0 }));
+    // Settling from {0,1,2} to {1,2,3}: a majority of both sets is needed.
+    try std.testing.expect(!jointMajority(0b1100, .{ 0b1110, 0b0111 }));
+    try std.testing.expect(jointMajority(0b0110, .{ 0b1110, 0b0111 }));
+    try std.testing.expectEqual(std.math.maxInt(u256), allNodes(256));
+}
 
 test "lease table grants, renews, expires, and unlocks by uid" {
     var t: Table = .{ .gpa = std.testing.allocator };
