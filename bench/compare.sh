@@ -8,7 +8,7 @@
 # PUTs run for DUR_PUT_BIG only.
 #
 # env: PRODUCTS ("zkfsm minio rustfs"), TOPOS ("single cluster"), WORKLOADS (see below), REPS (3),
-#      DUR (15s), DUR_PUT_BIG (6s, PUT of 1 MiB and larger), CONC (32),
+#      DUR (15s), DUR_PUT_BIG (6s, PUT of 1 MiB and larger), DUR_MP (10s, multipart), CONC (32),
 #      SERVER_CPUS (0,1,2,3), CLIENT_CPUS (4-7), CLIENT_NCPU (4),
 #      SINGLE_MEM (20g), SINGLE_DRIVE (4096m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
@@ -24,6 +24,7 @@ WORKLOADS="${WORKLOADS:-put-4k put-64k put-1m put-16m get-4k get-64k get-1m get-
 REPS="${REPS:-3}"
 DUR="${DUR:-15s}"
 DUR_PUT_BIG="${DUR_PUT_BIG:-6s}"
+DUR_MP="${DUR_MP:-10s}"
 CONC="${CONC:-32}"
 SERVER_CPUS="${SERVER_CPUS:-0,1,2,3}"
 CLIENT_CPUS="${CLIENT_CPUS:-4-7}"
@@ -177,7 +178,7 @@ run_workload() { # product topo workload rep
     put) extra+=(--disable-multipart)
       [[ $size == 4KiB || $size == 64KiB ]] || extra[3]="$DUR_PUT_BIG" ;;
     # 64 MiB objects through minio-go's default 16 MiB parts: 4 parts each.
-    mp) kind=put extra[3]="$DUR_PUT_BIG" ;;
+    mp) kind=put extra[3]="$DUR_MP" ;;
     get | mixed) case $size in 4KiB | 64KiB) extra+=(--objects 2500) ;; 1MiB) extra+=(--objects 1000) ;; *) extra+=(--objects 100) ;; esac ;;
     list) extra+=(--objects 2500) ;;
   esac
