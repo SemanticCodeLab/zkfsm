@@ -268,7 +268,7 @@ fn resolve(c: *Ctx, info: object.ObjectInfo, want_segs: bool) ConnError!?Resolve
                     return null;
                 }
                 const rg = slo.resolveRange(c.a, s.range, si.blob_size) catch return corrupt(c);
-                out.* = .{ .blob = si.object_id, .offset = rg.offset, .length = rg.length };
+                out.* = blob.Segment.of(si.object_id, si.inline_data, rg.offset, rg.length);
                 sum += rg.length;
             }
             if (sum != total) return corrupt(c);
@@ -350,7 +350,7 @@ fn resolveDlo(c: *Ctx, info: object.ObjectInfo, want_segs: bool) ConnError!?Reso
                     try c.fail(.conflict, "A segment of this large object changed.");
                     return null;
                 }
-                try segs.append(c.a, .{ .blob = si.object_id, .offset = 0, .length = si.blob_size });
+                try segs.append(c.a, blob.Segment.of(si.object_id, si.inline_data, 0, si.blob_size));
             }
         }
         n += r.contents.len;

@@ -354,6 +354,8 @@ pub const Node = struct {
         try w.writeAll("# HELP zkfsm_cluster_rpc_clock_skew_rejected_total Node-to-node requests refused because the sender's clock is outside the allowed window.\n# TYPE zkfsm_cluster_rpc_clock_skew_rejected_total counter\n");
         try w.print("zkfsm_cluster_rpc_clock_skew_rejected_total{{direction=\"received\"}} {d}\n", .{n.clock_rejects.load(.monotonic)});
         try w.print("zkfsm_cluster_rpc_clock_skew_rejected_total{{direction=\"sent\"}} {d}\n", .{n.clock_refused.load(.monotonic)});
+        try w.writeAll("# HELP zkfsm_cluster_rpc_sent_total Node-to-node calls this node started, by op.\n# TYPE zkfsm_cluster_rpc_sent_total counter\n");
+        for (rpc_mod.counted_ops, &n.rpc.sent) |op, *c| try w.print("zkfsm_cluster_rpc_sent_total{{op=\"{s}\"}} {d}\n", .{ op, c.load(.monotonic) });
     }
 
     fn setCount(n: *const Node) usize {

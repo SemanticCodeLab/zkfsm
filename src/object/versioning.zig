@@ -117,7 +117,8 @@ pub const Garbage = struct {
     const Remote = struct { name: [metadata.record.max_tier_name]u8, len: u8, id: [16]u8 };
 
     fn add(g: *Garbage, r: Record) void {
-        if (r.flags.delete_marker) return;
+        // Inline objects have no blob: their bytes go with the record.
+        if (r.flags.delete_marker or (r.inline_data != null and r.tier.len == 0)) return;
         for (&g.ids, &g.remote) |*s, *rm| if (s.* == null) {
             s.* = r.object_id;
             if (r.tier.len > 0) {

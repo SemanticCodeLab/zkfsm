@@ -87,7 +87,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
     std.crypto.random.bytes(&id);
     var buf: [64 * 1024]u8 = undefined;
     const ok = if (rec.tier.len == 0) blk: {
-        const segs = [_]blob.Segment{.{ .blob = rec.object_id, .offset = 0, .length = rec.size }};
+        const segs = [_]blob.Segment{blob.Segment.of(rec.object_id, rec.inline_data, 0, rec.size)};
         var br = blob.BlobReader.init(svc.store, &segs, &buf);
         t.put(id, &br.reader, rec.size) catch |e| {
             if (br.err) |be| if (be == error.NotFound) return .skipped; // replaced meanwhile
@@ -108,6 +108,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
             if (c.from.len > 0 and !std.mem.eql(u8, &r.tier_object, &c.from_id)) return error.PreconditionFailed;
             r.tier = c.tier;
             r.tier_object = c.id;
+            r.inline_data = null;
             if (c.from.len == 0) r.restore_expiry_ns = 0;
         }
     }.f) catch |e| {
@@ -123,7 +124,7 @@ pub fn transition(svc: *Svc, bucket: []const u8, rec: Record, tier_name: []const
         };
     };
     if (rec.tier.len == 0) {
-        svc.store.delete(placement.dataKey(rec.object_id)) catch {};
+        if (rec.inline_data == null) svc.store.delete(placement.dataKey(rec.object_id)) catch {};
     } else {
         dropRemote(svc, reg, rec.tier, rec.tier_object);
     }

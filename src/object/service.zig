@@ -137,6 +137,8 @@ pub const ObjectInfo = struct {
     tier_object: [16]u8 = @splat(0),
     /// Expiry of a restored local copy of tiered data; 0 when none.
     restore_expiry_ns: i128 = 0,
+    /// The object's bytes when the record holds them (no data blob); borrowed.
+    inline_data: ?[]const u8 = null,
 
     /// The bytes must come from the tier (no live restored copy).
     pub fn remote(i: ObjectInfo, now_ns: i128) bool {
@@ -233,6 +235,9 @@ pub const ObjectService = struct {
     replication: ?replica.Sink = null,
     /// Bucket notifications; set right after init, before serving.
     events: ?events_mod.Sink = null,
+    /// Bodies of known length up to this many bytes are stored inside the record
+    /// (one write per drive, no data blob); 0 disables. Set before serving.
+    inline_max: u32 = 0,
 
     const Pending = struct { change: Change, seq: u64 };
 
@@ -534,7 +539,8 @@ pub const ObjectService = struct {
         return out;
     }
 
-    /// Streams `source` into a new data blob, then swaps the record in atomically.
+    /// Streams `source` into a new data blob (or, when small, into the record itself),
+    /// then swaps the record in atomically.
     pub fn put(self: *ObjectService, bucket: []const u8, key: []const u8, source: *std.Io.Reader, in: PutInput) Error!ObjectInfo {
         try validKey(key);
         const bid = try self.bucketId(bucket);
@@ -546,11 +552,22 @@ pub const ObjectService = struct {
 
         var hbuf: [8 * 1024]u8 = undefined;
         var hr = io.HashingReader(Md5).init(source, Md5.init(.{}), &hbuf);
-        _ = self.store.put(data_key, &hr.reader, .{ .size_hint = in.content_length }) catch |e| return mapBackend(e);
-        var keep_blob = false;
+        const small: ?u64 = if (in.content_length) |n| (if (n <= self.inline_max) n else null) else null;
+        var body: ?[]u8 = null;
+        defer if (body) |b| self.gpa.free(b);
+        var keep_blob = small != null;
+        if (small) |n| {
+            const b = try self.gpa.alloc(u8, @intCast(n));
+            body = b;
+            hr.reader.readSliceAll(b) catch |e| return switch (e) {
+                error.EndOfStream => error.IncompleteBody,
+                error.ReadFailed => error.ReadFailed,
+            };
+        } else {
+            _ = self.store.put(data_key, &hr.reader, .{ .size_hint = in.content_length }) catch |e| return mapBackend(e);
+        }
         defer if (!keep_blob) self.store.delete(data_key) catch {};
         if (in.content_length) |n| if (hr.count != n) return error.IncompleteBody;
-
         var digest: [16]u8 = undefined;
         hr.hasher.final(&digest);
         if (in.content_md5) |want| if (!std.mem.eql(u8, &want, &digest)) return error.BadDigest;
@@ -579,11 +596,13 @@ pub const ObjectService = struct {
             .system = in.system,
             .logical_size = logical_size,
             .etag_override = etag_override,
+            .inline_data = body,
         };
         const garbage = try versioning.commitPut(self, bucket, &rec, in);
         keep_blob = true;
         garbage.collect(self);
         var info = infoFrom(rec);
+        info.inline_data = null;
         info.metadata = in.metadata;
         info.internal = in.internal;
         return info;
@@ -607,6 +626,12 @@ pub const ObjectService = struct {
     /// Streams the object's bytes (or `range` of them) into `sink`.
     pub fn read(self: *ObjectService, info: ObjectInfo, range: ?core.Range, sink: *std.Io.Writer) Error!void {
         if (info.remote(core.time.nowNs())) return tier_mod.readRemote(self, info, range, sink);
+        if (info.inline_data) |d| {
+            const r = range orelse core.Range{ .offset = 0, .length = d.len };
+            if (r.offset > d.len or r.length > d.len - r.offset) return error.StorageFailed;
+            const lo: usize = @intCast(r.offset);
+            return sink.writeAll(d[lo..][0..@intCast(r.length)]) catch error.WriteFailed;
+        }
         _ = self.store.get(placement.dataKey(info.object_id), range, sink) catch |e| return switch (e) {
             // A restored copy may have just expired.
             error.NotFound => if (info.tier.len > 0) tier_mod.readRemote(self, info, range, sink) else error.NoSuchKey,
@@ -735,6 +760,7 @@ pub fn infoFrom(r: metadata.ObjectRecord) ObjectInfo {
         .tier = r.tier,
         .tier_object = r.tier_object,
         .restore_expiry_ns = r.restore_expiry_ns,
+        .inline_data = r.inline_data,
     };
 }
 

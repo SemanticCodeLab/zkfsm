@@ -7,8 +7,11 @@ const headers = @import("headers.zig");
 pub const magic = "ZKOR";
 /// v2 adds flags, retention, and tags; v3 the multipart part count; v4 user and
 /// internal metadata, system headers, and size/ETag overrides; v5 multipart part sizes;
-/// v6 the remote tier pointer and restored-copy expiry. Older records still decode.
-pub const format_version: u16 = 6;
+/// v6 the remote tier pointer and restored-copy expiry; v7 inline object bytes.
+/// Older records still decode.
+pub const format_version: u16 = 7;
+/// Upper bound on bytes stored inside a record instead of a data blob.
+pub const max_inline: u32 = 1024 * 1024;
 pub const max_tier_name = 64;
 pub const max_parts = 10000;
 pub const max_key_len = 1024;
@@ -61,6 +64,8 @@ pub const ObjectRecord = struct {
     tier_object: [16]u8 = @splat(0),
     /// A restored local copy of tiered data lives until this time; 0 means none.
     restore_expiry_ns: i128 = 0,
+    /// The object's bytes when stored in the record itself (no data blob); borrowed.
+    inline_data: ?[]const u8 = null,
 
     pub fn reportedSize(r: ObjectRecord) u64 {
         return r.logical_size orelse r.size;
@@ -88,6 +93,7 @@ pub fn encode(r: ObjectRecord, gpa: std.mem.Allocator) Error![]u8 {
     r.system.validate() catch return error.MetadataTooLarge;
     if (r.part_sizes.len % 8 != 0 or r.part_sizes.len / 8 > max_parts) return error.MetadataTooLarge;
     if (r.tier.len > max_tier_name) return error.MetadataTooLarge;
+    if (r.inline_data) |d| if (d.len > max_inline or d.len != r.size) return error.MetadataTooLarge;
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     encodeTo(r, &a.writer) catch return error.OutOfMemory;
@@ -124,7 +130,7 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try headers.putSystem(w, r.system);
     try w.writeByte(@as(u8, @intFromBool(r.logical_size != null)) | @as(u8, @intFromBool(r.etag_override != null)) << 1 |
         @as(u8, @intFromBool(r.part_sizes.len > 0)) << 2 | @as(u8, @intFromBool(r.tier.len > 0)) << 3 |
-        @as(u8, @intFromBool(r.restore_expiry_ns != 0)) << 4);
+        @as(u8, @intFromBool(r.restore_expiry_ns != 0)) << 4 | @as(u8, @intFromBool(r.inline_data != null)) << 5);
     if (r.logical_size) |n| try codec.putInt(w, u64, n);
     if (r.etag_override) |e| {
         try w.writeAll(&e.md5);
@@ -140,6 +146,10 @@ fn encodeTo(r: ObjectRecord, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(&r.tier_object);
     }
     if (r.restore_expiry_ns != 0) try codec.putInt(w, i128, r.restore_expiry_ns);
+    if (r.inline_data) |d| {
+        try codec.putInt(w, u32, @intCast(d.len));
+        try w.writeAll(d);
+    }
 }
 
 /// Size of part `i` (0-based) from an encoded part-size list.
@@ -196,7 +206,7 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         r.internal_meta = try headers.take(&c, .internal);
         r.system = try headers.takeSystem(&c);
         const has = (try c.take(1))[0];
-        const known: u8 = if (ver >= 6) 31 else if (ver >= 5) 7 else 3;
+        const known: u8 = if (ver >= 7) 63 else if (ver >= 6) 31 else if (ver >= 5) 7 else 3;
         if (has & ~known != 0) return error.Corrupt;
         if (has & 1 != 0) r.logical_size = try c.int(u64);
         if (has & 2 != 0) r.etag_override = .{ .md5 = try c.fixed(16), .parts = try c.int(u32) };
@@ -214,6 +224,11 @@ pub fn decode(bytes: []const u8) codec.DecodeError!ObjectRecord {
         if (has & 16 != 0) {
             r.restore_expiry_ns = try c.int(i128);
             if (r.restore_expiry_ns == 0) return error.Corrupt;
+        }
+        if (has & 32 != 0) {
+            const n = try c.int(u32);
+            if (n > max_inline or n != r.size) return error.Corrupt;
+            r.inline_data = try c.take(n);
         }
     }
     if (c.pos != bytes.len) return error.Corrupt;
@@ -346,6 +361,16 @@ test "v4 metadata roundtrip; v3 records still decode; oversized lists rejected" 
     for (0..tiered.len) |n| try std.testing.expectError(error.Corrupt, decode(tiered[0..n]));
     r.tier = "";
     r.restore_expiry_ns = 0;
+    r.part_sizes = "";
+    r.inline_data = "x" ** 100;
+    const inl = try encode(r, gpa);
+    defer gpa.free(inl);
+    try std.testing.expectEqualStrings("x" ** 100, (try decode(inl)).inline_data.?);
+    for (0..inl.len) |n| try std.testing.expectError(error.Corrupt, decode(inl[0..n]));
+    r.inline_data = "short";
+    try std.testing.expectError(error.MetadataTooLarge, encode(r, gpa));
+    r.inline_data = null;
+    r.part_sizes = &sizes;
     for (0..withparts.len) |n| try std.testing.expectError(error.Corrupt, decode(withparts[0..n]));
     r.part_sizes = "";
 

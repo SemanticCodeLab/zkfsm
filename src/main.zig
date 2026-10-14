@@ -49,6 +49,9 @@ const usage =
     \\  --metrics-path   Prometheus metrics path (default: /metrics)
     \\  --no-minio-compat  do not serve /minio/health/* and /minio/v2/metrics/cluster
     \\  --lifecycle-interval  seconds between lifecycle passes, 0 disables (default: 3600)
+    \\  --inline-max N  objects up to N bytes are stored inside their metadata record (one
+    \\                   write per drive, no data blob); 0 disables (default: 128 KiB spread
+    \\                   over the protection width, e.g. 21845 for EC:4+2)
     \\  --admin-prefix   admin API path prefix (default: $ZKFSM_ADMIN_PREFIX, else /minio/admin);
     \\                   /zkfsm/admin is always accepted too. Path-style keys under
     \\                   <prefix>/v3/ (bucket = first segment) are shadowed by the admin API
@@ -87,6 +90,14 @@ const usage =
     \\
 ;
 
+const metadata_record_max_inline = @import("metadata/root.zig").record.max_inline;
+
+/// Inline threshold: the flag, else 128 KiB over the width, since every drive keeps
+/// a full copy of an inline object while erasure coding stores 1/k of it.
+fn inlineMax(flag: ?u32, width: usize) u32 {
+    return flag orelse @intCast(128 * 1024 / @max(1, width));
+}
+
 const Config = struct {
     heal_only: bool = false,
     data: []const []const u8,
@@ -102,6 +113,7 @@ const Config = struct {
     metrics_path: []const u8 = "/metrics",
     minio_compat: bool = true,
     lifecycle_interval_s: u64 = 3600,
+    inline_max: ?u32 = null,
     admin_prefix: ?[]const u8 = null,
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
@@ -224,6 +236,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             };
         } else if (std.mem.eql(u8, a, "--scan-interval")) {
             cfg.scan_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--inline-max")) {
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return error.BadArgs;
+            if (v > metadata_record_max_inline) return error.BadArgs;
+            cfg.inline_max = v;
         } else if (std.mem.eql(u8, a, "--lifecycle-interval")) {
             cfg.lifecycle_interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--domain")) {
@@ -370,6 +386,7 @@ pub fn run(opts: Options) u8 {
         return 1;
     };
     defer svc.deinit();
+    svc.inline_max = inlineMax(cfg.inline_max, drives.profile.width());
     var tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
     defer tiers.deinit();
     svc.tiers = &tiers;
@@ -651,6 +668,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         };
         tiers = object.tier.Registry.init(gpa, &svc, tierKey(creds));
         svc.tiers = &tiers;
+        svc.inline_max = inlineMax(cfg.inline_max, node.profile.width());
         svc_ready = true;
         if (creds) |c| {
             while (true) {

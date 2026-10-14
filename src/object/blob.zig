@@ -9,6 +9,13 @@ pub const Segment = struct {
     blob: core.ObjectId,
     offset: u64,
     length: u64,
+    /// The blob's bytes when its record holds them inline; `blob` is then unused.
+    inline_bytes: ?[]const u8 = null,
+
+    /// A segment over an object's data, inline or stored.
+    pub fn of(info_id: core.ObjectId, inline_data: ?[]const u8, offset: u64, length: u64) Segment {
+        return .{ .blob = info_id, .offset = offset, .length = length, .inline_bytes = inline_data };
+    }
 };
 
 pub const BlobReader = struct {
@@ -49,6 +56,16 @@ pub const BlobReader = struct {
         const n = limit.minInt64(@min(seg.length - self.pos, room));
         if (n == 0) return 0;
         const range: core.Range = .{ .offset = seg.offset + self.pos, .length = n };
+        if (seg.inline_bytes) |d| {
+            if (range.offset > d.len or n > d.len - range.offset) {
+                self.err = error.IoFailed;
+                return error.ReadFailed;
+            }
+            const lo: usize = @intCast(range.offset);
+            w.writeAll(d[lo..][0..@intCast(n)]) catch return error.WriteFailed;
+            self.pos += n;
+            return n;
+        }
         _ = self.store.get(placement.dataKey(seg.blob), range, w) catch |e| switch (e) {
             error.WriteFailed => return error.WriteFailed,
             else => {

@@ -31,6 +31,18 @@ pub const Opts = struct {
     probe: bool = false,
 };
 
+/// Ops counted per name in `Rpc.sent`; anything else counts as "other".
+pub const counted_ops = [_][]const u8{
+    "write",  "rput", "rget",     "rputs",      "rgets",      "del",   "dels", "rdelif", "lock",  "refresh", "unlock",
+    "notify", "open", "pread",    "close",      "read",       "stat",  "scan", "format", "fresh", "hello",   "sync",
+    "jread",  "ext",  "diskinfo", "pools_sync", "format_put", "other",
+};
+
+pub fn opIndex(op: []const u8) usize {
+    inline for (counted_ops, 0..) |name, i| if (std.mem.eql(u8, op, name)) return i;
+    return counted_ops.len - 1;
+}
+
 /// Longest wait for a free connection slot before a call fails with Busy.
 const slot_wait_ms = 5000;
 /// Pooled connections idle longer than this are dropped (servers close them at 30 s).
@@ -135,6 +147,8 @@ pub const Rpc = struct {
     /// Connection cap per peer; the peer's RPC pool is sized from it. Idle connections
     /// are kept up to the same number: a busy node reuses them instead of dialing.
     peer_cap: usize,
+    /// Calls started per op (see `counted_ops`), for the metrics endpoint.
+    sent: [counted_ops.len]std.atomic.Value(u64) = @splat(.init(0)),
 
     pub fn init(gpa: std.mem.Allocator, topo: *const topology.Topology, secret: auth.Secret) Error!Rpc {
         const peers = try gpa.alloc(Peer, topo.nodes.len);
@@ -366,6 +380,7 @@ pub const Rpc = struct {
     pub fn call(self: *Rpc, node: u16, op: []const u8, query: []const u8, body: Body, opts: Opts) Error!Call {
         const p = &self.peers[node];
         if (!opts.probe and !p.online.load(.acquire)) return error.NodeOffline;
+        _ = self.sent[opIndex(op)].fetchAdd(1, .monotonic);
         var sp = core.trace.leaf("internode", .client, .internal);
         sp.str("rpc.op", op);
         sp.int("rpc.node", node);

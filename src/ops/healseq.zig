@@ -324,8 +324,8 @@ fn healVersion(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, v: object.ver
 }
 
 fn healOne(o: *Ops, s: *Seq, a: Allocator, bucket: []const u8, key: []const u8, vid: []const u8, info: object.service.ObjectInfo, rkey: placement.PhysicalKey, set_count: usize) !void {
-    // Tiered objects and delete markers keep no local data; their record is what heal covers.
-    const dkey = if (info.delete_marker or info.remote(core.time.nowNs())) rkey else placement.dataKey(info.object_id);
+    // Tiered, inline objects and delete markers keep no data blob; heal covers the record.
+    const dkey = if (info.delete_marker or info.inline_data != null or info.remote(core.time.nowNs())) rkey else placement.dataKey(info.object_id);
     const set = try o.locate(a, dkey);
     if (!wanted(s, set)) return;
     const before = try states(o, a, set, dkey);

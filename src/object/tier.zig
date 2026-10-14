@@ -876,7 +876,7 @@ pub const Source = struct {
     tr: Reader = undefined,
 
     pub fn init(s: *Source, svc: *Svc, info: service.ObjectInfo, offset: u64, len: u64, buf: []u8) service.Error!void {
-        s.* = .{ .gpa = svc.gpa, .seg = .{.{ .blob = info.object_id, .offset = offset, .length = len }} };
+        s.* = .{ .gpa = svc.gpa, .seg = .{blob.Segment.of(info.object_id, info.inline_data, offset, len)} };
         if (!info.remote(core.time.nowNs())) {
             s.br = blob.BlobReader.init(svc.store, &s.seg, buf);
             return;
