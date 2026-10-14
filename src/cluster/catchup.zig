@@ -52,18 +52,28 @@ pub const Origins = struct {
     gpa: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     list: []Origin,
+    cap: usize,
     /// Index changes since the last snapshot (applied or made here).
     dirty: std.atomic.Value(u64) = .init(0),
 
-    pub fn init(gpa: std.mem.Allocator, nodes: usize) error{OutOfMemory}!Origins {
-        const l = try gpa.alloc(Origin, nodes);
+    /// Room for `cap` peers (nodes added at runtime, see `grow`); `nodes` known now.
+    pub fn init(gpa: std.mem.Allocator, nodes: usize, cap: usize) error{OutOfMemory}!Origins {
+        const l = try gpa.alloc(Origin, @max(nodes, cap));
         for (l) |*o| o.* = .{};
-        return .{ .gpa = gpa, .list = l };
+        return .{ .gpa = gpa, .list = l[0..nodes], .cap = l.len };
     }
 
     pub fn deinit(s: *Origins) void {
         for (s.list) |*o| o.deinit(s.gpa);
-        s.gpa.free(s.list);
+        s.gpa.free(s.list.ptr[0..s.cap]);
+    }
+
+    /// Tracks `nodes` peers; call before the node list itself grows.
+    pub fn grow(s: *Origins, nodes: usize) void {
+        s.mutex.lock();
+        defer s.mutex.unlock();
+        std.debug.assert(nodes <= s.cap);
+        if (nodes > s.list.len) s.list = s.list.ptr[0..nodes];
     }
 
     /// A note's change from `node`, entry `m`, was applied.
@@ -156,7 +166,7 @@ pub const Origins = struct {
     pub fn rebuilt(s: *Origins, hs: []const Want) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        for (s.list, hs) |*o, h| {
+        for (s.list[0..hs.len], hs) |*o, h| {
             o.above.clearRetainingCapacity();
             o.epoch = h.epoch;
             o.seq = h.seq;
@@ -169,20 +179,20 @@ pub const Origins = struct {
     pub fn heads(s: *Origins, out: []Want) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        for (s.list, out) |o, *w| w.* = .{ .epoch = o.head_epoch, .seq = o.head_seq };
+        for (s.list[0..out.len], out) |o, *w| w.* = .{ .epoch = o.head_epoch, .seq = o.head_seq };
     }
 
     pub fn marks(s: *Origins, out: []Want) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        for (s.list, out) |o, *w| w.* = if (o.behind) .{ .epoch = 0, .seq = 0 } else .{ .epoch = o.epoch, .seq = o.seq };
+        for (s.list[0..out.len], out) |o, *w| w.* = if (o.behind) .{ .epoch = 0, .seq = 0 } else .{ .epoch = o.epoch, .seq = o.seq };
     }
 
     /// Loaded from a snapshot: trusted only once each peer is pulled from there.
     pub fn restore(s: *Origins, from: []const Want) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        for (s.list, from) |*o, w| {
+        for (s.list[0..from.len], from) |*o, w| {
             o.epoch = w.epoch;
             o.seq = w.seq;
             o.behind = true;
@@ -290,7 +300,7 @@ pub fn save(dir: std.fs.Dir, bytes: []const u8) !void {
 
 test "watermarks: in order, overtaken, gaps, epochs, heads" {
     const gpa = std.testing.allocator;
-    var s = try Origins.init(gpa, 2);
+    var s = try Origins.init(gpa, 2, 3);
     defer s.deinit();
     s.rebuilt(&.{ .{ .epoch = 0, .seq = 0 }, .{ .epoch = 9, .seq = 10 } });
     try std.testing.expect(s.want(1) == null);
@@ -315,4 +325,8 @@ test "watermarks: in order, overtaken, gaps, epochs, heads" {
     try std.testing.expect(s.want(0) != null);
     try std.testing.expect(s.heard(0, 3, 7, 5, 6000));
     try std.testing.expectEqual(Origins.Want{ .epoch = 3, .seq = 5 }, s.want(0).?);
+    // A node added at runtime starts unknown, behind until its first pull.
+    s.grow(3);
+    try std.testing.expectEqual(@as(usize, 3), s.list.len);
+    try std.testing.expect(s.want(2) != null and !s.knowsHead(2));
 }
