@@ -3,7 +3,8 @@
 # (OAuth2 JWT bearer grant), S3 roles (web identity against a zkfsm STS, and the
 # instance-metadata endpoint), Azure service principal against Azurite (HTTPS +
 # OAuth), storage class on remote writes, chained transitions, and asynchronous
-# restore. Token endpoints and a bearer-checking store are mocked in Python
+# restore, and a role tier whose STS and store require a client certificate.
+# Token endpoints and a bearer-checking store are mocked in Python
 # (tests/tier_oauth_mock.py); Azurite parts are skipped without docker or the image.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -220,6 +221,45 @@ if [[ -n "$AZ" ]]; then
   azcount() { curl -sk -H "Authorization: Bearer $aztok" -H "x-ms-version: 2021-08-06" "$AZ/azsp?restype=container&comp=list&prefix=sp/" | grep -o '<Blob>' | wc -l | tr -d ' '; }
   wait_for "azure SP cleanup" 0 azcount
 fi
+
+# ---- role tier over mutual TLS: STS and store both demand a client certificate ----
+source "$ROOT/tests/tls_remote.sh"
+tls_pki
+MT_PORT="$(freeport)"
+tls_zkfsm mtlsrem "$MT_PORT" "$RAK" "$RSK" --identity-openid "config_url=$IDP/.well-known/openid-configuration client_id=zkfsm role_policy=readwrite"
+PIDS+=("${TLS_PIDS[@]}")
+check "mtls remote bucket" 200 "$(tls_s3 "$MT_PORT" "$RAK" "$RSK" PUT /mrole -o /dev/null -w '%{http_code}')"
+H2_PORT="$(freeport)"
+H2="http://127.0.0.1:$H2_PORT"
+ZKFSM_ILM_DAY_SECONDS=1 ZKFSM_ACCESS_KEY="$AK" ZKFSM_SECRET_KEY="$SK" ZKFSM_TIER_STS_ENDPOINT="https://127.0.0.1:$MT_PORT" \
+  "$BIN" --data "$WORK/hot2" --listen "127.0.0.1:$H2_PORT" --lifecycle-interval 1 2>>"$WORK/hot2.log" &
+PIDS+=($!)
+wait_up "$H2"
+"$MC" alias set hot2 "$H2" "$AK" "$SK" >/dev/null
+tier2() { # JSON -> status of the admin tier add on hot2
+  printf '%s' "$1" | python3 "$ROOT/tests/madmin_encrypt.py" "$SK" >"$WORK/tier.enc"
+  curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X PUT --data-binary @"$WORK/tier.enc" "$H2/minio/admin/v3/tier"
+}
+mrole() { # NAME EXTRA-JSON
+  printf '{"Version":"v1","Type":"s3","Name":"%s","S3":{"Endpoint":"https://127.0.0.1:%s","AWSRoleARN":"arn:zkfsm:iam:::role/_","AWSRoleWebIdentityTokenFile":"%s","Bucket":"mrole","Prefix":"m/","CAFile":"%s"%s}}' \
+    "$1" "$MT_PORT" "$WORK/wi.token" "$PKI/ca.pem" "$2"
+}
+check "mtls role tier without client cert refused" 400 "$(tier2 "$(mrole MNOCERT "")")"
+check "mtls role tier add" 204 "$(tier2 "$(mrole MROLE ",\"ClientCert\":\"$PKI/client.pem\",\"ClientKey\":\"$PKI/client.key\"")")"
+"$MC" mb hot2/mrdata >/dev/null
+"$MC" cp "$WORK/obj.bin" hot2/mrdata/obj >/dev/null
+"$MC" ilm rule add hot2/mrdata --transition-days 1 --transition-tier MROLE >/dev/null
+h2class() { AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$S3CLI_BIN" --endpoint-url "$H2" s3api head-object --bucket mrdata --key obj 2>/dev/null | jget "d.get('$1','')"; }
+wait_for "mtls role transition" MROLE h2class StorageClass
+check "mtls role remote holds the data" 1 "$(tls_count "$MT_PORT" "$RAK" "$RSK" mrole m/)"
+check "mtls role read-through" "$(sha256sum <"$WORK/obj.bin")" "$("$MC" cat hot2/mrdata/obj | sha256sum)"
+AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$S3CLI_BIN" --endpoint-url "$H2" s3api get-object --bucket mrdata --key obj --range bytes=100-199 "$WORK/mr.out" >/dev/null
+check "mtls role range" "$(tail -c +101 "$WORK/obj.bin" | head -c 100 | sha256sum)" "$(sha256sum <"$WORK/mr.out")"
+check "mtls role restore accepted" 202 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>1</Days></RestoreRequest>' "$H2/mrdata/obj?restore")"
+h2restore() { h2class Restore | cut -d, -f1; }
+wait_for "mtls role restore completes" 'ongoing-request="false"' h2restore
+"$MC" rm hot2/mrdata/obj >/dev/null
+wait_for "mtls role delete cleans the tier" 0 tls_count "$MT_PORT" "$RAK" "$RSK" mrole m/
 
 # ---- persistence ----
 kill "$HOT_PID"; wait "$HOT_PID" 2>/dev/null || true; HOT_PID=""

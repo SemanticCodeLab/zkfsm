@@ -38,10 +38,10 @@ pub const Run = struct {
     now_ns: i128,
     failures: bool = false,
     last_save_ns: i128 = 0,
-    hc: std.http.Client,
+    hc: client.Http,
 
     pub fn init(env: Env, j: *Job, s: spec.Job, attempt: u32) Run {
-        return .{ .env = env, .job = j, .spec = s, .attempt = attempt, .now_ns = std.time.nanoTimestamp(), .failures = j.pass_failed, .hc = .{ .allocator = j.gpa } };
+        return .{ .env = env, .job = j, .spec = s, .attempt = attempt, .now_ns = std.time.nanoTimestamp(), .failures = j.pass_failed, .hc = client.newHttp(j.gpa) };
     }
 
     pub fn deinit(r: *Run) void {

@@ -56,6 +56,9 @@ const usage =
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
     \\  --tls-min-version V   lowest TLS version accepted: 1.2 (default) or 1.3
+    \\  --tls-max-version V   newest TLS version offered: 1.3 (default) or 1.2
+    \\  --tls-client-auth M   optional (default) or require: refuse clients without a
+    \\                        certificate from --tls-client-ca
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -119,6 +122,8 @@ const Config = struct {
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
     tls_min_version: tls.Version = .tls12,
+    tls_max_version: tls.Version = .tls13,
+    tls_require_client_cert: bool = false,
     kms: sse.setup.Flags = .{},
     obs: observe.config.Flags = .{},
     console: console_wire.Flags = .{},
@@ -234,6 +239,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.tls_client_ca = args[i];
         } else if (std.mem.eql(u8, a, "--tls-min-version")) {
             cfg.tls_min_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--tls-max-version")) {
+            cfg.tls_max_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--tls-client-auth")) {
+            if (std.mem.eql(u8, args[i], "require")) cfg.tls_require_client_cert = true else if (!std.mem.eql(u8, args[i], "optional")) return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -503,6 +512,8 @@ pub fn run(opts: Options) u8 {
             return 2;
         };
         tls_ctx.min_version = cfg.tls_min_version;
+        tls_ctx.max_version = cfg.tls_max_version;
+        tls_ctx.require_client_cert = cfg.tls_require_client_cert;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -644,6 +655,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             return 2;
         };
         tls_ctx.min_version = cfg.tls_min_version;
+        tls_ctx.max_version = cfg.tls_max_version;
+        tls_ctx.require_client_cert = cfg.tls_require_client_cert;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });

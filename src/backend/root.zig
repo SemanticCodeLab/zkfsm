@@ -8,6 +8,7 @@ pub const s3 = @import("s3.zig");
 pub const azure = @import("azure.zig");
 pub const gcs = @import("gcs.zig");
 pub const creds = @import("creds.zig");
+pub const remote_http = @import("remote/http.zig");
 pub const nas = @import("nas.zig");
 pub const drive = @import("drive.zig");
 

@@ -136,6 +136,8 @@ pub const Context = struct {
     min_version: Version = .tls12,
     /// Newest version offered; 1.2 here is for tests against 1.2-only peers.
     max_version: Version = .tls13,
+    /// Refuse handshakes without a verified client certificate (needs `client_cas`).
+    require_client_cert: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) LoadError!Context {
         return .{ .gpa = gpa, .cert_path = cert_path, .key_path = key_path, .current = try Credentials.fromFiles(gpa, cert_path, key_path) };

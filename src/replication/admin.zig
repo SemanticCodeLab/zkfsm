@@ -107,6 +107,7 @@ fn setRemoteTarget(c: Ctx) Error!Response {
         error.Malformed => bad(c.a, "XMinioAdminConfigBadJSON", "Malformed remote target."),
     };
     t.source_bucket = bucket;
+    if (!t.tls.check(c.r.gpa)) return bad(c.a, "XMinioAdminInvalidArgument", "Remote target TLS settings are invalid (certificate, key, CA file or minimum version).");
     const cfg = object.versioning.getConfig(c.r.svc, c.a, bucket) catch return api.fail(c.a, .internal_server_error, "XMinioInternalError", "bucket config unreadable");
     if (cfg.versioning != .enabled) return bad(c.a, "XMinioAdminReplicationSourceNotVersioned", "Replication source bucket does not have versioning enabled.");
     if (try probeRemote(c, t)) |res| return res;
@@ -124,6 +125,7 @@ fn setRemoteTarget(c: Ctx) Error!Response {
                 n.access_key = old.access_key;
                 n.secret_key = old.secret_key;
             }
+            if (n.tls.isEmpty()) n.tls = old.tls;
             try list.append(c.a, n);
         } else try list.append(c.a, old);
     }
@@ -209,7 +211,21 @@ fn addFailed(c: Ctx, detail: []const u8) Error!Response {
     return c.json(.{ .success = false, .status = "Some sites could not be configured for replication.", .errorDetail = detail });
 }
 
-const PeerSite = struct { name: []const u8 = "", endpoints: []const u8 = "", accessKey: []const u8 = "", secretKey: []const u8 = "" };
+const PeerSite = struct {
+    name: []const u8 = "",
+    endpoints: []const u8 = "",
+    accessKey: []const u8 = "",
+    secretKey: []const u8 = "",
+    clientCert: []const u8 = "",
+    clientKey: []const u8 = "",
+    caFile: []const u8 = "",
+    serverName: []const u8 = "",
+    minVersion: []const u8 = "",
+
+    fn tls(s: PeerSite) client.TlsFields {
+        return .{ .client_cert = s.clientCert, .client_key = s.clientKey, .ca_file = s.caFile, .server_name = s.serverName, .min_version = s.minVersion };
+    }
+};
 
 fn siteAdd(c: Ctx) Error!Response {
     const plain = try c.decrypted() orelse return bad(c.a, "XMinioAdminConfigBadJSON", "Request body could not be decrypted.");
@@ -231,14 +247,15 @@ fn siteAdd(c: Ctx) Error!Response {
     var has_self = false;
     for (sites) |s| {
         const u = client.parseUrl(s.endpoints) orelse return addFailed(c, try std.fmt.allocPrint(c.a, "invalid endpoint {s}", .{s.endpoints}));
-        const remote: client.Remote = .{ .endpoint = u.endpoint, .secure = u.secure, .access_key = s.accessKey, .secret_key = s.secretKey };
+        if (!s.tls().check(c.r.gpa)) return addFailed(c, try std.fmt.allocPrint(c.a, "site {s} has invalid TLS settings", .{s.name}));
+        const remote: client.Remote = .{ .endpoint = u.endpoint, .secure = u.secure, .access_key = s.accessKey, .secret_key = s.secretKey, .tls = s.tls() };
         const res = client.send(&hc, c.a, remote, .{ .method = .GET, .path = site.peer_prefix ++ "/peer/whoami" }) catch
             return addFailed(c, try std.fmt.allocPrint(c.a, "site {s} ({s}) is unreachable", .{ s.name, s.endpoints }));
         if (!res.ok()) return addFailed(c, try std.fmt.allocPrint(c.a, "site {s} refused the request: {d} {s}", .{ s.name, res.status, res.code() }));
         const who = std.json.parseFromSliceLeaky(struct { deploymentID: []const u8, enabled: bool = false }, c.a, res.body, .{ .ignore_unknown_fields = true }) catch
             return addFailed(c, try std.fmt.allocPrint(c.a, "site {s} is not a zkfsm deployment", .{s.name}));
         if (std.mem.eql(u8, who.deploymentID, self_dep)) has_self = true;
-        const p: site.Peer = .{ .name = s.name, .endpoint = s.endpoints, .deployment_id = who.deploymentID };
+        const p: site.Peer = .{ .name = s.name, .endpoint = s.endpoints, .deployment_id = who.deploymentID, .tls = s.tls() };
         const known = for (peers.items, 0..) |q, i| {
             if (std.mem.eql(u8, q.deployment_id, p.deployment_id)) break i;
         } else null;

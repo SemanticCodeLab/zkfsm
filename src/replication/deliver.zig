@@ -26,7 +26,7 @@ pub const hdr_etag = "x-minio-source-etag";
 /// Version deletes and markers give up after this many attempts (e.g. a locked replica).
 const max_delete_attempts = 50;
 
-pub fn process(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Entry) Outcome {
+pub fn process(r: *engine.Replicator, hc: *client.Http, a: Allocator, e: Entry) Outcome {
     var sp = core.trace.root("replication", .producer, .replication, .{});
     defer sp.end();
     sp.str("path", e.key);
@@ -38,7 +38,7 @@ pub fn process(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Ent
     return out;
 }
 
-fn processInner(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Entry) Outcome {
+fn processInner(r: *engine.Replicator, hc: *client.Http, a: Allocator, e: Entry) Outcome {
     const bid = r.svc.bucketId(e.bucket) catch |err| return if (err == error.NoSuchBucket) .drop else .retry;
     const version = ov.parseVersionId(e.version) catch return .drop;
     const d = (r.destByArn(a, bid, e.bucket, e.arn) catch return .retry) orelse return .drop;
@@ -160,14 +160,14 @@ fn replicaHeaders(a: Allocator, hs: *std.ArrayList(Header), info: object.ObjectI
     try hs.append(a, .{ .name = hdr_etag, .value = try etagText(a, info.etag) });
 }
 
-fn sendObject(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
+fn sendObject(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
     return sendObjectInner(r, hc, a, d, e, info) catch |err| switch (err) {
         error.OutOfMemory, error.SourceFailed, error.SinkFailed, error.InvalidEndpoint => failed(r, d, e, info.size, @errorName(err)),
         error.Unreachable => unreachable_(r, d, e, info.size),
     };
 }
 
-fn sendObjectInner(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) client.Error!Outcome {
+fn sendObjectInner(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) client.Error!Outcome {
     const path = try objectPath(a, d, e.key);
     const vid = try versionParam(a, info.version_id);
     const vq = try withVersion(a, vid, &.{});
@@ -192,7 +192,7 @@ fn sendObjectInner(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d:
     return .done;
 }
 
-fn sendSingle(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, path: []const u8, vid: []const u8, info: object.ObjectInfo) client.Error!client.Response {
+fn sendSingle(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, path: []const u8, vid: []const u8, info: object.ObjectInfo) client.Error!client.Response {
     var src: Source = .{ .svc = r.svc, .info = info, .range = null };
     return client.send(hc, a, d.remote, .{
         .method = .PUT,
@@ -205,7 +205,7 @@ fn sendSingle(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engi
 }
 
 /// Same part boundaries as the source, so the replica's multipart ETag matches.
-fn sendMultipart(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, path: []const u8, vid: []const u8, info: object.ObjectInfo, parts: usize) client.Error!client.Response {
+fn sendMultipart(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, path: []const u8, vid: []const u8, info: object.ObjectInfo, parts: usize) client.Error!client.Response {
     const init_res = try client.send(hc, a, d.remote, .{
         .method = .POST,
         .path = path,
@@ -255,7 +255,7 @@ fn sendMultipart(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: e
     return res;
 }
 
-fn sendMarker(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
+fn sendMarker(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
     if (!d.rule.delete_marker) return .drop;
     // A null-version marker becomes a fresh marker on the target.
     const nullv = info.version_id.eql(ov.null_version_id);
@@ -275,7 +275,7 @@ fn sendMarker(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engi
     return .done;
 }
 
-fn sendDeleteVersion(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry) Outcome {
+fn sendDeleteVersion(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry) Outcome {
     if (!d.rule.delete) return .drop;
     const res = client.send(hc, a, d.remote, .{
         .method = .DELETE,
@@ -288,14 +288,14 @@ fn sendDeleteVersion(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, 
     return .done;
 }
 
-fn sendMetadata(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
+fn sendMetadata(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) Outcome {
     return sendMetadataInner(r, hc, a, d, e, info) catch |err| switch (err) {
         error.Unreachable => unreachable_(r, d, e, 0),
         else => failed(r, d, e, 0, @errorName(err)),
     };
 }
 
-fn sendMetadataInner(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) client.Error!Outcome {
+fn sendMetadataInner(r: *engine.Replicator, hc: *client.Http, a: Allocator, d: engine.Dest, e: Entry, info: object.ObjectInfo) client.Error!Outcome {
     const path = try objectPath(a, d, e.key);
     const vid = try versionParam(a, info.version_id);
     const hs = [_]Header{.{ .name = hdr_request, .value = "true" }};

@@ -29,6 +29,8 @@ pub const Peer = struct {
     deployment_id: []const u8,
     /// Synchronous replication to this site (`mc admin replicate update --sync`).
     sync: bool = false,
+    /// TLS to this site (client certificate, CA file, server name, minimum version).
+    tls: client.TlsFields = .{},
 };
 
 pub const State = struct {
@@ -110,6 +112,7 @@ pub fn remoteFor(st: State, p: Peer) client.Remote {
         .secure = if (u) |x| x.secure else false,
         .access_key = st.svc_access_key,
         .secret_key = st.svc_secret,
+        .tls = p.tls,
     };
 }
 
@@ -173,7 +176,7 @@ fn unbase64(a: Allocator, s: []const u8) ?[]u8 {
 
 const max_bucket_attempts = 40;
 
-pub fn process(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Entry) Outcome {
+pub fn process(r: *engine.Replicator, hc: *client.Http, a: Allocator, e: Entry) Outcome {
     const st = (r.siteState(a) catch return .retry) orelse return .drop;
     const p = st.peer(e.arn) orelse return .drop;
     const remote = remoteFor(st, p);
@@ -187,7 +190,7 @@ pub fn process(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, e: Ent
     return out;
 }
 
-fn replayIam(hc: *std.http.Client, a: Allocator, remote: client.Remote, e: Entry) Outcome {
+fn replayIam(hc: *client.Http, a: Allocator, remote: client.Remote, e: Entry) Outcome {
     const body = unbase64(a, e.payload) orelse return .drop;
     const method = std.meta.stringToEnum(std.http.Method, e.method) orelse return .drop;
     const q = std.mem.indexOfScalar(u8, e.path, '?');
@@ -229,7 +232,7 @@ const subresources = [_]struct { name: []const u8, root: []const u8, deletable: 
     .{ .name = "ownershipControls", .root = "<OwnershipControls", .deletable = true },
 };
 
-fn pushBucket(r: *engine.Replicator, hc: *std.http.Client, a: Allocator, st: State, remote: client.Remote, bucket: []const u8) client.Error!Outcome {
+fn pushBucket(r: *engine.Replicator, hc: *client.Http, a: Allocator, st: State, remote: client.Remote, bucket: []const u8) client.Error!Outcome {
     const path = try std.fmt.allocPrint(a, "/{s}", .{bucket});
     r.svc.headBucket(bucket) catch |e| {
         if (e != error.NoSuchBucket) return .retry;
