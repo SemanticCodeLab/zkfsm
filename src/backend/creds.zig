@@ -64,6 +64,8 @@ pub const Source = struct {
     /// Strings borrowed; must outlive the source.
     kind: Kind,
     mutex: std.Thread.Mutex = .{},
+    /// TLS for credential requests (role tiers reuse the tier's client certificate).
+    tls: rhttp.Tls = .{},
     rsa: ?RsaKey = null,
     /// Bearer: "Bearer <token>". Signing: access key, secret, session token back to back.
     cached: std.ArrayListUnmanaged(u8) = .empty,
@@ -266,7 +268,7 @@ pub const Source = struct {
         return out.written();
     }
 
-    fn request(_: *Source, a: Allocator, method: std.http.Method, url: []const u8, body: ?[]const u8, extra: []const std.http.Header) FetchError![]const u8 {
+    fn request(self: *Source, a: Allocator, method: std.http.Method, url: []const u8, body: ?[]const u8, extra: []const std.http.Header) FetchError![]const u8 {
         var hs: [8]std.http.Header = undefined;
         if (extra.len >= hs.len) return error.Http;
         @memcpy(hs[0..extra.len], extra);
@@ -280,7 +282,7 @@ pub const Source = struct {
             .url = url,
             .headers = hs[0..n],
             .body = body,
-            .tls = rhttp.tierTls(.{}),
+            .tls = rhttp.tierTls(self.tls),
         }) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             log.warn("credential request to {s} failed: {t}", .{ url, e });

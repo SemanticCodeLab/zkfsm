@@ -108,6 +108,8 @@ pub const Tier = struct {
         const creds: backend.s3.Credentials = .{ .access_key = c.access_key, .secret_key = c.secret_key };
         if (c.auth != .keys) t.source = try makeSource(gpa, a, c);
         errdefer if (t.source) |src| src.deinit();
+        // Role credentials come from the same site; other token endpoints keep system roots.
+        if (c.auth == .role) t.source.?.tls = tls;
         switch (c.kind) {
             .s3, .minio => {
                 const ep = if (c.endpoint.len > 0) c.endpoint else "https://s3.amazonaws.com";
