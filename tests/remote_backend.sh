@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # End-to-end test of the remote S3 backend against a throwaway MinIO container.
-# Also runs the Azure Blob suite against Azurite when that image is available.
+# Also runs the Azure Blob suite against Azurite when that image is available, and
+# the S3 suite against zkfsm over HTTPS requiring a client certificate (IP and host
+# name endpoints, with and without a server name override) and a TLS 1.2-only one.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOCKER="${DOCKER:-docker}"
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 CIDS=()
-cleanup() { for c in "${CIDS[@]}"; do "$DOCKER" rm -f "$c" >/dev/null 2>&1 || true; done; }
+WORK="$(mktemp -d)"
+cleanup() {
+  for c in "${CIDS[@]}"; do "$DOCKER" rm -f "$c" >/dev/null 2>&1 || true; done
+  for p in "${TLS_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 wait_http() { # url
@@ -38,3 +45,33 @@ fi
 
 cd "$ROOT"
 zig build test-remote -Doptimize="${OPTIMIZE:-ReleaseSafe}" --summary all
+
+# ---- zkfsm over mutual TLS: the same S3 suite through client certificates ----
+unset ZKFSM_AZURE_ENDPOINT
+zig build -Doptimize="${OPTIMIZE:-ReleaseSafe}"
+BIN="$ROOT/zig-out/bin/zkfsm"
+source "$ROOT/tests/tls_remote.sh"
+tls_pki
+MT_PORT="$(freeport)"
+T12_PORT="$(freeport)"
+tls_zkfsm mtls "$MT_PORT" "$ZKFSM_S3_ACCESS_KEY" "$ZKFSM_S3_SECRET_KEY"
+tls_zkfsm tls12 "$T12_PORT" "$ZKFSM_S3_ACCESS_KEY" "$ZKFSM_S3_SECRET_KEY" --tls-max-version 1.2
+live() { # label, then VAR=value settings for one run of the live suite
+  local label="$1"; shift
+  echo "--- live s3 over TLS: $label"
+  env "$@" ZKFSM_S3_CA_FILE="$PKI/ca.pem" ZKFSM_S3_BIG_MB="${TLS_BIG_MB:-32}" \
+    zig build test-remote -Doptimize="${OPTIMIZE:-ReleaseSafe}" --summary all
+}
+CERT=(ZKFSM_S3_CLIENT_CERT="$PKI/client.pem" ZKFSM_S3_CLIENT_KEY="$PKI/client.key")
+live "client cert, IP endpoint" ZKFSM_S3_ENDPOINT="https://127.0.0.1:$MT_PORT" "${CERT[@]}"
+live "client cert, host name endpoint" ZKFSM_S3_ENDPOINT="https://localhost:$MT_PORT" "${CERT[@]}"
+live "client cert, server name override" ZKFSM_S3_ENDPOINT="https://127.0.0.1:$MT_PORT" ZKFSM_S3_SERVER_NAME=localhost "${CERT[@]}"
+live "TLS 1.2-only endpoint" ZKFSM_S3_ENDPOINT="https://127.0.0.1:$T12_PORT" ZKFSM_S3_MIN_VERSION=1.2 "${CERT[@]}"
+# Refusals: a 1.3 minimum against the 1.2-only endpoint, and an untrusted client cert.
+if live "1.3 minimum against 1.2-only (must fail)" ZKFSM_S3_ENDPOINT="https://127.0.0.1:$T12_PORT" ZKFSM_S3_MIN_VERSION=1.3 "${CERT[@]}" >"$WORK/neg1.log" 2>&1; then
+  echo "FAIL: TLS 1.3 minimum accepted by a 1.2-only endpoint"; exit 1
+fi
+if live "untrusted client cert (must fail)" ZKFSM_S3_ENDPOINT="https://127.0.0.1:$MT_PORT" ZKFSM_S3_CLIENT_CERT="$PKI/rogue-client.pem" ZKFSM_S3_CLIENT_KEY="$PKI/rogue-client.key" >"$WORK/neg2.log" 2>&1; then
+  echo "FAIL: untrusted client certificate accepted"; exit 1
+fi
+echo "remote_backend: PASS (MinIO, Azurite, mutual TLS, TLS 1.2-only)"

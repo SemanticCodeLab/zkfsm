@@ -735,8 +735,17 @@ test "remote live s3 backend" {
         break :blk std.fmt.parseInt(u64, s, 10) catch 100;
     } else 100;
 
-    var sb: S3Backend = undefined;
-    try sb.init(gpa, .{
+    var tls_env: [5]?[]u8 = undefined;
+    for (&tls_env, [_][]const u8{ "ZKFSM_S3_CA_FILE", "ZKFSM_S3_CLIENT_CERT", "ZKFSM_S3_CLIENT_KEY", "ZKFSM_S3_SERVER_NAME", "ZKFSM_S3_MIN_VERSION" }) |*v, n| v.* = envOrNull(gpa, n);
+    defer for (tls_env) |v| if (v) |x| gpa.free(x);
+    const tls: rhttp.Tls = .{
+        .ca_file = tls_env[0] orelse "",
+        .client_cert_file = tls_env[1] orelse "",
+        .client_key_file = tls_env[2] orelse "",
+        .server_name = tls_env[3] orelse "",
+        .min_version = rhttp.parseMinVersion(tls_env[4] orelse "") orelse return error.InvalidConfig,
+    };
+    const cfg: Config = .{
         .endpoint = ep,
         .bucket = bucket,
         .prefix = "live/",
@@ -744,7 +753,20 @@ test "remote live s3 backend" {
         .part_size = min_part_size,
         .list_page_size = 3,
         .retry = .{ .max_attempts = 4, .base_ms = 50 },
-    });
+        .tls = tls,
+    };
+    if (tls.hasClientCert()) {
+        // The endpoint demands a client certificate: without one every request fails.
+        var bare = cfg;
+        bare.tls.client_cert_file = "";
+        bare.tls.client_key_file = "";
+        bare.retry = .{ .max_attempts = 1 };
+        var nc = try S3Client.init(gpa, bare);
+        defer nc.deinit();
+        try std.testing.expectError(error.IoFailed, nc.headObject("live/none"));
+    }
+    var sb: S3Backend = undefined;
+    try sb.init(gpa, cfg);
     defer sb.deinit();
     try sb.client.ensureBucket();
     try runLiveSuite(gpa, &sb.remote, big_mb);
