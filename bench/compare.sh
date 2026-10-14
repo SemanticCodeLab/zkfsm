@@ -7,7 +7,7 @@
 # Drives are tmpfs charged to the container: they must hold a whole PUT run, so large
 # PUTs run for DUR_PUT_BIG only.
 #
-# env: PRODUCTS ("zkfsm minio rustfs"), TOPOS ("single cluster"), WORKLOADS (see below), REPS (3),
+# env: PRODUCTS ("zkfsm minio rustfs"), TOPOS ("single cluster"), WORKLOADS (see below), REPS (3), ROUNDS (1..REPS; run a subset of rounds),
 #      DUR (15s), DUR_PUT_BIG (6s, PUT of 1 MiB and larger), DUR_MP (10s, multipart), CONC (32),
 #      SERVER_CPUS (0,1,2,3), CLIENT_CPUS (4-7), CLIENT_NCPU (4),
 #      SINGLE_MEM (20g), SINGLE_DRIVE (4096m), NODE_MEM (3g), NODE_DRIVE (512m),
@@ -22,6 +22,7 @@ PRODUCTS="${PRODUCTS:-zkfsm minio rustfs}"
 TOPOS="${TOPOS:-single cluster}"
 WORKLOADS="${WORKLOADS:-put-4k put-64k put-1m put-16m get-4k get-64k get-1m get-16m list-4k mixed-4k mixed-1m mp-64m}"
 REPS="${REPS:-3}"
+ROUNDS="${ROUNDS:-$(seq -s" " 1 "$REPS")}"
 DUR="${DUR:-15s}"
 DUR_PUT_BIG="${DUR_PUT_BIG:-6s}"
 DUR_MP="${DUR_MP:-10s}"
@@ -212,7 +213,7 @@ main() {
   } >"$OUT/versions.txt"
   local failed=0 prods
   read -r -a prods <<<"$PRODUCTS"
-  for r in $(seq 1 "$REPS"); do
+  for r in $ROUNDS; do
     # Rotate the product order each round.
     local k=$(((r - 1) % ${#prods[@]}))
     local order=("${prods[@]:k}" "${prods[@]:0:k}")
