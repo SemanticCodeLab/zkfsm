@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { admin, cluster, raw } from "../lib/api";
+import { cluster, raw } from "../lib/api";
 import { date } from "../lib/format";
 import { href, navigate, useRoute } from "../lib/router";
 import { Badge, Button, Card, Empty, KeyValue, Loading, PageHeader, Tabs, TextInput, toast, toastError, useAsync } from "../components/ui";
-import { ClusterInfoX, errText, isUnavailable, Unavailable } from "./ops/common";
+import { ClusterInfoX, Unavailable } from "./ops/common";
+import { BgHealCard, ScannerCard } from "./ops/HealPanels";
+import { LogsTab, TraceTab } from "./ops/LiveTabs";
+import { PoolsTab } from "./ops/PoolsTab";
 import { MetricCharts, useLiveMetrics } from "./ops/metrics";
 import { labelText, parseFamilies } from "./ops/prom";
 import "./ops/ops.css";
@@ -100,6 +103,7 @@ function HealTab() {
         const h = c.heal;
         if (!h || c.features?.heal === false) return <Unavailable title="Heal is not available on this server." />;
         return (
+          <>
           <Card
             title="Heal status"
             actions={
@@ -124,86 +128,13 @@ function HealTab() {
             />
             <p class="hint">A heal pass scans every object and rebuilds missing or corrupt shards from parity. Background passes also run on a schedule.</p>
           </Card>
-        );
-      }}
-    </Loading>
-  );
-}
-
-function PoolsTab() {
-  const info = useAsync(() => cluster.info() as unknown as Promise<ClusterInfoX>);
-  return (
-    <Loading state={info}>
-      {() => {
-        const c = info.data!;
-        return (
-          <>
-            <Card title="Pools">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Pool</th>
-                    <th scope="col" class="num">Drives</th>
-                    <th scope="col" class="num">Online</th>
-                    <th scope="col" class="num">Sets</th>
-                    <th scope="col" class="num">Set size</th>
-                    <th scope="col">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {c.pools.map((p) => {
-                    const sets = new Set(c.drives.filter((d) => d.pool === p.index).map((d) => d.set ?? 0)).size;
-                    return (
-                      <tr key={p.index}>
-                        <td>Pool {p.index}</td>
-                        <td class="ops-num">{p.drives}</td>
-                        <td class="ops-num">{p.online}</td>
-                        <td class="ops-num">{sets || "-"}</td>
-                        <td class="ops-num">{p.setSize}</td>
-                        <td>
-                          <Badge kind={p.online === p.drives ? "ok" : "warn"}>active</Badge>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </Card>
-            <Unavailable title="Decommissioning is not supported by this server.">Pools cannot be drained or removed from the console. Capacity can be added by starting the server with an extra pool.</Unavailable>
+          <BgHealCard />
+          <ScannerCard />
           </>
         );
       }}
     </Loading>
   );
-}
-
-/** Probes a streaming admin endpoint once and reports whether it exists. */
-function StreamTab({ op, what }: { op: string; what: string }) {
-  const [state, setState] = useState<{ status: "probing" | "unavailable" | "available"; detail?: string }>({ status: "probing" });
-  useEffect(() => {
-    const ctl = new AbortController();
-    admin(op, { signal: ctl.signal }).then(
-      () => setState({ status: "available" }),
-      (e) => {
-        if (ctl.signal.aborted) return;
-        const un = isUnavailable(e) || (e as { status?: number }).status === 400;
-        setState({ status: un ? "unavailable" : "available", detail: un ? undefined : errText(e) });
-      },
-    );
-    const t = setTimeout(() => ctl.abort(), 4000);
-    return () => {
-      clearTimeout(t);
-      ctl.abort();
-    };
-  }, [op]);
-  if (state.status === "probing") return <div class="loading">Checking {what} support…</div>;
-  if (state.status === "unavailable")
-    return (
-      <Unavailable title={`${what} is not available on this server.`}>
-        Use the <a href={href("/monitoring", { tab: "metrics" })}>metrics</a> view for live request rates, or configure an <a href={href("/events", { tab: "audit" })}>audit target</a> to receive a record of every request.
-      </Unavailable>
-    );
-  return <Unavailable title={`${what} streaming is not supported in the console yet.`}>{state.detail}</Unavailable>;
 }
 
 function AuditTab() {
@@ -230,8 +161,8 @@ export function Monitoring() {
         {tab === "metrics" && <MetricsTab />}
         {tab === "heal" && <HealTab />}
         {tab === "pools" && <PoolsTab />}
-        {tab === "trace" && <StreamTab op="/trace" what="Request trace" />}
-        {tab === "logs" && <StreamTab op="/log" what="Server log" />}
+        {tab === "trace" && <TraceTab />}
+        {tab === "logs" && <LogsTab />}
         {tab === "audit" && <AuditTab />}
       </div>
     </>

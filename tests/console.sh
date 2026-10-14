@@ -109,6 +109,27 @@ contains "cluster drives" '"drives":[{"path"' "$CL"
 contains "cluster usage" '"buckets":1' "$CL"
 contains "metrics" "zkfsm_requests_total" "$(curl "${C[@]}" "$API/metrics")"
 check "heal trigger" 202 "$(status "${C[@]}" -X POST "$API/heal")"
+contains "background heal status" '"sets":[{"id":"0-0"' "$(curl "${C[@]}" -X POST "$API/s3/minio/admin/v3/background-heal/status")"
+contains "scanner status sample" '"scanner":{"collected"' "$(curl "${C[@]}" --max-time 10 "$API/s3/minio/admin/v3/metrics?types=1&n=1")"
+check "pools need a pooled server" 501 "$(status "${C[@]}" "$API/s3/minio/admin/v4/pools/list")"
+
+# --- live trace and log streams relayed as they arrive (no buffering in the proxy)
+curl "${C[@]}" -N --max-time 4 "$API/s3/minio/admin/v3/trace?s3=true" >"$WORK/trace.out" &
+TRP=$!
+sleep 1
+curl "${C[@]}" -o /dev/null -X PUT --data-binary traced "$API/s3/con/traced.txt"
+wait "$TRP" || true
+contains "trace streams a PUT" '"funcname":"s3.PutObject"' "$(cat "$WORK/trace.out")"
+curl "${C[@]}" -N --max-time 4 "$API/s3/minio/admin/v3/trace?s3=true&err=true" >"$WORK/trace-err.out" &
+TRP=$!
+sleep 1
+curl "${C[@]}" -o /dev/null "$API/s3/con/missing-for-trace"
+curl "${C[@]}" -o /dev/null "$API/s3/con/traced.txt"
+wait "$TRP" || true
+contains "error-only trace keeps a 404" '"statuscode":404' "$(cat "$WORK/trace-err.out")"
+if grep -q '"funcname":"s3.GetObject","time"[^}]*"statuscode":200' "$WORK/trace-err.out"; then check "error-only trace drops a 200" no yes; else check "error-only trace drops a 200" no no; fi
+contains "log stream replays recent entries" '"level":"INFO"' "$(curl "${C[@]}" -N --max-time 2 "$API/s3/minio/admin/v3/log?limit=20" || true)"
+check "trace needs a session" 401 "$(status "$API/s3/minio/admin/v3/trace")"
 
 # --- S3 Tables mount (signed for the s3tables service), batch, KMS, lambda config
 check "tables needs session" 401 "$(status "$API/tables/buckets")"
@@ -142,6 +163,7 @@ check "bob reads" "hello console" "$(curl -s -b "$BJ" "$API/s3/con/dir%20a/h%2B1
 check "bob cannot write" 403 "$(status -b "$BJ" -H 'x-console-csrf: 1' -X PUT --data-binary x "$API/s3/con/nope")"
 check "bob cannot admin" 403 "$(status -b "$BJ" "$API/s3/minio/admin/v3/list-users")"
 check "bob has no dashboard" 403 "$(status -b "$BJ" "$API/cluster")"
+check "bob cannot trace" 403 "$(status -b "$BJ" --max-time 5 "$API/s3/minio/admin/v3/trace")"
 
 # --- logout
 check "logout" 200 "$(status "${C[@]}" -X POST "$API/logout")"
@@ -189,6 +211,65 @@ check "sso user lists buckets" 200 "$(status -b "$OJ" "$API/s3/")"
 check "replayed code rejected" "/?error=" "$(header location "$CB" | cut -c1-8)"
 check "unknown provider" "/?error=" "$(header location "$API/oidc/start?provider=nope" | cut -c1-8)"
 
+# --- 2-pool 4-node cluster (EC:4+2): pools API through the proxy. The second pool is
+# appended after data is written so a throttled rebalance has work to do.
+NPORT=(0 "$(free_port)" "$(free_port)" "$(free_port)" "$(free_port)")
+PCPORT="$(free_port)"
+PCON="http://127.0.0.1:$PCPORT"
+PAPI="$PCON/api/v1"
+NPIDS=(0 0 0 0 0)
+pool_args() { local i; for i in 1 2 3 4; do printf 'http://127.0.0.1:%s%s/n%s/%s{1...4} ' "${NPORT[$i]}" "$WORK" "$i" "$1"; done; }
+start_node() { # node pool-args...
+  local i="$1"; shift
+  local extra=()
+  [[ "$i" == 1 ]] && extra=(--console-address "127.0.0.1:$PCPORT" --console-session 3600)
+  ZKFSM_REBALANCE_MBPS=1 ZKFSM_DECOMMISSION_MBPS=1 ZKFSM_ACCESS_KEY=admin ZKFSM_SECRET_KEY=adminsecret "$ROOT/zig-out/bin/zkfsm" "$@" \
+    --listen "127.0.0.1:${NPORT[$i]}" --node-address "127.0.0.1:${NPORT[$i]}" --protection EC:4+2 "${extra[@]}" >>"$WORK/node$i.log" 2>&1 &
+  NPIDS[$i]=$!
+}
+start_cluster() {
+  local i j
+  for i in 1 2 3 4; do start_node "$i" "$@"; done
+  for i in 1 2 3 4; do
+    for j in $(seq 1200); do [[ "$(status "http://127.0.0.1:${NPORT[$i]}/health/ready")" == 200 ]] && break; sleep 0.1; done
+  done
+}
+stop_cluster() {
+  local i
+  for i in 1 2 3 4; do [[ "${NPIDS[$i]}" != 0 ]] && kill "${NPIDS[$i]}" 2>/dev/null || true; done
+  for i in 1 2 3 4; do [[ "${NPIDS[$i]}" != 0 ]] && { wait "${NPIDS[$i]}" 2>/dev/null || true; }; NPIDS[$i]=0; done
+}
+cleanup_cluster() { local p; for p in "${NPIDS[@]}"; do [[ "$p" != 0 ]] && kill -9 "$p" 2>/dev/null || true; done; }
+trap 'cleanup_cluster; cleanup' EXIT
+read -r -a PA <<<"$(pool_args a)"
+read -r -a PB <<<"$(pool_args b)"
+start_cluster --data "${PA[@]}"
+NSIG=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "admin:adminsecret")
+curl -s -o /dev/null "${NSIG[@]}" -X PUT "http://127.0.0.1:${NPORT[1]}/pooled"
+for i in $(seq 1 24); do
+  head -c 1048576 /dev/urandom >"$WORK/mid"
+  curl -s -o /dev/null "${NSIG[@]}" -T "$WORK/mid" "http://127.0.0.1:${NPORT[$((i % 4 + 1))]}/pooled/mid$i"
+done
+stop_cluster
+start_cluster --data "${PA[@]}" --data "${PB[@]}"
+PJ="$WORK/pjar"
+PC=(-s -b "$PJ" -H "x-console-csrf: 1")
+check "cluster console login" 200 "$(status -c "$PJ" -H 'x-console-csrf: 1' -d '{"accessKey":"admin","secretKey":"adminsecret"}' "$PAPI/login")"
+PL="$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/pools/list")"
+contains "pool list has two pools" '"id":1,' "$PL"
+contains "pool list usage" '"totalSize":' "$PL"
+contains "rebalance not started" 'XMinioAdminRebalanceNotStarted' "$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/rebalance/status")"
+contains "rebalance start" '"id":"' "$(curl "${PC[@]}" -X POST "$PAPI/s3/minio/admin/v4/rebalance/start")"
+contains "rebalance status" '"stoppedAt":"0001-01-01T00:00:00Z"' "$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/rebalance/status")"
+check "rebalance stop" 200 "$(status "${PC[@]}" -X POST "$PAPI/s3/minio/admin/v4/rebalance/stop")"
+contains "rebalance stopped" '"status":"Stopped"' "$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/rebalance/status")"
+P1="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])[0]["cmdline"])' "$PL")"
+PQ="$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$P1")"
+check "decommission start" 200 "$(status "${PC[@]}" -X POST "$PAPI/s3/minio/admin/v4/pools/decommission?pool=$PQ")"
+contains "decommission status" '"startTime":"20' "$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/pools/status?pool=$PQ")"
+check "decommission cancel" 200 "$(status "${PC[@]}" -X POST "$PAPI/s3/minio/admin/v4/pools/cancel?pool=$PQ")"
+contains "decommission canceled" '"canceled":true' "$(curl "${PC[@]}" "$PAPI/s3/minio/admin/v4/pools/status?pool=$PQ")"
+
 echo "api: $pass passed, $fail failed"
 [[ $fail -eq 0 ]] || { echo "--- server log"; tail -50 "$WORK/server.log"; exit 1; }
 
@@ -196,7 +277,7 @@ echo "api: $pass passed, $fail failed"
 if [[ "${CONSOLE_E2E:-1}" != "0" && -d "$ROOT/console/node_modules" ]]; then
   cd "$ROOT/console"
   npx vitest run
-  CONSOLE_URL="$CON" SCREENSHOT_DIR="${SCREENSHOT_DIR:-$WORK/shots}" npx playwright test
+  CONSOLE_URL="$CON" POOLS_CONSOLE_URL="$PCON" SCREENSHOT_DIR="${SCREENSHOT_DIR:-$WORK/shots}" npx playwright test
 else
   echo "skip UI suites (console/node_modules missing or CONSOLE_E2E=0)"
 fi
