@@ -4,6 +4,7 @@
 const std = @import("std");
 const core = @import("../core/root.zig");
 const rhttp = @import("remote/http.zig");
+const https = @import("../tls/https.zig");
 const xml = @import("remote/xml.zig");
 const sign = @import("s3/sign.zig");
 
@@ -63,7 +64,6 @@ pub const Source = struct {
     /// Strings borrowed; must outlive the source.
     kind: Kind,
     mutex: std.Thread.Mutex = .{},
-    http: std.http.Client,
     rsa: ?RsaKey = null,
     /// Bearer: "Bearer <token>". Signing: access key, secret, session token back to back.
     cached: std.ArrayListUnmanaged(u8) = .empty,
@@ -76,9 +76,7 @@ pub const Source = struct {
 
     /// Initializes in place.
     pub fn init(self: *Source, gpa: Allocator, kind: Kind) InitError!void {
-        self.* = .{ .gpa = gpa, .kind = kind, .http = .{ .allocator = gpa } };
-        rhttp.applyCaFile(&self.http);
-        errdefer self.http.deinit();
+        self.* = .{ .gpa = gpa, .kind = kind };
         if (kind == .service_account) {
             self.rsa = RsaKey.fromPem(gpa, kind.service_account.private_key_pem) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -90,7 +88,6 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         self.cached.deinit(self.gpa);
-        self.http.deinit();
     }
 
     pub fn isBearer(self: *const Source) bool {
@@ -269,30 +266,31 @@ pub const Source = struct {
         return out.written();
     }
 
-    fn request(self: *Source, a: Allocator, method: std.http.Method, url: []const u8, body: ?[]const u8, extra: []const std.http.Header) FetchError![]const u8 {
-        var out: std.Io.Writer.Allocating = .init(a);
-        const res = self.http.fetch(.{
-            .location = .{ .url = url },
+    fn request(_: *Source, a: Allocator, method: std.http.Method, url: []const u8, body: ?[]const u8, extra: []const std.http.Header) FetchError![]const u8 {
+        var hs: [8]std.http.Header = undefined;
+        if (extra.len >= hs.len) return error.Http;
+        @memcpy(hs[0..extra.len], extra);
+        var n = extra.len;
+        if (body != null and body.?.len > 0) {
+            hs[n] = .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" };
+            n += 1;
+        }
+        const res = https.send(a, .{
             .method = method,
-            .payload = body,
-            .redirect_behavior = .unhandled,
-            .keep_alive = false,
-            .headers = .{
-                .content_type = if (body != null and body.?.len > 0) .{ .override = "application/x-www-form-urlencoded" } else .default,
-                .user_agent = .{ .override = "zkfsm" },
-                .accept_encoding = .omit,
-            },
-            .extra_headers = extra,
-            .response_writer = &out.writer,
+            .url = url,
+            .headers = hs[0..n],
+            .body = body,
+            .tls = rhttp.tierTls(.{}),
         }) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
             log.warn("credential request to {s} failed: {t}", .{ url, e });
             return error.Http;
         };
-        if (res.status != .ok) {
-            log.warn("credential request to {s}: HTTP {d}", .{ url, @intFromEnum(res.status) });
+        if (res.status != 200) {
+            log.warn("credential request to {s}: HTTP {d}", .{ url, res.status });
             return error.Rejected;
         }
-        return out.written();
+        return res.body;
     }
 };
 

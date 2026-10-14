@@ -52,6 +52,13 @@ pub const Config = struct {
     token_uri: []const u8 = "",
     tenant_id: []const u8 = "",
     client_id: []const u8 = "",
+    /// TLS to the endpoint: PEM client certificate and key paths, CA bundle path,
+    /// verified host name, and minimum version ("1.2"/"1.3"); all node-local.
+    client_cert: []const u8 = "",
+    client_key: []const u8 = "",
+    ca_file: []const u8 = "",
+    server_name: []const u8 = "",
+    min_version: []const u8 = "",
 
     pub fn eql(a: Config, b: Config) bool {
         if (a.kind != b.kind or a.created_ns != b.created_ns or a.auth != b.auth) return false;
@@ -62,9 +69,11 @@ pub const Config = struct {
 
 const v1_fields = .{ "name", "endpoint", "access_key", "secret_key", "bucket", "prefix", "region", "storage_class" };
 const v2_fields = .{ "role_arn", "token_file", "token_uri", "tenant_id", "client_id" };
-pub const string_fields = v1_fields ++ v2_fields;
-/// Leading u16 of the v2 encoding (v1 starts with the tier count, at most 256).
+const v3_fields = .{ "client_cert", "client_key", "ca_file", "server_name", "min_version" };
+pub const string_fields = v1_fields ++ v2_fields ++ v3_fields;
+/// Leading u16 of the v2/v3 encodings (v1 starts with the tier count, at most 256).
 const v2_marker: u16 = 0xffff;
+const v3_marker: u16 = 0xfffe;
 
 /// Tier names are upper-case letters, digits, '-' and '_' (S3 storage-class style),
 /// and never STANDARD, which names the local hot tier.
@@ -81,7 +90,7 @@ pub fn encode(gpa: std.mem.Allocator, tiers: []const Config) Error![]u8 {
     var a: std.Io.Writer.Allocating = .init(gpa);
     defer a.deinit();
     const w = &a.writer;
-    codec.putInt(w, u16, v2_marker) catch return error.OutOfMemory;
+    codec.putInt(w, u16, v3_marker) catch return error.OutOfMemory;
     codec.putInt(w, u16, @intCast(tiers.len)) catch return error.OutOfMemory;
     for (tiers) |t| {
         if (!validName(t.name)) return error.InvalidConfig;
@@ -102,7 +111,8 @@ pub fn encode(gpa: std.mem.Allocator, tiers: []const Config) Error![]u8 {
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) (codec.DecodeError || error{OutOfMemory})![]Config {
     var c: codec.Cursor = .{ .bytes = bytes };
     var n = try c.int(u16);
-    const v2 = n == v2_marker;
+    const v3 = n == v3_marker;
+    const v2 = v3 or n == v2_marker;
     if (v2) n = try c.int(u16);
     if (n > max_tiers) return error.Corrupt;
     const out = try arena.alloc(Config, n);
@@ -113,6 +123,9 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) (codec.DecodeError ||
         if (v2) t.auth = std.meta.intToEnum(Auth, (try c.take(1))[0]) catch return error.Corrupt;
         inline for (v1_fields) |f| @field(t, f) = try c.take(try c.int(u16));
         if (v2) inline for (v2_fields) |f| {
+            @field(t, f) = try c.take(try c.int(u16));
+        };
+        if (v3) inline for (v3_fields) |f| {
             @field(t, f) = try c.take(try c.int(u16));
         };
         if (!validName(t.name)) return error.Corrupt;
@@ -128,7 +141,7 @@ test "tier config roundtrip and names" {
     const tiers = [_]Config{
         .{ .name = "WARM", .kind = .minio, .endpoint = "http://127.0.0.1:9000", .access_key = "ak", .secret_key = "sk", .bucket = "b", .prefix = "p/", .created_ns = 5 },
         .{ .name = "AZ_1", .kind = .azure, .access_key = "acct", .secret_key = "a2V5", .bucket = "cont" },
-        .{ .name = "AZ_SP", .kind = .azure, .access_key = "acct", .secret_key = "cs", .bucket = "cont", .auth = .service_principal, .tenant_id = "t", .client_id = "c" },
+        .{ .name = "AZ_SP", .kind = .azure, .access_key = "acct", .secret_key = "cs", .bucket = "cont", .auth = .service_principal, .tenant_id = "t", .client_id = "c", .client_cert = "/c.pem", .client_key = "/k.pem", .min_version = "1.3" },
     };
     const b = try encode(gpa, &tiers);
     defer gpa.free(b);
@@ -136,6 +149,7 @@ test "tier config roundtrip and names" {
     try std.testing.expectEqual(@as(usize, 3), d.len);
     try std.testing.expect(d[0].eql(tiers[0]) and d[1].eql(tiers[1]) and !d[0].eql(tiers[1]) and d[2].eql(tiers[2]));
     try std.testing.expectEqualStrings("c", d[2].client_id);
+    try std.testing.expectEqualStrings("/k.pem", d[2].client_key);
     // v1 encoding (no marker, no auth) still decodes.
     const v1 = [_]u8{ 1, 0, 1 } ++ [_]u8{0} ** 16 ++ [_]u8{ 1, 0, 'W' } ++ [_]u8{ 0, 0 } ** 3 ++ [_]u8{ 1, 0, 'b' } ++ [_]u8{ 0, 0 } ** 3;
     const old = try decode(arena.allocator(), &v1);

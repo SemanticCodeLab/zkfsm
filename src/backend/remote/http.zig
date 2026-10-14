@@ -1,6 +1,12 @@
-//! HTTP plumbing shared by remote object providers: endpoints, single exchanges, retry policy.
+//! HTTP plumbing shared by remote object providers: endpoints, pooled exchanges over the
+//! outbound TLS client (CA files, client certificates, IP SANs), retry policy.
 const std = @import("std");
 const http = std.http;
+const httpc = @import("../../tls/httpc.zig");
+const dial = @import("../../tls/dial.zig");
+
+pub const Tls = dial.TlsOptions;
+pub const parseMinVersion = dial.parseMinVersion;
 
 pub const Endpoint = struct {
     tls: bool,
@@ -36,40 +42,53 @@ pub const Endpoint = struct {
     }
 
     /// `host` without port; `path` and `query` already percent-encoded.
-    pub fn uri(e: Endpoint, host: []const u8, path: []const u8, query: []const u8) std.Uri {
-        return .{
-            .scheme = if (e.tls) "https" else "http",
-            .host = .{ .raw = host },
-            .port = e.port,
-            .path = .{ .percent_encoded = path },
-            .query = if (query.len == 0) null else .{ .percent_encoded = query },
-        };
+    pub fn uri(e: Endpoint, host: []const u8, path: []const u8, query: []const u8) Url {
+        const h = if (host.len > 1 and host[0] == '[' and host[host.len - 1] == ']') host[1 .. host.len - 1] else host;
+        return .{ .tls = e.tls, .host = h, .port = e.port orelse @as(u16, if (e.tls) 443 else 80), .path = path, .query = query };
     }
 };
 
-/// Trusts the PEM bundle named by ZKFSM_TIER_CA_FILE in addition to the system roots.
-pub fn applyCaFile(client: *http.Client) void {
-    if (http.Client.disable_tls) return;
-    const path = std.posix.getenv("ZKFSM_TIER_CA_FILE") orelse return;
-    const gpa = client.allocator;
-    client.ca_bundle.rescan(gpa) catch |e| std.log.warn("system CA roots unavailable: {t}", .{e});
-    client.ca_bundle.addCertsFromFilePathAbsolute(gpa, path) catch |e| return std.log.warn("cannot load {s}: {t}", .{ path, e });
-    client.next_https_rescan_certs = false;
+pub const Url = struct {
+    tls: bool,
+    /// Dial host (no brackets).
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+    query: []const u8,
+};
+
+/// Connection pool plus the TLS settings of one remote endpoint.
+pub const Client = struct {
+    pool: httpc.Pool,
+    tls: Tls,
+
+    pub const InitError = error{ InvalidConfig, OutOfMemory };
+
+    /// Validates the TLS files now so bad settings fail at configuration time.
+    pub fn init(gpa: std.mem.Allocator, tls: Tls) InitError!Client {
+        const t = tierTls(tls);
+        try t.check(gpa);
+        return .{ .pool = .init(gpa, .{}), .tls = t };
+    }
+
+    pub fn deinit(c: *Client) void {
+        c.pool.deinit();
+    }
+};
+
+/// Falls back to ZKFSM_TIER_CA_FILE when no CA file is configured.
+pub fn tierTls(tls: Tls) Tls {
+    var t = tls;
+    if (t.ca_file.len == 0) if (std.posix.getenv("ZKFSM_TIER_CA_FILE")) |p| {
+        t.ca_file = p;
+    };
+    return t;
 }
 
 fn componentStr(c: std.Uri.Component) []const u8 {
     return switch (c) {
         .raw, .percent_encoded => |s| s,
     };
-}
-
-/// Trusts `ca_file` (else $SSL_CERT_FILE) instead of the system roots when one is set.
-pub fn useCaFile(client: *http.Client, gpa: std.mem.Allocator, ca_file: []const u8) error{ InvalidConfig, OutOfMemory }!void {
-    const path = if (ca_file.len > 0) ca_file else std.posix.getenv("SSL_CERT_FILE") orelse return applyCaFile(client);
-    if (path.len == 0) return applyCaFile(client);
-    client.ca_bundle.addCertsFromFilePath(gpa, std.fs.cwd(), path) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidConfig;
-    if (client.ca_bundle.map.count() == 0) return error.InvalidConfig;
-    @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
 }
 
 /// Exponential backoff with full jitter.
@@ -120,68 +139,68 @@ pub const Info = struct {
 
 pub const SendError = error{ Transient, OutOfMemory };
 
+pub const Body = httpc.Body;
+
 /// One request/response. Must stay at a stable address between `start` and `deinit`.
 pub const Exchange = struct {
-    req: http.Client.Request,
+    x: httpc.Exchange,
     info: Info,
-    te: http.TransferEncoding,
 
     pub const Options = struct {
         method: http.Method,
-        uri: std.Uri,
+        uri: Url,
         host: []const u8,
         authorization: ?[]const u8,
         headers: []const http.Header,
         body: ?[]const u8 = null,
+        /// Streamed upload; overrides `body`.
+        stream: ?httpc.Stream = null,
     };
 
+    const max_extra = 32;
+
     /// Sends the request and reads the response head. On success call `deinit`.
-    pub fn start(x: *Exchange, client: *http.Client, o: Options) SendError!void {
-        x.req = client.request(o.method, o.uri, .{
-            .redirect_behavior = .unhandled,
-            .headers = .{
-                .host = .{ .override = o.host },
-                .authorization = if (o.authorization) |a| .{ .override = a } else .omit,
-                .user_agent = .{ .override = "zkfsm" },
-                .accept_encoding = .omit,
-            },
-            .extra_headers = o.headers,
+    pub fn start(x: *Exchange, client: *Client, o: Options) SendError!void {
+        var target_buf: [8192]u8 = undefined;
+        const target = (if (o.uri.query.len > 0)
+            std.fmt.bufPrint(&target_buf, "{s}?{s}", .{ if (o.uri.path.len == 0) "/" else o.uri.path, o.uri.query })
+        else
+            std.fmt.bufPrint(&target_buf, "{s}", .{if (o.uri.path.len == 0) "/" else o.uri.path})) catch return error.Transient;
+        var hs: [max_extra + 1]http.Header = undefined;
+        if (o.headers.len > max_extra) return error.Transient;
+        var n: usize = 0;
+        if (o.authorization) |a| {
+            hs[0] = .{ .name = "Authorization", .value = a };
+            n = 1;
+        }
+        @memcpy(hs[n..][0..o.headers.len], o.headers);
+        n += o.headers.len;
+        const payload: Body = if (o.stream) |st| .{ .stream = st } else if (o.body) |b| .{ .bytes = b } else .none;
+        x.x.start(&client.pool, .{
+            .host = o.uri.host,
+            .port = o.uri.port,
+            .tls = if (o.uri.tls) client.tls else null,
+        }, .{
+            .method = o.method,
+            .target = target,
+            .host = o.host,
+            .headers = hs[0..n],
+            .body = payload,
+            .user_agent = "zkfsm",
         }) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => blk: {
-                std.log.scoped(.remote).debug("cannot connect to {s}: {t}", .{ o.host, e });
+                std.log.scoped(.remote).debug("{s} {s}: {t}", .{ @tagName(o.method), o.host, e });
                 break :blk error.Transient;
             },
         };
-        // A failed exchange must not return its (possibly dead) connection to the pool.
-        errdefer {
-            if (x.req.connection) |c| c.closing = true;
-            x.req.deinit();
-        }
-        const payload: ?[]const u8 = o.body orelse if (o.method.requestHasBody()) @as([]const u8, "") else null;
-        if (payload) |b| {
-            x.req.transfer_encoding = .{ .content_length = b.len };
-            var bw = x.req.sendBodyUnflushed(&.{}) catch return error.Transient;
-            bw.writer.writeAll(b) catch return error.Transient;
-            bw.end() catch return error.Transient;
-            // Over TLS, end() leaves the last records in the socket writer's buffer.
-            if (x.req.connection) |c| c.flush() catch return error.Transient;
-        } else {
-            x.req.sendBodiless() catch return error.Transient;
-        }
-        const resp = x.req.receiveHead(&.{}) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.Transient,
-        };
-        x.info = .{ .status = resp.head.status, .content_length = resp.head.content_length };
-        x.te = resp.head.transfer_encoding;
-        if (!x.hasBody()) x.info.content_length = x.info.content_length orelse 0;
-        var it = resp.head.iterateHeaders();
-        while (it.next()) |h| {
+        x.info = .{ .status = @enumFromInt(x.x.status), .content_length = x.x.content_length };
+        if (x.x.framing == .none) x.info.content_length = x.info.content_length orelse 0;
+        for (x.x.headers()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "etag")) {
-                const n = @min(h.value.len, x.info.etag_buf.len);
-                @memcpy(x.info.etag_buf[0..n], h.value[0..n]);
-                x.info.etag_len = @intCast(n);
+                const k = @min(h.value.len, x.info.etag_buf.len);
+                @memcpy(x.info.etag_buf[0..k], h.value[0..k]);
+                x.info.etag_len = @intCast(k);
             } else if (std.ascii.eqlIgnoreCase(h.name, "last-modified")) {
                 x.info.mtime_ns = parseHttpDate(h.value);
             } else if (std.ascii.eqlIgnoreCase(h.name, "content-range")) {
@@ -190,42 +209,23 @@ pub const Exchange = struct {
         }
     }
 
-    fn hasBody(x: *const Exchange) bool {
-        const c = @intFromEnum(x.info.status);
-        return x.req.method != .HEAD and c >= 200 and c != 204 and c != 304;
+    pub fn header(x: *const Exchange, name: []const u8) ?[]const u8 {
+        return x.x.header(name);
     }
 
-    /// Body stream; call at most once. Bypasses std's PUT-has-no-response-body rule.
+    /// Body stream; call at most once.
     pub fn body(x: *Exchange, transfer_buf: []u8) *std.Io.Reader {
-        if (!x.hasBody()) return std.Io.Reader.ending;
-        return x.req.reader.bodyReader(transfer_buf, x.te, x.info.content_length);
+        return x.x.body(transfer_buf);
     }
 
     /// Reads a small body (XML, error document) into memory.
     pub fn readAll(x: *Exchange, gpa: std.mem.Allocator, limit: usize) error{ Transient, OutOfMemory, TooLarge }![]u8 {
-        var buf: [4096]u8 = undefined;
-        const r = x.body(&buf);
-        return r.allocRemaining(gpa, .limited(limit)) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.StreamTooLong => error.TooLarge,
-            error.ReadFailed => error.Transient,
-        };
+        return x.x.readAll(gpa, limit);
     }
 
+    /// Drains a short unread body for reuse; otherwise closes the connection.
     pub fn deinit(x: *Exchange) void {
-        // Drain unread bodies so keep-alive connections return to the pool; std would
-        // otherwise read a bodiless 204 until EOF.
-        const rd = &x.req.reader;
-        if (rd.state == .received_head) {
-            if (!x.hasBody()) {
-                _ = rd.bodyReader(&.{}, .none, 0).discardRemaining() catch {};
-            } else if (x.info.content_length != null or x.te == .chunked) {
-                _ = rd.bodyReader(&.{}, x.te, x.info.content_length).discardRemaining() catch {};
-            }
-        } else if (rd.state == .body_remaining_content_length and rd.state.body_remaining_content_length == 0) {
-            rd.state = .ready;
-        }
-        x.req.deinit();
+        x.x.deinit();
     }
 };
 

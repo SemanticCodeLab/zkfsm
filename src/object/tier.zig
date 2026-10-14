@@ -104,6 +104,7 @@ pub const Tier = struct {
         const p = std.mem.trimLeft(u8, c.prefix, "/");
         t.prefix = if (p.len == 0 or p[p.len - 1] == '/') p else try std.fmt.allocPrint(a, "{s}/", .{p});
         if (c.bucket.len == 0) return error.InvalidTierConfig;
+        const tls = tlsOf(c) orelse return error.InvalidTierConfig;
         const creds: backend.s3.Credentials = .{ .access_key = c.access_key, .secret_key = c.secret_key };
         if (c.auth != .keys) t.source = try makeSource(gpa, a, c);
         errdefer if (t.source) |src| src.deinit();
@@ -120,6 +121,7 @@ pub const Tier = struct {
                     .retry = retry,
                     .storage_class = c.storage_class,
                     .source = t.source,
+                    .tls = tls,
                 }) catch |e| return mapInit(e) };
             },
             .gcs => {
@@ -131,6 +133,7 @@ pub const Tier = struct {
                 sc.storage_class = c.storage_class;
                 sc.storage_class_header = "x-goog-storage-class";
                 sc.source = t.source;
+                sc.tls = tls;
                 t.client = .{ .s3 = backend.s3.S3Client.init(gpa, sc) catch |e| return mapInit(e) };
             },
             .azure => {
@@ -144,10 +147,22 @@ pub const Tier = struct {
                     .retry = retry,
                     .access_tier = c.storage_class,
                     .source = t.source,
+                    .tls = tls,
                 }) catch |e| return mapInit(e);
             },
         }
         return t;
+    }
+
+    /// Endpoint TLS settings of `c`; null when the minimum version is unknown.
+    fn tlsOf(c: Config) ?backend.remote_http.Tls {
+        return .{
+            .ca_file = c.ca_file,
+            .server_name = c.server_name,
+            .client_cert_file = c.client_cert,
+            .client_key_file = c.client_key,
+            .min_version = backend.remote_http.parseMinVersion(c.min_version) orelse return null,
+        };
     }
 
     /// Credential source for `c` (strings in the tier arena); node settings come from env.
@@ -610,7 +625,21 @@ pub const Registry = struct {
         token_uri: []const u8 = "",
         tenant_id: []const u8 = "",
         client_id: []const u8 = "",
+        /// TLS settings; each non-null value replaces the stored one ("" clears it).
+        client_cert: ?[]const u8 = null,
+        client_key: ?[]const u8 = null,
+        ca_file: ?[]const u8 = null,
+        server_name: ?[]const u8 = null,
+        min_version: ?[]const u8 = null,
+
+        pub fn empty(c: Creds) bool {
+            if (c.access_key != null or c.secret_key != null or c.auth != null) return false;
+            inline for (tls_fields) |f| if (@field(c, f) != null) return false;
+            return true;
+        }
     };
+
+    pub const tls_fields = .{ "client_cert", "client_key", "ca_file", "server_name", "min_version" };
 
     /// Replaces credentials after probing them.
     pub fn edit(r: *Registry, name: []const u8, creds: Creds) AdminError!void {
@@ -627,6 +656,9 @@ pub const Registry = struct {
             next.auth = m;
             inline for (.{ "role_arn", "token_file", "token_uri", "tenant_id", "client_id" }) |f| @field(next, f) = @field(creds, f);
         }
+        inline for (tls_fields) |f| if (@field(creds, f)) |v| {
+            @field(next, f) = v;
+        };
         try probe(r, next, false);
         try r.update(next, struct {
             fn f(x: Config, _: std.mem.Allocator, l: *std.ArrayList(Config)) AdminError!void {

@@ -49,8 +49,8 @@ pub const Config = struct {
     list_page_size: u16 = 1000,
     /// SigV4 service name in the credential scope.
     service: []const u8 = "s3",
-    /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
-    ca_file: []const u8 = "",
+    /// TLS for https endpoints: CA file, client certificate, server name, minimum version.
+    tls: rhttp.Tls = .{},
     /// Sent on every object write when set (tiers with a storage class).
     storage_class: []const u8 = "",
     /// Lowercase header carrying `storage_class` (GCS uses x-goog-storage-class).
@@ -72,7 +72,7 @@ pub const S3Client = struct {
     gpa: std.mem.Allocator,
     cfg: Config,
     endpoint: rhttp.Endpoint,
-    http: std.http.Client,
+    http: rhttp.Client,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) InitError!S3Client {
         const ep = rhttp.Endpoint.parse(cfg.endpoint) catch return error.InvalidConfig;
@@ -82,10 +82,7 @@ pub const S3Client = struct {
         if (cfg.list_page_size == 0 or cfg.region.len == 0) return error.InvalidConfig;
         if (cfg.addressing == .virtual_host and std.mem.indexOfScalar(u8, cfg.bucket, '.') != null and ep.tls)
             return error.InvalidConfig; // dotted buckets break wildcard TLS certs
-        var c: S3Client = .{ .gpa = gpa, .cfg = cfg, .endpoint = ep, .http = .{ .allocator = gpa } };
-        errdefer c.http.deinit();
-        if (ep.tls) try rhttp.useCaFile(&c.http, gpa, cfg.ca_file);
-        return c;
+        return .{ .gpa = gpa, .cfg = cfg, .endpoint = ep, .http = try rhttp.Client.init(gpa, if (ep.tls) cfg.tls else .{}) };
     }
 
     pub fn deinit(self: *S3Client) void {
