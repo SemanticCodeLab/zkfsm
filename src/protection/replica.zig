@@ -530,24 +530,14 @@ pub const ReplicaStore = struct {
         const m = self.stripe(key);
         m.lock();
         defer m.unlock();
-        const Each = struct {
-            self: *ReplicaStore,
-            holds: *Holds,
-            key: PhysicalKey,
-            framed: []const u8,
-            res: [max_drives]?Error = @splat(error.IoFailed),
-            fn f(c: *@This(), j: usize) void {
-                const lb = c.holds.lbs[j] orelse return;
-                c.res[j] = if (c.self.putFramed(lb, c.key, c.framed)) |_| null else |e| e;
-            }
-        };
-        var each: Each = .{ .self = self, .holds = &holds, .key = key, .framed = framed };
-        fanout.run(placed.len, holds.parallel(), &each, Each.f);
+        var res: [max_drives]?Error = @splat(error.IoFailed);
+        const want: [max_drives]bool = @splat(true);
+        self.putMany(holds.lbs[0..placed.len], want[0..placed.len], key, framed, &res);
         var ok: usize = 0;
         var worst: Error = error.IoFailed;
         for (placed, 0..) |_, j| {
             if (holds.lbs[j] == null) continue;
-            if (each.res[j]) |e| worst = worse(worst, e) else ok += 1;
+            if (res[j]) |e| worst = worse(worst, e) else ok += 1;
         }
         if (ok < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
         if (ok < placed.len and self.clustered()) self.drives.noteDegraded(key);
@@ -560,6 +550,78 @@ pub const ReplicaStore = struct {
             .local => |l| shard.putRecordNewer(l, self.gpa, key, framed),
             .ext => lb.store().putRecord(key, framed),
         };
+    }
+
+    /// Drives to call for one record slot: each local drive alone, remote drives of
+    /// one owner together (one batched call). Returns the group count.
+    fn groupDrives(lbs: []const ?Handle, want: []const bool, groups: *[max_drives][max_drives]u8, lens: *[max_drives]u8) usize {
+        var n: usize = 0;
+        var owner: [max_drives]?u32 = undefined;
+        for (lbs, 0..) |l, j| {
+            if (!want[j]) continue;
+            const h = l orelse continue;
+            const o: ?u32 = if (h == .ext) h.ext.vtable.owner(h.ext.ctx) else null;
+            var g: usize = n;
+            if (o) |x| for (0..n) |i| if (owner[i] == x) {
+                g = i;
+                break;
+            };
+            if (g == n) {
+                owner[n] = o;
+                lens[n] = 0;
+                n += 1;
+            }
+            groups[g][lens[g]] = @intCast(j);
+            lens[g] += 1;
+        }
+        return n;
+    }
+
+    /// Writes `framed` to the wanted drives; `res[j]` is drive j's outcome.
+    fn putMany(self: *ReplicaStore, lbs: []const ?Handle, want: []const bool, key: PhysicalKey, framed: []const u8, res: *[max_drives]?Error) void {
+        const Each = struct {
+            self: *ReplicaStore,
+            lbs: []const ?Handle,
+            key: PhysicalKey,
+            framed: []const u8,
+            groups: [max_drives][max_drives]u8 = undefined,
+            lens: [max_drives]u8 = undefined,
+            res: *[max_drives]?Error,
+            fn f(c: *@This(), g: usize) void {
+                const idx = c.groups[g][0..c.lens[g]];
+                const first = c.lbs[idx[0]].?;
+                if (first == .local or idx.len == 1) {
+                    c.res[idx[0]] = if (c.self.putFramed(first, c.key, c.framed)) |_| null else |e| e;
+                    return;
+                }
+                var ctxs: [max_drives]*anyopaque = undefined;
+                var out: [max_drives]?Error = undefined;
+                for (idx, 0..) |j, i| ctxs[i] = c.lbs[j].?.ext.ctx;
+                first.ext.vtable.putRecords(ctxs[0..idx.len], c.key, c.framed, out[0..idx.len]);
+                for (idx, 0..) |j, i| c.res[j] = out[i];
+            }
+        };
+        var each: Each = .{ .self = self, .lbs = lbs, .key = key, .framed = framed, .res = res };
+        const n = groupDrives(lbs, want, &each.groups, &each.lens);
+        var remote = false;
+        for (0..n) |g| remote = remote or lbs[each.groups[g][0]].? == .ext;
+        fanout.run(n, remote, &each, Each.f);
+    }
+
+    /// What one drive holds for a record slot, from its raw bytes (owned) or error.
+    fn classify(self: *ReplicaStore, d: u8, key: PhysicalKey, got: Error![]u8) Error!Replica {
+        const raw = got catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotFound => .missing,
+            else => .offline,
+        };
+        const u = shard.unframeAny(raw) orelse {
+            self.gpa.free(raw);
+            std.log.warn("drive {s}: corrupt record {s}", .{ self.drives.drives[d].path, &key.hex });
+            return .corrupt;
+        };
+        shard.observeStamp(u.stamp);
+        return .{ .present = .{ .raw = raw, .stamp = u.stamp, .tombstone = u.tombstone } };
     }
 
     /// Cluster delete: a newer tombstone replaces the record on a majority.
@@ -624,46 +686,56 @@ pub const ReplicaStore = struct {
         present: struct { raw: []u8, stamp: u64, tombstone: bool },
     };
 
-    fn readReplica(self: *ReplicaStore, d: u8, key: PhysicalKey) Error!Replica {
-        const lb = self.drives.acquire(d) orelse return .offline;
-        defer self.drives.release(d);
-        const raw = lb.store().getRecord(key, self.gpa) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.NotFound => .missing,
-            else => .offline,
-        };
-        const u = shard.unframeAny(raw) orelse {
-            self.gpa.free(raw);
-            std.log.warn("drive {s}: corrupt record {s}", .{ self.drives.drives[d].path, &key.hex });
-            return .corrupt;
-        };
-        shard.observeStamp(u.stamp);
-        return .{ .present = .{ .raw = raw, .stamp = u.stamp, .tombstone = u.tombstone } };
-    }
-
-    /// Concurrent replica reads of one record slot.
+    /// Concurrent replica reads of one record slot, batched per owner node.
     const ReadMany = struct {
         self: *ReplicaStore,
         placed: []const u8,
         key: PhysicalKey,
+        holds: Holds,
         reps: [max_drives]Replica = @splat(.offline),
         oom: bool = false,
-        lo: usize = 0,
+        groups: [max_drives][max_drives]u8 = undefined,
+        lens: [max_drives]u8 = undefined,
 
-        fn run(r: *ReadMany, lo: usize, hi: usize) void {
-            if (hi <= lo) return;
-            r.lo = lo;
-            var remote = false;
-            for (r.placed[lo..hi]) |d| remote = remote or !r.self.drives.isLocal(d);
-            fanout.run(hi - lo, remote, r, one);
+        fn init(self: *ReplicaStore, placed: []const u8, key: PhysicalKey) ReadMany {
+            return .{ .self = self, .placed = placed, .key = key, .holds = Holds.acquire(self.drives, placed) };
         }
 
-        fn one(r: *ReadMany, i: usize) void {
-            const j = r.lo + i;
-            r.reps[j] = r.self.readReplica(r.placed[j], r.key) catch blk: {
-                r.oom = true;
-                break :blk .offline;
-            };
+        /// Reads the wanted drives that were not read yet.
+        fn run(r: *ReadMany, want: []const bool) void {
+            var todo: [max_drives]bool = @splat(false);
+            for (0..r.placed.len) |j| todo[j] = want[j] and r.reps[j] == .offline and r.holds.lbs[j] != null;
+            const n = groupDrives(r.holds.lbs[0..r.placed.len], todo[0..r.placed.len], &r.groups, &r.lens);
+            var remote = false;
+            for (0..n) |g| remote = remote or r.holds.lbs[r.groups[g][0]].? == .ext;
+            fanout.run(n, remote, r, one);
+        }
+
+        fn one(r: *ReadMany, g: usize) void {
+            const idx = r.groups[g][0..r.lens[g]];
+            const first = r.holds.lbs[idx[0]].?;
+            if (first == .local or idx.len == 1) {
+                const j = idx[0];
+                r.reps[j] = r.self.classify(r.placed[j], r.key, first.store().getRecord(r.key, r.self.gpa)) catch blk: {
+                    r.oom = true;
+                    break :blk .offline;
+                };
+                return;
+            }
+            var ctxs: [max_drives]*anyopaque = undefined;
+            var out: [max_drives]iface.drive.RecordRead = undefined;
+            for (idx, 0..) |j, i| ctxs[i] = r.holds.lbs[j].?.ext.ctx;
+            first.ext.vtable.getRecords(ctxs[0..idx.len], r.self.gpa, r.key, out[0..idx.len]);
+            for (idx, 0..) |j, i| {
+                const got: Error![]u8 = switch (out[i]) {
+                    .bytes => |b| b,
+                    .err => |e| e,
+                };
+                r.reps[j] = r.self.classify(r.placed[j], r.key, got) catch blk: {
+                    r.oom = true;
+                    break :blk .offline;
+                };
+            }
         }
 
         fn answered(r: *const ReadMany) usize {
@@ -680,12 +752,40 @@ pub const ReplicaStore = struct {
             return best;
         }
 
+        /// The drives worth reading first to get `need` answers: local ones, then
+        /// owners holding the most drives (one call each).
+        fn cheapest(r: *const ReadMany, need: usize, out: *[max_drives]bool) void {
+            out.* = @splat(false);
+            const all: [max_drives]bool = @splat(true);
+            var groups: [max_drives][max_drives]u8 = undefined;
+            var lens: [max_drives]u8 = undefined;
+            const n = groupDrives(r.holds.lbs[0..r.placed.len], all[0..r.placed.len], &groups, &lens);
+            var taken: [max_drives]bool = @splat(false);
+            var have: usize = 0;
+            for (0..n) |g| if (r.holds.lbs[groups[g][0]].? == .local) {
+                taken[g] = true;
+                for (groups[g][0..lens[g]]) |j| out[j] = true;
+                have += lens[g];
+            };
+            while (have < need) {
+                var best: ?usize = null;
+                for (0..n) |g| if (!taken[g] and (best == null or lens[g] > lens[best.?])) {
+                    best = g;
+                };
+                const g = best orelse break;
+                taken[g] = true;
+                for (groups[g][0..lens[g]]) |j| out[j] = true;
+                have += lens[g];
+            }
+        }
+
         fn deinit(r: *ReadMany) void {
             for (r.reps[0..r.placed.len]) |x| if (x == .present) r.self.gpa.free(x.present.raw);
+            r.holds.release();
         }
     };
 
-    /// Concurrent rewrites of chosen replicas with one framed record.
+    /// Rewrites the chosen replicas with one framed record, batched per owner node.
     const FixMany = struct {
         self: *ReplicaStore,
         placed: []const u8,
@@ -695,18 +795,14 @@ pub const ReplicaStore = struct {
         ok: [max_drives]bool = @splat(false),
 
         fn run(x: *FixMany) void {
-            var remote = false;
-            for (x.placed, 0..) |d, j| remote = remote or (x.todo[j] and !x.self.drives.isLocal(d));
-            fanout.run(x.placed.len, remote, x, one);
-        }
-
-        fn one(x: *FixMany, j: usize) void {
-            if (!x.todo[j]) return;
-            const d = x.placed[j];
-            const lb = x.self.drives.acquire(d) orelse return;
-            defer x.self.drives.release(d);
-            x.self.putFramed(lb, x.key, x.raw) catch return;
-            x.ok[j] = true;
+            var any = false;
+            for (x.todo[0..x.placed.len]) |t| any = any or t;
+            if (!any) return;
+            var holds = Holds.acquire(x.self.drives, x.placed);
+            defer holds.release();
+            var res: [max_drives]?Error = @splat(error.IoFailed);
+            x.self.putMany(holds.lbs[0..x.placed.len], x.todo[0..x.placed.len], x.key, x.raw, &res);
+            for (0..x.placed.len) |j| x.ok[j] = x.todo[j] and res[j] == null;
         }
     };
 
@@ -715,12 +811,15 @@ pub const ReplicaStore = struct {
         var pbuf: [max_drives]u8 = undefined;
         const placed = self.drives.placed(key, &pbuf);
         const need = placed.len - quorum(placed.len) + 1;
-        var reads: ReadMany = .{ .self = self, .placed = placed, .key = key };
+        var reads: ReadMany = .init(self, placed, key);
         defer reads.deinit();
         const reps = &reads.reps;
-        // The first `need` drives at once; the rest only if some did not answer.
-        reads.run(0, need);
-        if (reads.answered() < need) reads.run(need, placed.len);
+        // The cheapest drives that can answer `need`; the rest only if some did not.
+        var first: [max_drives]bool = undefined;
+        reads.cheapest(need, &first);
+        reads.run(first[0..placed.len]);
+        const all: [max_drives]bool = @splat(true);
+        if (reads.answered() < need) reads.run(all[0..placed.len]);
         if (reads.oom) return error.OutOfMemory;
         if (reads.answered() < need) return error.ReadQuorum;
         const b = reads.newest() orelse return error.NotFound;
@@ -748,10 +847,11 @@ pub const ReplicaStore = struct {
         m.lock();
         defer m.unlock();
         var rep: KeyReport = .{};
-        var reads: ReadMany = .{ .self = self, .placed = placed, .key = key };
+        var reads: ReadMany = .init(self, placed, key);
         defer reads.deinit();
         const reps = &reads.reps;
-        reads.run(0, placed.len);
+        const all: [max_drives]bool = @splat(true);
+        reads.run(all[0..placed.len]);
         const best = reads.newest();
         var corrupt = false;
         for (reps[0..placed.len]) |r| corrupt = corrupt or r == .corrupt;

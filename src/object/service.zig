@@ -76,8 +76,9 @@ pub const Cluster = struct {
         lock: *const fn (ctx: *anyopaque, resource: []const u8) Error!u64,
         unlock: *const fn (ctx: *anyopaque, token: u64) void,
         /// Delivers changes to every peer; called with no service lock held.
-        /// `seqs[i]` is what `journal` returned for `changes[i]`.
-        publish: *const fn (ctx: *anyopaque, changes: []const Change, seqs: []const u64) void,
+        /// `seqs[i]` is what `journal` returned for `changes[i]`. `unlock`, when set,
+        /// is a lock token to release once the changes are delivered.
+        publish: *const fn (ctx: *anyopaque, changes: []const Change, seqs: []const u64, unlock: ?u64) void,
         /// Records a change before its record is written (caller holds `mutex`);
         /// returns its journal sequence number.
         journal: *const fn (ctx: *anyopaque, change: Change) u64,
@@ -90,15 +91,35 @@ pub const Cluster = struct {
 /// A committed change peers must mirror in their caches.
 pub const Change = union(enum) {
     /// A record slot was written or removed; `version` null is the current slot.
-    record: struct { pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8, version: ?core.VersionId },
+    /// `stored` is what the writer put there, when known: peers then skip the re-read.
+    /// `lock` is the namespace lock the writer held, so peers can tell a late notice.
+    record: struct { pk: backend.PhysicalKey, bid: core.BucketId, key: []const u8, version: ?core.VersionId, stored: ?index_mod.Version = null, lock: ?LockRef = null },
     upload: core.ObjectId,
     catalog,
     /// Reload everything (a peer may have missed changes).
     resync,
 };
 
+/// A held namespace lock: its token and resource name.
+pub const LockRef = struct { uid: u64, resource: []const u8 };
+
 /// Held cluster lock on one resource; release with `ObjectService.clusterUnlock`.
-pub const Held = struct { token: ?u64 = null };
+pub const Held = struct { token: ?u64 = null, pushed: bool = false };
+
+/// Cluster locks this thread holds, innermost last; changes carry the innermost.
+threadlocal var tl_uid: [4]u64 = @splat(0);
+threadlocal var tl_res: [4][1400]u8 = undefined;
+threadlocal var tl_len: [4]usize = @splat(0);
+threadlocal var tl_depth: usize = 0;
+
+fn heldUid() u64 {
+    return if (tl_depth == 0 or tl_depth > tl_uid.len) 0 else tl_uid[tl_depth - 1];
+}
+
+fn heldLock() ?LockRef {
+    const uid = heldUid();
+    return if (uid == 0) null else .{ .uid = uid, .resource = tl_res[tl_depth - 1][0..tl_len[tl_depth - 1]] };
+}
 
 pub const Header = metadata.headers.Header;
 pub const SystemHeaders = metadata.headers.System;
@@ -239,7 +260,8 @@ pub const ObjectService = struct {
     /// (one write per drive, no data blob); 0 disables. Set before serving.
     inline_max: u32 = 0,
 
-    const Pending = struct { change: Change, seq: u64 };
+    /// `uid`: the lock the change was made under (0: none), published with its release.
+    const Pending = struct { change: Change, seq: u64, uid: u64 = 0 };
 
     pub fn init(gpa: std.mem.Allocator, store: backend.StorageBackend) Error!ObjectService {
         return initWith(gpa, store, true);
@@ -341,14 +363,23 @@ pub const ObjectService = struct {
         const c = self.cluster orelse return .{};
         var buf: [1400]u8 = undefined;
         const res = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ kind, a, b }) catch return error.KeyTooLong;
-        return .{ .token = try c.vtable.lock(c.ctx, res) };
+        const token = try c.vtable.lock(c.ctx, res);
+        // Deeper nesting than the stack holds: its changes carry no lock.
+        if (tl_depth < tl_uid.len) {
+            tl_uid[tl_depth] = token;
+            @memcpy(tl_res[tl_depth][0..res.len], res);
+            tl_len[tl_depth] = res.len;
+        }
+        tl_depth += 1;
+        return .{ .token = token, .pushed = true };
     }
 
-    /// Publishes pending changes, then releases the lock. Call with `mutex` released.
+    /// Publishes this lock's pending changes, then releases it (peers that took the
+    /// changes release it with them). Call with `mutex` released.
     pub fn clusterUnlock(self: *ObjectService, h: Held) void {
-        self.publishPending();
-        const c = self.cluster orelse return;
-        if (h.token) |t| c.vtable.unlock(c.ctx, t);
+        if (h.pushed) tl_depth -= 1;
+        if (self.cluster == null) return;
+        self.publishOwn(h.token);
     }
 
     /// Journals a change; call before writing the record so a crash cannot hide a
@@ -367,41 +398,81 @@ pub const ObjectService = struct {
     pub fn emitSeq(self: *ObjectService, change: Change, seq: u64) void {
         if (self.cluster == null) return;
         var c = change;
-        if (c == .record) c.record.key = self.gpa.dupe(u8, change.record.key) catch return;
+        if (c == .record) {
+            c.record.key = self.gpa.dupe(u8, change.record.key) catch return;
+            c.record.lock = null;
+            if (change.record.stored != null) if (heldLock()) |l| {
+                c.record.lock = .{ .uid = l.uid, .resource = self.gpa.dupe(u8, l.resource) catch {
+                    c.record.stored = null;
+                    return self.queue(c, seq, 0);
+                } };
+            };
+        }
+        self.queue(c, seq, heldUid());
+    }
+
+    fn queue(self: *ObjectService, c: Change, seq: u64, uid: u64) void {
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
-        self.pending.append(self.gpa, .{ .change = c, .seq = seq }) catch self.freeChange(c);
+        self.pending.append(self.gpa, .{ .change = c, .seq = seq, .uid = uid }) catch self.freeChange(c);
     }
 
     fn freeChange(self: *ObjectService, c: Change) void {
-        if (c == .record) self.gpa.free(c.record.key);
+        if (c != .record) return;
+        self.gpa.free(c.record.key);
+        if (c.record.lock) |l| self.gpa.free(l.resource);
     }
 
+    /// Publishes every pending change.
     pub fn publishPending(self: *ObjectService) void {
+        self.publishSome(null, null);
+    }
+
+    /// Publishes the changes made under lock `token` (and unowned ones), releasing it.
+    fn publishOwn(self: *ObjectService, token: ?u64) void {
+        self.publishSome(token orelse 0, token);
+    }
+
+    fn publishSome(self: *ObjectService, owner: ?u64, unlock: ?u64) void {
         const c = self.cluster orelse return;
         // Peers reload the catalog and with it drop their cached bucket documents.
         if (self.docs.dirty.swap(false, .acq_rel)) self.emit(.catalog);
-        var pend: std.ArrayList(Pending) = blk: {
+        var pend: std.ArrayList(Pending) = .empty;
+        {
             self.pending_mutex.lock();
             defer self.pending_mutex.unlock();
-            const l = self.pending;
-            self.pending = .empty;
-            break :blk l;
-        };
+            if (owner) |o| {
+                var i: usize = 0;
+                while (i < self.pending.items.len) {
+                    const p = self.pending.items[i];
+                    if (p.uid != 0 and p.uid != o) {
+                        i += 1;
+                        continue;
+                    }
+                    pend.append(self.gpa, p) catch {
+                        i += 1;
+                        continue;
+                    };
+                    _ = self.pending.orderedRemove(i);
+                }
+            } else {
+                pend = self.pending;
+                self.pending = .empty;
+            }
+        }
         defer {
             for (pend.items) |p| self.freeChange(p.change);
             pend.deinit(self.gpa);
         }
-        if (pend.items.len == 0) return;
-        const changes = self.gpa.alloc(Change, pend.items.len) catch return;
+        const changes = self.gpa.alloc(Change, pend.items.len) catch return c.vtable.publish(c.ctx, &.{}, &.{}, unlock);
         defer self.gpa.free(changes);
-        const seqs = self.gpa.alloc(u64, pend.items.len) catch return;
+        const seqs = self.gpa.alloc(u64, pend.items.len) catch return c.vtable.publish(c.ctx, &.{}, &.{}, unlock);
         defer self.gpa.free(seqs);
         for (pend.items, changes, seqs) |p, *ch, *sq| {
             ch.* = p.change;
             sq.* = p.seq;
         }
-        c.vtable.publish(c.ctx, changes, seqs);
+        c.vtable.publish(c.ctx, changes, seqs, unlock);
     }
 
     /// Mirrors a peer's change in this node's caches.
@@ -410,7 +481,8 @@ pub const ObjectService = struct {
             .record => |r| {
                 self.mutex.lock();
                 defer self.mutex.unlock();
-                self.indexResync(r.pk, r.bid, r.key, r.version);
+                const v = r.stored orelse return self.indexResync(r.pk, r.bid, r.key, r.version);
+                if (r.version == null) self.index.setCurrent(r.bid, r.key, v) else self.index.putNoncurrent(r.bid, r.key, v);
             },
             .upload => |id| {
                 self.mutex.lock();
@@ -884,4 +956,57 @@ test "finalizer sets reported size and etag after streaming" {
     const h = try svc.head(arena.allocator(), "fin", "k");
     try std.testing.expectEqual(@as(u64, 2), h.size);
     try std.testing.expectEqual(@as(u64, 10), h.blob_size);
+}
+
+test "small bodies live in the record: no blob, ranged reads, overwrite to a blob and back" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    var lb = try backend.local.LocalBackend.open(try tmp.dir.realpath(".", &pbuf));
+    defer lb.close();
+    var svc = try ObjectService.init(gpa, lb.backend());
+    defer svc.deinit();
+    svc.inline_max = 8;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Count = struct {
+        n: usize = 0,
+        fn f(c: *anyopaque, _: backend.PhysicalKey) backend.Error!void {
+            const s: *@This() = @ptrCast(@alignCast(c));
+            s.n += 1;
+        }
+        fn blobs(b: backend.StorageBackend) !usize {
+            var c: @This() = .{};
+            b.list(.data, .{ .ctx = &c, .func = f }) catch |e| if (e != error.NotFound) return e;
+            return c.n;
+        }
+    };
+    try svc.createBucket("inl");
+    var s1: std.Io.Reader = .fixed("tiny");
+    _ = try svc.put("inl", "k", &s1, .{ .content_length = 4 });
+    try std.testing.expectEqual(@as(usize, 0), try Count.blobs(lb.backend()));
+    const info = try svc.head(a, "inl", "k");
+    try std.testing.expectEqualStrings("tiny", info.inline_data.?);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try svc.read(info, .{ .offset = 1, .length = 2 }, &out.writer);
+    try std.testing.expectEqualStrings("in", out.written());
+    // A short body is an incomplete upload, not a truncated inline object.
+    var short: std.Io.Reader = .fixed("abc");
+    try std.testing.expectError(error.IncompleteBody, svc.put("inl", "k", &short, .{ .content_length = 4 }));
+    // Larger than the threshold (or of unknown length): a blob; back to inline frees it.
+    var s2: std.Io.Reader = .fixed("a larger body");
+    _ = try svc.put("inl", "k", &s2, .{ .content_length = 13 });
+    try std.testing.expectEqual(@as(usize, 1), try Count.blobs(lb.backend()));
+    var s3: std.Io.Reader = .fixed("again");
+    _ = try svc.put("inl", "k", &s3, .{ .content_length = 5 });
+    try std.testing.expectEqual(@as(usize, 0), try Count.blobs(lb.backend()));
+    out.clearRetainingCapacity();
+    try svc.read(try svc.head(a, "inl", "k"), null, &out.writer);
+    try std.testing.expectEqualStrings("again", out.written());
+    var s4: std.Io.Reader = .fixed("x");
+    _ = try svc.put("inl", "u", &s4, .{});
+    try std.testing.expect((try svc.head(a, "inl", "u")).inline_data == null);
 }

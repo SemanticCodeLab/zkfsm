@@ -46,7 +46,62 @@ pub const RemoteDrive = struct {
         .online = online,
         .deleteRecordIf = deleteRecordIf,
         .fresh = freshFn,
+        .owner = owner,
+        .putRecords = putRecords,
+        .getRecords = getRecords,
     };
+
+    fn owner(ctx: *anyopaque) u32 {
+        return cast(ctx).node;
+    }
+
+    /// Query `ds=<addr>,<addr>...&k=<key>` for a batch of drives of one node.
+    fn batchQuery(buf: []u8, ctxs: []const *anyopaque, key: PhysicalKey) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeAll("ds=") catch unreachable;
+        for (ctxs, 0..) |c, i| w.print("{s}{s}", .{ if (i > 0) "," else "", cast(c).address() }) catch unreachable;
+        w.print("&k={c}{s}", .{ wire.spaceChar(key.space), &key.hex }) catch unreachable;
+        return w.buffered();
+    }
+
+    fn putRecords(ctxs: []const *anyopaque, key: PhysicalKey, framed: []const u8, out: []?Error) void {
+        @memset(out, error.IoFailed);
+        if (ctxs.len == 0 or ctxs.len > wire.max_batch) return;
+        const d = cast(ctxs[0]);
+        var qb: [wire.max_batch * 26 + 64]u8 = undefined;
+        var c = d.rpc.call(d.node, "rputs", batchQuery(&qb, ctxs, key), .{ .bytes = framed }, .{}) catch |e| return @memset(out, mapCall(e));
+        defer c.deinit();
+        if (!c.ok()) return @memset(out, mapStatus(c.status));
+        var sb: [wire.max_batch * 2]u8 = undefined;
+        if (c.body_left != 2 * ctxs.len) return;
+        c.readInto(sb[0 .. 2 * ctxs.len]) catch return;
+        for (out, 0..) |*o, i| {
+            const st = std.mem.readInt(u16, sb[2 * i ..][0..2], .little);
+            o.* = if (st == 200) null else mapStatus(st);
+        }
+    }
+
+    fn getRecords(ctxs: []const *anyopaque, gpa: std.mem.Allocator, key: PhysicalKey, out: []drive.RecordRead) void {
+        @memset(out, .{ .err = error.IoFailed });
+        if (ctxs.len == 0 or ctxs.len > wire.max_batch) return;
+        const d = cast(ctxs[0]);
+        var qb: [wire.max_batch * 26 + 64]u8 = undefined;
+        var c = d.rpc.call(d.node, "rgets", batchQuery(&qb, ctxs, key), .{ .bytes = "" }, .{}) catch |e| return @memset(out, .{ .err = mapCall(e) });
+        defer c.deinit();
+        if (!c.ok()) return @memset(out, .{ .err = mapStatus(c.status) });
+        const body = c.readAll(gpa, wire.max_batch * (max_record + 6)) catch |e| return @memset(out, .{ .err = mapCall(e) });
+        defer gpa.free(body);
+        var pos: usize = 0;
+        for (out) |*o| {
+            if (body.len - pos < 6) break;
+            const st = std.mem.readInt(u16, body[pos..][0..2], .little);
+            const n = std.mem.readInt(u32, body[pos + 2 ..][0..4], .little);
+            pos += 6;
+            if (n > body.len - pos) break;
+            o.* = if (st != 200) .{ .err = mapStatus(st) } else if (gpa.dupe(u8, body[pos..][0..n])) |b| .{ .bytes = b } else |_| .{ .err = error.OutOfMemory };
+            pos += n;
+        }
+    }
 
     fn freshFn(ctx: *anyopaque) Error!bool {
         var c = try cast(ctx).exchange("fresh", null, "", "");

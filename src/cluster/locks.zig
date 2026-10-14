@@ -22,7 +22,8 @@ pub const Table = struct {
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
 
     /// `since_ms`: when `uid` was first granted the lease (observability).
-    pub const Entry = struct { uid: u64, expires_ms: i64, since_ms: i64 = 0 };
+    /// `superseded`: another holder's notice arrived while this lease was held here.
+    pub const Entry = struct { uid: u64, expires_ms: i64, since_ms: i64 = 0, superseded: bool = false };
 
     pub fn deinit(t: *Table) void {
         var it = t.entries.keyIterator();
@@ -36,7 +37,7 @@ pub const Table = struct {
         defer t.mutex.unlock();
         if (t.entries.getPtr(resource)) |e| {
             if (e.uid != uid and e.expires_ms > now_ms) return false;
-            e.* = .{ .uid = uid, .expires_ms = now_ms + lease_ms, .since_ms = if (e.uid == uid) e.since_ms else now_ms };
+            e.* = .{ .uid = uid, .expires_ms = now_ms + lease_ms, .since_ms = if (e.uid == uid) e.since_ms else now_ms, .superseded = e.uid == uid and e.superseded };
             return true;
         }
         const k = try t.gpa.dupe(u8, resource);
@@ -54,6 +55,18 @@ pub const Table = struct {
         if (e.uid != uid) return false;
         e.expires_ms = now_ms + lease_ms;
         return true;
+    }
+
+    /// True when this node still grants `resource` to `uid` and saw no later writer:
+    /// a notice from `uid` is then the newest for the resource. A notice from anyone
+    /// else marks the current holder superseded, so its late notice is not trusted.
+    pub fn trust(t: *Table, resource: []const u8, uid: u64) bool {
+        t.mutex.lock();
+        defer t.mutex.unlock();
+        const e = t.entries.getPtr(resource) orelse return false;
+        if (e.uid == uid) return !e.superseded;
+        e.superseded = true;
+        return false;
     }
 
     pub fn unlock(t: *Table, resource: []const u8, uid: u64) void {
@@ -106,7 +119,7 @@ pub const Manager = struct {
     stop_ev: std.Thread.ResetEvent = .{},
     thread: ?std.Thread = null,
 
-    const Held = struct { resource: []u8, granted: u256 };
+    pub const Held = struct { resource: []u8, granted: u256 };
 
     pub fn deinit(m: *Manager) void {
         m.stop_ev.set();
@@ -143,7 +156,9 @@ pub const Manager = struct {
         var backoff_ms: u64 = 5;
         while (true) {
             if (!m.haveQuorum()) return error.NoQuorum;
-            const granted = m.ask(resource, uid, "lock");
+            // Every node, not a bare majority: a node holding the lease trusts the
+            // holder's change notices and skips re-reading the record.
+            const granted = m.ask(resource, uid, "lock", ~@as(u256, 0));
             if (@popCount(granted) >= m.quorum()) {
                 const copy = try m.gpa.dupe(u8, resource);
                 m.mutex.lock();
@@ -173,8 +188,22 @@ pub const Manager = struct {
         m.release(h.resource, uid, h.granted);
     }
 
-    /// Sends `op` to every reachable node at once; returns the bitmask of nodes that said yes.
-    fn ask(m: *Manager, resource: []const u8, uid: u64, op: []const u8) u256 {
+    /// Forgets a held lock whose release the caller delivers itself (with its change
+    /// notices); the caller frees `resource` and calls `releaseOn` for misses.
+    pub fn take(m: *Manager, uid: u64) ?Held {
+        m.mutex.lock();
+        defer m.mutex.unlock();
+        const kv = m.held.fetchRemove(uid) orelse return null;
+        return kv.value;
+    }
+
+    /// Unlocks on the nodes in `nodes` (a subset of the granted ones).
+    pub fn releaseOn(m: *Manager, resource: []const u8, uid: u64, on: u256) void {
+        m.release(resource, uid, on);
+    }
+
+    /// Sends `op` to the reachable nodes in `to` at once; returns the bitmask of nodes that said yes.
+    fn ask(m: *Manager, resource: []const u8, uid: u64, op: []const u8, to: u256) u256 {
         var bb: [max_resource + 32]u8 = undefined;
         const body = encodeBody(&bb, resource, uid) catch return 0;
         const Each = struct {
@@ -185,8 +214,10 @@ pub const Manager = struct {
             body: []const u8,
             now: i64,
             yes: [max_nodes]bool = @splat(false),
+            to: u256,
             fn f(c: *@This(), i: usize) void {
                 const node: u16 = @intCast(i);
+                if (c.to & (@as(u256, 1) << @intCast(i)) == 0) return;
                 c.yes[i] = if (node == c.m.rpc.self_node) blk: {
                     if (std.mem.eql(u8, c.op, "lock")) break :blk c.m.table.lock(c.resource, c.uid, c.now) catch false;
                     break :blk c.m.table.refresh(c.resource, c.uid, c.now);
@@ -197,7 +228,7 @@ pub const Manager = struct {
                 };
             }
         };
-        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp() };
+        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp(), .to = to };
         fanout.run(m.nodes(), true, &each, Each.f);
         var granted: u256 = 0;
         for (0..m.nodes()) |i| if (each.yes[i]) {
@@ -256,7 +287,7 @@ pub const Manager = struct {
                 }
             }
             for (todo.items) |t| {
-                const ok = m.ask(t.resource, t.uid, "refresh");
+                const ok = m.ask(t.resource, t.uid, "refresh", ~@as(u256, 0));
                 if (@popCount(ok) >= m.quorum()) continue;
                 // Released while the refresh was on its way: nothing was lost.
                 m.mutex.lock();
@@ -282,6 +313,12 @@ test "lease table grants, renews, expires, and unlocks by uid" {
     try std.testing.expect(!try t.lock("obj/b/k", 3, 30 + lease_ms));
     t.unlock("obj/b/k", 2);
     try std.testing.expect(try t.lock("obj/b/k", 3, 40 + lease_ms));
+    // Notices: the holder is trusted until another writer's notice supersedes it.
+    try std.testing.expect(t.trust("obj/b/k", 3));
+    try std.testing.expect(!t.trust("obj/b/k", 4));
+    try std.testing.expect(!t.trust("obj/b/k", 3));
+    try std.testing.expect(!t.trust("obj/none", 3));
+    t.unlock("obj/b/k", 3);
 
     var bb: [64]u8 = undefined;
     const body = try encodeBody(&bb, "obj/b/k", 0xabc);

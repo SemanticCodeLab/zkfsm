@@ -132,8 +132,18 @@ pub const Ext = struct {
         deleteRecordIf: *const fn (ctx: *anyopaque, key: PhysicalKey, stamp: u64) Error!void,
         /// The owner formatted the drive empty and has not fully healed it yet.
         fresh: *const fn (ctx: *anyopaque) Error!bool,
+        /// Owner of the drive: drives of one owner share batched calls.
+        owner: *const fn (ctx: *anyopaque) u32,
+        /// Stores one framed cluster record (newest stamp wins) on several drives of
+        /// one owner in a single call; `out[i]` is drive i's outcome.
+        putRecords: *const fn (ctxs: []const *anyopaque, key: PhysicalKey, framed: []const u8, out: []?Error) void,
+        /// Reads one record slot from several drives of one owner in a single call.
+        getRecords: *const fn (ctxs: []const *anyopaque, gpa: std.mem.Allocator, key: PhysicalKey, out: []RecordRead) void,
     };
 };
+
+/// One drive's answer to a batched record read; `bytes` is owned by the caller.
+pub const RecordRead = union(enum) { bytes: []u8, err: Error };
 
 /// A drive the caller holds; see `placement.DriveSet.acquire`.
 pub const Handle = union(enum) {

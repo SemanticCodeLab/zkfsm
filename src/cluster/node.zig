@@ -99,6 +99,8 @@ pub const Node = struct {
     root_fp: [16]u8,
     topo_fp: [16]u8,
     table: locks.Table,
+    /// Serialize applying notices of one lock resource (see `applyChange`).
+    note_stripes: [64]std.Thread.Mutex = @splat(.{}),
     locks: locks.Manager = undefined,
     /// Blobs peers are reading by lease.
     leases: handles.Table,
@@ -1137,7 +1139,7 @@ pub const Node = struct {
             if (n.gpa.alloc(wire.Note, fresh.items.len)) |notes| {
                 defer n.gpa.free(notes);
                 for (fresh.items, notes) |id, *o| o.* = .{ .garbage = id.bytes };
-                n.sendNotes(next, notes);
+                _ = n.sendNotes(next, notes);
             } else |_| {}
         };
         for (due.items) |item| {
@@ -1187,11 +1189,17 @@ pub const Node = struct {
     }
 
     /// Sends each change with its journal mark, then lets the entries turn stable:
-    /// a peer that sees the head move without the note knows it missed one.
-    fn publishFn(ctx: *anyopaque, changes: []const object.service.Change, seqs: []const u64) void {
+    /// a peer that sees the head move without the note knows it missed one. A lock
+    /// to release rides along; peers that missed the notes get a plain unlock.
+    fn publishFn(ctx: *anyopaque, changes: []const object.service.Change, seqs: []const u64, unlock: ?u64) void {
         const n: *Node = @ptrCast(@alignCast(ctx));
         defer n.journal.finish(seqs);
-        const notes = n.gpa.alloc(wire.Note, 2 * changes.len) catch return;
+        const held = if (unlock) |t| n.locks.take(t) else null;
+        defer if (held) |h| n.gpa.free(h.resource);
+        const notes = n.gpa.alloc(wire.Note, 2 * changes.len + 1) catch {
+            if (held) |h| n.locks.releaseOn(h.resource, unlock.?, h.granted);
+            return;
+        };
         defer n.gpa.free(notes);
         const epoch = n.journal.head().epoch;
         var k: usize = 0;
@@ -1203,7 +1211,15 @@ pub const Node = struct {
             notes[k] = .{ .change = c };
             k += 1;
         }
-        n.broadcast(notes[0..k]);
+        const h = held orelse {
+            if (k > 0) _ = n.broadcast(notes[0..k]);
+            return;
+        };
+        if (k == 0) return n.locks.releaseOn(h.resource, unlock.?, h.granted);
+        notes[k] = .{ .unlock = .{ .uid = unlock.?, .resource = h.resource } };
+        const delivered = n.broadcast(notes[0 .. k + 1]);
+        const self_bit = @as(u256, 1) << @intCast(n.topo.local);
+        n.locks.releaseOn(h.resource, unlock.?, h.granted & ~(delivered & ~self_bit));
     }
 
     /// Asks every online peer to apply the pool state; true when each reports
@@ -1234,27 +1250,37 @@ pub const Node = struct {
         return each.ok.load(.acquire);
     }
 
-    /// Sends notes to every online peer at once.
-    pub fn broadcast(n: *Node, notes: []const wire.Note) void {
+    /// Sends notes to every online peer at once; returns the nodes that took them.
+    pub fn broadcast(n: *Node, notes: []const wire.Note) u256 {
         const Each = struct {
             n: *Node,
             notes: []const wire.Note,
+            ok: [locks.max_nodes]bool = @splat(false),
             fn f(c: *@This(), i: usize) void {
                 const node: u16 = @intCast(i);
                 if (node == c.n.topo.local or !c.n.rpc.isOnline(node)) return;
-                c.n.sendNotes(node, c.notes);
+                c.ok[i] = c.n.sendNotes(node, c.notes);
             }
         };
         var each: Each = .{ .n = n, .notes = notes };
         protection.fanout.run(n.topo.nodes.len, true, &each, Each.f);
+        var mask: u256 = 0;
+        for (0..@min(n.topo.nodes.len, locks.max_nodes)) |i| if (each.ok[i]) {
+            mask |= @as(u256, 1) << @intCast(i);
+        };
+        return mask;
     }
 
-    fn sendNotes(n: *Node, node: u16, notes: []const wire.Note) void {
-        const body = wire.encodeNotes(n.gpa, notes) catch return;
+    fn sendNotes(n: *Node, node: u16, notes: []const wire.Note) bool {
+        const body = wire.encodeNotes(n.gpa, notes) catch return false;
         defer n.gpa.free(body);
-        if (body.len > wire.max_notify) return n.sendNotes(node, &.{.{ .change = .resync }});
-        var c = n.rpc.call(node, "notify", "", .{ .bytes = body }, .{ .timeout_ms = 5000 }) catch return;
-        c.deinit();
+        if (body.len > wire.max_notify) {
+            _ = n.sendNotes(node, &.{.{ .change = .resync }});
+            return false;
+        }
+        var c = n.rpc.call(node, "notify", "", .{ .bytes = body }, .{ .timeout_ms = 5000 }) catch return false;
+        defer c.deinit();
+        return c.ok();
     }
 
     /// Applies a peer's notes to this node's caches; a mark before a change says
@@ -1266,15 +1292,32 @@ pub const Node = struct {
             .garbage => |id| _ = n.gc.add(n.gpa, .{ .bytes = id }, backup_grace_ns, .{ .node = from, .boot = if (from < n.topo.nodes.len) n.rpc.bootOf(from) else 0 }),
             .pools => if (n.pools_hook) |h| h.func(h.ctx),
             .iam => if (n.iam_store.load(.acquire)) |s| s.reload() catch |e| std.log.warn("iam reload failed: {t}", .{e}),
+            .unlock => |u| n.table.unlock(u.resource, u.uid),
             .change => |c| {
                 defer mark = null;
                 // Before the service exists the startup catch-up covers it.
                 const svc = n.svc.load(.acquire) orelse continue;
-                svc.applyChange(c);
+                n.applyChange(svc, c);
                 if (c == .resync) if (n.iam_store.load(.acquire)) |s| s.reload() catch {};
                 if (mark) |m| if (from < n.topo.nodes.len) n.origins.applied(from, m);
             },
         };
+    }
+
+    /// A record's carried state is used only while this node still grants the writer
+    /// its lock and saw no later writer; else (a late notice) the record is re-read.
+    fn applyChange(n: *Node, svc: *object.ObjectService, c: object.service.Change) void {
+        if (c != .record or c.record.stored == null) return svc.applyChange(c);
+        var r = c.record;
+        const l = r.lock orelse {
+            r.stored = null;
+            return svc.applyChange(.{ .record = r });
+        };
+        const m = &n.note_stripes[std.hash.Wyhash.hash(0, l.resource) % n.note_stripes.len];
+        m.lock();
+        defer m.unlock();
+        if (!n.table.trust(l.resource, l.uid)) r.stored = null;
+        svc.applyChange(.{ .record = r });
     }
 
     // ---- background loops ----
@@ -1560,6 +1603,6 @@ pub const IamPersist = struct {
         const self = cast(ptr);
         self.node.locks.unlock(self.uid);
         self.mutex.unlock();
-        self.node.broadcast(&.{.iam});
+        _ = self.node.broadcast(&.{.iam});
     }
 };

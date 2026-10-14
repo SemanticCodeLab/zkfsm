@@ -133,6 +133,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
         return req.respond("", .{});
     }
     if (!n.drives_open.load(.acquire)) return fail(req, .service_unavailable, "starting");
+    if (std.mem.eql(u8, op, "rputs") or std.mem.eql(u8, op, "rgets")) return recordBatch(n, req, q, op[1] == 'p', body, arena);
     const d = n.localDrive(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
     const lb = d.set.acquire(d.slot) orelse return fail(req, .service_unavailable, "offline");
     defer d.set.release(d.slot);
@@ -175,6 +176,42 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
         return req.respond("", .{});
     }
     return fail(req, .not_found, "op");
+}
+
+/// One record slot on several local drives: `rputs` stores the framed body on each
+/// (newest stamp wins), `rgets` returns each copy. Per drive: u16 status, then for
+/// reads u32 length and the bytes.
+fn recordBatch(n: *Node, req: *Request, q: Query, put: bool, body: []const u8, arena: std.mem.Allocator) RawError!void {
+    const key = wire.parseKey(q.get("k") orelse "") orelse return fail(req, .bad_request, "key");
+    if (key.space == .data) return fail(req, .bad_request, "space");
+    if (put and (protection.shard.unframeAny(body) orelse return fail(req, .bad_request, "record")).stamp == 0) return fail(req, .bad_request, "stamp");
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var it = std.mem.splitScalar(u8, q.get("ds") orelse return fail(req, .bad_request, "ds"), ',');
+    var count: usize = 0;
+    while (it.next()) |addr| {
+        count += 1;
+        if (count > wire.max_batch) return fail(req, .bad_request, "ds");
+        var status: u16 = 200;
+        var bytes: []const u8 = "";
+        if (n.localDrive(addr)) |d| {
+            if (d.set.acquire(d.slot)) |lb| {
+                defer d.set.release(d.slot);
+                if (put) {
+                    protection.shard.putRecordNewer(lb.local, n.gpa, key, body) catch |e| {
+                        status = @intFromEnum(statusOf(e));
+                    };
+                } else if (lb.local.backend().getRecord(key, arena)) |b| {
+                    bytes = b;
+                } else |e| status = @intFromEnum(statusOf(e));
+            } else status = 503;
+        } else status = 404;
+        out.writer.writeInt(u16, status, .little) catch return error.OutOfMemory;
+        if (!put) {
+            out.writer.writeInt(u32, @intCast(bytes.len), .little) catch return error.OutOfMemory;
+            out.writer.writeAll(bytes) catch return error.OutOfMemory;
+        }
+    }
+    try req.respond(out.written(), .{});
 }
 
 fn respondMeta(req: *Request, body: []const u8, size: u64, mtime: i128) RawError!void {

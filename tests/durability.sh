@@ -23,6 +23,8 @@ check() { # name expected actual
 NDRIVES=4
 PROFILE=replica:2
 COPIES=2
+# Objects up to this size live inside their record (the default: 128 KiB / width).
+INLINE=65536
 start() {
   "$BIN" --data "$DATA/d{1...$NDRIVES}" --protection "$PROFILE" --scan-interval 1 --anonymous \
     --listen "127.0.0.1:$PORT" 2>>"$WORK/server.log" &
@@ -47,7 +49,9 @@ reads_ok() {
 # Full redundancy: every data blob/shard and record on exactly COPIES drives
 # (replicas byte-identical; EC shards differ), and the catalog on every drive.
 redundancy() {
-  python3 - "$DATA" "$N" "$COPIES" "$NDRIVES" "$PROFILE" <<'EOF'
+  local blobs=0 i
+  for i in $(seq $N); do (($(stat -c %s "$WORK/obj$i") > INLINE)) && blobs=$((blobs + 1)); done
+  python3 - "$DATA" "$blobs" "$COPIES" "$NDRIVES" "$PROFILE" <<'EOF'
 import collections, hashlib, os, sys
 root, n, want, ndrives, profile = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 copies = collections.defaultdict(list)
@@ -147,6 +151,7 @@ rm -rf "${DATA:?}"/*
 NDRIVES=6
 PROFILE=EC:4+2
 COPIES=6
+INLINE=21845
 start
 curl -s -o /dev/null -X PUT "$EP/dur"
 for i in $(seq $N); do
@@ -178,6 +183,55 @@ set +e
 "$BIN" heal --data "$DATA/d{1...6}" 2>"$WORK/heal-ec.log"
 check "EC loss of 3 drives reported as data loss" 3 "$?"
 set -e
+
+# kill -9 while small (inline) objects are written: every acknowledged object is
+# read back intact after the restart; an overwritten key holds its last acknowledged
+# body or the one in flight at the kill.
+rm -rf "${DATA:?}"/*
+start
+curl -s -o /dev/null -X PUT "$EP/dur"
+writer() { # id rounds
+  local w="$1" j=0 f="$WORK/w$1"
+  while :; do
+    j=$((j + 1))
+    head -c $((RANDOM % 20000 + 1)) /dev/urandom >"$f.body"
+    local m; m=$(md5sum <"$f.body" | cut -d' ' -f1)
+    if curl -sf -o /dev/null -T "$f.body" "$EP/dur/k$w-$j-$2"; then echo "k$w-$j-$2 $m" >>"$f.acked"; fi
+    echo "$m" >"$f.pending"
+    if curl -sf -o /dev/null -T "$f.body" "$EP/dur/hot$w"; then echo "$m" >"$f.hot"; fi
+  done
+}
+lost=0
+bad_hot=0
+acked=0
+for round in 1 2 3; do
+  WPIDS=()
+  for w in 1 2 3 4; do writer "$w" "$round" & WPIDS+=($!); done
+  sleep 2
+  kill -9 "$PID"
+  wait "$PID" 2>/dev/null || true
+  PID=""
+  kill "${WPIDS[@]}" 2>/dev/null || true
+  wait "${WPIDS[@]}" 2>/dev/null || true
+  start
+  for w in 1 2 3 4; do
+    while read -r k m; do
+      acked=$((acked + 1))
+      got=$(curl -sf "$EP/dur/$k" | md5sum | cut -d' ' -f1)
+      [[ "$got" == "$m" ]] || { lost=$((lost + 1)); echo "     lost or corrupt: $k"; }
+    done <"$WORK/w$w.acked"
+    : >"$WORK/w$w.acked"
+    if [[ -s "$WORK/w$w.hot" ]]; then
+      got=$(curl -sf "$EP/dur/hot$w" | md5sum | cut -d' ' -f1)
+      [[ "$got" == "$(cat "$WORK/w$w.hot")" || "$got" == "$(cat "$WORK/w$w.pending")" ]] || bad_hot=$((bad_hot + 1))
+    fi
+  done
+done
+check "kill -9 during small PUTs: objects acknowledged" yes "$([[ $acked -gt 50 ]] && echo yes || echo "no ($acked)")"
+check "kill -9 during small PUTs: no acknowledged object lost or corrupt" 0 "$lost"
+check "kill -9 during small PUTs: overwritten keys hold an acknowledged body" 0 "$bad_hot"
+check "kill -9 during small PUTs: stored inline" 0 "$(find "$DATA"/d*/data -type f 2>/dev/null | wc -l)"
+stop
 
 echo "durability: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

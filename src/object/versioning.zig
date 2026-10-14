@@ -13,6 +13,7 @@ const transition = @import("transition.zig");
 const quota = @import("quota.zig");
 const replica = @import("replica.zig");
 const events = @import("events.zig");
+const index_mod = @import("index.zig");
 
 const Svc = service.ObjectService;
 const Error = service.Error;
@@ -75,13 +76,16 @@ fn store(svc: *Svc, pk: backend.PhysicalKey, rec: Record) Error!void {
     defer svc.gpa.free(bytes);
     try svc.beginIndexChange();
     const version = if (isCurrentSlot(pk, rec.bucket_id, rec.key)) null else rec.versionId();
-    const change: service.Change = .{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } };
-    defer svc.emitSeq(change, svc.journal(change));
+    var change: service.Change = .{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } };
+    const seq = svc.journal(change);
+    defer svc.emitSeq(change, seq);
     svc.store.putRecord(pk, bytes) catch |e| {
         svc.indexResync(pk, rec.bucket_id, rec.key, version);
         return service.mapBackend(e);
     };
     svc.indexStored(pk, rec);
+    // Peers take the stored version from the notice instead of reading it back.
+    change.record.stored = index_mod.Version.of(rec);
 }
 
 /// Deletes the current record (`version` null) or one noncurrent version record.

@@ -67,6 +67,9 @@ redundant() { # expected blob count
   counts=$(find "$WORK"/n*/[dp]* -path '*/data/*' -type f -printf '%f\n' | sort | uniq -c | awk '$1 >= 4 {print $1}' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')
   [[ "$counts" == "6:$1 " ]]
 }
+# Objects up to this size live inside their record (128 KiB / 6 drives): no blob.
+INLINE=21845
+blobs_of() { local c=0 o; for o in $OBJS; do (($(stat -c %s "$WORK/obj/$o") > INLINE)) && c=$((c + 1)); done; echo "$c"; }
 wait_redundant() { # expected blob count, seconds
   for _ in $(seq "$2"); do redundant "$1" && return 0; sleep 1; done
   echo "     want 6:$1; shards per blob (count:blobs):" \
@@ -210,7 +213,7 @@ check "new objects listed via node 1" 3 "$(cli 1 s3 ls s3://clu/ | grep -c ' dow
 # ---- the node returns and healing restores full redundancy ----
 start 3
 wait_ready 3 60
-NOBJ=$(echo "$OBJS" | wc -w)
+NOBJ=$(blobs_of)
 if wait_redundant "$NOBJ" 90; then r=yes; else r=no; fi
 check "heal restored all shards of $NOBJ objects" yes "$r"
 # The key index comes back from node 3's snapshot plus the peers' journals; no node
@@ -253,7 +256,7 @@ start 3
 start 4
 for i in 1 2 3 4; do wait_ready "$i" 60; done
 OBJS=$(ls "$WORK/obj")
-NOBJ=$(echo "$OBJS" | wc -w)
+NOBJ=$(blobs_of)
 if wait_redundant "$NOBJ" 120; then r=yes; else r=no; fi
 check "heal after quorum returns" yes "$r"
 
@@ -277,20 +280,60 @@ for i in 1 2 3 4; do
   check "32 parallel keys listed via node $i" 32 "$(cli "$i" s3 ls s3://clu/par | grep -c ' par')"
 done
 
+# ---- kill -9 of a node during small (inline) PUTs: nothing acknowledged is lost ----
+cli 1 s3 mb s3://kdur >/dev/null
+mkdir -p "$WORK/kd"
+kwriter() { # node
+  local j=0 f="$WORK/kd/w$1"
+  while :; do
+    j=$((j + 1))
+    head -c $((RANDOM % 20000 + 1)) /dev/urandom >"$f.body"
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$f.body" "$(ep "$1")/kdur/w$1-$j")" == 200 ]]; then
+      echo "w$1-$j $(md5 "$f.body")" >>"$f.acked"
+    fi
+  done
+}
+KW=()
+for n in 1 2 3; do kwriter "$n" & KW+=($!); done
+sleep 3
+kill9 2
+sleep 1
+kill "${KW[@]}" 2>/dev/null || true
+wait "${KW[@]}" 2>/dev/null || true
+klost=0
+kacked=0
+for n in 1 2 3; do while read -r k m; do
+  kacked=$((kacked + 1))
+  code=$(curl -s -o "$WORK/got" -w '%{http_code}' "${sig[@]}" "$(ep 3)/kdur/$k")
+  [[ "$code" == 200 && "$(md5 "$WORK/got")" == "$m" ]] || klost=$((klost + 1))
+done <"$WORK/kd/w$n.acked"; done
+check "small PUTs acknowledged around a kill -9" yes "$([[ $kacked -gt 30 ]] && echo yes || echo "no ($kacked)")"
+check "no acknowledged small object lost or corrupt after kill -9" 0 "$klost"
+start 2
+wait_ready 2 60
+klost=0
+for n in 1 2 3; do while read -r k m; do
+  code=$(curl -s -o "$WORK/got" -w '%{http_code}' "${sig[@]}" "$(ep 2)/kdur/$k")
+  [[ "$code" == 200 && "$(md5 "$WORK/got")" == "$m" ]] || klost=$((klost + 1))
+done <"$WORK/kd/w$n.acked"; done
+check "killed node serves every acknowledged small object" 0 "$klost"
+
 # ---- a replaced node: its drives come back empty and are rebuilt ----
 kill9 2
 rm -rf "$WORK"/n2/d*
 start 2
 wait_ready 2 60
-if wait_redundant $((NOBJ + 33)) 120; then r=yes; else r=no; fi
+if wait_redundant $NOBJ 120; then r=yes; else r=no; fi
 check "replaced node's drives rebuilt" yes "$r"
 cli 2 s3 cp --no-progress s3://clu/multi "$WORK/got" >/dev/null
 check "replaced node serves reads" "$(md5 "$WORK/obj/multi")" "$(md5 "$WORK/got")"
+cget 2 hot "$WORK/got" >/dev/null
+check "replaced node serves an inline object" 1 "$(echo "$sums" | grep -c "$(md5 "$WORK/got")")"
 check "replaced node lists the bucket" "$(listing 1)" "$(listing 2)"
 
 # ---- drive contents removed under a running node: it notices and heals, no restart ----
 rm -rf "$WORK"/n3/d*/data/* "$WORK"/n3/d*/record/*
-if wait_redundant $((NOBJ + 33)) 90; then r=yes; else r=no; fi
+if wait_redundant $NOBJ 90; then r=yes; else r=no; fi
 check "contents removed under a running node are rebuilt" yes "$r"
 cget 3 multi "$WORK/got" >/dev/null
 check "and serves reads" "$(md5 "$WORK/obj/multi")" "$(md5 "$WORK/got")"
@@ -312,7 +355,7 @@ kill "${PIDS[4]}"
 wait "${PIDS[4]}" 2>/dev/null || true
 start 4
 wait_ready 4 60
-if wait_redundant $((NOBJ + 33)) 120; then r=yes; else r=no; fi
+if wait_redundant $NOBJ 120; then r=yes; else r=no; fi
 check "cluster whole again after the skewed node rejoined" yes "$r"
 # Leftovers of deletes a node missed and shards out of reach are pending, never "lost".
 check "no heal pass reported lost data" 0 "$(cat "$WORK"/n*.log | grep -cE 'no healthy replica left|lost=[1-9]' || true)"

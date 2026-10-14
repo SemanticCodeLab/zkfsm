@@ -167,7 +167,7 @@ pub const Manager = struct {
         m.node.locks.unlock(tok);
         try res;
         m.applyModes(meta);
-        m.node.broadcast(&.{.pools});
+        _ = m.node.broadcast(&.{.pools});
         m.wake_ev.set();
     }
 

@@ -35,6 +35,9 @@ pub fn parseKey(s: []const u8) ?PhysicalKey {
     return .{ .space = parseSpace(s[0]) orelse return null, .hex = s[1..33].* };
 }
 
+/// Drives addressed by one batched record call.
+pub const max_batch = 16;
+
 // ---- write frames: D len data | P off len data | C key | A ----
 
 pub const data_header_len = 5;
@@ -109,9 +112,18 @@ pub const Note = union(enum) {
     mark: Mark,
     /// A blob the sender will delete after its grace; delete it later if it cannot.
     garbage: [16]u8,
+    /// The sender releases its namespace lock (after the notes before it apply).
+    unlock: object.service.LockRef,
 };
 
+/// Longest lock resource name (see cluster/locks.zig).
+pub const max_resource = 1400;
+
 pub const Mark = struct { epoch: u64, seq: u64 };
+
+const Version = object.index.Version;
+/// id, size, md5, parts, mtime, flags.
+const stored_len = 16 + 8 + 16 + 4 + 16 + 1;
 
 pub fn encodeNotes(gpa: std.mem.Allocator, notes: []const Note) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -135,6 +147,11 @@ pub fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
             try w.writeByte('g');
             try w.writeAll(&id);
         },
+        .unlock => |u| {
+            try w.writeByte('k');
+            try w.writeInt(u64, u.uid, .little);
+            try w.writeAll(u.resource);
+        },
         .mark => |m| {
             try w.writeByte('j');
             try w.writeInt(u64, m.epoch, .little);
@@ -148,7 +165,7 @@ pub fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
                 try w.writeAll(&id.bytes);
             },
             .record => |r| {
-                try w.writeByte('r');
+                try w.writeByte(if (r.stored != null) 'R' else 'r');
                 try w.writeByte(spaceChar(r.pk.space));
                 try w.writeAll(&r.pk.hex);
                 try w.writeAll(&r.bid.bytes);
@@ -156,6 +173,18 @@ pub fn encodeNote(w: *std.Io.Writer, n: Note) std.Io.Writer.Error!void {
                     try w.writeByte(1);
                     try w.writeAll(&v.bytes);
                 } else try w.writeByte(0);
+                if (r.stored) |v| {
+                    try w.writeAll(&v.id.bytes);
+                    try w.writeInt(u64, v.size, .little);
+                    try w.writeAll(&v.etag.md5);
+                    try w.writeInt(u32, v.etag.parts, .little);
+                    try w.writeInt(i128, v.mtime_ns, .little);
+                    try w.writeByte(@as(u8, @intFromBool(v.delete_marker)) | @as(u8, @intFromBool(v.tiered)) << 1);
+                    const l = r.lock orelse object.service.LockRef{ .uid = 0, .resource = "" };
+                    try w.writeInt(u64, l.uid, .little);
+                    try w.writeInt(u16, @intCast(l.resource.len), .little);
+                    try w.writeAll(l.resource);
+                }
                 try w.writeAll(r.key);
             },
         },
@@ -192,13 +221,17 @@ pub fn decodeNote(e: []const u8) error{BadNote}!Note {
             if (e.len != 17) return error.BadNote;
             return .{ .mark = .{ .epoch = std.mem.readInt(u64, e[1..9], .little), .seq = std.mem.readInt(u64, e[9..17], .little) } };
         },
+        'k' => {
+            if (e.len < 10 or e.len > 9 + max_resource) return error.BadNote;
+            return .{ .unlock = .{ .uid = std.mem.readInt(u64, e[1..9], .little), .resource = e[9..] } };
+        },
         'c' => return .{ .change = .catalog },
         'x' => return .{ .change = .resync },
         'u' => {
             if (e.len != 17) return error.BadNote;
             return .{ .change = .{ .upload = .{ .bytes = e[1..17].* } } };
         },
-        'r' => {
+        'r', 'R' => {
             if (e.len < 1 + 33 + 16 + 1) return error.BadNote;
             const pk = parseKey(e[1..34]) orelse return error.BadNote;
             const bid: core.BucketId = .{ .bytes = e[34..50].* };
@@ -213,9 +246,32 @@ pub fn decodeNote(e: []const u8) error{BadNote}!Note {
                 },
                 else => return error.BadNote,
             }
+            var stored: ?Version = null;
+            var lock: ?object.service.LockRef = null;
+            if (e[0] == 'R') {
+                if (e.len < pos + stored_len) return error.BadNote;
+                const b = e[pos..][0..stored_len];
+                if (b[60] > 3) return error.BadNote;
+                stored = .{
+                    .id = .{ .bytes = b[0..16].* },
+                    .size = std.mem.readInt(u64, b[16..24], .little),
+                    .etag = .{ .md5 = b[24..40].*, .parts = std.mem.readInt(u32, b[40..44], .little) },
+                    .mtime_ns = std.mem.readInt(i128, b[44..60], .little),
+                    .delete_marker = b[60] & 1 != 0,
+                    .tiered = b[60] & 2 != 0,
+                };
+                pos += stored_len;
+                if (e.len < pos + 10) return error.BadNote;
+                const uid = std.mem.readInt(u64, e[pos..][0..8], .little);
+                const rl = std.mem.readInt(u16, e[pos + 8 ..][0..2], .little);
+                pos += 10;
+                if (rl > max_resource or e.len < pos + rl) return error.BadNote;
+                if (uid != 0) lock = .{ .uid = uid, .resource = e[pos..][0..rl] };
+                pos += rl;
+            }
             const key = e[pos..];
             if (key.len == 0 or key.len > 1024) return error.BadNote;
-            return .{ .change = .{ .record = .{ .pk = pk, .bid = bid, .key = key, .version = version } } };
+            return .{ .change = .{ .record = .{ .pk = pk, .bid = bid, .key = key, .version = version, .stored = stored, .lock = lock } } };
         },
         else => return error.BadNote,
     }
@@ -243,6 +299,8 @@ test "frames and notes roundtrip; garbage is rejected" {
         .iam,
         .{ .change = .{ .record = .{ .pk = key, .bid = .{ .bytes = @splat(3) }, .key = "a/b", .version = .{ .bytes = @splat(4) } } } },
         .{ .change = .catalog },
+        .{ .change = .{ .record = .{ .pk = key, .bid = .{ .bytes = @splat(5) }, .key = "k", .version = null, .stored = .{ .id = .{ .bytes = @splat(6) }, .size = 77, .etag = .{ .md5 = @splat(8), .parts = 2 }, .mtime_ns = -5, .delete_marker = false, .tiered = true }, .lock = .{ .uid = 9, .resource = "obj/b/k" } } } },
+        .{ .unlock = .{ .uid = 9, .resource = "obj/b/k" } },
     };
     const enc = try encodeNotes(std.testing.allocator, &notes);
     defer std.testing.allocator.free(enc);
@@ -252,6 +310,13 @@ test "frames and notes roundtrip; garbage is rejected" {
     try std.testing.expectEqualStrings("a/b", rec.key);
     try std.testing.expectEqual(@as(u8, 4), rec.version.?.bytes[0]);
     try std.testing.expect((try it.next()).?.change == .catalog);
+    const st = (try it.next()).?.change.record;
+    try std.testing.expectEqualStrings("k", st.key);
+    try std.testing.expectEqual(@as(u64, 77), st.stored.?.size);
+    try std.testing.expectEqual(@as(i128, -5), st.stored.?.mtime_ns);
+    try std.testing.expect(st.stored.?.tiered and !st.stored.?.delete_marker);
+    try std.testing.expectEqualStrings("obj/b/k", st.lock.?.resource);
+    try std.testing.expectEqual(@as(u64, 9), (try it.next()).?.unlock.uid);
     try std.testing.expect((try it.next()) == null);
     var junk: NoteIter = .{ .bytes = "\x05\x00\x00\x00r" };
     try std.testing.expectError(error.BadNote, junk.next());
