@@ -204,6 +204,7 @@ writer() { # id rounds
 lost=0
 bad_hot=0
 acked=0
+for w in 1 2 3 4; do : >"$WORK/w$w.acked"; : >"$WORK/w$w.hot"; done
 for round in 1 2 3; do
   WPIDS=()
   for w in 1 2 3 4; do writer "$w" "$round" & WPIDS+=($!); done

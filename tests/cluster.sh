@@ -294,6 +294,7 @@ kwriter() { # node
   done
 }
 KW=()
+for n in 1 2 3; do : >"$WORK/kd/w$n.acked"; done
 for n in 1 2 3; do kwriter "$n" & KW+=($!); done
 sleep 3
 kill9 2

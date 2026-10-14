@@ -631,10 +631,15 @@ pub const ObjectService = struct {
         if (small) |n| {
             const b = try self.gpa.alloc(u8, @intCast(n));
             body = b;
-            hr.reader.readSliceAll(b) catch |e| return switch (e) {
-                error.EndOfStream => error.IncompleteBody,
-                error.ReadFailed => error.ReadFailed,
-            };
+            // Bounded reads only: an HTTP body must not be polled past its end.
+            var w: std.Io.Writer = .fixed(b);
+            while (w.end < b.len) {
+                _ = hr.reader.stream(&w, .limited(b.len - w.end)) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return error.ReadFailed,
+                    error.WriteFailed => break,
+                };
+            }
         } else {
             _ = self.store.put(data_key, &hr.reader, .{ .size_hint = in.content_length }) catch |e| return mapBackend(e);
         }

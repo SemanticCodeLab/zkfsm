@@ -10,7 +10,9 @@
 #      SINGLE_MEM (18g), SINGLE_DRIVE (3584m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
 #      ZKFSM_BIN / MINIO_BIN / WARP_BIN (prebuilt binaries; built into CACHE when unset),
-#      ZKFSM_SINGLE_PROTECTION (EC:2+2, matching MinIO EC:2), RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl).
+#      ZKFSM_SINGLE_PROTECTION (EC:2+2, matching MinIO EC:2), RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl),
+#      PFX (zc-bench: prefix of container, network and image names, so two runs can coexist),
+#      ZKFSM_ARGS (extra zkfsm server flags).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${CACHE:-${TMPDIR:-/tmp}/zc-bench-cache}"
@@ -33,19 +35,20 @@ BASE_IMAGE="${BASE_IMAGE:-busybox:1.36-musl}"
 AK=zcbenchadmin
 SK=zcbenchsecret123
 BUCKET=zc-bench
+PFX="${PFX:-zc-bench}"
 IFS=, read -r -a CPUS <<<"$SERVER_CPUS"
 NCPU=${#CPUS[@]}
 
 mkdir -p "$CACHE" "$OUT"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log" >&2; }
 
-containers() { docker ps -aq --filter "name=^zc-bench-(node-|client)" 2>/dev/null || true; }
+containers() { docker ps -aq --filter "name=^$PFX-(node-|client)" 2>/dev/null || true; }
 stop_all() {
   local ids
   ids="$(containers)"
   [[ -n "$ids" ]] && docker rm -f $ids >/dev/null 2>&1 || true
 }
-cleanup() { stop_all; docker network rm zc-bench-net >/dev/null 2>&1 || true; }
+cleanup() { stop_all; docker network rm "$PFX-net" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
@@ -70,26 +73,26 @@ prepare() {
   cp "$ZKFSM_BIN" "$ctx/zkfsm"
   cp "$MINIO_BIN" "$ctx/minio"
   cp "$WARP_BIN" "$ctx/warp"
-  for b in zkfsm minio warp; do docker build -q --build-arg BIN=$b -t zc-bench-$b "$ctx" >/dev/null; done
+  for b in zkfsm minio warp; do docker build -q --build-arg BIN=$b -t "$PFX-$b" "$ctx" >/dev/null; done
   rm -f "$ctx/zkfsm" "$ctx/minio" "$ctx/warp"
   docker image inspect "$RUSTFS_IMAGE" >/dev/null 2>&1 || docker pull "$RUSTFS_IMAGE" >/dev/null
 }
 
 # --- targets ---------------------------------------------------------------
 # Own bridge network; the client is a container on it too (no docker-proxy/NAT).
-NET=zc-bench-net
+NET=$PFX-net
 start_target() { # product topo
   local p=$1 t=$2 n mem drive cpus ncpu
   if [[ $t == single ]]; then n=1 mem=$SINGLE_MEM drive=$SINGLE_DRIVE ncpu=$NCPU; else n=4 mem=$NODE_MEM drive=$NODE_DRIVE ncpu=1; fi
   local eps="/data{1...4}" zkp=${ZKFSM_SINGLE_PROTECTION:-EC:2+2} parity=EC:2
   if [[ $t == cluster ]]; then
-    eps="http://zc-bench-node-{1...4}:9000/data{1...4}"
+    eps="http://$PFX-node-{1...4}:9000/data{1...4}"
     zkp=EC:12+4 parity=EC:4
   fi
   docker network inspect $NET >/dev/null 2>&1 || docker network create $NET >/dev/null
   HOSTS=""
   for i in $(seq 1 "$n"); do
-    local name="zc-bench-node-$i"
+    local name="$PFX-node-$i"
     if [[ $t == single ]]; then cpus="$SERVER_CPUS"; else cpus="${CPUS[$((i - 1))]}"; fi
     local args=(-d --name "$name" --hostname "$name" --network $NET --cpuset-cpus "$cpus" --cpus "$ncpu"
       --memory "$mem" --memory-swap "$mem" --ulimit nofile=65536:65536 --tmpfs /tmp:size=256m)
@@ -98,12 +101,12 @@ start_target() { # product topo
     for d in 1 2 3 4; do args+=(--tmpfs "/data$d:size=$drive,uid=$uid,gid=$uid,mode=0750"); done
     case $p in
       zkfsm)
-        local cmd=(zkfsm --data "$eps" --listen 0.0.0.0:9000 --protection "$zkp")
+        local cmd=(zkfsm --data "$eps" --listen 0.0.0.0:9000 --protection "$zkp" ${ZKFSM_ARGS:-})
         [[ $t == cluster ]] && cmd+=(--node-address "$name:9000")
-        docker run "${args[@]}" -e ZKFSM_ACCESS_KEY=$AK -e ZKFSM_SECRET_KEY=$SK zc-bench-zkfsm "${cmd[@]}" >/dev/null ;;
+        docker run "${args[@]}" -e ZKFSM_ACCESS_KEY=$AK -e ZKFSM_SECRET_KEY=$SK "$PFX-zkfsm" "${cmd[@]}" >/dev/null ;;
       minio)
         docker run "${args[@]}" -e MINIO_ROOT_USER=$AK -e MINIO_ROOT_PASSWORD=$SK \
-          -e MINIO_STORAGE_CLASS_STANDARD=$parity zc-bench-minio \
+          -e MINIO_STORAGE_CLASS_STANDARD=$parity "$PFX-minio" \
           minio server --address :9000 --console-address :9001 "$eps" >/dev/null ;;
       rustfs)
         docker run "${args[@]}" -e RUSTFS_ACCESS_KEY=$AK -e RUSTFS_SECRET_KEY=$SK \
@@ -119,9 +122,9 @@ start_target() { # product topo
 warp() { # subcommand tag args...
   local sub=$1 tag=$2
   shift 2
-  docker run --rm --name zc-bench-client --network $NET --cpuset-cpus "$CLIENT_CPUS" --cpus "$CLIENT_NCPU" \
+  docker run --rm --name "$PFX-client" --network $NET --cpuset-cpus "$CLIENT_CPUS" --cpus "$CLIENT_NCPU" \
     --sysctl net.ipv4.ip_local_port_range="1024 65535" --sysctl net.ipv4.tcp_tw_reuse=1 \
-    --tmpfs /tmp:size=512m zc-bench-warp warp "$sub" --host "$HOSTS" --host-select roundrobin \
+    --tmpfs /tmp:size=512m "$PFX-warp" warp "$sub" --host "$HOSTS" --host-select roundrobin \
     --access-key $AK --secret-key $SK --bucket $BUCKET --concurrent "$CONC" \
     --benchdata "/tmp/$tag" "$@"
 }
@@ -199,7 +202,7 @@ main() {
     echo "minio: $(go version -m "$MINIO_BIN" 2>/dev/null | awk '$1=="mod"{print $3}')"
     echo "zkfsm: $(git -C "$ROOT" rev-parse --short HEAD) ReleaseFast x86_64-linux-musl"
     echo "rustfs: $(docker image inspect -f '{{index .RepoDigests 0}}' "$RUSTFS_IMAGE")"
-    for img in zc-bench-zkfsm zc-bench-minio; do echo "$img: $(docker image inspect -f '{{.Id}}' $img)"; done
+    for img in "$PFX-zkfsm" "$PFX-minio"; do echo "$img: $(docker image inspect -f '{{.Id}}' $img)"; done
   } >"$OUT/versions.txt"
   local failed=0
   for t in $TOPOS; do
