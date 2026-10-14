@@ -121,7 +121,8 @@ wait_for "big.bin transitioned" WARM sclass big.bin
 wait_for "small transitioned" WARM sclass logs/small.txt
 check "unmatched stays local" "" "$(sclass keep/local.txt)"
 check "remote holds the data" 2 "$(remote_count warm/tiered/)"
-check "local blobs released" "$((blobs_before - 2))" "$(local_blobs)"
+# small.txt is stored inside its record (no blob): only big.bin frees one.
+check "local blobs released" "$((blobs_before - 1))" "$(local_blobs)"
 hot s3 cp s3://data/big.bin "$WORK/big.out" >/dev/null
 check "read-through content" "$(sha256sum <"$WORK/big.bin")" "$(sha256sum <"$WORK/big.out")"
 hot s3api get-object --bucket data --key big.bin --range bytes=1000-1999999 "$WORK/range.out" >/dev/null
