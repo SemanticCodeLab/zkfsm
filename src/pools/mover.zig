@@ -91,28 +91,26 @@ fn moveData(r: *Router, key: PhysicalKey, src_pool: usize, src: backend.StorageB
         if (e != error.NotFound) {
             // Remnants of a move whose source delete missed a drive that was down.
             if (!try activeHolder(r, key, src_pool, r.gpa, buf)) return e;
-            src.delete(key) catch |de| if (de != error.NotFound) return de;
-            return .{ .outcome = .dup };
+            return dropSource(src, key);
         }
         src.delete(key) catch {};
         return .{ .outcome = .gone };
     };
-    if (try activeHolder(r, key, src_pool, r.gpa, buf)) {
-        src.delete(key) catch |e| if (e != error.NotFound) return e;
-        return .{ .outcome = .dup };
-    }
+    if (try activeHolder(r, key, src_pool, r.gpa, buf)) return dropSource(src, key);
     const dst = try destination(r, key, src_pool);
+    // An unreadable earlier copy is rewritten, but never deleted if the rewrite fails.
+    const prior = if (dst.stat(key)) |_| true else |_| false;
     var rr: RangeReader = .init(src, key, meta.size, buf);
     _ = dst.put(key, &rr.interface, .{ .size_hint = meta.size }) catch |e| {
-        dst.delete(key) catch {};
+        if (!prior) dst.delete(key) catch {};
         return if (rr.err) |re| re else e;
     };
     const got = dst.stat(key) catch |e| {
-        dst.delete(key) catch {};
+        if (!prior) dst.delete(key) catch {};
         return e;
     };
     if (rr.err != null or got.size != meta.size) {
-        dst.delete(key) catch {};
+        if (!prior) dst.delete(key) catch {};
         return rr.err orelse error.IoFailed;
     }
     src.delete(key) catch |e| {
@@ -124,6 +122,13 @@ fn moveData(r: *Router, key: PhysicalKey, src_pool: usize, src: backend.StorageB
         return e;
     };
     return .{ .outcome = .moved, .bytes = meta.size };
+}
+
+/// An active pool holds a whole copy: drop the source. Nothing deleted is no progress
+/// (the shards sit on drives out of reach), so the drain retries it.
+fn dropSource(src: backend.StorageBackend, key: PhysicalKey) Error!Result {
+    src.delete(key) catch |e| return if (e == error.NotFound) .{ .outcome = .gone } else e;
+    return .{ .outcome = .dup };
 }
 
 /// Streams a blob through ranged reads; a failed read fails the stream instead of
@@ -285,6 +290,12 @@ test "a resumed move drops remnants only when an active pool holds a whole copy"
     rd = .fixed("short");
     _ = try dst.sb().put(key, &rd, .{});
     dst.get_err = error.IoFailed;
+    // With the source unreadable as well, the rewrite fails and the old copy stays.
+    src.get_err = error.IoFailed;
+    try std.testing.expectError(error.IoFailed, moveKey(&r, a, key, 0, buf));
+    _ = try dst.lb.backend().stat(key);
+    _ = try src.lb.backend().stat(key);
+    src.get_err = null;
     const res = moveKey(&r, a, key, 0, buf);
     dst.get_err = null;
     try std.testing.expectEqual(Outcome.moved, (try res).outcome);
