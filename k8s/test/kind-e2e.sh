@@ -38,7 +38,8 @@ CURL_TLS=()
 forward() {
   [[ -n "$PF" ]] && kill "$PF" 2>/dev/null || true
   PORT="$(free_port)"
-  k port-forward svc/s3 "$PORT:9000" >"$WORK/pf.log" 2>&1 &
+  # kubectl itself, not the k() subshell: $! must be the process to kill.
+  kubectl -n "$NS" port-forward svc/s3 "$PORT:9000" >"$WORK/pf.log" 2>&1 &
   PF=$!
   for _ in $(seq 50); do curl -s --max-time 2 "${CURL_TLS[@]}" -o /dev/null "$SCHEME://127.0.0.1:$PORT/health/live" && return 0; sleep 0.2; done
   echo "port-forward failed"; cat "$WORK/pf.log"; return 1
@@ -87,6 +88,8 @@ helm upgrade --install zkop "$ROOT/helm/zkfsm-operator" -n zkfsm-system --create
 # The test image's entrypoint is the server; run the operator binary instead.
 kubectl -n zkfsm-system patch deploy zkop-zkfsm-operator --type=json \
   -p '[{"op":"add","path":"/spec/template/spec/containers/0/command","value":["/usr/local/bin/zkfsm-operator"]}]' >/dev/null
+# A reused kind cluster keeps the old operator pod on the same tag: restart it.
+kubectl -n zkfsm-system rollout restart deploy/zkop-zkfsm-operator >/dev/null
 kubectl -n zkfsm-system rollout status deploy/zkop-zkfsm-operator --timeout=120s >/dev/null
 
 log "deploy a 4-server cluster (4 drives each, EC:4+2)"
@@ -144,6 +147,7 @@ for _ in $(seq 900); do
   ready=$(k get pods -l zkfsm.io/cluster=s3 -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c True || true)
   total=$(k get pods -l zkfsm.io/cluster=s3 --no-headers 2>/dev/null | wc -l)
   down=$((4 - ready)); ((down > max_down)) && max_down=$down
+  { date +%T.%N | cut -c1-12; k get pods -l zkfsm.io/cluster=s3 -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image} del={.metadata.deletionTimestamp} ready={.status.conditions[?(@.type=="Ready")].status}@{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}'; } >>"$WORK/roll.log"
   [[ "$(get obj1 "$WORK/back" 2>/dev/null)" == 200 ]] || get_fail=$((get_fail + 1))
   imgs=$(k get pods -l zkfsm.io/cluster=s3 -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' | sort -u | tr '\n' ' ')
   [[ "$imgs" == "zc-k8s/zkfsm:v2 " && "$ready" == 4 && "$total" == 4 && "$(phase)" == Ready ]] && break
@@ -151,6 +155,10 @@ for _ in $(seq 900); do
 done
 check "all pods on v2" "zc-k8s/zkfsm:v2 " "$imgs"
 check "at most one server down during the rollout" 1 "$max_down"
+if ((max_down > 1)); then
+  cat "$WORK/roll.log"; kubectl -n zkfsm-system logs deploy/zkop-zkfsm-operator --timestamps --tail=40
+  for p in 0 1 2 3; do echo "-- s3-pool-0-$p"; k logs "s3-pool-0-$p" --timestamps | grep -E 'offline|online' | tail -20; done
+fi
 echo "     GETs failed during rollout (port-forward reconnects included): $get_fail"
 forward
 check "data after upgrade" 200 "$(get obj1 "$WORK/back")"
@@ -182,8 +190,12 @@ check "decommission request answered" yes "$([[ -n "$st" ]] && echo yes)"
 echo "     decommission condition: $(k get zkc s3 -o jsonpath='{.status.conditions[?(@.type=="Decommissioning")]}')"
 pool1=$(k get zkc s3 -o jsonpath='{.status.pools[?(@.name=="pool-1")].state}')
 if [[ "$pool1" == decommissioned ]]; then
-  wait_phase Ready 300
+  # Phase is still Ready from before the prune; wait for the prune and the restart.
+  for _ in $(seq 120); do [[ -z "$(k get sts s3-pool-1 --ignore-not-found -o name)" ]] && break; sleep 1; done
   check "pool-1 statefulset removed" "" "$(k get sts s3-pool-1 --ignore-not-found -o name)"
+  sleep 5
+  wait_phase Ready 300
+  check "pool-0 restarted without pool-1" "4/4" "$(k get zkc s3 -o jsonpath='{.status.readyServers}/{.status.servers}')"
   forward
   check "data after decommission" same "$( [[ $(get n8 "$WORK/back") == 200 ]] && same "$WORK/n8" "$WORK/back")"
 else
@@ -208,7 +220,7 @@ check "tls cluster ready" Ready "$(k get zkc s3tls -o jsonpath='{.status.phase}'
 k get secret s3tls-tls -o jsonpath='{.data.ca\.crt}' | base64 -d >"$WORK/ca.crt"
 [[ -n "$PF" ]] && kill "$PF" 2>/dev/null || true
 TPORT="$(free_port)"
-k port-forward svc/s3tls "$TPORT:9000" >"$WORK/pf2.log" 2>&1 &
+kubectl -n "$NS" port-forward svc/s3tls "$TPORT:9000" >"$WORK/pf2.log" 2>&1 &
 PF=$!
 for _ in $(seq 50); do curl -s --cacert "$WORK/ca.crt" -o /dev/null "https://127.0.0.1:$TPORT/health/live" && break; sleep 0.2; done
 U=admin:admin-secret-123
