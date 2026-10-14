@@ -128,3 +128,22 @@ the node-to-node replay guard no longer scans a table of every nonce.
 - RustFS was not run again; its rows from 2026-10-08 are in this file's history.
 - zkfsm cluster put-4k is still behind MinIO: a small PUT costs about 45 node-to-node
   calls (lock, record read, shard and record writes, notices).
+
+## Tier transport: std.http.Client vs pooled outbound client (bench/tier_transport.sh)
+
+512 MiB object, zkfsm hot node over a zkfsm tier on one laptop (shared, noisy);
+old = main 7e47494, new = feat/tiercert. Seconds; read is a full read-through GET,
+ranges is 64 sequential 64 KiB ranged GETs.
+
+| run | transition old/new | read old/new | ranges old/new |
+|---|---|---|---|
+| http 1 | 13.06 / 16.43 | 0.42 / 0.66 | 0.87 / 1.11 |
+| http 2 | 17.92 / 11.78 | 0.80 / 0.47 | 2.08 / 0.85 |
+| http 3 | 10.50 / 10.12 | 0.41 / 0.78 | 1.10 / 1.14 |
+| http 4 | 11.21 / 8.93 | 0.60 / 0.52 | 1.14 / 0.89 |
+| http 5 | 7.63 / 6.95 | 0.34 / 0.53 | 0.46 / 1.04 |
+| https 1 | 9.26 / 9.26 | 0.87 / 0.63 | 3.33 / 3.18 |
+| https 2 | 7.70 / 12.37 | 0.91 / 0.82 | 3.19 / 3.49 |
+
+Medians: transition 10.50 / 10.12 (http), reads 0.42 / 0.53 (http) and 0.89 / 0.73
+(https), ranges 1.10 / 1.04. Run-to-run spread is wider than the old/new gap.

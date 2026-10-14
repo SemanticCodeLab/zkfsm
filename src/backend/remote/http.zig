@@ -161,7 +161,7 @@ pub const Exchange = struct {
 
     /// Sends the request and reads the response head. On success call `deinit`.
     pub fn start(x: *Exchange, client: *Client, o: Options) SendError!void {
-        var target_buf: [8192]u8 = undefined;
+        var target_buf: [16 << 10]u8 = undefined; // percent-encoded names up to 4 KiB
         const target = (if (o.uri.query.len > 0)
             std.fmt.bufPrint(&target_buf, "{s}?{s}", .{ if (o.uri.path.len == 0) "/" else o.uri.path, o.uri.query })
         else
