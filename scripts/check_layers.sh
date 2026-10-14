@@ -41,7 +41,10 @@ while IFS= read -r file; do
   fi
   while IFS= read -r target; do
     [[ "$target" == ../* ]] || continue
-    to="${target#../}"; to="${to%%/*}"
+    # Resolve against the importing file's directory (files may sit in subdirectories).
+    resolved="$(realpath -m --relative-to=. "$(dirname "$file")/$target")"
+    to="${resolved%%/*}"
+    [[ "$to" == "$from" ]] && continue
     to_rank=$(rank "$to")
     if [[ "$to_rank" -lt 0 || "$to_rank" -ge "$from_rank" ]] || forbidden "$from" "$to"; then
       echo "layer violation: $file imports $target ($from:$from_rank -> $to:$to_rank)"
