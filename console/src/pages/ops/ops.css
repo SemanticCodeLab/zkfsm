@@ -132,3 +132,41 @@
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+.ops-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  border: 0;
+  padding: 0;
+  margin: 0 0 12px;
+}
+.ops-types legend {
+  padding: 0;
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+.ops-types label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.ops-usage,
+.ops-decom {
+  min-width: 180px;
+}
+.ops-usage .progress,
+.ops-decom .progress {
+  margin-bottom: 4px;
+}
+.ops-cmdline {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ops-live {
+  max-height: 560px;
+}
+.ops-row-err td {
+  background: color-mix(in srgb, var(--danger, #c33) 8%, transparent);
+}
