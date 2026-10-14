@@ -207,6 +207,12 @@ pub const FormatV2 = struct {
             a.pool == b.pool and a.set == b.set and a.index == b.index and a.set_size == b.set_size and a.profile.eql(b.profile);
     }
 
+    /// `new` only records more retired pools or a larger pool count than `cur`: the
+    /// one change a formatted drive accepts (decommission marks every drive).
+    pub fn isUpdateOf(new: FormatV2, cur: FormatV2) bool {
+        return new.sameSlot(cur) and new.retired & cur.retired == cur.retired and new.pools >= cur.pools;
+    }
+
     fn field(line: ?[]const u8, prefix: []const u8) error{CorruptFormat}![]const u8 {
         const l = line orelse return error.CorruptFormat;
         if (!std.mem.startsWith(u8, l, prefix)) return error.CorruptFormat;
@@ -338,5 +344,12 @@ test "format v2 roundtrip and slot check" {
     var h = f;
     h.index = 4;
     try std.testing.expect(!h.sameSlot(f));
+    // Retiring a pool updates a formatted drive; nothing else may.
+    try std.testing.expect(r.isUpdateOf(f));
+    try std.testing.expect(!f.isUpdateOf(r));
+    try std.testing.expect(!h.isUpdateOf(f));
+    var less = r;
+    less.retired = 0b100;
+    try std.testing.expect(!less.isUpdateOf(r));
     try std.testing.expectError(error.CorruptFormat, FormatV2.parse("zkfsm-format 2\ndeployment x\n"));
 }
