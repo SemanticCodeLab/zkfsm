@@ -373,7 +373,7 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     "$MC" alias set "d$tname" "http://127.0.0.1:$port" dockeradmin docker-secret-123 >/dev/null 2>&1 || true
     for _ in $(seq 50); do "$MC" mb --ignore-existing "d$tname/tier" >/dev/null 2>&1 && break; sleep 0.3; done
     # A freshly started container may still refuse writes; retry the probe briefly.
-    for _ in 1 2 3 4 5; do "$MC" ilm tier add s3 hot "$tname" --endpoint "http://127.0.0.1:$port" --access-key dockeradmin --secret-key docker-secret-123 --bucket tier --prefix z/ >/dev/null 2>&1 && break; sleep 2; done
+    for _ in $(seq 10); do "$MC" ilm tier add s3 hot "$tname" --endpoint "http://127.0.0.1:$port" --access-key dockeradmin --secret-key docker-secret-123 --bucket tier --prefix z/ >/dev/null 2>&1 && break; sleep 2; done
     check "$tname tier add" 0 "$(ok "$MC" ilm tier verify hot "$tname")"
     "$MC" mb "hot/d-$(echo "$tname" | tr A-Z a-z)" >/dev/null
     b="d-$(echo "$tname" | tr A-Z a-z)"
@@ -387,6 +387,40 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     "$MC" rm "hot/$b/obj" >/dev/null
     wait_for "$tname cleanup" 0 bash -c "\"$MC\" ls --recursive d$tname/tier/z/ 2>/dev/null | wc -l | tr -d ' '"
   done
+  # RustFS with mutual TLS (RUSTFS_SERVER_MTLS_ENABLE): client certificate required.
+  if docker image inspect rustfs/rustfs:latest >/dev/null 2>&1; then
+    mkdir -p "$WORK/rtls"
+    cp "$PKI/server.pem" "$WORK/rtls/rustfs_cert.pem"; cp "$PKI/server.key" "$WORK/rtls/rustfs_key.pem"
+    cp "$PKI/ca.pem" "$WORK/rtls/ca.crt"; cp "$PKI/ca.pem" "$WORK/rtls/client_ca.crt"
+    chmod 755 "$WORK/rtls"; chmod 644 "$WORK/rtls"/*
+    RP="$(freeport)"
+    RN="zkfsm-tiering-rustfs-mtls-$$"
+    if docker run -d --name "$RN" -p "127.0.0.1:$RP:9000" -v "$WORK/rtls:/tls:ro,Z" -e RUSTFS_TLS_PATH=/tls -e RUSTFS_SERVER_MTLS_ENABLE=true \
+        -e RUSTFS_ACCESS_KEY=dockeradmin -e RUSTFS_SECRET_KEY=docker-secret-123 rustfs/rustfs:latest >/dev/null 2>&1; then
+      CONTAINERS+=("$RN")
+      for _ in $(seq 100); do [[ "$(tls_s3 "$RP" dockeradmin docker-secret-123 PUT /rmtls -o /dev/null -w '%{http_code}')" == 200 ]] && break; sleep 0.3; done
+      check "rustfs mtls refuses clients without a certificate" 1 "$(ok curl -sf --cacert "$PKI/ca.pem" "https://127.0.0.1:$RP/")"
+      rtier() { # NAME EXTRA-JSON
+        printf '{"Version":"v1","Type":"s3","Name":"%s","S3":{"Endpoint":"https://127.0.0.1:%s","AccessKey":"dockeradmin","SecretKey":"docker-secret-123","Bucket":"rmtls","Prefix":"z/","Region":"us-east-1","CAFile":"%s"%s}}' "$1" "$RP" "$PKI/ca.pem" "$2"
+      }
+      check "rustfs mtls tier without client cert refused" 400 "$(tier_put "$(rtier RNOCERT "")")"
+      for _ in 1 2 3 4 5; do [[ "$(tier_put "$(rtier RMTLS "$CERT")")" == 204 ]] && break; sleep 2; done
+      check "rustfs mtls tier add" 0 "$(ok "$MC" ilm tier verify hot RMTLS)"
+      "$MC" mb hot/d-rmtls >/dev/null
+      "$MC" cp "$WORK/big.bin" hot/d-rmtls/obj >/dev/null
+      "$MC" ilm rule add hot/d-rmtls --transition-days 1 --transition-tier RMTLS >/dev/null
+      wait_for "rustfs mtls transition" RMTLS mclass d-rmtls obj
+      check "rustfs mtls remote holds the data" 1 "$(tls_count "$RP" dockeradmin docker-secret-123 rmtls z/)"
+      check "rustfs mtls read-through" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/d-rmtls/obj | sha256sum)"
+      hot s3api get-object --bucket d-rmtls --key obj --range bytes=5-104 "$WORK/r.out" >/dev/null
+      check "rustfs mtls range" "$(tail -c +6 "$WORK/big.bin" | head -c 100 | sha256sum)" "$(sha256sum <"$WORK/r.out")"
+      check "rustfs mtls restore accepted" 202 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>1</Days></RestoreRequest>' "$HOT/d-rmtls/obj?restore")"
+      r_restored() { hot s3api head-object --bucket d-rmtls --key obj 2>/dev/null | jget "d.get('Restore','')" | cut -d, -f1; }
+      wait_for "rustfs mtls restore completes" 'ongoing-request="false"' r_restored
+      "$MC" rm hot/d-rmtls/obj >/dev/null
+      wait_for "rustfs mtls cleanup" 0 tls_count "$RP" dockeradmin docker-secret-123 rmtls z/
+    else echo "skip rustfs mtls: container did not start"; fi
+  else echo "skip rustfs mtls: image not present"; fi
 else
   echo "skip docker tiers: docker not available"
 fi
