@@ -289,7 +289,8 @@ pub const Console = struct {
             else => return jsonError(req, .bad_gateway, "Unavailable", "The storage server did not answer."),
         };
         defer res.close();
-        return c.relay(req, a, res, s, admin, if (download) std.fs.path.basenamePosix(path) else null);
+        const live = admin and isLiveStream(path);
+        return c.relay(req, a, res, s, admin and !live, if (download) std.fs.path.basenamePosix(path) else null, live);
     }
 
     pub fn call(c: *Console, a: Allocator, s: session.Session, method: std.http.Method, path: []const u8, params: []const sign.Param, headers: []const Header, body: []const u8, now: i64) upstream.Error!*upstream.Response {
@@ -313,7 +314,8 @@ pub const Console = struct {
     }
 
     /// Streams the upstream response back; admin responses are decrypted first.
-    fn relay(c: *Console, req: *Request, a: Allocator, res: *upstream.Response, s: session.Session, admin: bool, attachment: ?[]const u8) ServeError!void {
+    /// `live` streams are flushed per read: trace and log never end on their own.
+    fn relay(c: *Console, req: *Request, a: Allocator, res: *upstream.Response, s: session.Session, admin: bool, attachment: ?[]const u8, live: bool) ServeError!void {
         var hs: std.ArrayList(Header) = .empty;
         try hs.appendSlice(a, &proxy_security_headers);
         var hit = res.head.iterateHeaders();
@@ -349,7 +351,16 @@ pub const Console = struct {
         var buf: [16 * 1024]u8 = undefined;
         var bw = try req.respondStreaming(&buf, .{ .content_length = len, .respond_options = .{ .status = status, .extra_headers = hs.items, .keep_alive = req.head.keep_alive and len != null } });
         const rd = res.bodyReader();
-        _ = rd.streamRemaining(&bw.writer) catch |e| switch (e) {
+        if (live) {
+            while (true) {
+                _ = rd.stream(&bw.writer, .limited(buf.len)) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    error.WriteFailed, error.ReadFailed => return error.WriteFailed,
+                };
+                bw.writer.flush() catch return error.WriteFailed;
+                bw.flush() catch return error.WriteFailed;
+            }
+        } else _ = rd.streamRemaining(&bw.writer) catch |e| switch (e) {
             error.WriteFailed => return error.WriteFailed,
             error.ReadFailed => return error.WriteFailed, // upstream cut: the client sees a short body
         };
@@ -393,7 +404,7 @@ pub const Console = struct {
             else => return jsonError(req, .bad_gateway, "Unavailable", "The storage server did not answer."),
         };
         defer res.close();
-        return c.relay(req, a, res, s, false, null);
+        return c.relay(req, a, res, s, false, null, false);
     }
 
     fn presign(c: *Console, req: *Request, a: Allocator, s: session.Session, now: i64) ServeError!void {
@@ -442,6 +453,11 @@ pub const Console = struct {
 };
 
 // ---------------------------------------------------------------- helpers
+
+/// Admin trace and log streams (`mc admin trace`, `mc admin logs`).
+fn isLiveStream(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, "/trace") or std.mem.endsWith(u8, path, "/log");
+}
 
 fn under(path: []const u8, prefix: []const u8) bool {
     return std.mem.startsWith(u8, path, prefix) and (path.len == prefix.len or path[prefix.len] == '/');
@@ -673,5 +689,7 @@ test "header forwarding rules" {
     try std.testing.expect(forwardResponseHeader("ETag"));
     try std.testing.expect(!forwardResponseHeader("set-cookie"));
     try std.testing.expect(under("/minio/admin/v3/info", "/minio/admin"));
+    try std.testing.expect(isLiveStream("/minio/admin/v3/trace") and isLiveStream("/minio/admin/v3/log"));
+    try std.testing.expect(!isLiveStream("/minio/admin/v3/info"));
     try std.testing.expect(!under("/minio/administrator", "/minio/admin"));
 }
