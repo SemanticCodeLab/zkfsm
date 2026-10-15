@@ -5,7 +5,8 @@
 #     data; kill -9 the moving node mid-way and resume; restart without the pool;
 #     a pool that was not decommissioned cannot be dropped.
 #  2. three pools: append an empty pool, rebalance (throttled; stop and restart it),
-#     then decommission the middle pool and restart without it.
+#     then decommission the middle pool (two nodes restart mid-way) and restart
+#     without it.
 set -euo pipefail
 S3CLI_BIN="${S3CLI_BIN:-aws}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -390,7 +391,17 @@ check "data intact after rebalance" "" "$(diff "$WORK/before" "$WORK/after" || t
 
 CMD_D="${PD[*]}"
 "$MC" admin decommission start z4 "$CMD_D" >/dev/null
-check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 300)"
+# Two nodes restart mid-drain: keys short of quorum meanwhile wait, the drain does not fail.
+for _ in $(seq 300); do [[ "$(decom 1 "$CMD_D" objectsDecommissioned)" =~ ^[1-9] ]] && break; sleep 0.2; done
+check "middle pool still draining before the restarts" false "$(decom 1 "$CMD_D" complete)"
+kill9 3
+kill9 4
+sleep 2
+start 3
+start 4
+wait_ready 3 120
+wait_ready 4 120
+check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 600)"
 check "middle pool drives hold no blobs" 0 "$(keyfiles d)"
 info=$("$MC" admin decommission status z2)
 check "status table: complete middle, active others" "Active Complete Active" "$(echo "$info" | grep -o 'Active\|Complete' | tr '\n' ' ' | sed 's/ $//')"

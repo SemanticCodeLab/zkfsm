@@ -660,28 +660,36 @@ pub const Node = struct {
     pub fn markRetired(n: *Node, mask: u64, local_only: bool) usize {
         n.retire_mu.lock();
         defer n.retire_mu.unlock();
-        n.retired |= mask;
+        const want = n.retired | mask;
         var failed: usize = 0;
         for (n.topo.pools, 0..) |pool, p| for (pool.endpoints, 0..) |_, i| {
             if (n.local_eps[p][i]) |le| {
-                retireLocal(le.path, n.retired) catch {
+                retireLocal(le.path, want) catch {
                     failed += 1;
                 };
             } else if (!local_only) {
-                // Peers OR the bit into their own formats; format_put refuses formatted drives.
-                const rd = &n.remotes[p][i].?;
-                var qb: [32]u8 = undefined;
-                var bb: [24]u8 = undefined;
-                const q = std.fmt.bufPrint(&qb, "d={d}.{d}", .{ p, i }) catch unreachable;
-                const body = std.fmt.bufPrint(&bb, "{d}", .{n.retired}) catch unreachable;
-                var c = n.rpc.call(rd.node, "format_retire", q, .{ .bytes = body }, .{ .probe = true }) catch {
+                const f = switch (n.readFormat(p, i)) {
+                    .fmt => |f| f,
+                    else => {
+                        failed += 1;
+                        continue;
+                    },
+                };
+                var g = f;
+                g.retired |= want;
+                var buf: [layout.format_max]u8 = undefined;
+                const bytes = g.encode(&buf) catch {
                     failed += 1;
                     continue;
                 };
-                defer c.deinit();
-                if (!c.ok()) failed += 1;
+                n.writeFormat(p, i, bytes) catch {
+                    failed += 1;
+                };
             }
         };
+        // Applied in memory only once recorded, so a failed attempt is retried.
+        if (failed > 0) return failed;
+        n.retired = want;
         for (n.pools) |*ps| for (ps.sets) |*st| if (st.drives.cluster) |*c| {
             c.format.retired = n.retired;
         };

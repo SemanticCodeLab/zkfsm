@@ -28,7 +28,8 @@ const poll_ns = 2 * std.time.ns_per_s;
 /// How long a node waits for writes that predate a drain before refusing to confirm.
 const quiesce_ms = 10_000;
 const persist_ns: i128 = 2 * std.time.ns_per_s;
-/// A drain gives up once no key moved for this long while some still could not be.
+/// A drain gives up once no key moved for this long while some failed for reasons
+/// other than unreachable drives.
 const stall_ns: i128 = 5 * 60 * std.time.ns_per_s;
 
 /// Outcome counts of one drain pass over the pool.
@@ -67,6 +68,8 @@ const Stall = struct {
             return .retry;
         }
         s.idle +|= 1;
+        // Only quorum losses left (nodes restarting): pause and retry, never fail.
+        if (pass.left == pass.unreachable_) s.since = now;
         return if (now - s.since >= s.limit) .give_up else .retry;
     }
 
@@ -560,8 +563,13 @@ pub const Manager = struct {
             if (m.stopping()) return persistQuiet(m, p, &prog);
         }
         // Retire the pool in the drive formats before reporting it complete.
+        // Complete only once every drive records it; else the job stays draining and retries.
         const failed = m.node.markRetired(m.bit(p), false);
-        if (failed > 0) std.log.warn("pools: {d} drive format(s) could not record pool {d} as decommissioned", .{ failed, p + 1 });
+        if (failed > 0) {
+            std.log.err("pools: {d} drive format(s) could not record pool {d} as decommissioned; not complete yet", .{ failed, p + 1 });
+            persistQuiet(m, p, &prog) catch {};
+            return error.Unavailable;
+        }
         if (try m.persistDecom(p, &prog, .complete) == .go)
             std.log.info("pools: decommission of pool {d} complete; it may be removed from the endpoint list", .{p + 1});
     }
@@ -789,6 +797,18 @@ test "drain passes: tombstones are no progress, leftovers retry until the stall 
     try std.testing.expectEqual(@as(u64, std.time.ns_per_s), s.backoff());
     try std.testing.expectEqual(.retry, s.next(stuck, 150));
     try std.testing.expectEqual(.give_up, s.next(stuck, 190));
+    // Every key short of quorum (two nodes restarting): waits however long it takes.
+    var q: Stall = .{ .since = 0, .limit = 100 };
+    var down: Pass = .{};
+    for (0..5) |_| down.fail(error.ReadQuorum);
+    down.kinds[@intFromEnum(mover.Outcome.gone)] = 44;
+    for (1..20) |t| try std.testing.expectEqual(.retry, q.next(down, @intCast(t * 100)));
+    try std.testing.expectEqual(@as(u64, 8 * std.time.ns_per_s), q.backoff());
+    // Once they are back, a key that still fails counts from then on.
+    var hard: Pass = .{};
+    hard.fail(error.IoFailed);
+    try std.testing.expectEqual(.retry, q.next(hard, 1950));
+    try std.testing.expectEqual(.give_up, q.next(hard, 2000));
     // Only tombstones left: the pool is empty.
     var clean: Pass = .{};
     clean.kinds[@intFromEnum(mover.Outcome.gone)] = 44;

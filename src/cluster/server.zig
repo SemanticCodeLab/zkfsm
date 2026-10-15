@@ -113,7 +113,6 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     }
     if (std.mem.eql(u8, op, "format")) return formatGet(n, req, q);
     if (std.mem.eql(u8, op, "format_put")) return formatPut(n, req, q, body);
-    if (std.mem.eql(u8, op, "format_retire")) return formatRetire(n, req, q, body);
     if (std.mem.eql(u8, op, "lock") or std.mem.eql(u8, op, "refresh") or std.mem.eql(u8, op, "unlock")) return lockOp(n, req, op, body);
     if (std.mem.eql(u8, op, "notify")) return notify(n, req, body, std.fmt.parseInt(u16, h.node, 10) catch std.math.maxInt(u16));
     if (std.mem.eql(u8, op, "jread")) return jread(n, req, q, arena);
@@ -231,14 +230,6 @@ fn formatPut(n: *Node, req: *Request, q: Query, body: []const u8) RawError!void 
         if (!want.isUpdateOf(have)) return fail(req, .conflict, "formatted");
     } else |e| if (e != error.NotFound) return fail(req, .internal_server_error, "io");
     lb.writeFormat(body) catch return fail(req, .internal_server_error, "io");
-    try req.respond("", .{});
-}
-
-/// A finished decommission: record the retired pools in this drive's format.
-fn formatRetire(n: *Node, req: *Request, q: Query, body: []const u8) RawError!void {
-    const d = n.endpoint(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
-    const mask = std.fmt.parseInt(u64, body, 10) catch return fail(req, .bad_request, "mask");
-    Node.retireLocal(d.path, mask) catch return fail(req, .internal_server_error, "io");
     try req.respond("", .{});
 }
 
