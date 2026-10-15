@@ -129,6 +129,8 @@ const Config = struct {
     console: console_wire.Flags = .{},
     /// Pools came from `ClusterHooks.layout`: membership changes at runtime.
     dynamic: bool = false,
+    /// Per pool, decommissioned (`StartLayout.retired`).
+    retired_pools: []const bool = &.{},
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -150,18 +152,22 @@ pub const ClusterHooks = struct {
     /// The node is bootstrapped and about to serve; changes go through
     /// `cluster.Node.applyMembership` and the node's "ext" channels.
     attach: ?*const fn (ctx: ?*anyopaque, node: *cluster.Node) void = null,
+    /// The pools manager (decommission, rebalance), called just before `attach`.
+    pools: ?*const fn (ctx: ?*anyopaque, mgr: *pools.Manager) void = null,
     /// The listener stopped; called before the node stops (only after `attach`).
     detach: ?*const fn (ctx: ?*anyopaque, node: *cluster.Node) void = null,
 
     /// Applies `layout` to the startup pools; true when it replaced them.
-    fn startLayout(h: ClusterHooks, arena: std.mem.Allocator, specs: *[]const []const []const u8) bool {
+    fn startLayout(h: ClusterHooks, arena: std.mem.Allocator, specs: *[]const []const []const u8, retired: *[]const bool) bool {
         const f = h.layout orelse return false;
         const l = f(h.ctx, arena, specs.*) orelse return false;
         specs.* = l.pools;
+        retired.* = l.retired;
         return true;
     }
 
-    fn attachTo(h: ClusterHooks, node: *cluster.Node) bool {
+    fn attachTo(h: ClusterHooks, node: *cluster.Node, mgr: *pools.Manager) bool {
+        if (h.pools) |f| f(h.ctx, mgr);
         const f = h.attach orelse return false;
         f(h.ctx, node);
         return true;
@@ -175,6 +181,9 @@ pub const ClusterHooks = struct {
 pub const StartLayout = struct {
     /// Per pool, its endpoint arguments, as on the command line.
     pools: []const []const []const u8,
+    /// Per pool (may be shorter): decommissioned. Its drives are not waited for and
+    /// no sets open for it, so its nodes may be gone. Formats also record this.
+    retired: []const bool = &.{},
 };
 
 const ConfigError = error{ BadArgs, HelpRequested, OutOfMemory };
@@ -388,7 +397,7 @@ pub fn run(opts: Options) u8 {
         };
         if (kms_holder.handle != null) std.log.info("kms backend {s}, default key {s}", .{ cfg.kms.backend.text(), kms_holder.default_key });
     }
-    if (!cfg.heal_only and opts.cluster.startLayout(arena, &cfg.pools)) cfg.dynamic = true;
+    if (!cfg.heal_only and opts.cluster.startLayout(arena, &cfg.pools, &cfg.retired_pools)) cfg.dynamic = true;
     if (cfg.pools.len > 0) return runCluster(gpa, arena, cfg, creds, addr, opts, &kms_holder);
     var drives = placement.DriveSet.open(gpa, cfg.data, cfg.protection) catch |e| {
         std.log.err("cannot open drives: {t}", .{e});
@@ -596,6 +605,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .scan_interval_s = cfg.scan_interval_s,
         .refresh_s = cfg.cluster_refresh_s,
         .dynamic = cfg.dynamic,
+        .retired = cfg.retired_pools,
     }) catch return 2;
     defer node.destroy();
     var pool_mgr = pools.Manager.init(gpa, node);
@@ -748,7 +758,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         notif.peers = .{ .ctx = node, .count = node.nodeCount(), .call = eventsPeerCall };
         node.ext.store(&events_ext, .release);
         // Before serving, so a restarted node catches up on membership first.
-        attached = opts.cluster.attachTo(node);
+        attached = opts.cluster.attachTo(node, &pool_mgr);
         node.start(if (iam_ready) &iam_store else null);
         gateways = gateway.Running.start(.{
             .gpa = gpa,
@@ -1158,12 +1168,12 @@ fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const 
 
 test "cluster hooks: layout replaces the pools; detach only after attach" {
     const Double = struct {
-        calls: [3]u8 = @splat(0),
+        calls: [4]u8 = @splat(0),
         const two = [_][]const []const u8{ &.{"http://a:9000/d1"}, &.{"http://b:9000/d1"} };
         fn layout(ctx: ?*anyopaque, _: std.mem.Allocator, argv: []const []const []const u8) ?StartLayout {
             const d: *@This() = @ptrCast(@alignCast(ctx.?));
             d.calls[0] += 1;
-            return if (argv.len == 0) .{ .pools = &two } else null;
+            return if (argv.len == 0) .{ .pools = &two, .retired = &.{true} } else null;
         }
         fn attach(ctx: ?*anyopaque, _: *cluster.Node) void {
             const d: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -1173,21 +1183,29 @@ test "cluster hooks: layout replaces the pools; detach only after attach" {
             const d: *@This() = @ptrCast(@alignCast(ctx.?));
             d.calls[2] += 1;
         }
+        fn pools_(ctx: ?*anyopaque, _: *pools.Manager) void {
+            const d: *@This() = @ptrCast(@alignCast(ctx.?));
+            // Handed over before attach.
+            if (d.calls[1] == 0) d.calls[3] += 1;
+        }
     };
     var d: Double = .{};
-    const h: ClusterHooks = .{ .ctx = &d, .layout = Double.layout, .attach = Double.attach, .detach = Double.detach };
+    const h: ClusterHooks = .{ .ctx = &d, .layout = Double.layout, .attach = Double.attach, .detach = Double.detach, .pools = Double.pools_ };
     var specs: []const []const []const u8 = &.{};
-    try std.testing.expect(h.startLayout(std.testing.allocator, &specs));
+    var retired: []const bool = &.{};
+    try std.testing.expect(h.startLayout(std.testing.allocator, &specs, &retired));
     try std.testing.expectEqual(@as(usize, 2), specs.len);
+    try std.testing.expectEqualSlices(bool, &.{true}, retired);
     // Keeping the argv pools: not dynamic.
-    try std.testing.expect(!h.startLayout(std.testing.allocator, &specs));
-    try std.testing.expect(!(ClusterHooks{}).startLayout(std.testing.allocator, &specs));
+    try std.testing.expect(!h.startLayout(std.testing.allocator, &specs, &retired));
+    try std.testing.expect(!(ClusterHooks{}).startLayout(std.testing.allocator, &specs, &retired));
     var fake: cluster.Node = undefined;
+    var mgr: pools.Manager = undefined;
     h.detachFrom(&fake, false);
-    try std.testing.expect(h.attachTo(&fake));
+    try std.testing.expect(h.attachTo(&fake, &mgr));
     h.detachFrom(&fake, true);
-    try std.testing.expectEqual([3]u8{ 2, 1, 1 }, d.calls);
-    try std.testing.expect(!(ClusterHooks{}).attachTo(&fake));
+    try std.testing.expectEqual([4]u8{ 2, 1, 1, 1 }, d.calls);
+    try std.testing.expect(!(ClusterHooks{}).attachTo(&fake, &mgr));
 }
 
 test "arg parsing" {

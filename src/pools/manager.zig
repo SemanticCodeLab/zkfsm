@@ -200,9 +200,38 @@ pub const Manager = struct {
         };
     }
 
-    // ---- admin operations ----
+    // ---- admin operations (also the in-process API for extensions) ----
+
+    /// Pools in the endpoint list, including retired ones.
+    pub fn poolCount(m: *Manager) usize {
+        return m.router().pools.len;
+    }
+
+    pub const DecommissionStatus = struct {
+        /// `complete` also for a pool retired before the state record knew it.
+        status: state.DecomStatus,
+        mode: cluster.router.Mode,
+        progress: state.Decom,
+    };
+
+    pub fn decommissionStatus(m: *Manager, p: usize) Error!DecommissionStatus {
+        if (p >= m.poolCount()) return error.NoSuchPool;
+        var arena = std.heap.ArenaAllocator.init(m.gpa);
+        defer arena.deinit();
+        var meta = try m.loadFresh(arena.allocator());
+        var d: state.Decom = if (meta.pool(m.node.poolIndex(p))) |ps| ps.decom else .{};
+        if (m.node.retired & m.bit(p) != 0) d.status = .complete;
+        return .{ .status = d.status, .mode = m.router().mode(p), .progress = d };
+    }
+
+    /// The current or last rebalance; its strings live in `a`.
+    pub fn rebalanceStatus(m: *Manager, a: std.mem.Allocator) Error!state.Rebalance {
+        const meta = try m.loadFresh(a);
+        return meta.rebalance;
+    }
 
     pub fn decommissionStart(m: *Manager, p: usize) Error!void {
+        if (p >= m.poolCount()) return error.NoSuchPool;
         const Ctx = struct {
             p: usize,
             fn f(ctx: *anyopaque, mg: *Manager, a: std.mem.Allocator, meta: *Meta) Error!void {
@@ -230,6 +259,7 @@ pub const Manager = struct {
     }
 
     pub fn decommissionCancel(m: *Manager, p: usize) Error!void {
+        if (p >= m.poolCount()) return error.NoSuchPool;
         const Ctx = struct {
             p: usize,
             fn f(ctx: *anyopaque, mg: *Manager, a: std.mem.Allocator, meta: *Meta) Error!void {
@@ -720,4 +750,48 @@ pub const Manager = struct {
 test {
     _ = state;
     _ = mover;
+}
+
+test "in-process API: decommission and rebalance start, status, cancel and stop" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    const p1 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/a{{1...2}}", .{root})};
+    const p2 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/b{{1...2}}", .{root})};
+    for ([_][]const u8{ "a1", "a2", "b1", "b2" }) |d| try tmp.dir.makeDir(d);
+    const two = [_][]const []const u8{ &p1, &p2 };
+    const n = try Node.create(gpa, .{ .pools = &two, .node_address = "127.0.0.1:1", .listen_host = "127.0.0.1", .listen_port = 1, .secret = @splat(7) });
+    defer n.destroy();
+    try n.bootstrap();
+    var m = Manager.init(gpa, n);
+    m.load();
+    try std.testing.expectEqual(@as(usize, 2), m.poolCount());
+    try std.testing.expectEqual(state.DecomStatus.none, (try m.decommissionStatus(0)).status);
+    try std.testing.expectError(error.NoSuchPool, m.decommissionStatus(2));
+    try std.testing.expectError(error.NoSuchPool, m.decommissionStart(5));
+    try std.testing.expectError(error.Conflict, m.decommissionCancel(0));
+
+    try m.decommissionStart(0);
+    const s = try m.decommissionStatus(0);
+    try std.testing.expectEqual(state.DecomStatus.draining, s.status);
+    try std.testing.expectEqual(cluster.router.Mode.draining, s.mode);
+    // One pool drains at a time, and the last active one cannot go.
+    try std.testing.expectError(error.Conflict, m.decommissionStart(1));
+    try std.testing.expectError(error.Conflict, m.rebalanceStart(a));
+    try m.decommissionCancel(0);
+    try std.testing.expectEqual(state.DecomStatus.canceled, (try m.decommissionStatus(0)).status);
+    try std.testing.expectEqual(cluster.router.Mode.active, m.router().mode(0));
+
+    try std.testing.expectEqual(state.RebalStatus.none, (try m.rebalanceStatus(a)).status);
+    const id = try m.rebalanceStart(a);
+    const rb = try m.rebalanceStatus(a);
+    try std.testing.expectEqual(state.RebalStatus.started, rb.status);
+    try std.testing.expectEqualStrings(id, rb.id);
+    try m.rebalanceStop();
+    try std.testing.expectEqual(state.RebalStatus.stopped, (try m.rebalanceStatus(a)).status);
+    try std.testing.expectError(error.Conflict, m.rebalanceStop());
 }
