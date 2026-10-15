@@ -15,6 +15,8 @@ pub const Outcome = enum {
     gone,
     /// An active pool already held the key; the stale source copy was dropped.
     dup,
+    /// Fewer than k shards of a deleted blob (a delete that missed a drive) were removed.
+    purged,
 };
 
 pub const Result = struct { outcome: Outcome, bytes: u64 = 0 };

@@ -34,7 +34,7 @@ const stall_ns: i128 = 5 * 60 * std.time.ns_per_s;
 
 /// Outcome counts of one drain pass over the pool.
 const Pass = struct {
-    kinds: [3]usize = @splat(0),
+    kinds: [std.meta.fields(mover.Outcome).len]usize = @splat(0),
     left: usize = 0,
     /// Of `left`: failed for want of reachable drives.
     unreachable_: usize = 0,
@@ -47,7 +47,8 @@ const Pass = struct {
     /// Only moves and dropped duplicates are progress: keys reported gone (delete
     /// tombstones) stay listed pass after pass.
     fn progressed(p: Pass) bool {
-        return p.kinds[@intFromEnum(mover.Outcome.moved)] + p.kinds[@intFromEnum(mover.Outcome.dup)] > 0;
+        const k = p.kinds;
+        return k[@intFromEnum(mover.Outcome.moved)] + k[@intFromEnum(mover.Outcome.dup)] + k[@intFromEnum(mover.Outcome.purged)] > 0;
     }
 
     fn done(p: Pass) bool {
@@ -539,8 +540,13 @@ pub const Manager = struct {
                         throttle(&m.stop_ev, m.decom_rate, started, total);
                     } else |e| {
                         if (e == error.OutOfMemory) return error.OutOfMemory;
-                        std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
-                        pass.fail(e);
+                        // Unreadable with every drive answering and no active copy: leftovers of a delete.
+                        if (e == error.IoFailed and m.dropRemnant(p, key)) {
+                            pass.kinds[@intFromEnum(mover.Outcome.purged)] += 1;
+                        } else {
+                            std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
+                            pass.fail(e);
+                        }
                     }
                     if (std.time.nanoTimestamp() - prog.last_persist >= persist_ns) {
                         if (try m.persistDecom(p, &prog, null) == .stop) return;
@@ -548,7 +554,7 @@ pub const Manager = struct {
                 }
             };
             const k = pass.kinds;
-            std.log.info("pools: pool {d} pass: {d} moved, {d} gone, {d} dup, {d} left ({d} unreachable)", .{ p + 1, k[0], k[1], k[2], pass.left, pass.unreachable_ });
+            std.log.info("pools: pool {d} pass: {d} moved, {d} gone, {d} dup, {d} purged, {d} left ({d} unreachable)", .{ p + 1, k[0], k[1], k[2], k[3], pass.left, pass.unreachable_ });
             if (pass.done()) break;
             switch (stall.next(pass, std.time.nanoTimestamp())) {
                 .retry => {},
@@ -572,6 +578,12 @@ pub const Manager = struct {
         }
         if (try m.persistDecom(p, &prog, .complete) == .go)
             std.log.info("pools: decommission of pool {d} complete; it may be removed from the endpoint list", .{p + 1});
+    }
+
+    fn dropRemnant(m: *Manager, p: usize, key: backend.PhysicalKey) bool {
+        const ps = m.node.pools[p];
+        if (ps.sets.len == 0) return false;
+        return ps.sets[Router.setIndex(&m.router().pools[p], key)].strategy.dropRemnant(key);
     }
 
     fn persistQuiet(m: *Manager, p: usize, prog: *Progress) Error!void {
