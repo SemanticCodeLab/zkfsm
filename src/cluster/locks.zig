@@ -2,6 +2,7 @@
 //! majority of nodes granted it. Holders refresh leases; unlocks are retried; leases of
 //! crashed holders expire.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const rpc_mod = @import("rpc.zig");
 const fanout = @import("../protection/root.zig").fanout;
 
@@ -159,7 +160,7 @@ pub const Manager = struct {
     pub fn lock(m: *Manager, resource: []const u8) Error!u64 {
         if (resource.len > max_resource) return error.OutOfMemory;
         const uid = std.crypto.random.int(u64) | 1;
-        const deadline = std.time.milliTimestamp() + acquire_timeout_ms;
+        const deadline = core.time.monoMs() + acquire_timeout_ms;
         var backoff_ms: u64 = 5;
         while (true) {
             if (!m.haveQuorum()) return error.NoQuorum;
@@ -176,7 +177,7 @@ pub const Manager = struct {
                 return uid;
             }
             m.release(resource, uid, granted);
-            if (std.time.milliTimestamp() > deadline) return error.LockTimeout;
+            if (core.time.monoMs() > deadline) return error.LockTimeout;
             std.Thread.sleep((backoff_ms + std.crypto.random.uintLessThan(u64, backoff_ms)) * std.time.ns_per_ms);
             backoff_ms = @min(backoff_ms * 2, 250);
         }
@@ -220,7 +221,7 @@ pub const Manager = struct {
             }
         };
         const v = m.voterSets();
-        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = std.time.milliTimestamp(), .want = v[0] | v[1] };
+        var each: Each = .{ .m = m, .resource = resource, .uid = uid, .op = op, .body = body, .now = core.time.monoMs(), .want = v[0] | v[1] };
         fanout.run(m.nodes(), true, &each, Each.f);
         var granted: u256 = 0;
         for (0..m.nodes()) |i| if (each.yes[i]) {

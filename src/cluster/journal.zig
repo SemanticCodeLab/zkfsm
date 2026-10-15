@@ -4,6 +4,7 @@
 //! entries past their watermark instead of rebuilding their key index.
 //! The epoch changes when the file is lost or a reboot may have cut its tail.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const wire = @import("wire.zig");
 
 pub const Error = error{ OutOfMemory, IoFailed };
@@ -149,7 +150,7 @@ pub const Journal = struct {
     fn keep(j: *Journal, seq: u64, bytes: []const u8, done: bool) error{OutOfMemory}!void {
         const copy = try j.gpa.dupe(u8, bytes);
         errdefer j.gpa.free(copy);
-        try j.entries.append(j.gpa, .{ .seq = seq, .bytes = copy, .done = done, .born_ms = std.time.milliTimestamp() });
+        try j.entries.append(j.gpa, .{ .seq = seq, .bytes = copy, .done = done, .born_ms = core.time.monoMs() });
         j.bytes += copy.len;
         if (j.entries.items.len <= max_entries and j.bytes <= max_bytes) return;
         // Drop the oldest eighth at once so trimming stays cheap.

@@ -235,7 +235,7 @@ fn formatPut(n: *Node, req: *Request, q: Query, body: []const u8) RawError!void 
 
 fn lockOp(n: *Node, req: *Request, op: []const u8, body: []const u8) RawError!void {
     const b = locks.decodeBody(body) orelse return fail(req, .bad_request, "lock");
-    const now = std.time.milliTimestamp();
+    const now = core.time.monoMs();
     const ok = if (std.mem.eql(u8, op, "lock"))
         try n.table.lock(b.resource, b.uid, now)
     else if (std.mem.eql(u8, op, "refresh"))
@@ -310,10 +310,10 @@ fn openLease(n: *Node, req: *Request, q: Query, l: *LocalBackend, key: PhysicalK
         defer file.close();
         return sendRange(req, file, st.size, st.mtime, 0, st.size, null);
     }
-    const now = std.time.milliTimestamp();
+    const now = core.time.monoMs();
     const id = n.leases.open(file, now) catch |e| return fail(req, .service_unavailable, @errorName(e));
     const f = n.leases.acquire(id, now) orelse return fail(req, .internal_server_error, "lease");
-    defer n.leases.release(id, std.time.milliTimestamp());
+    defer n.leases.release(id, core.time.monoMs());
     return sendRange(req, f, st.size, st.mtime, 0, want, id);
 }
 
@@ -323,8 +323,8 @@ fn pread(n: *Node, req: *Request, q: Query) RawError!void {
     const off = q.int(u64, "off") orelse return fail(req, .bad_request, "off");
     const want = q.int(u64, "len") orelse return fail(req, .bad_request, "len");
     if (want > max_read) return fail(req, .payload_too_large, "len");
-    const f = n.leases.acquire(id, std.time.milliTimestamp()) orelse return fail(req, .gone, "lease");
-    defer n.leases.release(id, std.time.milliTimestamp());
+    const f = n.leases.acquire(id, core.time.monoMs()) orelse return fail(req, .gone, "lease");
+    defer n.leases.release(id, core.time.monoMs());
     const st = f.stat() catch return fail(req, .internal_server_error, "io");
     const len = if (off >= st.size) 0 else @min(want, st.size - off);
     return sendRange(req, f, st.size, st.mtime, off, len, null);

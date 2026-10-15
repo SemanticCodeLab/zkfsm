@@ -55,7 +55,7 @@ pub const Throttle = struct {
     pub fn tick(self: *Throttle) Error!void {
         if (self.stop) |s| if (s.isSet()) return error.Stopped;
         if (self.per_sec == 0) return;
-        const now = core.time.nowNs();
+        const now = core.time.monoNs();
         if (now - self.window_start >= std.time.ns_per_s) {
             self.window_start = now;
             self.n = 0;
@@ -67,7 +67,7 @@ pub const Throttle = struct {
             s.timedWait(wait) catch {};
             if (s.isSet()) return error.Stopped;
         } else std.Thread.sleep(wait);
-        self.window_start = core.time.nowNs();
+        self.window_start = core.time.monoNs();
         self.n = 1;
     }
 };

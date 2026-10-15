@@ -3,6 +3,7 @@
 //! deletes find a key in whichever pool holds it. New system keys go to the first
 //! active pool; draining pools take no new keys and are searched last.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const iface = @import("../backend/root.zig");
 
 const Error = iface.Error;
@@ -100,9 +101,9 @@ pub const Router = struct {
     /// Waits until no write that started before the current modes is in flight;
     /// false after `timeout_ms`.
     pub fn quiesce(self: *Router, timeout_ms: i64) bool {
-        const until = std.time.milliTimestamp() + timeout_ms;
+        const until = core.time.monoMs() + timeout_ms;
         while (self.unguarded.load(.seq_cst) != 0) {
-            if (std.time.milliTimestamp() > until) return false;
+            if (core.time.monoMs() > until) return false;
             std.Thread.sleep(std.time.ns_per_ms);
         }
         return true;
