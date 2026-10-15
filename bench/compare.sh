@@ -13,6 +13,7 @@
 #      SINGLE_MEM (20g), SINGLE_DRIVE (4096m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
 #      ZKFSM_BIN / WARP_BIN (prebuilt binaries; built into CACHE when unset),
+#      LOAD_MAX (unset; wait before each run until load1 < LOAD_MAX), LOAD_WAIT (43200 s),
 #      MINIO_IMAGE (pgsty/minio:latest), RUSTFS_IMAGE (rustfs/rustfs:latest), BASE_IMAGE (busybox:1.36-musl).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,6 +41,8 @@ BASE_IMAGE="${BASE_IMAGE:-busybox:1.36-musl}"
 AK=zcbenchadmin
 SK=zcbenchsecret123
 BUCKET=zc-bench
+LOAD_MAX="${LOAD_MAX:-}"
+LOAD_WAIT="${LOAD_WAIT:-43200}"
 IFS=, read -r -a CPUS <<<"$SERVER_CPUS"
 NCPU=${#CPUS[@]}
 
@@ -201,6 +204,21 @@ run_workload() { # product topo workload rep
   done >>"$OUT/results.tsv"
 }
 
+# Waits until the 1-minute load average is below LOAD_MAX (unset: no gate), and the
+# output directory has room for logs (a full OUT filesystem leaves empty logs and rc=1).
+load_gate() {
+  local waited=0
+  while :; do
+    local free
+    free=$(df -Pm "$OUT" | awk 'NR==2{print $4}')
+    if ((free < 512)); then log "OUT has ${free} MiB free; waiting"; elif [[ -z "$LOAD_MAX" ]] ||
+      awk -v l="$(cut -d' ' -f1 /proc/loadavg)" -v m="$LOAD_MAX" 'BEGIN{exit !(l < m)}'; then return 0; fi
+    ((waited >= LOAD_WAIT)) && return 1
+    sleep 15
+    waited=$((waited + 15))
+  done
+}
+
 main() {
   log "out: $OUT"
   prepare
@@ -223,6 +241,7 @@ main() {
           # A fresh target with empty drives per workload: RustFS keeps deleted objects
           # in .rustfs.sys/tmp/.trash, so earlier runs would fill the next run's drives.
           stop_all
+          load_gate || { log "load gate: load1 stayed >= $LOAD_MAX for $LOAD_WAIT s; stopping"; return 2; }
           start_target "$p" "$t"
           if ! wait_ready "$p-$t-$w-r$r"; then
             log "FAIL $p $t $w r$r: not ready"
