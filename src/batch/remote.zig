@@ -31,7 +31,7 @@ pub const Page = struct {
 pub const max_list_entries = 1000;
 
 /// One ListObjectVersions page.
-pub fn listVersions(hc: *http.Client, a: Allocator, r: client.Remote, bucket: []const u8, prefix: []const u8, key_marker: []const u8, version_marker: []const u8) Error!Page {
+pub fn listVersions(hc: *client.Http, a: Allocator, r: client.Remote, bucket: []const u8, prefix: []const u8, key_marker: []const u8, version_marker: []const u8) Error!Page {
     var q: std.ArrayList(client.Param) = .empty;
     try q.append(a, .{ .name = "versions", .value = "" });
     try q.append(a, .{ .name = "max-keys", .value = "1000" });
@@ -99,7 +99,7 @@ pub const Consumer = struct {
 };
 
 /// GETs `path`; on 2xx hands the body to `c` (its result is returned as `consumed`).
-pub fn getInto(hc: *http.Client, a: Allocator, r: client.Remote, path: []const u8, query: []const client.Param, c: Consumer) client.Error!struct { head: Head, consumed: bool } {
+pub fn getInto(hc: *client.Http, a: Allocator, r: client.Remote, path: []const u8, query: []const client.Param, c: Consumer) client.Error!struct { head: Head, consumed: bool } {
     var path_w: std.Io.Writer.Allocating = .init(a);
     sign.uriEncode(&path_w.writer, path, false) catch return error.OutOfMemory;
     var query_w: std.Io.Writer.Allocating = .init(a);
@@ -120,36 +120,31 @@ pub fn getInto(hc: *http.Client, a: Allocator, r: client.Remote, path: []const u
         .amz_date = &date,
     }, &auth_buf) catch return error.OutOfMemory;
     const hp = splitHostPort(r.endpoint) orelse return error.InvalidEndpoint;
-    const uri: std.Uri = .{
-        .scheme = if (r.secure) "https" else "http",
-        .host = .{ .raw = hp.host },
-        .port = hp.port,
-        .path = .{ .percent_encoded = path_w.written() },
-        .query = if (query_w.written().len == 0) null else .{ .percent_encoded = query_w.written() },
-    };
+    var target: std.Io.Writer.Allocating = .init(a);
+    target.writer.writeAll(if (path_w.written().len == 0) "/" else path_w.written()) catch return error.OutOfMemory;
+    if (query_w.written().len > 0) target.writer.print("?{s}", .{query_w.written()}) catch return error.OutOfMemory;
     const extra = [_]http.Header{
         .{ .name = "x-amz-content-sha256", .value = sign.empty_sha256 },
         .{ .name = "x-amz-date", .value = &date },
+        .{ .name = "Authorization", .value = auth },
     };
-    var req = hc.request(.GET, uri, .{
-        .redirect_behavior = .unhandled,
-        .keep_alive = true,
-        .headers = .{
-            .host = .{ .override = r.endpoint },
-            .authorization = .{ .override = auth },
-            .user_agent = .{ .override = "zkfsm-batch" },
-            .accept_encoding = .omit,
-        },
-        .extra_headers = &extra,
-    }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Unreachable;
-    defer req.deinit();
-    req.sendBodiless() catch return error.Unreachable;
-    var redirect_buf: [0]u8 = .{};
-    var resp = req.receiveHead(&redirect_buf) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Unreachable;
-    var head: Head = .{ .status = @intFromEnum(resp.head.status), .content_length = resp.head.content_length };
+    const tls = if (r.secure) r.tls.options() orelse return error.InvalidEndpoint else null;
+    var x: client.Exchange = undefined;
+    x.start(hc, .{ .host = hp.host, .port = hp.port orelse @as(u16, if (r.secure) 443 else 80), .tls = tls }, .{
+        .method = .GET,
+        .target = target.written(),
+        .host = r.endpoint,
+        .headers = &extra,
+        .user_agent = "zkfsm-batch",
+    }) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidArgument => error.InvalidEndpoint,
+        else => error.Unreachable,
+    };
+    defer x.deinit();
+    var head: Head = .{ .status = x.status, .content_length = x.content_length };
     var meta: std.ArrayList(http.Header) = .empty;
-    var it = resp.head.iterateHeaders();
-    while (it.next()) |h| {
+    for (x.headers()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "content-type")) head.content_type = try a.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) head.etag = try a.dupe(u8, std.mem.trim(u8, h.value, "\""));
         if (std.ascii.startsWithIgnoreCase(h.name, "x-amz-meta-") and h.name.len > 11 and meta.items.len < 64)
@@ -157,11 +152,8 @@ pub fn getInto(hc: *http.Client, a: Allocator, r: client.Remote, path: []const u
     }
     head.metadata = meta.items;
     var tbuf: [64 * 1024]u8 = undefined;
-    const body = req.reader.bodyReader(&tbuf, resp.head.transfer_encoding, resp.head.content_length);
-    if (head.status < 200 or head.status >= 300) {
-        _ = body.discardRemaining() catch {};
-        return .{ .head = head, .consumed = false };
-    }
+    const body = x.body(&tbuf);
+    if (head.status < 200 or head.status >= 300) return .{ .head = head, .consumed = false };
     return .{ .head = head, .consumed = c.func(c.ctx, head, body) };
 }
 

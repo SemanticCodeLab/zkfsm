@@ -25,6 +25,8 @@ pub const Target = struct {
     disable_proxy: bool = false,
     deployment_id: []const u8 = "",
     reset_id: []const u8 = "",
+    /// Client certificate, CA file, server name, minimum version for https endpoints.
+    tls: client.TlsFields = .{},
 
     pub fn remote(t: Target) client.Remote {
         return .{
@@ -34,6 +36,7 @@ pub const Target = struct {
             .secret_key = t.secret_key,
             .region = if (t.region.len > 0) t.region else "us-east-1",
             .bandwidth = if (t.bandwidth > 0) @intCast(t.bandwidth) else 0,
+            .tls = t.tls,
         };
     }
 };
@@ -82,6 +85,7 @@ pub fn parseRequest(a: Allocator, doc: []const u8) ParseError!Target {
         .disable_proxy = boolean(o, "disableProxy"),
         .deployment_id = str(o, "deploymentID"),
         .reset_id = str(o, "resetID"),
+        .tls = client.TlsFields.fromJson(o),
     };
     if (o.get("credentials")) |c| if (c == .object) {
         t.access_key = str(c.object, "accessKey");
@@ -116,6 +120,7 @@ pub fn writeJson(w: *std.json.Stringify, t: Target, h: Health) std.Io.Writer.Err
         try w.objectField(f[0]);
         try w.write(f[1]);
     }
+    try t.tls.writeJson(w);
     try w.objectField("credentials");
     try w.write(.{ .accessKey = t.access_key });
     try w.objectField("secure");

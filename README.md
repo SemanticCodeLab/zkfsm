@@ -187,6 +187,33 @@ zkfsm --data http://127.0.0.1:{9001...9004}/srv/d{1...4} --listen 127.0.0.1:9001
   shards of interrupted writes after 15 minutes. A returning node triggers a
   pass right away.
 
+#### Cluster extension points
+
+Builds that embed zkfsm (`lib.zig`, `app.run(opts)`) can manage cluster
+membership at runtime through `app.Options.cluster` (`ClusterHooks`). With no
+hooks installed nothing changes: the endpoint list is fixed and the RPC wire
+format is the same.
+
+- `layout(ctx, arena, argv_pools) ?StartLayout`: startup pools replacing the
+  endpoint arguments (for example a stored or fetched membership). Returning
+  one marks the node dynamic: peers' endpoint-list fingerprints are not
+  compared, since nodes may briefly run with different lists.
+- `attach(ctx, node)`: the node is bootstrapped and about to serve.
+  `detach(ctx, node)`: the listener stopped, before the node stops.
+- `cluster.Node.applyMembership(.{ .epoch, .pools, .settling })`: the full pool
+  list with the current one as prefix. New nodes and pools are appended live;
+  a new pool is formatted by the owner of its first endpoint and opened by
+  every node once its drives answer (`error.NotReady` until then: call again).
+  Lock voters become the nodes with a drive in a pool that is not retired;
+  with `settling`, a lock also needs a majority of the previous voters. Pool
+  modes stay with the pools manager (decommission, rebalance); call again
+  after they change so departed nodes stop voting and getting heartbeats.
+- The membership epoch is reported to peers in `hello` once nonzero;
+  `node.allApplied(epoch)` is true when every reachable member reports it.
+- Peer calls: `node.setExt(channel, handler)` and
+  `node.extCallOn(channel, peer, ...)` on channels 1..3 (0 is the built-in
+  handler used by `extCall`).
+
 ### Users, policies, and temporary credentials
 
 `mc admin` manages users, groups, canned policies, and service accounts
@@ -278,6 +305,23 @@ next lifecycle pass. Usage per tier is reported by `mc ilm tier info` and as
 minute; restore expiry and the usage scan run every 10 minutes (both follow
 `--lifecycle-interval` when it is shorter than a minute).
 
+Tier traffic goes through zkfsm's own HTTP/1.1 and TLS 1.2/1.3 client (pooled
+keep-alive connections, streamed bodies, IP-address SANs). TLS settings per
+tier, set through the admin API (`PUT /minio/admin/v3/tier`, body encrypted like
+`mc` does) in the tier section, or changed with `POST .../tier/NAME`
+(`clientCert`, `clientKey`, `caFile`, `serverName`, `minVersion`):
+
+```json
+{"Version":"v1","Type":"minio","Name":"WARM","MinIO":{"Endpoint":"https://10.0.0.5:9000",
+ "AccessKey":"AK","SecretKey":"SK","Bucket":"tier","ClientCert":"/etc/zkfsm/tier.pem",
+ "ClientKey":"/etc/zkfsm/tier.key","CAFile":"/etc/zkfsm/ca.pem","ServerName":"",
+ "MinVersion":"1.2"}}
+```
+
+Paths are node-local and must exist on every node. Without `CAFile`,
+`$ZKFSM_TIER_CA_FILE`, then `$SSL_CERT_FILE`, then the system roots are trusted.
+Role tiers fetch their STS credentials with the same settings.
+
 ### External identity
 
 Federated STS actions turn an external identity into temporary credentials
@@ -342,7 +386,8 @@ listings) and revocation cut-offs.
   (optional for every other request). A client presenting a certificate that
   chains to that CA gets credentials whose policy is the one named by the
   certificate's subject Common Name, for at most an hour and never past the
-  certificate's expiry.
+  certificate's expiry. `--tls-client-auth require` refuses handshakes without
+  such a certificate; `--tls-max-version 1.2` limits the listener to TLS 1.2.
 
 Secrets in IdP settings (`client_secret`, `lookup_bind_password`) are stored
 in the IAM state and shown redacted by `info`. Configuration changes apply
@@ -414,6 +459,10 @@ mc replicate resync start src/photos --remote-bucket <arn>
   StorageClass, DeleteMarkerReplication, DeleteReplication, ExistingObjectReplication,
   ReplicaModifications. Targets are managed through the admin API
   (`set-remote-target`, `list-remote-targets`, `remove-remote-target`, encrypted bodies).
+  A target may carry `clientCert`, `clientKey`, `caFile`, `serverName` and `minVersion`
+  for HTTPS endpoints that require a client certificate; site peers take the same
+  keys in each `site-replication/add` entry. Empty fields fall back to
+  `ZKFSM_REPLICATION_{CLIENT_CERT,CLIENT_KEY,CA_FILE,SERVER_NAME,MIN_VERSION}`.
 - Every change is queued as a durable record before the client gets its answer and
   delivered asynchronously with exponential backoff (1 s up to 30 s), so a crash or
   target outage loses nothing. Version ids and times, user metadata, tags, retention,

@@ -91,6 +91,7 @@ pub const Session = struct {
     alpn: bool = false,
     peer_cn_buf: [peer_cert.max_common_name]u8 = undefined,
     peer_cn_len: u8 = 0,
+    require_cert: bool = false,
     peer_not_before: i64 = 0,
     peer_not_after: i64 = 0,
     pend: []u8 = &.{},
@@ -117,6 +118,7 @@ pub const Session = struct {
         };
         s.reader.buffer = &s.rbuf;
         s.writer.buffer = &s.wbuf;
+        s.require_cert = ctx.require_client_cert and ctx.client_cas.len > 0;
         const creds = ctx.acquire();
         defer creds.release();
         s.handshake(creds, ctx.client_cas, ctx.min_version, ctx.max_version) catch |e| {
@@ -296,7 +298,7 @@ pub const Session = struct {
             try record12(S, &transcript, &raw, keep_raw, s.gpa, chain_msg);
             var list: [hs.max_peer_chain][]const u8 = undefined;
             const chain = try hs.parseCertificate12(chain_msg[4..], &list);
-            if (chain.len > 0) leaf = try peer_cert.verifyChain(chain, cas, std.time.timestamp());
+            if (chain.len > 0) leaf = try peer_cert.verifyChain(chain, cas, std.time.timestamp()) else if (s.require_cert) return error.HandshakeFailure;
         }
 
         const cke = try s.readHandshake();
@@ -531,7 +533,7 @@ pub const Session = struct {
         transcript.update(msg);
         var list: [hs.max_peer_chain][]const u8 = undefined;
         const chain = try hs.parseCertificate(msg[4..], &list);
-        if (chain.len == 0) return;
+        if (chain.len == 0) return if (s.require_cert) error.HandshakeFailure;
         const leaf = try peer_cert.verifyChain(chain, cas, std.time.timestamp());
 
         const cv = try s.readHandshake();

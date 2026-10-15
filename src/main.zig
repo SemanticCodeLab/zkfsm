@@ -56,6 +56,9 @@ const usage =
     \\  --tls-key FILE   PEM private key: EC P-256 or RSA 2048-4096 (or $ZKFSM_TLS_KEY)
     \\  --tls-client-ca FILE  PEM CAs for optional client certificates (AssumeRoleWithCertificate)
     \\  --tls-min-version V   lowest TLS version accepted: 1.2 (default) or 1.3
+    \\  --tls-max-version V   newest TLS version offered: 1.3 (default) or 1.2
+    \\  --tls-client-auth M   optional (default) or require: refuse clients without a
+    \\                        certificate from --tls-client-ca
     \\  --certs-dir DIR  directory holding public.crt and private.key (or $ZKFSM_CERTS_DIR)
     \\                   SIGHUP reloads the certificate and key
     \\  --max-conns      open connections before new ones get 503 (default: 1024)
@@ -119,9 +122,13 @@ const Config = struct {
     identity_ldap: ?[]const u8 = null,
     tls_client_ca: ?[]const u8 = null,
     tls_min_version: tls.Version = .tls12,
+    tls_max_version: tls.Version = .tls13,
+    tls_require_client_cert: bool = false,
     kms: sse.setup.Flags = .{},
     obs: observe.config.Flags = .{},
     console: console_wire.Flags = .{},
+    /// Pools came from `ClusterHooks.layout`: membership changes at runtime.
+    dynamic: bool = false,
 };
 
 /// Hooks for builds that embed zkfsm (see lib.zig `app`).
@@ -131,6 +138,43 @@ pub const Options = struct {
     extra_flag: ?*const fn (ctx: ?*anyopaque, flag: []const u8, value: []const u8) bool = null,
     extra_ctx: ?*anyopaque = null,
     extra_usage: []const u8 = "",
+    cluster: ClusterHooks = .{},
+};
+
+/// Cluster extension points: lets an embedding build manage membership at runtime.
+pub const ClusterHooks = struct {
+    ctx: ?*anyopaque = null,
+    /// Startup pools replacing the endpoint arguments (`argv_pools`, maybe empty);
+    /// null keeps them. A returned layout marks the node dynamic (see `Config.dynamic`).
+    layout: ?*const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, argv_pools: []const []const []const u8) ?StartLayout = null,
+    /// The node is bootstrapped and about to serve; changes go through
+    /// `cluster.Node.applyMembership` and the node's "ext" channels.
+    attach: ?*const fn (ctx: ?*anyopaque, node: *cluster.Node) void = null,
+    /// The listener stopped; called before the node stops (only after `attach`).
+    detach: ?*const fn (ctx: ?*anyopaque, node: *cluster.Node) void = null,
+
+    /// Applies `layout` to the startup pools; true when it replaced them.
+    fn startLayout(h: ClusterHooks, arena: std.mem.Allocator, specs: *[]const []const []const u8) bool {
+        const f = h.layout orelse return false;
+        const l = f(h.ctx, arena, specs.*) orelse return false;
+        specs.* = l.pools;
+        return true;
+    }
+
+    fn attachTo(h: ClusterHooks, node: *cluster.Node) bool {
+        const f = h.attach orelse return false;
+        f(h.ctx, node);
+        return true;
+    }
+
+    fn detachFrom(h: ClusterHooks, node: *cluster.Node, attached: bool) void {
+        if (attached) if (h.detach) |f| f(h.ctx, node);
+    }
+};
+
+pub const StartLayout = struct {
+    /// Per pool, its endpoint arguments, as on the command line.
+    pools: []const []const []const u8,
 };
 
 const ConfigError = error{ BadArgs, HelpRequested, OutOfMemory };
@@ -195,6 +239,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8, env_data: ?[]co
             cfg.tls_client_ca = args[i];
         } else if (std.mem.eql(u8, a, "--tls-min-version")) {
             cfg.tls_min_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--tls-max-version")) {
+            cfg.tls_max_version = tls.Version.parse(args[i]) orelse return error.BadArgs;
+        } else if (std.mem.eql(u8, a, "--tls-client-auth")) {
+            if (std.mem.eql(u8, args[i], "require")) cfg.tls_require_client_cert = true else if (!std.mem.eql(u8, args[i], "optional")) return error.BadArgs;
         } else if (std.mem.eql(u8, a, "--identity-ldap")) {
             cfg.identity_ldap = args[i];
         } else if (std.mem.eql(u8, a, "--set-size")) {
@@ -340,6 +388,7 @@ pub fn run(opts: Options) u8 {
         };
         if (kms_holder.handle != null) std.log.info("kms backend {s}, default key {s}", .{ cfg.kms.backend.text(), kms_holder.default_key });
     }
+    if (!cfg.heal_only and opts.cluster.startLayout(arena, &cfg.pools)) cfg.dynamic = true;
     if (cfg.pools.len > 0) return runCluster(gpa, arena, cfg, creds, addr, opts, &kms_holder);
     var drives = placement.DriveSet.open(gpa, cfg.data, cfg.protection) catch |e| {
         std.log.err("cannot open drives: {t}", .{e});
@@ -463,6 +512,8 @@ pub fn run(opts: Options) u8 {
             return 2;
         };
         tls_ctx.min_version = cfg.tls_min_version;
+        tls_ctx.max_version = cfg.tls_max_version;
+        tls_ctx.require_client_cert = cfg.tls_require_client_cert;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -544,6 +595,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         .ca_files = cas.items,
         .scan_interval_s = cfg.scan_interval_s,
         .refresh_s = cfg.cluster_refresh_s,
+        .dynamic = cfg.dynamic,
     }) catch return 2;
     defer node.destroy();
     var pool_mgr = pools.Manager.init(gpa, node);
@@ -603,6 +655,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
             return 2;
         };
         tls_ctx.min_version = cfg.tls_min_version;
+        tls_ctx.max_version = cfg.tls_max_version;
+        tls_ctx.require_client_cert = cfg.tls_require_client_cert;
         tls_ctx.watchSighup() catch std.log.warn("tls: SIGHUP reload unavailable", .{});
         if (cfg.tls_client_ca) |ca| tls_ctx.setClientCa(ca) catch |e| {
             std.log.err("cannot load client CA {s}: {t}", .{ ca, e });
@@ -638,6 +692,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         std.log.err("cannot start the listener", .{});
         return 1;
     };
+    var attached = false;
     const code: u8 = blk: {
         node.bootstrap() catch |e| {
             if (e != error.Stopped) std.log.err("cluster bootstrap failed: {t}", .{e});
@@ -692,6 +747,8 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
         svc.events = ev_ext.sink();
         notif.peers = .{ .ctx = node, .count = node.nodeCount(), .call = eventsPeerCall };
         node.ext.store(&events_ext, .release);
+        // Before serving, so a restarted node catches up on membership first.
+        attached = opts.cluster.attachTo(node);
         node.start(if (iam_ready) &iam_store else null);
         gateways = gateway.Running.start(.{
             .gpa = gpa,
@@ -714,6 +771,7 @@ fn runCluster(gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: Config, cre
     };
     if (code != 0) _ = server.requestStop();
     serving.join();
+    opts.cluster.detachFrom(node, attached);
     web.stop();
     inner.stop();
     gateways.stop();
@@ -1096,6 +1154,40 @@ fn envVar(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const 
     };
     if (v.len == 0) return null;
     return v;
+}
+
+test "cluster hooks: layout replaces the pools; detach only after attach" {
+    const Double = struct {
+        calls: [3]u8 = @splat(0),
+        const two = [_][]const []const u8{ &.{"http://a:9000/d1"}, &.{"http://b:9000/d1"} };
+        fn layout(ctx: ?*anyopaque, _: std.mem.Allocator, argv: []const []const []const u8) ?StartLayout {
+            const d: *@This() = @ptrCast(@alignCast(ctx.?));
+            d.calls[0] += 1;
+            return if (argv.len == 0) .{ .pools = &two } else null;
+        }
+        fn attach(ctx: ?*anyopaque, _: *cluster.Node) void {
+            const d: *@This() = @ptrCast(@alignCast(ctx.?));
+            d.calls[1] += 1;
+        }
+        fn detach(ctx: ?*anyopaque, _: *cluster.Node) void {
+            const d: *@This() = @ptrCast(@alignCast(ctx.?));
+            d.calls[2] += 1;
+        }
+    };
+    var d: Double = .{};
+    const h: ClusterHooks = .{ .ctx = &d, .layout = Double.layout, .attach = Double.attach, .detach = Double.detach };
+    var specs: []const []const []const u8 = &.{};
+    try std.testing.expect(h.startLayout(std.testing.allocator, &specs));
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+    // Keeping the argv pools: not dynamic.
+    try std.testing.expect(!h.startLayout(std.testing.allocator, &specs));
+    try std.testing.expect(!(ClusterHooks{}).startLayout(std.testing.allocator, &specs));
+    var fake: cluster.Node = undefined;
+    h.detachFrom(&fake, false);
+    try std.testing.expect(h.attachTo(&fake));
+    h.detachFrom(&fake, true);
+    try std.testing.expectEqual([3]u8{ 2, 1, 1 }, d.calls);
+    try std.testing.expect(!(ClusterHooks{}).attachTo(&fake));
 }
 
 test "arg parsing" {

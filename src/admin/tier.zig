@@ -144,6 +144,15 @@ fn isTrue(o: ?std.json.ObjectMap, key: []const u8) bool {
     return v == .bool and v.bool;
 }
 
+/// Tier TLS settings: config field, JSON name in the tier section, JSON name in edits.
+const tls_json = .{
+    .{ "client_cert", "ClientCert", "clientCert" },
+    .{ "client_key", "ClientKey", "clientKey" },
+    .{ "ca_file", "CAFile", "caFile" },
+    .{ "server_name", "ServerName", "serverName" },
+    .{ "min_version", "MinVersion", "minVersion" },
+};
+
 const gcs_creds_msg = "GCS tiers need a service-account key file or an HMAC key pair (access_key, secret_key)";
 
 fn add(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry, force: bool) Error!Response {
@@ -193,6 +202,7 @@ fn add(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry,
         .gcs => applyGcs(&cfg, gcsCreds(a, str(s, "Creds")) orelse return badRequest(a, "XMinioAdminTierInvalidCredentials", gcs_creds_msg)),
     }
     if (cfg.auth == .keys and (cfg.access_key.len == 0 or cfg.secret_key.len == 0)) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
+    inline for (tls_json) |p| @field(cfg, p[0]) = str(s, p[1]);
     reg.add(cfg, .{ .force = force }) catch |e| return tierFail(a, e);
     return .{ .status = .no_content };
 }
@@ -248,6 +258,7 @@ fn writeList(js: *std.json.Stringify, cfgs: []const Config) std.Io.Writer.Error!
         try optField(js, "Prefix", c.prefix);
         try optField(js, "Region", c.region);
         if (c.kind != .minio) try optField(js, "StorageClass", c.storage_class);
+        inline for (tls_json) |p| try optField(js, p[1], @field(c, p[0]));
         try js.endObject();
         try js.endObject();
     }
@@ -291,7 +302,10 @@ fn edit(a: Allocator, env: api.Env, req: api.Request, reg: *object.tier.Registry
         .hmac => |p| creds = .{ .access_key = p[0], .secret_key = p[1], .auth = .keys },
         .service_account => |p| creds = .{ .access_key = p[0], .secret_key = p[1], .auth = .service_account, .token_uri = p[2] },
     };
-    if (creds.access_key == null and creds.secret_key == null and creds.auth == null) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
+    inline for (tls_json) |p| if (body.get(p[2])) |v| if (v == .string) {
+        @field(creds, p[0]) = v.string;
+    };
+    if (creds.empty()) return badRequest(a, "XMinioAdminTierMissingCredentials", "Specified remote credentials are empty");
     reg.edit(name, creds) catch |e| return tierFail(a, e);
     return .{ .status = .no_content };
 }

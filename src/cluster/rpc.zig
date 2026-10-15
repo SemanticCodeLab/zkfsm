@@ -99,6 +99,8 @@ pub const Peer = struct {
     port: u16,
     name: []const u8,
     online: std.atomic.Value(bool) = .init(true),
+    /// Gets heartbeats and votes; cleared by a membership update for a departed node.
+    member: std.atomic.Value(bool) = .init(true),
     mutex: std.Thread.Mutex = .{},
     idle: std.ArrayList(*Conn) = .empty,
     /// Open connections, idle or in use; at most `Rpc.peer_cap` (probes may exceed it).
@@ -130,16 +132,28 @@ pub const Rpc = struct {
     tls: bool,
     /// Trust anchors for peer certificates (TLS clusters).
     ca: ?std.crypto.Certificate.Bundle = null,
+    /// Known peers: a prefix of `slots`, which never moves so `grow` can append live.
     peers: []Peer,
+    slots: []Peer,
     on_change: ?OnChange = null,
     /// Connection cap per peer; the peer's RPC pool is sized from it. Idle connections
     /// are kept up to the same number: a busy node reuses them instead of dialing.
     peer_cap: usize,
 
     pub fn init(gpa: std.mem.Allocator, topo: *const topology.Topology, secret: auth.Secret) Error!Rpc {
-        const peers = try gpa.alloc(Peer, topo.nodes.len);
+        const slots = try gpa.alloc(Peer, topology.max_nodes);
+        const peers = slots[0..topo.nodes.len];
         for (topo.nodes, peers, 0..) |n, *p, i| p.* = .{ .node = @intCast(i), .host = n.host, .port = n.port, .name = n.name };
-        return .{ .gpa = gpa, .secret = secret, .self_node = topo.local, .tls = topo.tls, .peers = peers, .peer_cap = peerCap(topo.nodes.len) };
+        return .{ .gpa = gpa, .secret = secret, .self_node = topo.local, .tls = topo.tls, .peers = peers, .slots = slots, .peer_cap = peerCap(topo.nodes.len) };
+    }
+
+    /// Appends peers for nodes added at runtime (offline until a hello); `nodes` is the
+    /// full list with the current one as prefix. Single writer: a membership update.
+    pub fn grow(self: *Rpc, nodes: []const topology.Node) Error!void {
+        if (nodes.len > self.slots.len) return error.OutOfMemory;
+        const old = self.peers.len;
+        for (nodes[old..], old..) |n, i| self.slots[i] = .{ .node = @intCast(i), .host = n.host, .port = n.port, .name = n.name, .online = .init(false) };
+        @atomicStore(usize, &self.peers.len, nodes.len, .release);
     }
 
     /// Connections per peer: the whole cluster's inbound total stays near 2048.
@@ -157,7 +171,7 @@ pub const Rpc = struct {
             for (p.idle.items) |c| c.destroy(self.gpa);
             p.idle.deinit(self.gpa);
         }
-        self.gpa.free(self.peers);
+        self.gpa.free(self.slots);
         if (self.ca) |*b| b.deinit(self.gpa);
     }
 
@@ -622,6 +636,24 @@ pub const Call = struct {
         return c.status >= 200 and c.status < 300;
     }
 };
+
+test "peers grow in place for nodes added at runtime" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = [_][]const []const u8{&.{ "http://n1:9000/d1", "http://n2:9000/d1" }};
+    const t = try topology.parse(a, &one, "n1:9000", "0.0.0.0", 9000);
+    var r = try Rpc.init(gpa, &t, std.mem.zeroes(auth.Secret));
+    defer r.deinit();
+    const first = &r.peers[1];
+    const two = [_][]const []const u8{ one[0], &.{"http://n3:9000/d1"} };
+    const t2 = try topology.parse(a, &two, "n1:9000", "0.0.0.0", 9000);
+    try r.grow(t2.nodes);
+    try std.testing.expectEqual(@as(usize, 3), r.peers.len);
+    try std.testing.expectEqual(first, &r.peers[1]);
+    try std.testing.expect(!r.isOnline(2) and r.peers[2].member.load(.acquire));
+}
 
 test "connect timeout to a closed port fails fast" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 1);

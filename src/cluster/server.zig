@@ -119,7 +119,7 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (std.mem.eql(u8, op, "jread")) return jread(n, req, q, arena);
     if (std.mem.eql(u8, op, "diskinfo")) return diskInfo(n, req, q, arena);
     if (std.mem.eql(u8, op, "ext")) {
-        const x = n.ext.load(.acquire) orelse return fail(req, .service_unavailable, "starting");
+        const x = n.extHandler(q.int(u8, "c") orelse 0) orelse return fail(req, .service_unavailable, "starting");
         return req.respond(try x.handle(x.ctx, arena, body), .{});
     }
     if (std.mem.eql(u8, op, "pools_sync")) {
@@ -194,10 +194,14 @@ fn hello(n: *Node, req: *Request, arena: std.mem.Allocator) RawError!void {
     const open = n.open.load(.acquire);
     var ob: [32]u8 = undefined;
     const jopen = if (open) std.fmt.bufPrint(&ob, "jopen {d}\n", .{n.jopen.load(.acquire)}) catch unreachable else "";
-    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\nformatting {d}\nboot {d}\njepoch {d}\njseq {d}\n{s}", .{
+    // Only once a membership update was applied: the default reply is unchanged.
+    var eb: [32]u8 = undefined;
+    const ep = n.epoch.load(.acquire);
+    const epoch = if (ep != 0) std.fmt.bufPrint(&eb, "epoch {d}\n", .{ep}) catch unreachable else "";
+    const body = try std.fmt.allocPrint(arena, "node {d}\ntopology {s}\nroot {s}\nready {d}\ndrives {d}\nformatting {d}\nboot {d}\njepoch {d}\njseq {d}\n{s}{s}", .{
         n.topo.local,                               &topo,                                     &root,     @intFromBool(open),
         @intFromBool(n.drives_open.load(.acquire)), @intFromBool(n.formatting.load(.acquire)), n.boot_id, head.epoch,
-        head.stable,                                jopen,
+        head.stable,                                jopen,                                     epoch,
     });
     try req.respond(body, .{});
 }
@@ -217,13 +221,14 @@ fn formatGet(n: *Node, req: *Request, q: Query) RawError!void {
 /// Bootstrap: the formatting node writes identities onto every empty drive.
 fn formatPut(n: *Node, req: *Request, q: Query, body: []const u8) RawError!void {
     const d = n.endpoint(q.get("d") orelse "") orelse return fail(req, .not_found, "drive");
-    _ = placement.layout.FormatV2.parse(body) catch return fail(req, .bad_request, "format");
+    const want = placement.layout.FormatV2.parse(body) catch return fail(req, .bad_request, "format");
     var lb = LocalBackend.open(d.path) catch return fail(req, .internal_server_error, "open");
     defer lb.close();
     var buf: [placement.layout.format_max]u8 = undefined;
     if (lb.readFormat(&buf)) |cur| {
         if (std.mem.eql(u8, cur, body)) return req.respond("", .{});
-        return fail(req, .conflict, "formatted");
+        const have = placement.layout.FormatV2.parse(cur) catch return fail(req, .conflict, "formatted");
+        if (!want.isUpdateOf(have)) return fail(req, .conflict, "formatted");
     } else |e| if (e != error.NotFound) return fail(req, .internal_server_error, "io");
     lb.writeFormat(body) catch return fail(req, .internal_server_error, "io");
     try req.respond("", .{});

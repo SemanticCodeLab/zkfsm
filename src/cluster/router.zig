@@ -68,6 +68,12 @@ pub const Router = struct {
         return pool.sets[setIndex(pool, key)];
     }
 
+    /// Shows pools `[0, len)` of the backing array; entries must be filled first and
+    /// the array must have room (pools appended at runtime).
+    pub fn publish(self: *Router, len: usize) void {
+        @atomicStore(usize, &self.pools.len, len, .release);
+    }
+
     pub fn mode(self: *const Router, p: usize) Mode {
         return self.pools[p].mode.load(.acquire);
     }
@@ -328,4 +334,17 @@ test "set hashing is stable and spreads keys; the emptiest pool wins" {
     r.setMode(0, .retired);
     try std.testing.expect(!r.moving.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), r.systemPool());
+}
+
+test "pools published at runtime take new keys" {
+    var sets: [1]iface.StorageBackend = undefined;
+    var backing = [_]Pool{ .{ .sets = &sets, .seed = 1 }, .{ .sets = &sets, .seed = 2 } };
+    var r: Router = .{ .gpa = std.testing.allocator, .pools = backing[0..1] };
+    backing[0].free.store(10, .monotonic);
+    backing[1].free.store(20, .monotonic);
+    try std.testing.expectEqual(@as(usize, 0), r.pickPool());
+    r.publish(2);
+    try std.testing.expectEqual(@as(usize, 1), r.pickPool());
+    var ob: [max_pools]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, r.order(&ob));
 }
