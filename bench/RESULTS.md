@@ -128,3 +128,59 @@ the node-to-node replay guard no longer scans a table of every nonce.
 - RustFS was not run again; its rows from 2026-10-08 are in this file's history.
 - zkfsm cluster put-4k is still behind MinIO: a small PUT costs about 45 node-to-node
   calls (lock, record read, shard and record writes, notices).
+
+## feat/smallput: small-object PUT path (preliminary)
+
+PRELIMINARY: run 2026-10-14 18:47–19:02 on a shared host; other agents kept the
+1-minute load average at 25–60 for most of the day (samples taken right after the
+run: 0.4–1.4; load during the run was not recorded). Throughput mostly measures
+contention. The RPC counts below do not depend on load and are the primary evidence.
+
+### Node-to-node calls per PUT (bench/rpc_count.sh)
+
+4 nodes x 4 drives, EC:4+2, 200 new keys then 200 overwrites through node 1, summed
+over all nodes (zkfsm_cluster_rpc_sent_total).
+
+| op | 4 KiB before (7e47494) | 4 KiB after | 1 MiB after |
+|---|---|---|---|
+| lock | 3.00 | 3.00 | 3.00 |
+| unlock | 3.00 | 0 | 0 |
+| notify | 3.01 | 3.00 | 3.02 |
+| write (shard streams) | 4.51 | 0 | 4.51 |
+| rput | 4.55 | 1.05 | 1.04 |
+| rputs (batched per node) | - | 1.73 | 1.74 |
+| rget | 9.45 | 0 | 0 |
+| rgets (batched per node) | - | 1.16 | 1.2-2.3 |
+| other (hello, diskinfo, scan) | 0.27 | 0.30 | 0.36 |
+| total | 27.79 | 10.24 | ~14.9 |
+
+### Throughput (warp, compare.sh limits, PFX=zc-sp, server cpus 8-11, client 12-15)
+
+Protection: single zkfsm EC:2+2 vs MinIO EC:2; cluster zkfsm EC:12+4 vs MinIO EC:4.
+
+| product | topology | workload | obj/s | MiB/s | p50 | p99 |
+|---|---|---|---|---|---|---|
+| zkfsm before (7e47494) | single | put-4k | 10645.32 | 41.58 | 8.3ms | 20.3ms |
+| zkfsm after | single | put-4k | 10583.75 | 41.34 | 2.8ms | 18.4ms |
+| minio | single | put-4k | 5483.32 | 21.42 | 7.9ms | 24.7ms |
+| zkfsm before | single | put-1m | 846.44 | 846.44 | 34.1ms | 98.2ms |
+| zkfsm after | single | put-1m | 964.35 | 964.35 | 30.1ms | 92.7ms |
+| minio | single | put-1m | 1068.64 | 1068.64 | 30.4ms | 72.2ms |
+| zkfsm before | single | get-4k | 32413.57 | 126.62 | 7.0ms | 25.6ms |
+| zkfsm after | single | get-4k | 22726.03 | 88.77 | 1.2ms | 17.0ms |
+| minio | single | get-4k | 10000.58 | 39.06 | 6.3ms | 23.3ms |
+| zkfsm before | single | get-1m | 5605.43 | 5605.43 | 5.0ms | 22.1ms |
+| zkfsm after | single | get-1m | 5447.51 | 5447.51 | 5.1ms | 36.8ms |
+| minio | single | get-1m | 3414.38 | 3414.38 | 8.2ms | 38.9ms |
+| zkfsm before | cluster | put-4k | 663.40 | 2.59 | 37.3ms | 132.3ms |
+| zkfsm after | cluster | put-4k | 2766.37 | 10.81 | 8.8ms | 62.2ms |
+| minio | cluster | put-4k | 839.03 | 3.28 | 2.3ms | 339.0ms |
+| zkfsm before | cluster | put-1m | 232.56 | 232.56 | 106.9ms | 432.4ms |
+| zkfsm after | cluster | put-1m | 374.69 | 374.69 | 46.3ms | 545.1ms |
+| minio | cluster | put-1m | 311.66 | 311.66 | 34.9ms | 369.5ms |
+| zkfsm before | cluster | get-4k | 3480.52 | 13.60 | 4.1ms | 68.7ms |
+| zkfsm after | cluster | get-4k | 8077.93 | 31.55 | 2.7ms | 19.7ms |
+| minio | cluster | get-4k | 1721.80 | 6.73 | 16.3ms | 44.6ms |
+| zkfsm before | cluster | get-1m | 720.90 | 720.90 | 55.0ms | 241.0ms |
+| zkfsm after | cluster | get-1m | 912.35 | 912.35 | 27.1ms | 196.5ms |
+| minio | cluster | get-1m | 765.89 | 765.89 | 40.7ms | 82.1ms |
