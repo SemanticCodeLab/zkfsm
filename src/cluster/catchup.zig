@@ -296,6 +296,7 @@ pub fn save(dir: std.fs.Dir, bytes: []const u8) !void {
         try f.sync();
     }
     try dir.rename(tmp, snapshot_name);
+    try core.fsync.syncDir(dir);
 }
 
 test "watermarks: in order, overtaken, gaps, epochs, heads" {

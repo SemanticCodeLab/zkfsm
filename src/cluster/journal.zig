@@ -136,6 +136,7 @@ pub const Journal = struct {
         try fw.interface.flush();
         try f.sync();
         try d.rename(tmp, name);
+        try @import("../core/root.zig").fsync.syncDir(d);
         j.file_len = len;
     }
 

@@ -1046,6 +1046,8 @@ pub const Node = struct {
         return n.router.backend();
     }
 
+    const rebuild_strict_ns = 30 * std.time.ns_per_s;
+
     /// Creates the object service once the catalog is readable (needs read quorum),
     /// then brings its key index up to date: the local snapshot plus what every peer
     /// journaled since, or a rebuild from the records when that cannot be done.
@@ -1073,13 +1075,19 @@ pub const Node = struct {
             std.log.info("cluster: key index loaded from snapshot and peer journals in {d} ms", .{std.time.milliTimestamp() - t0});
             return;
         }
+        // Records still out of reach after a while are skipped (heal and reads recover them).
+        var since = std.time.Timer.start() catch unreachable;
+        var tries: u32 = 0;
         while (true) {
             if (n.stop_ev.isSet()) return error.Stopped;
+            out.rebuild_skip_unreachable = tries >= 3 and since.read() >= rebuild_strict_ns;
+            defer out.rebuild_skip_unreachable = false;
             if (n.rebuildIndex(out)) |_| {
                 std.log.info("cluster: key index rebuilt from records in {d} ms", .{std.time.milliTimestamp() - t0});
                 return;
             } else |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
+                tries += 1;
                 std.log.info("cluster: key index rebuild: {t}; retrying", .{e});
             }
             n.stop_ev.timedWait(time_ns(1)) catch {};
@@ -1092,7 +1100,7 @@ pub const Node = struct {
         find: for (n.local_eps) |eps| for (eps) |e| if (e) |le| {
             var root = std.fs.cwd().openDir(le.path, .{}) catch continue;
             defer root.close();
-            n.node_dir = root.makeOpenPath("node", .{}) catch continue;
+            n.node_dir = core.fsync.makeOpenPathSynced(root, "node") catch continue;
             break :find;
         };
         n.journal = journal_mod.Journal.open(n.gpa, n.node_dir);

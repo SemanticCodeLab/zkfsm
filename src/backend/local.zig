@@ -17,6 +17,9 @@ pub const LocalBackend = struct {
     usage: ?*std.atomic.Value(u64) = null,
     /// Directory fsyncs done (commits and new fan-out directories); for tests.
     dir_syncs: std.atomic.Value(u64) = .init(0),
+    /// data/record fan-out directories whose entries up to the root were fsynced by
+    /// this process; any other commit syncs the chain (covers races and crashed makers).
+    durable: [2 * 65536 / 64 + 1]std.atomic.Value(u64) = @splat(.init(0)),
 
     pub const capabilities: iface.Capabilities = .{
         .atomic_rename = true,
@@ -35,6 +38,7 @@ pub const LocalBackend = struct {
         for ([_][]const u8{ "data", "record", "system", "tmp" }) |sub| {
             root.makePath(sub) catch return error.OpenFailed;
         }
+        std.posix.fsync(root.fd) catch return error.OpenFailed;
         return .{ .root = root };
     }
 
@@ -95,23 +99,36 @@ pub const LocalBackend = struct {
         const grow = if (self.usage != null) self.sizeAt(tmp) else 0;
         const shrink = if (self.usage != null) self.sizeAt(final) else 0;
         // The fan-out directory usually exists: create it only when the rename says no.
-        var made = false;
         self.root.rename(tmp, final) catch |e| switch (e) {
             error.FileNotFound => {
                 self.root.makePath(dir) catch |me| return mapFs(me);
-                made = true;
                 self.root.rename(tmp, final) catch |re| return mapFs(re);
             },
             else => return mapFs(e),
         };
         self.account(grow, shrink);
         try self.syncDir(dir);
-        // New fan-out directories are entries of their parents: make those durable too.
-        if (made) {
-            var up = std.fs.path.dirname(dir);
-            while (up) |u| : (up = std.fs.path.dirname(u)) try self.syncDir(u);
-            try self.syncDir(".");
-        }
+        // A fan-out directory is an entry of its parents: sync the chain once per process.
+        const slot = fanoutSlot(dir);
+        if (slot) |i| if (self.durable[i / 64].load(.acquire) & bit(i) != 0) return;
+        var up = std.fs.path.dirname(dir);
+        while (up) |u| : (up = std.fs.path.dirname(u)) try self.syncDir(u);
+        if (!std.mem.eql(u8, dir, ".")) try self.syncDir(".");
+        if (slot) |i| _ = self.durable[i / 64].fetchOr(bit(i), .release);
+    }
+
+    fn bit(i: u32) u64 {
+        return @as(u64, 1) << @intCast(i % 64);
+    }
+
+    /// "data/ab/cd", "record/ab/cd" or "system" to a bitmap slot; null otherwise.
+    fn fanoutSlot(dir: []const u8) ?u32 {
+        if (std.mem.eql(u8, dir, "system")) return 2 * 65536;
+        const base: u32 = if (std.mem.startsWith(u8, dir, "data/")) 0 else if (std.mem.startsWith(u8, dir, "record/")) 65536 else return null;
+        if (dir.len < 5 or dir[dir.len - 3] != '/') return null;
+        const hi = std.fmt.parseInt(u8, dir[dir.len - 5 .. dir.len - 3], 16) catch return null;
+        const lo = std.fmt.parseInt(u8, dir[dir.len - 2 ..], 16) catch return null;
+        return base + @as(u32, hi) * 256 + lo;
     }
 
     fn syncDir(self: *LocalBackend, path: []const u8) Error!void {
@@ -481,4 +498,16 @@ test "a new fan-out directory is synced in its parents, an existing one is not" 
     var r2: std.Io.Reader = .fixed("two");
     _ = try b.put(k2, &r2, .{});
     try std.testing.expectEqual(@as(u64, 5), lb.dir_syncs.load(.monotonic));
+    // A directory made before (another writer, or a run that crashed before syncing
+    // its parents) is synced in its parents by this process's first commit into it.
+    try tmp.dir.makePath("record/ef/01");
+    try b.putRecord(.{ .space = .record, .hex = "ef010000000000000000000000000003".* }, "r");
+    try std.testing.expectEqual(@as(u64, 9), lb.dir_syncs.load(.monotonic));
+    try b.putRecord(.{ .space = .record, .hex = "ef010000000000000000000000000004".* }, "r");
+    try std.testing.expectEqual(@as(u64, 10), lb.dir_syncs.load(.monotonic));
+    // System records live in one directory created at open: leaf and root only.
+    try b.putRecord(.{ .space = .system, .hex = "ef010000000000000000000000000005".* }, "s");
+    try std.testing.expectEqual(@as(u64, 12), lb.dir_syncs.load(.monotonic));
+    try b.putRecord(.{ .space = .system, .hex = "ef010000000000000000000000000006".* }, "s");
+    try std.testing.expectEqual(@as(u64, 13), lb.dir_syncs.load(.monotonic));
 }

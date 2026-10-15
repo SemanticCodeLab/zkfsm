@@ -217,6 +217,8 @@ pub const ObjectService = struct {
     index: index_mod.Index,
     /// The on-disk index state is clean (snapshot matches); guarded by `mutex`.
     index_clean: bool = false,
+    /// Rebuild skips records whose copies are out of reach instead of failing.
+    rebuild_skip_unreachable: bool = false,
     index_gen: u64 = 0,
     /// False in cluster mode: the index is always rebuilt from records.
     persist_index: bool = true,

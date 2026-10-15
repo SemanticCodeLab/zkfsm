@@ -172,6 +172,14 @@ fn readStream(svc: *Svc, stream: [16]u8, gen: u64) error{ OutOfMemory, Corrupt }
 }
 
 /// Rebuilds the index from the record space. Caller holds `svc.mutex`.
+/// Records the last rebuilds skipped as unreadable (metric zkfsm_index_rebuild_skipped_total).
+pub var rebuild_skipped: std.atomic.Value(u64) = .init(0);
+
+fn skipRecord(pk: backend.PhysicalKey, e: anyerror) void {
+    _ = rebuild_skipped.fetchAdd(1, .monotonic);
+    std.log.err("key index rebuild: record {s} unreadable ({t}); skipped, left to heal", .{ &pk.hex, e });
+}
+
 pub fn rebuildLocked(svc: *Svc) Error!void {
     svc.index.clear();
     errdefer svc.index.markStale();
@@ -183,7 +191,16 @@ pub fn rebuildLocked(svc: *Svc) Error!void {
     for (it.keys) |pk| {
         const bytes = svc.store.getRecord(pk, svc.gpa) catch |e| switch (e) {
             error.NotFound => continue,
-            else => return service.mapBackend(e),
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadQuorum => if (svc.rebuild_skip_unreachable) {
+                skipRecord(pk, e);
+                continue;
+            } else return error.ReadQuorum,
+            // Damaged beyond reading: heal reports it; it must not hold the index back.
+            else => {
+                skipRecord(pk, e);
+                continue;
+            },
         };
         defer svc.gpa.free(bytes);
         if (metadata.upload.isUpload(bytes)) {
