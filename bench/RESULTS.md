@@ -1,8 +1,8 @@
 # bench/compare.sh results
 
-Status: PRELIMINARY. The run below (2026-10-14 13:28–16:19) was taken while other
-agents loaded the host: 1-minute load average 4.7 to 74.6, median 34, on 16 hardware
-threads. The numbers mostly measure contention. A re-run on a quiet host replaces them.
+Reported results: the gated run below (LOAD_MAX=4: each run starts only when the
+1-minute load average is below 4). The earlier run under load (2026-10-14) is kept at the
+end as preliminary and is not comparable.
 
 ## Machine
 
@@ -44,6 +44,8 @@ RustFS honouring the variable was checked: a 4 MiB object writes 2 MiB part file
 - GET/mixed prepare 2500 objects (4 KiB, 64 KiB), 1000 (1 MiB) or 100 (16 MiB). LIST uses 2500 x 4 KiB.
 - mixed: warp's default split 45% GET, 30% STAT, 15% PUT, 10% DELETE; the table reports the Total.
 - mp-64m: 64 MiB objects uploaded by minio-go as multipart with its default 16 MiB parts (4 parts).
+- With LOAD_MAX set, each run waits until the 1-minute load average is below it, and
+  until OUT has 512 MiB free.
 - Every (workload, product) gets a freshly started target with empty drives, and a 3 s 4 KiB
   PUT as readiness gate and warm-up.
 - 3 rounds. In each round, for every topology and workload, the three products run back to
@@ -53,7 +55,17 @@ RustFS honouring the variable was checked: a 4 MiB object writes 2 MiB part file
     bench/compare.sh                                   # full matrix, 3 rounds
     PRODUCTS=rustfs TOPOS=single ROUNDS=1 bench/compare.sh
 
-## Preliminary results (loaded host, do not cite)
+## Results (gated run, LOAD_MAX=4)
+
+<!-- gated:start -->
+(run in progress)
+<!-- gated:end -->
+
+The load average recorded is taken just before each run starts. The benchmark itself
+puts about 8 runnable threads on the host (4 server cores, 4 client cores), so the load
+rises during a run; the gate keeps other work from overlapping as far as it can.
+
+## Preliminary results (2026-10-14 13:28-16:19, load average 4.7-74.6, median 34; do not cite)
 ### single
 
 | workload | product | n | obj/s median | obj/s min-max | MiB/s median | p50 ms median | p99 ms median | err lines | load1 range |
@@ -165,3 +177,8 @@ cluster mixed-1m. Findings:
 
 - MinIO cluster get-16m round 1: 32 warp errors "Resource requested is unwritable, please
   reduce your request rate" (prepare step; 3 GiB-per-node memory limit, load average ~25). Rounds 2-3 clean.
+- A first attempt at the quiet re-run (2026-10-14 19:47) lost its quiet window after round 1
+  (rounds 2-3 started at load 20-51) and was stopped. In it, RustFS cluster mixed-1m round 2
+  failed with rc=1 and empty logs: the host /tmp tmpfs (which held OUT) was full from other
+  processes, so warp's and docker's output could not be written. That is a harness/host
+  failure, not RustFS; compare.sh now waits for free space in OUT before each run.
