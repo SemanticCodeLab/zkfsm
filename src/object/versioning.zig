@@ -86,15 +86,20 @@ fn storeOr(svc: *Svc, pk: backend.PhysicalKey, rec: Record, undo: ?Undo) Error!v
     const change: service.Change = .{ .record = .{ .pk = pk, .bid = rec.bucket_id, .key = rec.key, .version = version } };
     defer svc.emitSeq(change, svc.journal(change));
     svc.store.putRecord(pk, bytes) catch |e| {
-        if (undo) |u| if (e == error.WriteQuorum) undoPut(svc, pk, u.prev);
+        if (undo) |u| if (uncertain(e)) undoPut(svc, pk, u.prev);
         svc.indexResync(pk, rec.bucket_id, rec.key, version);
         return service.mapBackend(e);
     };
     svc.indexStored(pk, rec);
 }
 
+/// Failures after which some drives may hold the new record (a node died mid-write).
+fn uncertain(e: backend.Error) bool {
+    return e == error.WriteQuorum or e == error.IoFailed;
+}
+
 fn undoPut(svc: *Svc, pk: backend.PhysicalKey, prev: ?Record) void {
-    std.log.warn("record {s}: write lost quorum; restoring the previous version", .{&pk.hex});
+    std.log.warn("record {s}: write failed; restoring the previous version", .{&pk.hex});
     if (prev) |p| {
         const bytes = metadata.record.encode(p, svc.gpa) catch return;
         defer svc.gpa.free(bytes);
@@ -342,7 +347,7 @@ fn commitPutLocked(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutI
     }
     storeOr(svc, ck, rec.*, .{ .prev = cur }) catch |e| {
         // The demoted copy would list the previous version twice.
-        if (e == error.WriteQuorum and cfg.versioning != .unset) if (cur) |c| if (cfg.versioning == .enabled or !c.flags.null_version) dropRecord(svc, bid, c.key, c.versionId()) catch {};
+        if ((e == error.WriteQuorum or e == error.StorageFailed) and cfg.versioning != .unset) if (cur) |c| if (cfg.versioning == .enabled or !c.flags.null_version) dropRecord(svc, bid, c.key, c.versionId()) catch {};
         return e;
     };
     return g;
@@ -976,6 +981,7 @@ test "tags and conditional put" {
 const LandedButFailed = struct {
     inner: backend.StorageBackend,
     fail_at: u8 = 0,
+    fail_with: backend.Error = error.WriteQuorum,
 
     fn wrap(self: *LandedButFailed) backend.StorageBackend {
         var b = self.inner;
@@ -1006,7 +1012,7 @@ const LandedButFailed = struct {
         try me(c).inner.vtable.putRecord(me(c).inner.ctx, k, b);
         if (k.space != .record or me(c).fail_at == 0) return;
         me(c).fail_at -= 1;
-        if (me(c).fail_at == 0) return error.WriteQuorum;
+        if (me(c).fail_at == 0) return me(c).fail_with;
     }
     fn getRecord(c: *anyopaque, k: backend.PhysicalKey, g: std.mem.Allocator) backend.Error![]u8 {
         return me(c).inner.vtable.getRecord(me(c).inner.ctx, k, g);
@@ -1029,16 +1035,19 @@ test "a put that lost quorum after its record landed leaves the previous version
     svc.store = fault.wrap();
     try svc.createBucket("bkt");
     // Unversioned: the one record write fails. Versioned: the demotion, then the new current.
-    const cases = [_]struct { key: []const u8, mode: Versioning, fail_at: u8 }{
+    const cases = [_]struct { key: []const u8, mode: Versioning, fail_at: u8, fail_with: backend.Error = error.WriteQuorum }{
         .{ .key = "u", .mode = .unset, .fail_at = 1 },
+        .{ .key = "u2", .mode = .unset, .fail_at = 1, .fail_with = error.IoFailed },
         .{ .key = "v1", .mode = .enabled, .fail_at = 1 },
         .{ .key = "v2", .mode = .enabled, .fail_at = 2 },
+        .{ .key = "v3", .mode = .enabled, .fail_at = 2, .fail_with = error.IoFailed },
     };
     for (cases) |c| {
         if (c.mode == .enabled) try setVersioning(svc, "bkt", .enabled);
         _ = try env.put(c.key, "one", .{});
         fault.fail_at = c.fail_at;
-        try std.testing.expectError(error.WriteQuorum, env.put(c.key, "two", .{}));
+        fault.fail_with = c.fail_with;
+        try std.testing.expectError(service.mapBackend(c.fail_with), env.put(c.key, "two", .{}));
         try std.testing.expectEqualStrings("one", try env.body(try svc.head(a, "bkt", c.key)));
         const lv = try listVersions(svc, a, "bkt", .{ .prefix = c.key });
         try std.testing.expectEqual(@as(usize, 1), lv.entries.len);
