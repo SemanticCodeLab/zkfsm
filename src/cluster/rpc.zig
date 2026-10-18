@@ -186,8 +186,28 @@ pub const Rpc = struct {
         return self.peers[node].boot.load(.monotonic);
     }
 
+    /// Records the peer's process id; a new one drops connections to the old process.
     pub fn heardBoot(self: *Rpc, node: u16, boot: u64) void {
-        self.peers[node].boot.store(boot, .monotonic);
+        const p = &self.peers[node];
+        const old = p.boot.swap(boot, .monotonic);
+        if (old != 0 and boot != 0 and old != boot) self.dropIdle(p);
+    }
+
+    /// The peer called us from `addr`: dial that first when the name still resolves
+    /// elsewhere (a restarted pod gets a new address before DNS shows it).
+    pub fn learnAddress(self: *Rpc, node: u16, addr: std.net.Address) void {
+        if (node >= self.peers.len or node == self.self_node) return;
+        const p = &self.peers[node];
+        var a = addr;
+        a.setPort(p.port);
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        for (p.addrs[0..p.addr_count]) |o| if (o.eql(a)) return;
+        const keep = @min(p.addr_count, Peer.max_addrs - 1);
+        std.mem.copyBackwards(std.net.Address, p.addrs[1 .. keep + 1], p.addrs[0..keep]);
+        p.addrs[0] = a;
+        p.addr_count = keep + 1;
+        p.resolved_ns = std.time.nanoTimestamp();
     }
 
     pub fn isOnline(self: *Rpc, node: u16) bool {
@@ -238,6 +258,12 @@ pub const Rpc = struct {
     fn reserve(self: *Rpc, p: *Peer, probe: bool) Error!void {
         p.mutex.lock();
         defer p.mutex.unlock();
+        // An offline peer gets no other calls: whatever holds its slots is left over
+        // from the dead process, and must not keep the heartbeat out.
+        if (probe and !p.online.load(.acquire)) {
+            p.conns += 1;
+            return;
+        }
         const cap = if (probe) self.peer_cap + probe_extra else self.peer_cap;
         var timer = std.time.Timer.start() catch unreachable;
         while (p.conns >= cap) {
@@ -658,4 +684,36 @@ test "peers grow in place for nodes added at runtime" {
 test "connect timeout to a closed port fails fast" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 1);
     try std.testing.expectError(error.ConnectionRefused, connectTimeout(addr, 1000));
+}
+
+test "a restarted peer: slots held for the dead process do not block probes; hello teaches its address" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = [_][]const []const u8{&.{ "http://n1:9000/d1", "http://n2:9000/d1" }};
+    const t = try topology.parse(a, &one, "n1:9000", "0.0.0.0", 9000);
+    var r = try Rpc.init(gpa, &t, std.mem.zeroes(auth.Secret));
+    defer r.deinit();
+    const p = &r.peers[1];
+    p.conns = r.peer_cap + probe_extra;
+    try std.testing.expectError(error.Busy, r.reserve(p, true));
+    r.setOnline(1, false);
+    try r.reserve(p, true);
+    p.conns = 0;
+
+    const old = try std.net.Address.parseIp4("10.0.0.5", 9000);
+    p.addrs[0] = old;
+    p.addr_count = 1;
+    p.resolved_ns = std.time.nanoTimestamp();
+    r.learnAddress(1, try std.net.Address.parseIp4("10.0.0.9", 41234));
+    var out: [Peer.max_addrs]std.net.Address = undefined;
+    const n = r.addresses(p, &out, false);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(out[0].eql(try std.net.Address.parseIp4("10.0.0.9", 9000)));
+    try std.testing.expect(out[1].eql(old));
+    r.learnAddress(1, try std.net.Address.parseIp4("10.0.0.9", 5555));
+    try std.testing.expectEqual(@as(usize, 2), p.addr_count);
+    r.learnAddress(0, old);
+    try std.testing.expectEqual(@as(usize, 0), r.peers[0].addr_count);
 }

@@ -213,6 +213,23 @@ format is the same.
 - Peer calls: `node.setExt(channel, handler)` and
   `node.extCallOn(channel, peer, ...)` on channels 1..3 (0 is the built-in
   handler used by `extCall`).
+- `lib.zig` exports this surface as `zkfsm.cluster`: `Node`, `Config`,
+  `Membership`, `Ext`, `Topology`, `Rpc`, `Secret`, `StartLayout`, `Hooks`,
+  `Pools`, `parseTopology`, `expandEndpoints`, `fromRoot` and `fromString`
+  (cluster secret from root credentials or from `--cluster-secret`);
+  `cluster.internal` reaches every module without stability promises.
+- `StartLayout.retired` marks pools as decommissioned (per pool, may be
+  shorter than `pools`). Bootstrap does not wait for their drives and opens
+  no sets for them, so a node restarts after a retired pool's nodes are gone.
+  Pools recorded as retired in the surviving drive formats are skipped the
+  same way, also for a plain endpoint list that still names them.
+- Retired pools are never touched by reads, writes, deletes or listings.
+- `pools(ctx, mgr)` hands over the pools manager just before `attach`:
+  `decommissionStart/Cancel/Status(pool)`, `rebalanceStart/Stop/Status`,
+  `findPool(name)` and `poolCount()` act like the admin API, in process.
+- A peer's `hello` also tells the node where the peer calls from: that address
+  is dialed first, so a restarted peer is reached before DNS shows its new
+  address.
 
 ### Users, policies, and temporary credentials
 

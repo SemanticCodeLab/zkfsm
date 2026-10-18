@@ -106,9 +106,10 @@ fn serve(ctx: *anyopaque, req: *Request, arena: std.mem.Allocator) RawError!void
     if (!std.mem.eql(u8, &auth.bodyDigest(body), h.body)) return fail(req, .bad_request, "digest");
 
     if (std.mem.eql(u8, op, "hello")) {
-        if (std.mem.eql(u8, q.get("drives") orelse "", "1")) {
-            if (std.fmt.parseInt(u16, h.node, 10)) |from| n.peerSaysUp(from) else |_| {}
-        }
+        if (std.fmt.parseInt(u16, h.node, 10)) |from| {
+            if (from < n.topo.nodes.len) if (s3.server.raw_peer) |addr| n.rpc.learnAddress(from, addr);
+            if (std.mem.eql(u8, q.get("drives") orelse "", "1")) n.peerSaysUp(from);
+        } else |_| {}
         return hello(n, req, arena);
     }
     if (std.mem.eql(u8, op, "format")) return formatGet(n, req, q);
