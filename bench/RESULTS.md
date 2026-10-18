@@ -316,7 +316,7 @@ cluster mixed-1m. Findings:
   - put-16m cluster: zkfsm 24-27 "Write quorum not available" errors per run in rounds 1-2,
     with nodes logged offline ("its drives are not open", "cannot connect"); not seen in the
     re-run (0 errors in 3 runs). Not explained yet.
-  After the change: 0 warp error lines in all 27 re-run results.
+  After the change: 0 warp error lines in all 54 re-run results.
 - RustFS cluster get-16m round 1 failed in warp's prepare step: "Service not ready: waiting
   for iam" (a node was still loading IAM after another node answered the readiness PUT).
   Harness: compare.sh now retries a run once on "Service not ready". That cell has 2 runs.
