@@ -5,7 +5,8 @@
 #     data; kill -9 the moving node mid-way and resume; restart without the pool;
 #     a pool that was not decommissioned cannot be dropped.
 #  2. three pools: append an empty pool, rebalance (throttled; stop and restart it),
-#     then decommission the middle pool and restart without it.
+#     then decommission the middle pool (two nodes restart mid-way) and restart
+#     without it.
 set -euo pipefail
 S3CLI_BIN="${S3CLI_BIN:-aws}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,10 +15,16 @@ MC="${MC:-$(command -v mc || true)}"
 [[ -n "$MC" ]] || { echo "pools.sh needs mc (set MC=)"; exit 1; }
 PIDS=(0 0 0 0 0)
 TPID=0
+LOADPIDS=()
+keep_logs() { # tag
+  [[ -n "${POOLS_KEEP_LOGS:-}" ]] || return 0
+  mkdir -p "$POOLS_KEEP_LOGS/$1"; cp "$WORK"/n*.log "$POOLS_KEEP_LOGS/$1/" 2>/dev/null || true
+}
 cleanup() {
   local rc=$?
   [[ "$TPID" != 0 ]] && kill "$TPID" 2>/dev/null || true
-  if [[ $rc -ne 0 && -n "${POOLS_KEEP_LOGS:-}" ]]; then mkdir -p "$POOLS_KEEP_LOGS"; cp "$WORK"/n*.log "$POOLS_KEEP_LOGS/" 2>/dev/null || true; fi
+  for p in "${LOADPIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  [[ $rc -ne 0 ]] && keep_logs last
   for p in "${PIDS[@]}"; do [[ "$p" != 0 ]] && kill -9 "$p" 2>/dev/null || true; done
   rm -rf "$WORK"
 }
@@ -39,6 +46,8 @@ printf '[default]\ns3 =\n  addressing_style = path\n' >"$AWS_CONFIG_FILE"
 export MC_CONFIG_DIR="$WORK/mc"
 
 (cd "$ROOT" && zig build -Doptimize=ReleaseSafe)
+# POOLS_CPU_LOAD=N: N busy loops for the whole run (slow resumes, lease lapses).
+for _ in $(seq "${POOLS_CPU_LOAD:-0}"); do (while :; do :; done) & LOADPIDS+=($!); done
 BIN="$ROOT/zig-out/bin/zkfsm"
 
 PORT=(0 "$(freeport)" "$(freeport)" "$(freeport)" "$(freeport)")
@@ -221,8 +230,8 @@ load_data 1
 # The drain must still be running when its node is killed: at 1 MiB/s that takes a
 # pool holding well over ten megabytes (new blobs go to the emptier pool).
 mkdir -p "$WORK/fill"
-for i in $(seq 1 40); do
-  [[ $(du -sk "$WORK"/n*/a[0-9]* | awk '{s += $1} END {print s}') -ge 30000 ]] && break
+for i in $(seq 1 80); do
+  [[ $(du -sk "$WORK"/n*/a[0-9]* | awk '{s += $1} END {print s}') -ge 60000 ]] && break
   head -c 1048576 /dev/urandom >"$WORK/fill/f$i"
   curl -s -o /dev/null "${sig[@]}" -T "$WORK/fill/f$i" "$(ep 1)/plain/fill$i"
 done
@@ -303,6 +312,7 @@ check "all versions, markers, tags, lock, uploads, data intact" "" "$(diff "$WOR
 check "traffic data intact" 0 "$(verify_traffic 3)"
 check "new writes avoid the retired pool" 200 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -T "$WORK/obj/o1" "$(ep 1)/plain/after-decom")"
 check "pool 1 still empty" 0 "$(keyfiles a)"
+[[ $fail -ne 0 ]] && keep_logs phase1
 
 # ---- restart without pool 1 ----
 stop_all
@@ -381,7 +391,17 @@ check "data intact after rebalance" "" "$(diff "$WORK/before" "$WORK/after" || t
 
 CMD_D="${PD[*]}"
 "$MC" admin decommission start z4 "$CMD_D" >/dev/null
-check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 300)"
+# Two nodes restart mid-drain: keys short of quorum meanwhile wait, the drain does not fail.
+for _ in $(seq 300); do [[ "$(decom 1 "$CMD_D" objectsDecommissioned)" =~ ^[1-9] ]] && break; sleep 0.2; done
+check "middle pool still draining before the restarts" false "$(decom 1 "$CMD_D" complete)"
+kill9 3
+kill9 4
+sleep 2
+start 3
+start 4
+wait_ready 3 120
+wait_ready 4 120
+check "middle pool decommission completes" complete "$(wait_decom 1 "$CMD_D" 600)"
 check "middle pool drives hold no blobs" 0 "$(keyfiles d)"
 info=$("$MC" admin decommission status z2)
 check "status table: complete middle, active others" "Active Complete Active" "$(echo "$info" | grep -o 'Active\|Complete' | tr '\n' ' ' | sed 's/ $//')"
