@@ -1,7 +1,8 @@
 # bench/compare.sh results
 
 Reported results: the gated run below (LOAD_MAX=4: each run starts only when the
-1-minute load average is below 4). The earlier run under load (2026-10-14) is kept at the
+1-minute load average is below 4). Rounds 2026-10-17 15:59 to 2026-10-18 01:50; put-16m,
+mixed-1m and mp-64m re-run 2026-10-18 11:20-12:11 with resized runs (see Anomalies). The earlier run under load (2026-10-14) is kept at the
 end as preliminary and is not comparable.
 
 ## Machine
@@ -39,8 +40,8 @@ RustFS honouring the variable was checked: a 4 MiB object writes 2 MiB part file
 ## Method
 
 - Concurrency 32, bucket `zc-bench`. PUT runs use --disable-multipart (single-request PUT).
-- Durations: 15 s, except PUT of 1 MiB and 16 MiB (6 s) and multipart (10 s), so the
-  tmpfs drives can hold the run.
+- Durations: 15 s, except PUT of 1 MiB and 16 MiB (6 s), mixed-1m (6 s) and multipart
+  (6 s at concurrency 8), so the tmpfs drives can hold the run.
 - GET/mixed prepare 2500 objects (4 KiB, 64 KiB), 1000 (1 MiB) or 100 (16 MiB). LIST uses 2500 x 4 KiB.
 - mixed: warp's default split 45% GET, 30% STAT, 15% PUT, 10% DELETE; the table reports the Total.
 - mp-64m: 64 MiB objects uploaded by minio-go as multipart with its default 16 MiB parts (4 parts).
@@ -303,7 +304,26 @@ cluster mixed-1m. Findings:
   What remains RustFS behaviour: deleted data is not reclaimed promptly, so a drive near capacity
   under a delete-heavy load reports DiskFull.
 
-## Other anomalies
+## Anomalies in the gated run
+
+- First pass of put-16m, mixed-1m and mp-64m filled the drives, for all three products; those
+  rows were discarded and the three workloads re-run (3 gated rounds) with shorter runs:
+  - mp-64m (10 s, concurrency 32): MinIO single "Storage backend has reached its minimum free
+    drive threshold" (799-1107 errors per run; its 85.6 obj/s counted fast failures); MinIO
+    cluster nodes went down and timed out; RustFS "internal error", "File is corrupted",
+    "service is unavailable" with StorageFull/DiskFull in its log.
+  - mixed-1m (15 s): MinIO single hit its free-drive threshold (722-1093 errors per run).
+  - put-16m cluster: zkfsm 24-27 "Write quorum not available" errors per run in rounds 1-2,
+    with nodes logged offline ("its drives are not open", "cannot connect"); not seen in the
+    re-run (0 errors in 3 runs). Not explained yet.
+  After the change: 0 warp error lines in all 27 re-run results.
+- RustFS cluster get-16m round 1 failed in warp's prepare step: "Service not ready: waiting
+  for iam" (a node was still loading IAM after another node answered the readiness PUT).
+  Harness: compare.sh now retries a run once on "Service not ready". That cell has 2 runs.
+- The gate checks the load before the target starts; the load recorded is read just before
+  warp starts, after target start and warm-up, so it can be above 4 (max 11.6, median 3.7).
+
+## Other anomalies (preliminary run)
 
 - MinIO cluster get-16m round 1: 32 warp errors "Resource requested is unwritable, please
   reduce your request rate" (prepare step; 3 GiB-per-node memory limit, load average ~25). Rounds 2-3 clean.
