@@ -425,12 +425,13 @@ pub const ReplicaStore = struct {
             return rep;
         };
         if (self.clustered() and !corrupt and rep.unrepaired == 0 and rep.healthy < quorum(placed.len) and
-            newest_ns != 0 and core.time.nowNs() - newest_ns > tombstone_grace_ns and !self.drives.anyFresh(placed))
+            ((newest_ns != 0 and core.time.nowNs() - newest_ns > tombstone_grace_ns and !self.drives.anyFresh(placed)) or self.drives.wasDeleted(key, false)))
         {
             // Below a write quorum with every drive answering: a delete some drive
             // missed, or a failed write. Never a live object, so remove the rest.
             std.log.warn("purging {d} leftover replica(s) of {s} (missed delete or failed write)", .{ rep.healthy, &key.hex });
             for (placed, 0..) |_, j| if (holds.lbs[j]) |lb| lb.store().delete(key) catch {};
+            _ = self.drives.wasDeleted(key, true);
             return .{ .purged = true };
         }
         for (bad[0..nbad]) |j| {
@@ -507,6 +508,7 @@ pub const ReplicaStore = struct {
         }
         if (removed + absent < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
         if (removed == 0) return error.NotFound;
+        if (key.space == .data and self.clustered() and removed + absent < placed.len) self.drives.noteDeleted(key);
     }
 
     fn putRecord(ctx: *anyopaque, key: PhysicalKey, bytes: []const u8) Error!void {
