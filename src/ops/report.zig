@@ -1,6 +1,7 @@
 //! Per-node reports: this node's drives (state and space), scanner counters, and
 //! lock table, built locally or fetched from peers, then merged into cluster views.
 const std = @import("std");
+const core = @import("../core/root.zig");
 const placement = @import("../placement/root.zig");
 const heal = @import("../heal/root.zig");
 const root = @import("root.zig");
@@ -133,11 +134,13 @@ pub fn local(o: *Ops, a: Allocator) error{OutOfMemory}!Report {
         {
             n.table.mutex.lock();
             defer n.table.mutex.unlock();
-            const now = std.time.milliTimestamp();
+            // Lease times are monotonic; reported as wall time.
+            const now = core.time.monoMs();
+            const wall = std.time.milliTimestamp() - now;
             var it = n.table.entries.iterator();
             while (it.next()) |e| {
                 if (e.value_ptr.expires_ms <= now) continue;
-                try locks.append(a, .{ .resource = try a.dupe(u8, e.key_ptr.*), .uid = e.value_ptr.uid, .since_ms = e.value_ptr.since_ms, .expires_ms = e.value_ptr.expires_ms });
+                try locks.append(a, .{ .resource = try a.dupe(u8, e.key_ptr.*), .uid = e.value_ptr.uid, .since_ms = e.value_ptr.since_ms + wall, .expires_ms = e.value_ptr.expires_ms + wall });
             }
         }
         var held: std.ArrayList(u64) = .empty;

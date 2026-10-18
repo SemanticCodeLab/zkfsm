@@ -60,6 +60,7 @@ pub const Counters = struct {
         try w.print("# TYPE zkfsm_connection_errors_total counter\nzkfsm_connection_errors_total {d}\n", .{c.conn_errors.load(.monotonic)});
         const up_ns = std.time.nanoTimestamp() - c.started_ns;
         try w.print("# TYPE zkfsm_uptime_seconds gauge\nzkfsm_uptime_seconds {d}\n", .{@divTrunc(@max(up_ns, 0), std.time.ns_per_s)});
+        try w.print("# TYPE zkfsm_index_rebuild_skipped_total counter\nzkfsm_index_rebuild_skipped_total {d}\n", .{object.index_store.rebuild_skipped.load(.monotonic)});
         try w.writeAll("# TYPE zkfsm_build_info gauge\nzkfsm_build_info{version=\"0.1.0\"} 1\n");
         for (global.extra) |e| if (e) |r| try r.func(r.ctx, w);
     }

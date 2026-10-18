@@ -9,6 +9,7 @@ pub const license = @import("license.zig");
 pub const checksum_algos = @import("checksum_algos.zig");
 pub const hwhash = @import("hwhash.zig");
 pub const trace = @import("trace.zig");
+pub const fsync = @import("fsync.zig");
 
 pub const ObjectId = ids.ObjectId;
 pub const BucketId = ids.BucketId;
@@ -31,4 +32,5 @@ test {
     _ = checksum_algos;
     _ = hwhash;
     _ = trace;
+    _ = fsync;
 }

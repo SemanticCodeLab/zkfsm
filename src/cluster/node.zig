@@ -1071,6 +1071,8 @@ pub const Node = struct {
         return n.router.backend();
     }
 
+    const rebuild_strict_ns = 30 * std.time.ns_per_s;
+
     /// Creates the object service once the catalog is readable (needs read quorum),
     /// then brings its key index up to date: the local snapshot plus what every peer
     /// journaled since, or a rebuild from the records when that cannot be done.
@@ -1098,13 +1100,19 @@ pub const Node = struct {
             std.log.info("cluster: key index loaded from snapshot and peer journals in {d} ms", .{std.time.milliTimestamp() - t0});
             return;
         }
+        // Records still out of reach after a while are skipped (heal and reads recover them).
+        var since = std.time.Timer.start() catch unreachable;
+        var tries: u32 = 0;
         while (true) {
             if (n.stop_ev.isSet()) return error.Stopped;
+            out.rebuild_skip_unreachable = tries >= 3 and since.read() >= rebuild_strict_ns;
+            defer out.rebuild_skip_unreachable = false;
             if (n.rebuildIndex(out)) |_| {
                 std.log.info("cluster: key index rebuilt from records in {d} ms", .{std.time.milliTimestamp() - t0});
                 return;
             } else |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
+                tries += 1;
                 std.log.info("cluster: key index rebuild: {t}; retrying", .{e});
             }
             n.stop_ev.timedWait(time_ns(1)) catch {};
@@ -1117,7 +1125,7 @@ pub const Node = struct {
         find: for (n.local_eps) |eps| for (eps) |e| if (e) |le| {
             var root = std.fs.cwd().openDir(le.path, .{}) catch continue;
             defer root.close();
-            n.node_dir = root.makeOpenPath("node", .{}) catch continue;
+            n.node_dir = core.fsync.makeOpenPathSynced(root, "node") catch continue;
             break :find;
         };
         n.journal = journal_mod.Journal.open(n.gpa, n.node_dir);
@@ -1261,7 +1269,7 @@ pub const Node = struct {
             return;
         };
         _ = n.origins.dirty.fetchSub(dirty, .monotonic);
-        n.last_snapshot_ms = std.time.milliTimestamp();
+        n.last_snapshot_ms = core.time.monoMs();
     }
 
     fn time_ns(s: u64) u64 {
@@ -1361,7 +1369,7 @@ pub const Node = struct {
                 std.log.warn("cluster: a peer's journal does not reach back far enough; rebuilding the key index", .{});
                 n.rebuildIndex(svc) catch |e| std.log.warn("cluster: key index rebuild: {t}", .{e});
             }
-            const now = std.time.milliTimestamp();
+            const now = core.time.monoMs();
             if (n.origins.dirty.load(.monotonic) > 0 and now - n.last_snapshot_ms > snapshot_every_ms) n.saveSnapshot(svc);
         }
     }
@@ -1384,7 +1392,7 @@ pub const Node = struct {
         defer due.deinit(n.gpa);
         var fresh: std.ArrayListUnmanaged(core.ObjectId) = .empty;
         defer fresh.deinit(n.gpa);
-        n.gc.take(n.gpa, core.time.nowNs(), all, &due, &fresh);
+        n.gc.take(n.gpa, core.time.monoNs(), all, &due, &fresh);
         // The backup hears of new ids before a long run of deletes, not after it.
         if (fresh.items.len > 0 and !all) if (n.successor()) |next| {
             if (n.gpa.alloc(wire.Note, fresh.items.len)) |notes| {
@@ -1548,7 +1556,7 @@ pub const Node = struct {
                 nn.rpc.heardBoot(node, h.boot);
                 nn.peer_epochs[i].store(h.epoch, .release);
                 nn.rpc.setOnline(node, h.drives);
-                if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, std.time.milliTimestamp())) nn.sync_ev.set();
+                if (h.drives and h.jepoch != 0 and nn.origins.heard(node, h.jepoch, h.jseq, h.jopen, core.time.monoMs())) nn.sync_ev.set();
             }
         };
         protection.fanout.run(n.topo.nodes.len, true, n, Each.f);
@@ -1563,9 +1571,9 @@ pub const Node = struct {
     fn heartbeatLoop(n: *Node) void {
         while (!n.stop_ev.isSet()) {
             n.heartbeatRound();
-            _ = n.leases.sweep(std.time.milliTimestamp());
+            _ = n.leases.sweep(core.time.monoMs());
             if (n.journal_ok.load(.acquire)) {
-                n.journal.expireStuck(std.time.milliTimestamp());
+                n.journal.expireStuck(core.time.monoMs());
                 n.journal.sync(false);
             }
             n.stop_ev.timedWait(heartbeat_ns) catch {};
@@ -1706,7 +1714,7 @@ const Gc = struct {
         defer g.mutex.unlock();
         const list = if (owner == null) &g.own else &g.backup;
         if (list.items.len >= cap) return false;
-        list.append(gpa, .{ .id = id, .due_ns = core.time.nowNs() + grace, .owner = owner }) catch return false;
+        list.append(gpa, .{ .id = id, .due_ns = core.time.monoNs() + grace, .owner = owner }) catch return false;
         if (owner == null) g.announce.append(gpa, id) catch {};
         return true;
     }

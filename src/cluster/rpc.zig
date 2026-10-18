@@ -178,7 +178,7 @@ pub const Rpc = struct {
     /// True when the peer answered some call within the last `ms` milliseconds.
     pub fn answeredWithin(self: *Rpc, node: u16, ms: i64) bool {
         const t = self.peers[node].last_answer_ms.load(.monotonic);
-        return t != 0 and std.time.milliTimestamp() - t <= ms;
+        return t != 0 and core.time.monoMs() - t <= ms;
     }
 
     /// The peer's process id as last heard; 0 before its first hello.
@@ -262,7 +262,7 @@ pub const Rpc = struct {
     fn takeIdle(self: *Rpc, p: *Peer) ?*Conn {
         p.mutex.lock();
         defer p.mutex.unlock();
-        const now = std.time.nanoTimestamp();
+        const now = core.time.monoNs();
         while (p.idle.pop()) |c| {
             if (now - c.idle_since < max_idle_ns and quiet(c)) return c;
             self.discardLocked(p, c);
@@ -274,14 +274,14 @@ pub const Rpc = struct {
         p.mutex.lock();
         defer p.mutex.unlock();
         if (p.idle.items.len >= self.peer_cap) return self.discardLocked(p, c);
-        c.idle_since = std.time.nanoTimestamp();
+        c.idle_since = core.time.monoNs();
         p.idle.append(self.gpa, c) catch self.discardLocked(p, c);
     }
 
     /// The peer's addresses: cached ones while fresh, else a new lookup (a failed
     /// lookup falls back to the last known addresses).
     fn addresses(self: *Rpc, p: *Peer, out: *[Peer.max_addrs]std.net.Address, refresh: bool) usize {
-        const now = std.time.nanoTimestamp();
+        const now = core.time.monoNs();
         {
             p.mutex.lock();
             defer p.mutex.unlock();
@@ -580,7 +580,7 @@ pub const Call = struct {
             }
         }
         if (!have_len) return error.BadResponse;
-        c.peer.last_answer_ms.store(std.time.milliTimestamp(), .monotonic);
+        c.peer.last_answer_ms.store(core.time.monoMs(), .monotonic);
     }
 
     /// Reads the whole body (at most `limit` bytes) into memory.

@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const keyring = @import("keyring.zig");
+const core = @import("../core/root.zig");
 
 const Error = types.Error;
 const Allocator = std.mem.Allocator;
@@ -75,6 +76,7 @@ pub const LocalFileStore = struct {
             f.sync() catch return error.StorageFailed;
         }
         s.dir.rename(tmp, name) catch return error.StorageFailed;
+        core.fsync.syncDir(s.dir) catch return error.StorageFailed;
     }
 
     fn remove(p: *anyopaque, _: Allocator, id: []const u8) Error!void {

@@ -6,6 +6,17 @@ pub fn nowNs() i128 {
     return std.time.nanoTimestamp();
 }
 
+/// Monotonic clock for local deadlines, leases and graces: immune to wall-clock jumps.
+/// Never compare it with wall time or send it to another process.
+pub fn monoNs() i128 {
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+pub fn monoMs() i64 {
+    return @intCast(@divTrunc(monoNs(), std.time.ns_per_ms));
+}
+
 const Parts = struct { year: u16, month: u8, day: u8, hour: u8, min: u8, sec: u8, wday: u8 };
 
 fn split(ns: i128) Parts {

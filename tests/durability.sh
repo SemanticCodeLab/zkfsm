@@ -115,6 +115,13 @@ start
 check "(c') reads after restart" $N "$(reads_ok)"
 check "(c') heal rebuilds replacement" full "$(wait_full)"
 
+# (d) Power cut before a record reached the disk: one copy of every record torn.
+stop
+for f in $(find "$DATA/d2/record" -name '*.meta'); do truncate -s $(($(stat -c %s "$f") / 2)) "$f"; done
+start
+check "(d) reads after torn records" $N "$(reads_ok)"
+check "(d) heal rewrites torn records" full "$(wait_full)"
+
 # Leftover temp file from an interrupted write gets swept.
 touch -d '2 hours ago' "$DATA/d1/tmp/deadbeef.tmp"
 for _ in $(seq 50); do [[ -e "$DATA/d1/tmp/deadbeef.tmp" ]] || break; sleep 0.2; done

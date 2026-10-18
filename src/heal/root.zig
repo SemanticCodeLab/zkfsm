@@ -141,7 +141,8 @@ pub const Healer = struct {
             }
             const r = self.strategy.healKey(k);
             fixed += r.repaired;
-            if (r.unrepaired > 0) self.drives.noteDegraded(k);
+            // A deleted key with a drive still out of reach stays listed until it answers.
+            if (r.unrepaired > 0 or (r.pending and self.drives.wasDeleted(k, false))) self.drives.noteDegraded(k) else _ = self.drives.wasDeleted(k, true);
         }
         if (got.keys.len > 0) std.log.info("heal: {d} key(s) written degraded, {d} replica(s) repaired", .{ got.keys.len, fixed });
     }

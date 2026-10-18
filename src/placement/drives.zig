@@ -124,6 +124,9 @@ pub const Degraded = struct {
     keys: std.ArrayListUnmanaged(backend.PhysicalKey) = .empty,
     /// More keys than the cap arrived: only a full pass finds them all.
     overflow: bool = false,
+    /// Data keys deleted on a quorum while some drive missed it: their leftovers
+    /// are known garbage and need no grace.
+    gone: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
 
     pub const cap = 65536;
 };
@@ -262,6 +265,22 @@ pub const DriveSet = struct {
         };
     }
 
+    pub fn noteDeleted(self: *DriveSet, key: backend.PhysicalKey) void {
+        const g = &self.degraded;
+        g.mutex.lock();
+        const fits = g.gone.count() < Degraded.cap and (g.gone.put(self.gpa, key.hex, {}) catch null) != null;
+        g.mutex.unlock();
+        if (fits) self.noteDegraded(key);
+    }
+
+    /// True for a key `noteDeleted` saw; `forget` drops it once its leftovers are gone.
+    pub fn wasDeleted(self: *DriveSet, key: backend.PhysicalKey, forget: bool) bool {
+        const g = &self.degraded;
+        g.mutex.lock();
+        defer g.mutex.unlock();
+        return if (forget) g.gone.remove(key.hex) else g.gone.contains(key.hex);
+    }
+
     /// Hands the remembered keys to the caller (who frees them with `self.gpa`).
     pub fn takeDegraded(self: *DriveSet) struct { keys: []backend.PhysicalKey, overflow: bool } {
         const g = &self.degraded;
@@ -285,6 +304,7 @@ pub const DriveSet = struct {
 
     pub fn deinit(self: *DriveSet) void {
         self.degraded.keys.deinit(self.gpa);
+        self.degraded.gone.deinit(self.gpa);
         for (self.drives) |*d| {
             if (d.kind == .local) d.kind.local.close();
             self.gpa.free(d.path);

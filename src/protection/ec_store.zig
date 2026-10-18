@@ -547,11 +547,12 @@ pub const ErasureStore = struct {
             pend[i] = w;
         }
         if (rep.healthy < k) {
-            switch (self.fragments(&s, placed)) {
+            switch (self.fragments(&s, placed, key)) {
                 .purge => {
                     std.log.warn("purging dangling shards of {s} (partial write or delete)", .{&key.hex});
                     s.close();
                     for (0..n) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
+                    _ = self.drives.wasDeleted(key, true);
                     return .{ .purged = true };
                 },
                 // A write in flight or a recent delete: purged once old enough.
@@ -608,10 +609,11 @@ pub const ErasureStore = struct {
     /// interrupted write or a missed delete (a stored object has at least k), never
     /// readable again. Purged once older than the grace. Corrupt shards of a stored
     /// object still count as files, so damage is reported as loss, not purged.
-    fn fragments(self: *const ErasureStore, s: *const Shards, placed: []const u8) enum { no, young, purge } {
+    fn fragments(self: *const ErasureStore, s: *const Shards, placed: []const u8, key: PhysicalKey) enum { no, young, purge } {
         if (!self.clustered() or s.offline > 0) return .no;
         const files = self.width() - s.missing;
         if (files >= self.codec.k) return .no;
+        if (self.drives.wasDeleted(key, false)) return .purge;
         const now = core.time.nowNs();
         if (s.mtime == 0 or now - s.mtime <= replica.tombstone_grace_ns) return .young;
         // A replaced drive may be why shards are missing: that is loss, not a leftover.
