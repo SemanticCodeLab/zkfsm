@@ -8,7 +8,7 @@
 # PUTs run for DUR_PUT_BIG only.
 #
 # env: PRODUCTS ("zkfsm minio rustfs"), TOPOS ("single cluster"), WORKLOADS (see below), REPS (3), ROUNDS (1..REPS; run a subset of rounds),
-#      DUR (15s), DUR_PUT_BIG (6s, PUT of 1 MiB and larger), DUR_MP (10s, multipart), CONC (32),
+#      DUR (15s), DUR_PUT_BIG (6s, PUT of 1 MiB and larger), DUR_MP (6s, multipart, at CONC_MP 8), DUR_MIXED_BIG (6s, mixed-1m), CONC (32),
 #      SERVER_CPUS (0,1,2,3), CLIENT_CPUS (4-7), CLIENT_NCPU (4),
 #      SINGLE_MEM (20g), SINGLE_DRIVE (4096m), NODE_MEM (3g), NODE_DRIVE (512m),
 #      CACHE (build caches + binaries), OUT (raw logs + results.tsv),
@@ -26,7 +26,9 @@ REPS="${REPS:-3}"
 ROUNDS="${ROUNDS:-$(seq -s" " 1 "$REPS")}"
 DUR="${DUR:-15s}"
 DUR_PUT_BIG="${DUR_PUT_BIG:-6s}"
-DUR_MP="${DUR_MP:-10s}"
+DUR_MP="${DUR_MP:-6s}"
+CONC_MP="${CONC_MP:-8}"
+DUR_MIXED_BIG="${DUR_MIXED_BIG:-6s}"
 CONC="${CONC:-32}"
 SERVER_CPUS="${SERVER_CPUS:-0,1,2,3}"
 CLIENT_CPUS="${CLIENT_CPUS:-4-7}"
@@ -182,14 +184,23 @@ run_workload() { # product topo workload rep
     put) extra+=(--disable-multipart)
       [[ $size == 4KiB || $size == 64KiB ]] || extra[3]="$DUR_PUT_BIG" ;;
     # 64 MiB objects through minio-go's default 16 MiB parts: 4 parts each.
-    mp) kind=put extra[3]="$DUR_MP" ;;
-    get | mixed) case $size in 4KiB | 64KiB) extra+=(--objects 2500) ;; 1MiB) extra+=(--objects 1000) ;; *) extra+=(--objects 100) ;; esac ;;
+    # Shorter and less concurrent so a run fits the drives: full drives fail all three products.
+    mp) kind=put extra[3]="$DUR_MP" extra+=(--concurrent "$CONC_MP") ;;
+    get | mixed) [[ $kind == mixed && $size == 1MiB ]] && extra[3]="$DUR_MIXED_BIG"
+      case $size in 4KiB | 64KiB) extra+=(--objects 2500) ;; 1MiB) extra+=(--objects 1000) ;; *) extra+=(--objects 100) ;; esac ;;
     list) extra+=(--objects 2500) ;;
   esac
   local load
   load="$(cut -d' ' -f1-3 /proc/loadavg)"
   log "run $tag (load $load)"
   warp "$kind" "$tag" "${extra[@]}" >"$OUT/$tag.log" 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]] && grep -q 'Service not ready' "$OUT/$tag.log"; then
+    log "retry $tag: target not ready"
+    mv "$OUT/$tag.log" "$OUT/$tag.notready.log"
+    sleep 10
+    rc=0
+    warp "$kind" "$tag" "${extra[@]}" >"$OUT/$tag.log" 2>&1 || rc=$?
+  fi
   local errs
   errs="$(grep -ciE 'error' "$OUT/$tag.log" || true)"
   local alive="ok"
