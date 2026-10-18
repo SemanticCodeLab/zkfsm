@@ -169,6 +169,7 @@ pub const Node = struct {
     retired: u64 = 0,
     /// Endpoint-list pools left unopened at bootstrap: retired (bit per position).
     skipped: u64 = 0,
+    retire_mu: std.Thread.Mutex = .{},
     /// Deployment pools ever formatted; recorded in drive formats.
     pool_count: u32 = 0,
     /// Called when a peer announces a pool state change.
@@ -683,34 +684,60 @@ pub const Node = struct {
         return true;
     }
 
-    /// Records pools as decommissioned in every reachable drive format; returns the
-    /// number of drives that could not be updated.
-    pub fn markRetired(n: *Node, mask: u64) usize {
-        n.retired |= mask;
+    /// Records pools as decommissioned in drive formats (remote drives too unless
+    /// `local_only`); returns the number of drives that could not be updated.
+    pub fn markRetired(n: *Node, mask: u64, local_only: bool) usize {
+        n.retire_mu.lock();
+        defer n.retire_mu.unlock();
+        const want = n.retired | mask;
         var failed: usize = 0;
         for (n.topo.pools, 0..) |pool, p| for (pool.endpoints, 0..) |_, i| {
-            const f = switch (n.readFormat(p, i)) {
-                .fmt => |f| f,
-                else => {
+            // Pools retired earlier may have lost their nodes.
+            if (n.retired & bitOf(n.orig[p]) != 0) continue;
+            if (n.local_eps[p][i]) |le| {
+                retireLocal(le.path, want) catch {
+                    failed += 1;
+                };
+            } else if (!local_only) {
+                const f = switch (n.readFormat(p, i)) {
+                    .fmt => |f| f,
+                    else => {
+                        failed += 1;
+                        continue;
+                    },
+                };
+                var g = f;
+                g.retired |= want;
+                var buf: [layout.format_max]u8 = undefined;
+                const bytes = g.encode(&buf) catch {
                     failed += 1;
                     continue;
-                },
-            };
-            var g = f;
-            g.retired |= n.retired;
-            var buf: [layout.format_max]u8 = undefined;
-            const bytes = g.encode(&buf) catch {
-                failed += 1;
-                continue;
-            };
-            n.writeFormat(p, i, bytes) catch {
-                failed += 1;
-            };
+                };
+                n.writeFormat(p, i, bytes) catch {
+                    failed += 1;
+                };
+            }
         };
+        // Applied in memory only once recorded, so a failed attempt is retried.
+        if (failed > 0) return failed;
+        n.retired = want;
         for (n.pools) |*ps| for (ps.sets) |*st| if (st.drives.cluster) |*c| {
             c.format.retired = n.retired;
         };
         return failed;
+    }
+
+    /// ORs `mask` into the retired pools of the format on the drive at `path`.
+    pub fn retireLocal(path: []const u8, mask: u64) !void {
+        var lb = try backend.local.LocalBackend.open(path);
+        defer lb.close();
+        var buf: [layout.format_max]u8 = undefined;
+        const f = try FormatV2.parse(try lb.readFormat(&buf));
+        if (f.retired & mask == mask) return;
+        var g = f;
+        g.retired |= mask;
+        var out: [layout.format_max]u8 = undefined;
+        try lb.writeFormat(try g.encode(&out));
     }
 
     /// Local drives learn how many pools the deployment has, so dropping one that
@@ -1919,7 +1946,7 @@ test "restart after a pool is retired: its drives are gone, the rest opens" {
         try n.bootstrap();
         n.router.setMode(0, .retired);
         try n.storage().putRecord(key, "kept");
-        try std.testing.expectEqual(@as(usize, 0), n.markRetired(1));
+        try std.testing.expectEqual(@as(usize, 0), n.markRetired(1, false));
     }
     // The retired pool's drives disappear with its nodes.
     try tmp.dir.deleteTree("a1");

@@ -54,6 +54,14 @@ pub const Strategy = union(enum) {
         };
     }
 
+    /// Drops leftover shards of a missed delete in a draining pool; true when removed.
+    pub fn dropRemnant(self: Strategy, key: iface.PhysicalKey) bool {
+        return switch (self) {
+            .erasure => |s| s.dropRemnant(key),
+            .replica => false,
+        };
+    }
+
     /// Verifies all shards or replicas of `key` and rebuilds bad ones.
     pub fn healKey(self: Strategy, key: iface.PhysicalKey) KeyReport {
         return switch (self) {

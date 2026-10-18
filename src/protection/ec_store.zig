@@ -618,6 +618,27 @@ pub const ErasureStore = struct {
         return if (self.drives.anyFresh(placed)) .no else .purge;
     }
 
+    /// Removes fewer-than-k shards of `key` (a delete that missed a drive) without
+    /// waiting out the grace; only for a draining pool, where no write is in flight.
+    pub fn dropRemnant(self: *ErasureStore, key: PhysicalKey) bool {
+        if (key.space != .data) return false;
+        var pbuf: [max_drives]u8 = undefined;
+        const placed = self.drives.placed(key, &pbuf);
+        var holds = Holds.acquire(self.drives, placed);
+        defer holds.release();
+        const mtx = self.meta.stripe(key);
+        mtx.lock();
+        defer mtx.unlock();
+        var s = self.openShards(&holds, key);
+        const files = self.width() - s.missing;
+        const remnant = self.clustered() and s.offline == 0 and files > 0 and files < self.codec.k and !self.drives.anyFresh(placed);
+        s.close();
+        if (!remnant) return false;
+        std.log.warn("purging {d} dangling shard(s) of {s} from a draining pool", .{ files, &key.hex });
+        for (0..self.width()) |i| if (holds.lbs[i]) |lb| lb.store().delete(key) catch {};
+        return true;
+    }
+
     pub fn healKey(self: *ErasureStore, key: PhysicalKey) KeyReport {
         return if (key.space == .data) self.healData(key) else self.meta.healKey(key);
     }
@@ -857,4 +878,16 @@ test "cluster set: old shards below k are purged as leftovers, unless a drive wa
     try Fx.leave(be, tmp.dir, key, pl, rel, 4, old_ns);
     const live = store.healKey(key);
     try testing.expect(!live.purged and live.repaired == 2);
+    // A draining pool takes no writes: young fragments are dropped at once, a live
+    // object, a whole one, or fragments next to a replaced drive never are.
+    try testing.expect(!store.dropRemnant(key));
+    try Fx.leave(be, tmp.dir, key, pl, rel, 2, null);
+    set.drives[pl[5]].fresh.store(true, .release);
+    try testing.expect(!store.dropRemnant(key));
+    set.drives[pl[5]].fresh.store(false, .release);
+    try testing.expect(store.dropRemnant(key));
+    try testing.expectError(error.NotFound, be.stat(key));
+    try Fx.leave(be, tmp.dir, key, pl, rel, 4, null);
+    try testing.expect(!store.dropRemnant(key));
+    _ = try be.stat(key);
 }
