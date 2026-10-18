@@ -318,7 +318,8 @@ check "completing the open multipart upload" 0 "$(cli 2 s3api complete-multipart
   --multipart-upload "Parts=[{PartNumber=1,ETag=$(md5 "$WORK/part1")}]" >/dev/null 2>&1; echo $?)"
 cli 3 s3 cp --no-progress s3://plain/open-upload "$WORK/got" >/dev/null
 check "completed upload reads back" "$(md5 "$WORK/part1")" "$(md5 "$WORK/got")"
-snapshot 2 >"$WORK/before3"
+listall() { for b in $(cli "$1" s3 ls | awk '{print $3}'); do cli "$1" s3 ls --recursive "s3://$b/" | awk -v b="$b" '{print b, $3, $4}'; done | sort; }
+listall 2 >"$WORK/before3"
 stop_all
 
 # ---- the full list still names pool 1, but its drives are gone (its nodes left) ----
@@ -326,8 +327,9 @@ for i in 1 2 3 4; do mkdir -p "$WORK/gone$i"; mv "$WORK"/n$i/a* "$WORK/gone$i/";
 POOLS=(--data "${PA[@]}" --data "${PB[@]}")
 start_all
 check "restart with the retired pool's drives gone" "200 200 200 200" "$(ready 1) $(ready 2) $(ready 3) $(ready 4)"
-snapshot 1 >"$WORK/after3"
+listall 1 >"$WORK/after3"
 check "data intact with the retired pool's drives gone" "" "$(diff "$WORK/before3" "$WORK/after3" || true)"
+check "and it lists objects" yes "$([[ -s "$WORK/after3" ]] && echo yes || echo no)"
 check "missing key is a plain 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" "$(ep 2)/plain/no-such-key")"
 check "delete of a missing key succeeds" 204 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -X DELETE "$(ep 3)/plain/no-such-key")"
 stop_all

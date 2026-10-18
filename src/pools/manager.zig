@@ -79,6 +79,8 @@ pub const Manager = struct {
         var best: ?Meta = null;
         var reached = false;
         for (m.router().pools) |*p| {
+            // Retired pools left unopened have no sets (and maybe no nodes).
+            if (p.sets.len == 0) continue;
             const bytes = Router.at(p, meta_key).getRecord(meta_key, a) catch |e| switch (e) {
                 error.NotFound => {
                     reached = true;
