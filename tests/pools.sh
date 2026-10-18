@@ -343,7 +343,8 @@ check "and it lists objects" yes "$([[ -s "$WORK/after3" ]] && echo yes || echo 
 check "missing key is a plain 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" "$(ep 2)/plain/no-such-key")"
 check "delete of a missing key succeeds" 204 "$(curl -s -o /dev/null -w '%{http_code}' "${sig[@]}" -X DELETE "$(ep 3)/plain/no-such-key")"
 stop_all
-for i in 1 2 3 4; do mv "$WORK/gone$i"/* "$WORK/n$i/"; done
+# Startup probing may have recreated the empty drive directories.
+for i in 1 2 3 4; do rm -rf "$WORK"/n$i/a*; mv "$WORK/gone$i"/* "$WORK/n$i/"; done
 
 # ---- a pool that was not decommissioned cannot be dropped ----
 POOLS=(--data "${PA[@]}")
