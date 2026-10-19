@@ -194,6 +194,7 @@ pub const Ops = struct {
         const n = o.node orelse return all[0];
         var first: ?SetRef = null;
         for (n.router_pools, 0..) |*rp, p| {
+            if (rp.sets.len == 0) continue;
             const si = cluster.router.Router.setIndex(rp, key);
             const s = for (all) |x| {
                 if (x.pool == p and x.set == si) break x;

@@ -208,8 +208,19 @@ OBJS=$(ls "$WORK/obj")
 check "new objects listed via node 1" 3 "$(cli 1 s3 ls s3://clu/ | grep -c ' down')"
 
 # ---- the node returns and healing restores full redundancy ----
+seen_up() { grep -c "node 127.0.0.1:${PORT[3]} is online" "$WORK/n$1.log" || true; }
+UP0=("$(seen_up 1)" "$(seen_up 2)" "$(seen_up 4)")
 start 3
 wait_ready 3 60
+# Peers count a node restarted after kill -9 online within a few heartbeats.
+t0=$(date +%s)
+for _ in $(seq 150); do
+  [[ $(seen_up 1) -gt ${UP0[0]} && $(seen_up 2) -gt ${UP0[1]} && $(seen_up 4) -gt ${UP0[2]} ]] && break
+  sleep 0.1
+done
+check "peers see the restarted node online within 15 s" yes "$([[ $(seen_up 1) -gt ${UP0[0]} && $(seen_up 2) -gt ${UP0[1]} && $(seen_up 4) -gt ${UP0[2]} ]] && echo yes || echo no)"
+check "and keep it online" 0 "$(sleep 3; for i in 1 2 4; do tail -n 3 "$WORK/n$i.log"; done | grep -c "127.0.0.1:${PORT[3]} is offline" || true)"
+echo "     online on every peer $(($(date +%s) - t0)) s after ready"
 NOBJ=$(echo "$OBJS" | wc -w)
 if wait_redundant "$NOBJ" 90; then r=yes; else r=no; fi
 check "heal restored all shards of $NOBJ objects" yes "$r"

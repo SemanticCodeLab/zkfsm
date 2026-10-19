@@ -45,6 +45,9 @@ pub const RawRoute = struct {
     accept: ?*const fn (ctx: *anyopaque, req: *const std.http.Server.Request) bool = null,
 };
 
+/// The client address of the raw-route request this thread serves.
+pub threadlocal var raw_peer: ?std.net.Address = null;
+
 /// Readiness override (cluster quorum); default is a storage sync probe.
 pub const Ready = struct {
     ctx: *anyopaque,
@@ -362,6 +365,7 @@ pub const Server = struct {
             };
             const keep_alive = req.head.keep_alive;
             if (self.rawRoute(&req)) |r| {
+                raw_peer = conn.address;
                 r.serve(r.ctx, &req, arena.allocator()) catch return;
             } else if (metrics.matchPaths(self.ops, req.head.target)) |ep| {
                 serveOps(self, &req, ep) catch return;

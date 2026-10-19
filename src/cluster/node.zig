@@ -58,6 +58,8 @@ pub const Config = struct {
     /// Membership is managed at runtime (`applyMembership`): peers may briefly run
     /// with other endpoint lists, so their fingerprints are not compared.
     dynamic: bool = false,
+    /// Per pool (may be shorter): decommissioned; bootstrap skips its drives.
+    retired: []const bool = &.{},
 };
 
 /// A runtime membership update: every pool, in order (the current list as prefix).
@@ -165,6 +167,8 @@ pub const Node = struct {
     orig: []u32 = &.{},
     /// Deployment pools that finished decommissioning (bit per index).
     retired: u64 = 0,
+    /// Endpoint-list pools left unopened at bootstrap: retired (bit per position).
+    skipped: u64 = 0,
     retire_mu: std.Thread.Mutex = .{},
     /// Deployment pools ever formatted; recorded in drive formats.
     pool_count: u32 = 0,
@@ -573,6 +577,7 @@ pub const Node = struct {
         };
         var complete = true;
         for (seen, 0..) |s, p| {
+            if (n.skipped & bitOf(p) != 0) continue;
             const any = for (s) |e| {
                 if (e == .fmt) break true;
             } else false;
@@ -630,6 +635,30 @@ pub const Node = struct {
                 present |= bit;
             }
         }
+        // Retired pools are skipped: flagged by the caller, or recorded in the formats.
+        // An unreachable one keeps its list position as index when no pool was dropped.
+        n.skipped = 0;
+        const positional = seen.len == count;
+        for (seen, 0..) |_, p| {
+            if (known[p]) {
+                if (n.flagged(p) and retired & bitOf(n.orig[p]) == 0) {
+                    std.log.warn("cluster: pool {d} is marked retired; its formats do not say so", .{p + 1});
+                    retired |= bitOf(n.orig[p]);
+                }
+                if (retired & bitOf(n.orig[p]) != 0) n.skipped |= bitOf(p);
+                continue;
+            }
+            const free = retired & ~present;
+            if (positional and p < 63 and free & bitOf(p) != 0) {
+                n.orig[p] = @intCast(p);
+            } else if (n.flagged(p)) {
+                n.orig[p] = if (free != 0) @ctz(free) else @intCast(64 - @clz(present | retired));
+                retired |= bitOf(n.orig[p]);
+            } else continue;
+            present |= bitOf(n.orig[p]);
+            known[p] = true;
+            n.skipped |= bitOf(p);
+        }
         n.retired = retired;
         // New pools take the next unused indexes, in endpoint-list order.
         var next: u32 = @intCast(64 - @clz(present | retired));
@@ -663,6 +692,8 @@ pub const Node = struct {
         const want = n.retired | mask;
         var failed: usize = 0;
         for (n.topo.pools, 0..) |pool, p| for (pool.endpoints, 0..) |_, i| {
+            // Pools retired earlier may have lost their nodes.
+            if (n.retired & bitOf(n.orig[p]) != 0) continue;
             if (n.local_eps[p][i]) |le| {
                 retireLocal(le.path, want) catch {
                     failed += 1;
@@ -804,8 +835,28 @@ pub const Node = struct {
         n.pools = (try a.alloc(PoolState, router_mod.max_pools))[0..n.topo.pools.len];
         for (n.pools) |*p| p.* = .{ .set_size = 0, .sets = &.{}, .backends = &.{} };
         n.router_pools = (try a.alloc(router_mod.Pool, router_mod.max_pools))[0..n.topo.pools.len];
-        for (0..n.topo.pools.len) |p| try n.openPool(p, seen[p]);
+        for (0..n.topo.pools.len) |p| {
+            if (n.skipped & bitOf(p) != 0) {
+                n.router_pools.ptr[p] = .{ .sets = &.{}, .seed = 0, .mode = .init(.retired) };
+                continue;
+            }
+            try n.openPool(p, seen[p]);
+        }
         n.router = .{ .gpa = n.gpa, .pools = n.router_pools, .guard = .{ .ctx = n, .lock = guardLock, .unlock = unlockFn } };
+        if (n.skipped != 0) {
+            // Nodes only in retired pools may be gone: they neither vote nor get heartbeats.
+            n.voters = n.memberMask();
+            n.markMembers();
+            n.locks.setVoters(n.voters, 0);
+        }
+    }
+
+    fn bitOf(i: usize) u64 {
+        return @as(u64, 1) << @intCast(i);
+    }
+
+    fn flagged(n: *const Node, p: usize) bool {
+        return p < n.cfg.retired.len and n.cfg.retired[p];
     }
 
     /// Opens pool `p`'s sets and fills its router entry (not yet published).
@@ -1881,4 +1932,47 @@ test "runtime membership: a pool appended to a running node opens; ext channels 
     try std.testing.expect(n.extHandler(0) == null and n.extHandler(ext_channels) == null);
     // Calls to this node itself are refused.
     try std.testing.expect(n.extCallOn(2, 0, a, "", 16, 100) == null);
+}
+
+test "restart after a pool is retired: its drives are gone, the rest opens" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    const p1 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/a{{1...2}}", .{root})};
+    const p2 = [_][]const u8{try std.fmt.allocPrint(a, "http://127.0.0.1:1/{s}/b{{1...2}}", .{root})};
+    for ([_][]const u8{ "a1", "a2", "b1", "b2" }) |d| try tmp.dir.makeDir(d);
+    const two = [_][]const []const u8{ &p1, &p2 };
+    const cfg: Config = .{ .pools = &two, .node_address = "127.0.0.1:1", .listen_host = "127.0.0.1", .listen_port = 1, .secret = @splat(7) };
+    const key: backend.PhysicalKey = .{ .space = .record, .hex = @splat('b') };
+    {
+        const n = try Node.create(gpa, cfg);
+        defer n.destroy();
+        try n.bootstrap();
+        n.router.setMode(0, .retired);
+        try n.storage().putRecord(key, "kept");
+        try std.testing.expectEqual(@as(usize, 0), n.markRetired(1, false));
+    }
+    // The retired pool's drives disappear with its nodes.
+    try tmp.dir.deleteTree("a1");
+    try tmp.dir.deleteTree("a2");
+    // Recorded in the surviving formats, or flagged by the caller.
+    for ([_][]const bool{ &.{}, &.{true} }) |flags| {
+        var c = cfg;
+        c.retired = flags;
+        const n = try Node.create(gpa, c);
+        defer n.destroy();
+        try n.bootstrap();
+        try std.testing.expectEqual(@as(u64, 1), n.skipped);
+        try std.testing.expectEqual(router_mod.Mode.retired, n.router.mode(0));
+        try std.testing.expectEqual(@as(usize, 0), n.pools[0].sets.len);
+        try std.testing.expectEqual(@as(u32, 1), n.poolIndex(1));
+        const got = try n.storage().getRecord(key, gpa);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("kept", got);
+        try std.testing.expectError(error.NotFound, n.storage().getRecord(.{ .space = .record, .hex = @splat('c') }, gpa));
+    }
 }
