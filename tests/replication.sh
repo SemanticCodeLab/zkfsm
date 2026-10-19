@@ -3,7 +3,8 @@
 # B (4-node EC:4+2 cluster), C (single node). Covers one-way and two-way bucket
 # replication, version ids, multipart, metadata, delete markers and version deletes,
 # delivery after a target outage, resync, and `mc replicate` / `mc admin replicate`
-# with bucket, IAM, and object propagation.
+# with bucket, IAM, and object propagation; and a bucket target plus a site peer
+# that require a client certificate (admin API TLS fields).
 set -euo pipefail
 S3CLI_BIN="${S3CLI_BIN:-aws}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -205,6 +206,56 @@ check "remaining sites list two" 2 "$("$MC" admin replicate info b1 --json | jfi
 eventually "bucket still syncs between A and B" 1 sh -c "'$MC' ls b1 | grep -c ' after/'"
 sleep 2
 check "removed site gets nothing" 0 "$("$MC" ls c | grep -c ' after/' || true)"
+
+echo "== mutual TLS: bucket target and site peer requiring a client certificate"
+source "$ROOT/tests/tls_remote.sh"
+tls_pki
+PM="$(freeport)"
+PS="$(freeport)"
+PD="$(freeport)"
+tls_zkfsm m "$PM" "$AK" "$SK"
+tls_zkfsm s "$PS" "$AK" "$SK"
+for p in "${TLS_PIDS[@]}"; do PID["tls$p"]=$p; done
+run d --data "$WORK/d" --listen "127.0.0.1:$PD"
+ready "$PD"
+"$MC" alias set d "http://127.0.0.1:$PD" "$AK" "$SK" >/dev/null
+cliD() { "$S3CLI_BIN" --endpoint-url "http://127.0.0.1:$PD" "$@"; }
+admin_put() { # path json -> status (body sealed with the admin secret)
+  printf '%s' "$2" | python3 "$ROOT/tests/madmin_encrypt.py" "$SK" >"$WORK/adm.enc"
+  curl -s -o "$WORK/adm.out" -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X PUT --data-binary @"$WORK/adm.enc" "http://127.0.0.1:$PD/minio/admin/v3$1"
+}
+tls_s3 "$PM" "$AK" "$SK" PUT /rdst -o /dev/null
+tls_s3 "$PM" "$AK" "$SK" PUT "/rdst?versioning" --data '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' -o /dev/null
+"$MC" mb d/rsrc >/dev/null
+"$MC" version enable d/rsrc >/dev/null
+target() { # extra-json
+  printf '{"sourcebucket":"rsrc","endpoint":"127.0.0.1:%s","targetbucket":"rdst","secure":true,"type":"replication","credentials":{"accessKey":"%s","secretKey":"%s"},"caFile":"%s"%s}' "$PM" "$AK" "$SK" "$PKI/ca.pem" "$1"
+}
+CERTJ=",\"clientCert\":\"$PKI/client.pem\",\"clientKey\":\"$PKI/client.key\""
+check "remote target without client cert refused" 400 "$(admin_put "/set-remote-target?bucket=rsrc" "$(target "")")"
+check "remote target with a bad key path refused" 400 "$(admin_put "/set-remote-target?bucket=rsrc" "$(target ",\"clientCert\":\"$PKI/client.pem\",\"clientKey\":\"$WORK/none.key\"")")"
+check "remote target with client cert" 200 "$(admin_put "/set-remote-target?bucket=rsrc" "$(target "$CERTJ")")"
+ARN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])))' "$WORK/adm.out")"
+check "target listing shows the client cert" "$PKI/client.pem" "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "http://127.0.0.1:$PD/minio/admin/v3/list-remote-targets?bucket=rsrc" | jfield '[0].get("clientCert","")')"
+printf '{"Role":"","Rules":[{"ID":"m","Status":"Enabled","Priority":1,"Filter":{"Prefix":""},"DeleteMarkerReplication":{"Status":"Enabled"},"Destination":{"Bucket":"%s"}}]}' "$ARN" >"$WORK/repl.json"
+check "replication config with the mtls target" 0 "$(cliD s3api put-bucket-replication --bucket rsrc --replication-configuration "file://$WORK/repl.json" >/dev/null && echo 0)"
+head -c 2000000 /dev/urandom >"$WORK/m.bin"
+"$MC" cp "$WORK/m.bin" d/rsrc/big.bin >/dev/null
+mget() { tls_s3 "$PM" "$AK" "$SK" GET /rdst/big.bin | sha256sum; }
+eventually "object replicated over mutual TLS" "$(sha256sum <"$WORK/m.bin")" mget
+check "replica keeps the version id" "$(vid cliD rsrc big.bin)" "$(tls_s3 "$PM" "$AK" "$SK" HEAD /rdst/big.bin -I | tr -d '\r' | awk -F': ' 'tolower($1)=="x-amz-version-id"{print $2}')"
+eventually "replication status COMPLETED" COMPLETED rstatus cliD rsrc big.bin
+
+sites() { # extra-json for the TLS site
+  printf '[{"name":"d","endpoints":"http://127.0.0.1:%s","accessKey":"%s","secretKey":"%s"},{"name":"s","endpoints":"https://127.0.0.1:%s","accessKey":"%s","secretKey":"%s","caFile":"%s"%s}]' \
+    "$PD" "$AK" "$SK" "$PS" "$AK" "$SK" "$PKI/ca.pem" "$1"
+}
+check "site add without client cert fails" False "$(admin_put /site-replication/add "$(sites "")" >/dev/null; jfield '.get("success", False)' <"$WORK/adm.out")"
+check "site add with client cert" True "$(admin_put /site-replication/add "$(sites "$CERTJ")" >/dev/null; jfield '.get("success", False)' <"$WORK/adm.out")"
+"$MC" mb d/sitebkt >/dev/null
+echo viatls | "$MC" pipe d/sitebkt/k.txt >/dev/null
+sget() { tls_s3 "$PS" "$AK" "$SK" GET /sitebkt/k.txt; }
+eventually "site bucket and object reach the TLS peer" viatls sget
 
 echo "replication: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

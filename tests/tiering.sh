@@ -3,7 +3,8 @@
 # docker when available). Covers mc ilm tier add/ls/info/verify/edit/rm, transition
 # and noncurrent transition, read-through with ranges, RestoreObject and restore
 # expiry, delete/overwrite cleanup, object lock, tier outages, stats and metrics,
-# and a three-node cluster sharing the tier configuration.
+# a three-node cluster sharing the tier configuration, and TLS tiers: a zkfsm that
+# requires a client certificate (IP and host name endpoints) and a TLS 1.2-only one.
 # Lifecycle days are shortened to seconds with ZKFSM_ILM_DAY_SECONDS.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -244,6 +245,73 @@ check "other root secret cannot open tiers" 1 "$(ok "$MC" ilm tier verify hot2 W
 stop_hot
 start_hot
 
+# ---- TLS tiers: a zkfsm that requires a client certificate (admin API fields) ----
+source "$ROOT/tests/tls_remote.sh"
+tls_pki
+MT_PORT="$(freeport)"
+T12_PORT="$(freeport)"
+tls_zkfsm mtls "$MT_PORT" "$RAK" "$RSK"
+tls_zkfsm tls12 "$T12_PORT" "$RAK" "$RSK" --tls-max-version 1.2
+CPIDS+=("${TLS_PIDS[@]}")
+check "mtls remote refuses clients without a certificate" 1 "$(ok curl -sf --cacert "$PKI/ca.pem" "https://127.0.0.1:$MT_PORT/")"
+check "mtls remote bucket" 200 "$(tls_s3 "$MT_PORT" "$RAK" "$RSK" PUT /mtls -o /dev/null -w '%{http_code}')"
+check "tls12 remote bucket" 200 "$(tls_s3 "$T12_PORT" "$RAK" "$RSK" PUT /t12 -o /dev/null -w '%{http_code}')"
+tier_put() { # JSON -> HTTP status of the admin tier add
+  printf '%s' "$1" | python3 "$ROOT/tests/madmin_encrypt.py" "$SK" >"$WORK/tier.enc"
+  curl -s -o "$WORK/tier.out" -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X PUT --data-binary @"$WORK/tier.enc" "$HOT/minio/admin/v3/tier"
+}
+tier_edit() { # NAME JSON -> HTTP status of the admin tier edit
+  printf '%s' "$2" | python3 "$ROOT/tests/madmin_encrypt.py" "$SK" >"$WORK/tier.enc"
+  curl -s -o "$WORK/tier.out" -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data-binary @"$WORK/tier.enc" "$HOT/minio/admin/v3/tier/$1"
+}
+tls_tier() { # NAME ENDPOINT BUCKET PREFIX EXTRA-JSON
+  printf '{"Version":"v1","Type":"minio","Name":"%s","MinIO":{"Endpoint":"%s","AccessKey":"%s","SecretKey":"%s","Bucket":"%s","Prefix":"%s","CAFile":"%s"%s}}' \
+    "$1" "$2" "$RAK" "$RSK" "$3" "$4" "$PKI/ca.pem" "$5"
+}
+CERT=",\"ClientCert\":\"$PKI/client.pem\",\"ClientKey\":\"$PKI/client.key\""
+MT="https://127.0.0.1:$MT_PORT"
+check "tls tier without client cert refused" 400 "$(tier_put "$(tls_tier NOCERT "$MT" mtls n/ "")")"
+check "tls tier with an untrusted client cert refused" 400 "$(tier_put "$(tls_tier ROGUE "$MT" mtls r/ ",\"ClientCert\":\"$PKI/rogue-client.pem\",\"ClientKey\":\"$PKI/rogue-client.key\"")")"
+check "tls tier with a missing key file refused" 400 "$(tier_put "$(tls_tier NOKEY "$MT" mtls k/ ",\"ClientCert\":\"$PKI/client.pem\",\"ClientKey\":\"$WORK/nope.key\"")")"
+check "tls tier without the CA refused" 400 "$(tier_put "$(printf '{"Version":"v1","Type":"minio","Name":"NOCA","MinIO":{"Endpoint":"%s","AccessKey":"%s","SecretKey":"%s","Bucket":"mtls","Prefix":"c/"%s}}' "$MT" "$RAK" "$RSK" "$CERT")")"
+check "mtls tier add (IP address endpoint)" 204 "$(tier_put "$(tls_tier MTLS "$MT" mtls t/ "$CERT")")"
+check "mtls tier add (host name endpoint)" 204 "$(tier_put "$(tls_tier MTLSDNS "https://localhost:$MT_PORT" mtls d/ "$CERT")")"
+check "server name override must match the cert" 400 "$(tier_put "$(tls_tier BADSNI "$MT" mtls s/ "$CERT,\"ServerName\":\"other.example\"")")"
+check "tls 1.3 minimum refused by a 1.2-only endpoint" 400 "$(tier_put "$(tls_tier T13 "https://127.0.0.1:$T12_PORT" t12 x/ "$CERT,\"MinVersion\":\"1.3\"")")"
+check "tls 1.2-only tier add" 204 "$(tier_put "$(tls_tier T12 "https://127.0.0.1:$T12_PORT" t12 y/ "$CERT,\"MinVersion\":\"1.2\"")")"
+check "tier ls shows tls fields" "$PKI/client.pem 1.2" "$(curl -s --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" "$HOT/minio/admin/v3/tier" | jget "' '.join([[t['MinIO'].get('ClientCert',''), t['MinIO'].get('MinVersion','')] for t in d if t['Name']=='T12'][0])")"
+check "tier edit to a bad client key refused" 400 "$(tier_edit MTLS "{\"clientKey\":\"$PKI/rogue-client.key\"}")"
+check "tier edit tls settings" 204 "$(tier_edit MTLS "{\"clientCert\":\"$PKI/client.pem\",\"clientKey\":\"$PKI/client.key\",\"minVersion\":\"1.3\"}")"
+check "mtls tier verify" 0 "$(ok "$MC" ilm tier verify hot MTLS)"
+"$MC" mb hot/mtd hot/mt12 >/dev/null
+"$MC" cp "$WORK/big.bin" hot/mtd/obj >/dev/null
+"$MC" cp "$WORK/big.bin" hot/mtd/dns >/dev/null
+"$MC" cp "$WORK/big.bin" hot/mt12/obj >/dev/null
+"$MC" ilm rule add hot/mtd --prefix obj --transition-days 1 --transition-tier MTLS >/dev/null
+"$MC" ilm rule add hot/mtd --prefix dns --transition-days 1 --transition-tier MTLSDNS >/dev/null
+"$MC" ilm rule add hot/mt12 --transition-days 1 --transition-tier T12 >/dev/null
+mclass() { hot s3api head-object --bucket "$1" --key "$2" | jget "d.get('StorageClass','')"; }
+wait_for "mtls transition" MTLS mclass mtd obj
+wait_for "mtls transition (host name)" MTLSDNS mclass mtd dns
+wait_for "tls 1.2 transition" T12 mclass mt12 obj
+check "mtls remote holds the data" 1 "$(tls_count "$MT_PORT" "$RAK" "$RSK" mtls t/)"
+check "tls 1.2 remote holds the data" 1 "$(tls_count "$T12_PORT" "$RAK" "$RSK" t12 y/)"
+check "mtls read-through" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/mtd/obj | sha256sum)"
+check "mtls read-through (host name)" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/mtd/dns | sha256sum)"
+check "tls 1.2 read-through" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/mt12/obj | sha256sum)"
+hot s3api get-object --bucket mtd --key obj --range bytes=1000-1999999 "$WORK/range.out" >/dev/null
+check "mtls read-through range" "$(tail -c +1001 "$WORK/big.bin" | head -c 1999000 | sha256sum)" "$(sha256sum <"$WORK/range.out")"
+hot s3api get-object --bucket mt12 --key obj --range bytes=5-104 "$WORK/range.out" >/dev/null
+check "tls 1.2 read-through range" "$(tail -c +6 "$WORK/big.bin" | head -c 100 | sha256sum)" "$(sha256sum <"$WORK/range.out")"
+check "mtls restore accepted" 202 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>1</Days></RestoreRequest>' "$HOT/mtd/obj?restore")"
+mt_restored() { hot s3api head-object --bucket mtd --key obj 2>/dev/null | jget "d.get('Restore','')" | cut -d, -f1; }
+wait_for "mtls restore completes" 'ongoing-request="false"' mt_restored
+"$MC" rm hot/mtd/obj hot/mtd/dns hot/mt12/obj >/dev/null
+wait_for "mtls delete cleans the tier" 0 tls_count "$MT_PORT" "$RAK" "$RSK" mtls t/
+wait_for "mtls delete cleans the tier (host name)" 0 tls_count "$MT_PORT" "$RAK" "$RSK" mtls d/
+wait_for "tls 1.2 delete cleans the tier" 0 tls_count "$T12_PORT" "$RAK" "$RSK" t12 y/
+for t in MTLS MTLSDNS T12; do "$MC" ilm tier rm hot "$t" >/dev/null 2>&1 || true; done
+
 # ---- cluster: tiers are cluster-wide; any node reads through ----
 CPORT=(0 "$(freeport)" "$(freeport)" "$(freeport)")
 CDATA=()
@@ -306,7 +374,7 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     "$MC" alias set "d$tname" "http://127.0.0.1:$port" dockeradmin docker-secret-123 >/dev/null 2>&1 || true
     for _ in $(seq 50); do "$MC" mb --ignore-existing "d$tname/tier" >/dev/null 2>&1 && break; sleep 0.3; done
     # A freshly started container may still refuse writes; retry the probe briefly.
-    for _ in 1 2 3 4 5; do "$MC" ilm tier add s3 hot "$tname" --endpoint "http://127.0.0.1:$port" --access-key dockeradmin --secret-key docker-secret-123 --bucket tier --prefix z/ >/dev/null 2>&1 && break; sleep 2; done
+    for _ in $(seq 10); do "$MC" ilm tier add s3 hot "$tname" --endpoint "http://127.0.0.1:$port" --access-key dockeradmin --secret-key docker-secret-123 --bucket tier --prefix z/ >/dev/null 2>&1 && break; sleep 2; done
     check "$tname tier add" 0 "$(ok "$MC" ilm tier verify hot "$tname")"
     "$MC" mb "hot/d-$(echo "$tname" | tr A-Z a-z)" >/dev/null
     b="d-$(echo "$tname" | tr A-Z a-z)"
@@ -320,6 +388,40 @@ if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     "$MC" rm "hot/$b/obj" >/dev/null
     wait_for "$tname cleanup" 0 bash -c "\"$MC\" ls --recursive d$tname/tier/z/ 2>/dev/null | wc -l | tr -d ' '"
   done
+  # RustFS with mutual TLS (RUSTFS_SERVER_MTLS_ENABLE): client certificate required.
+  if docker image inspect rustfs/rustfs:latest >/dev/null 2>&1; then
+    mkdir -p "$WORK/rtls"
+    cp "$PKI/server.pem" "$WORK/rtls/rustfs_cert.pem"; cp "$PKI/server.key" "$WORK/rtls/rustfs_key.pem"
+    cp "$PKI/ca.pem" "$WORK/rtls/ca.crt"; cp "$PKI/ca.pem" "$WORK/rtls/client_ca.crt"
+    chmod 755 "$WORK/rtls"; chmod 644 "$WORK/rtls"/*
+    RP="$(freeport)"
+    RN="zkfsm-tiering-rustfs-mtls-$$"
+    if docker run -d --name "$RN" -p "127.0.0.1:$RP:9000" -v "$WORK/rtls:/tls:ro,Z" -e RUSTFS_TLS_PATH=/tls -e RUSTFS_SERVER_MTLS_ENABLE=true \
+        -e RUSTFS_ACCESS_KEY=dockeradmin -e RUSTFS_SECRET_KEY=docker-secret-123 rustfs/rustfs:latest >/dev/null 2>&1; then
+      CONTAINERS+=("$RN")
+      for _ in $(seq 100); do [[ "$(tls_s3 "$RP" dockeradmin docker-secret-123 PUT /rmtls -o /dev/null -w '%{http_code}')" == 200 ]] && break; sleep 0.3; done
+      check "rustfs mtls refuses clients without a certificate" 1 "$(ok curl -sf --cacert "$PKI/ca.pem" "https://127.0.0.1:$RP/")"
+      rtier() { # NAME EXTRA-JSON
+        printf '{"Version":"v1","Type":"s3","Name":"%s","S3":{"Endpoint":"https://127.0.0.1:%s","AccessKey":"dockeradmin","SecretKey":"docker-secret-123","Bucket":"rmtls","Prefix":"z/","Region":"us-east-1","CAFile":"%s"%s}}' "$1" "$RP" "$PKI/ca.pem" "$2"
+      }
+      check "rustfs mtls tier without client cert refused" 400 "$(tier_put "$(rtier RNOCERT "")")"
+      for _ in 1 2 3 4 5; do [[ "$(tier_put "$(rtier RMTLS "$CERT")")" == 204 ]] && break; sleep 2; done
+      check "rustfs mtls tier add" 0 "$(ok "$MC" ilm tier verify hot RMTLS)"
+      "$MC" mb hot/d-rmtls >/dev/null
+      "$MC" cp "$WORK/big.bin" hot/d-rmtls/obj >/dev/null
+      "$MC" ilm rule add hot/d-rmtls --transition-days 1 --transition-tier RMTLS >/dev/null
+      wait_for "rustfs mtls transition" RMTLS mclass d-rmtls obj
+      check "rustfs mtls remote holds the data" 1 "$(tls_count "$RP" dockeradmin docker-secret-123 rmtls z/)"
+      check "rustfs mtls read-through" "$(sha256sum <"$WORK/big.bin")" "$("$MC" cat hot/d-rmtls/obj | sha256sum)"
+      hot s3api get-object --bucket d-rmtls --key obj --range bytes=5-104 "$WORK/r.out" >/dev/null
+      check "rustfs mtls range" "$(tail -c +6 "$WORK/big.bin" | head -c 100 | sha256sum)" "$(sha256sum <"$WORK/r.out")"
+      check "rustfs mtls restore accepted" 202 "$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 --user "$AK:$SK" -X POST --data '<RestoreRequest><Days>1</Days></RestoreRequest>' "$HOT/d-rmtls/obj?restore")"
+      r_restored() { hot s3api head-object --bucket d-rmtls --key obj 2>/dev/null | jget "d.get('Restore','')" | cut -d, -f1; }
+      wait_for "rustfs mtls restore completes" 'ongoing-request="false"' r_restored
+      "$MC" rm hot/d-rmtls/obj >/dev/null
+      wait_for "rustfs mtls cleanup" 0 tls_count "$RP" dockeradmin docker-secret-123 rmtls z/
+    else echo "skip rustfs mtls: container did not start"; fi
+  else echo "skip rustfs mtls: image not present"; fi
 else
   echo "skip docker tiers: docker not available"
 fi

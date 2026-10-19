@@ -1,8 +1,11 @@
-//! Minimal SigV4 S3/admin client for replication targets and site peers: one request
-//! per call, small bodies in memory or streamed uploads, optional bandwidth cap.
+//! Minimal SigV4 S3/admin client for replication targets and site peers over the pooled
+//! outbound client (client certificates, CA files, IP SANs): small bodies in memory or
+//! streamed uploads, optional bandwidth cap.
 const std = @import("std");
 const sign = @import("../backend/s3/sign.zig");
 const core = @import("../core/root.zig");
+const httpc = @import("../tls/httpc.zig");
+const dial = @import("../tls/dial.zig");
 
 const Allocator = std.mem.Allocator;
 const http = std.http;
@@ -16,6 +19,64 @@ pub const Remote = struct {
     region: []const u8 = "us-east-1",
     /// Upload cap in bytes per second; 0 is unlimited.
     bandwidth: u64 = 0,
+    /// Per-remote TLS settings; empty fields fall back to the node defaults.
+    tls: TlsFields = .{},
+};
+
+/// TLS settings as stored on targets and peers (paths are node-local).
+pub const TlsFields = struct {
+    client_cert: []const u8 = "",
+    client_key: []const u8 = "",
+    ca_file: []const u8 = "",
+    server_name: []const u8 = "",
+    min_version: []const u8 = "",
+
+    pub const names = .{ "client_cert", "client_key", "ca_file", "server_name", "min_version" };
+    /// JSON keys in admin requests and listings.
+    pub const json = .{ "clientCert", "clientKey", "caFile", "serverName", "minVersion" };
+
+    pub fn isEmpty(f: TlsFields) bool {
+        inline for (names) |n| if (@field(f, n).len > 0) return false;
+        return true;
+    }
+
+    /// Effective options: these fields over the node defaults.
+    pub fn options(f: TlsFields) ?dial.TlsOptions {
+        var m = f;
+        inline for (names) |n| if (@field(m, n).len == 0) {
+            @field(m, n) = @field(node_tls, n);
+        };
+        return .{
+            .ca_file = m.ca_file,
+            .server_name = m.server_name,
+            .client_cert_file = m.client_cert,
+            .client_key_file = m.client_key,
+            .min_version = dial.parseMinVersion(m.min_version) orelse return null,
+        };
+    }
+
+    /// Rejects unreadable files and unknown versions at configuration time.
+    pub fn check(f: TlsFields, gpa: Allocator) bool {
+        const o = f.options() orelse return false;
+        o.check(gpa) catch return false;
+        return true;
+    }
+
+    /// Reads the fields from a JSON object (`json` key names).
+    pub fn fromJson(o: std.json.ObjectMap) TlsFields {
+        var f: TlsFields = .{};
+        inline for (names, json) |n, k| if (o.get(k)) |v| if (v == .string) {
+            @field(f, n) = v.string;
+        };
+        return f;
+    }
+
+    pub fn writeJson(f: TlsFields, w: *std.json.Stringify) std.Io.Writer.Error!void {
+        inline for (names, json) |n, k| if (@field(f, n).len > 0) {
+            try w.objectField(k);
+            try w.write(@field(f, n));
+        };
+    }
 };
 
 pub const Param = sign.Param;
@@ -49,23 +110,26 @@ pub const Sink = struct {
     begin: *const fn (ctx: *anyopaque, status: u16, headers: []const Header, len: ?u64) ?*std.Io.Writer,
 };
 
-/// Extra PEM CAs trusted for HTTPS targets and peers (`ZKFSM_REPLICATION_CA_FILE`).
-pub var ca_file: ?[]const u8 = null;
+/// Node-wide TLS defaults for targets and peers (`ZKFSM_REPLICATION_*` variables).
+pub var node_tls: TlsFields = .{};
 
-/// An HTTP client trusting the system roots plus `ca_file`.
-pub fn newHttp(gpa: Allocator) http.Client {
-    var hc: http.Client = .{ .allocator = gpa };
-    const path = ca_file orelse return hc;
-    hc.ca_bundle.rescan(gpa) catch |e| std.log.warn("replication: system CAs not loaded: {t}", .{e});
-    hc.ca_bundle.addCertsFromFilePathAbsolute(gpa, path) catch |e| std.log.warn("replication: CA file {s} not loaded: {t}", .{ path, e });
-    hc.next_https_rescan_certs = false;
-    return hc;
+pub const Http = httpc.Pool;
+pub const Exchange = httpc.Exchange;
+
+pub fn newHttp(gpa: Allocator) Http {
+    return .init(gpa, .{});
 }
 
-/// Reads `ZKFSM_REPLICATION_CA_FILE` once at startup.
+/// Reads `ZKFSM_REPLICATION_{CA_FILE,CLIENT_CERT,CLIENT_KEY,SERVER_NAME,MIN_VERSION}` once at startup.
 pub fn loadCaFromEnv() void {
-    const v = std.posix.getenv("ZKFSM_REPLICATION_CA_FILE") orelse return;
-    if (v.len > 0) ca_file = v;
+    const env = std.posix.getenv;
+    node_tls = .{
+        .ca_file = env("ZKFSM_REPLICATION_CA_FILE") orelse "",
+        .client_cert = env("ZKFSM_REPLICATION_CLIENT_CERT") orelse "",
+        .client_key = env("ZKFSM_REPLICATION_CLIENT_KEY") orelse "",
+        .server_name = env("ZKFSM_REPLICATION_SERVER_NAME") orelse "",
+        .min_version = env("ZKFSM_REPLICATION_MIN_VERSION") orelse "",
+    };
 }
 
 fn passthrough(name: []const u8) bool {
@@ -107,7 +171,7 @@ pub const Error = error{ Unreachable, SourceFailed, SinkFailed, InvalidEndpoint,
 pub const max_response = 4 * 1024 * 1024;
 
 /// Sends one request; response strings are allocated in `a`.
-pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!Response {
+pub fn send(client: *Http, a: Allocator, r: Remote, req: Request) Error!Response {
     const hp = splitHostPort(r.endpoint) orelse return error.InvalidEndpoint;
     var path_w: std.Io.Writer.Allocating = .init(a);
     sign.uriEncode(&path_w.writer, req.path, false) catch return error.OutOfMemory;
@@ -143,57 +207,39 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
     if (core.trace.outgoing(&tpb)) |tp| try extra.append(a, .{ .name = "traceparent", .value = try a.dupe(u8, tp) });
     // Replication's own reads must see the peer's local state, never a proxied one.
     if (req.method == .GET or req.method == .HEAD) try extra.append(a, .{ .name = hdr_no_proxy, .value = "true" });
-    const uri: std.Uri = .{
-        .scheme = if (r.secure) "https" else "http",
-        .host = .{ .raw = hp.host },
-        .port = hp.port,
-        .path = .{ .percent_encoded = path_w.written() },
-        .query = if (query_w.written().len == 0) null else .{ .percent_encoded = query_w.written() },
+    if (req.content_type) |ct| try extra.append(a, .{ .name = "Content-Type", .value = ct });
+    try extra.append(a, .{ .name = "Authorization", .value = auth });
+    var target: std.Io.Writer.Allocating = .init(a);
+    target.writer.writeAll(if (path_w.written().len == 0) "/" else path_w.written()) catch return error.OutOfMemory;
+    if (query_w.written().len > 0) target.writer.print("?{s}", .{query_w.written()}) catch return error.OutOfMemory;
+    const tls: ?dial.TlsOptions = if (r.secure) r.tls.options() orelse return error.InvalidEndpoint else null;
+    var st: StreamCtx = undefined;
+    const body: httpc.Body = switch (req.body) {
+        .none => .none,
+        .bytes => |b| .{ .bytes = b },
+        .stream => |s| blk: {
+            st = .{ .s = s, .rate = r.bandwidth };
+            break :blk .{ .stream = .{ .len = s.len, .ctx = &st, .write = StreamCtx.write } };
+        },
     };
-    var hreq = client.request(req.method, uri, .{
-        .redirect_behavior = .unhandled,
-        .keep_alive = true,
-        .headers = .{
-            .host = .{ .override = r.endpoint },
-            .authorization = .{ .override = auth },
-            .user_agent = .{ .override = "zkfsm-replication" },
-            .accept_encoding = .omit,
-            .content_type = if (req.content_type) |ct| .{ .override = ct } else .default,
-        },
-        .extra_headers = extra.items,
-    }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else lost(e, @src().line);
-    defer hreq.deinit();
-    var send_buf: [64 * 1024]u8 = undefined;
-    switch (req.body) {
-        .none => if (req.method.requestHasBody()) {
-            hreq.transfer_encoding = .{ .content_length = 0 };
-            var bw = hreq.sendBodyUnflushed(&.{}) catch |e| return lost(e, @src().line);
-            bw.end() catch |e| return lost(e, @src().line);
-            flushTls(&hreq) catch |e| return lost(e, @src().line);
-        } else hreq.sendBodiless() catch |e| return lost(e, @src().line),
-        .bytes => |b| {
-            hreq.transfer_encoding = .{ .content_length = b.len };
-            var bw = hreq.sendBodyUnflushed(&send_buf) catch |e| return lost(e, @src().line);
-            bw.writer.writeAll(b) catch |e| return lost(e, @src().line);
-            bw.end() catch |e| return lost(e, @src().line);
-            flushTls(&hreq) catch |e| return lost(e, @src().line);
-        },
-        .stream => |s| {
-            hreq.transfer_encoding = .{ .content_length = s.len };
-            var bw = hreq.sendBodyUnflushed(&send_buf) catch |e| return lost(e, @src().line);
-            var th: Throttle = .{ .inner = &bw.writer, .rate = r.bandwidth };
-            s.write(s.ctx, &th.writer) catch |e| return if (e == error.SourceFailed) error.SourceFailed else lost(e, @src().line);
-            th.writer.flush() catch |e| return lost(e, @src().line);
-            bw.end() catch |e| return lost(e, @src().line);
-            flushTls(&hreq) catch |e| return lost(e, @src().line);
-        },
-    }
-    var redirect_buf: [0]u8 = .{};
-    var resp = hreq.receiveHead(&redirect_buf) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else lost(e, @src().line);
-    var out: Response = .{ .status = @intFromEnum(resp.head.status) };
+    var x: httpc.Exchange = undefined;
+    x.start(client, .{ .host = hp.host, .port = hp.port orelse @as(u16, if (r.secure) 443 else 80), .tls = tls }, .{
+        .method = req.method,
+        .target = target.written(),
+        .host = r.endpoint,
+        .headers = extra.items,
+        .body = body,
+        .user_agent = "zkfsm-replication",
+    }) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SourceFailed => error.SourceFailed,
+        error.InvalidArgument => error.InvalidEndpoint,
+        else => lost(@errorName(e), @src().line),
+    };
+    defer x.deinit();
+    var out: Response = .{ .status = x.status };
     var keep: std.ArrayList(Header) = .empty;
-    var it = resp.head.iterateHeaders();
-    while (it.next()) |h| {
+    for (x.headers()) |h| {
         if (req.sink != null and passthrough(h.name) and !std.ascii.eqlIgnoreCase(h.name, "content-length"))
             try keep.append(a, .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) });
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try a.dupe(u8, std.mem.trim(u8, h.value, "\""));
@@ -201,33 +247,35 @@ pub fn send(client: *http.Client, a: Allocator, r: Remote, req: Request) Error!R
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-delete-marker")) out.delete_marker = std.mem.eql(u8, h.value, "true");
         if (std.ascii.eqlIgnoreCase(h.name, "x-amz-replication-status")) out.replication_status = try a.dupe(u8, h.value);
     }
-    const has_body = req.method != .HEAD and out.status >= 200 and out.status != 204 and out.status != 304;
     if (req.sink) |sk| if (out.ok()) {
-        const w = sk.begin(sk.ctx, out.status, keep.items, resp.head.content_length) orelse return out;
-        if (!has_body) return out;
+        const w = sk.begin(sk.ctx, out.status, keep.items, x.content_length) orelse return out;
         var tbuf: [64 * 1024]u8 = undefined;
-        const rd = hreq.reader.bodyReader(&tbuf, resp.head.transfer_encoding, resp.head.content_length);
-        _ = rd.streamRemaining(w) catch |e| return if (e == error.WriteFailed) error.SinkFailed else lost(e, @src().line);
+        _ = x.body(&tbuf).streamRemaining(w) catch |e| return if (e == error.WriteFailed) error.SinkFailed else lost(@errorName(e), @src().line);
         return out;
     };
-    if (has_body) {
-        var tbuf: [4096]u8 = undefined;
-        const rd = hreq.reader.bodyReader(&tbuf, resp.head.transfer_encoding, resp.head.content_length);
-        out.body = rd.allocRemaining(a, .limited(max_response)) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else lost(e, @src().line);
-    } else {
-        _ = hreq.reader.bodyReader(&.{}, .none, 0).discardRemaining() catch {};
-    }
+    out.body = x.readAll(a, max_response) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge, error.Transient => lost(@errorName(e), @src().line),
+    };
     return out;
 }
 
-/// BodyWriter.end flushes only the TLS layer; push the records out to the socket too.
-fn flushTls(hreq: *http.Client.Request) std.Io.Writer.Error!void {
-    if (hreq.connection) |cn| try cn.flush();
-}
+/// Feeds a request stream through the bandwidth throttle.
+const StreamCtx = struct {
+    s: Stream,
+    rate: u64,
+
+    fn write(ctx: *anyopaque, w: *std.Io.Writer) error{ WriteFailed, SourceFailed }!void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ctx));
+        var th: Throttle = .{ .inner = w, .rate = self.rate };
+        try self.s.write(self.s.ctx, &th.writer);
+        try th.writer.flush();
+    }
+};
 
 /// Connection-level failure; the cause is logged at debug level.
-fn lost(e: anyerror, line: u32) Error {
-    std.log.debug("replication client: {t} at line {d}", .{ e, line });
+fn lost(cause: []const u8, line: u32) Error {
+    std.log.debug("replication client: {s} at line {d}", .{ cause, line });
     return error.Unreachable;
 }
 

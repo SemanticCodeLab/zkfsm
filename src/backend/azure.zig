@@ -34,8 +34,8 @@ pub const Config = struct {
     block_size: usize = 16 * MiB,
     retry: rhttp.RetryPolicy = .{},
     list_page_size: u16 = 5000,
-    /// PEM CA bundle for https endpoints; empty uses $SSL_CERT_FILE, then system roots.
-    ca_file: []const u8 = "",
+    /// TLS for https endpoints: CA file, client certificate, server name, minimum version.
+    tls: rhttp.Tls = .{},
     /// Access tier (Hot, Cool, Cold, Archive) set on every blob written.
     access_tier: []const u8 = "",
     /// Bearer tokens (service principal) instead of the account key; borrowed.
@@ -87,11 +87,11 @@ pub const AzureClient = struct {
     endpoint_buf: [256]u8,
     key_buf: [128]u8,
     key_len: usize,
-    http: std.http.Client,
+    http: rhttp.Client,
 
     /// Initializes in place; `self` must not move afterwards (endpoint borrows endpoint_buf).
     pub fn init(self: *AzureClient, gpa: std.mem.Allocator, cfg: Config) InitError!void {
-        self.* = .{ .gpa = gpa, .cfg = cfg, .endpoint = undefined, .endpoint_buf = undefined, .key_buf = undefined, .key_len = 0, .http = .{ .allocator = gpa } };
+        self.* = .{ .gpa = gpa, .cfg = cfg, .endpoint = undefined, .endpoint_buf = undefined, .key_buf = undefined, .key_len = 0, .http = undefined };
         const url = cfg.endpoint orelse std.fmt.bufPrint(&self.endpoint_buf, "https://{s}.blob.core.windows.net", .{cfg.account}) catch return error.InvalidConfig;
         self.endpoint = rhttp.Endpoint.parse(url) catch return error.InvalidConfig;
         if (!validContainer(cfg.container) or cfg.account.len == 0) return error.InvalidConfig;
@@ -103,10 +103,7 @@ pub const AzureClient = struct {
             b64.Decoder.decode(self.key_buf[0..n], cfg.key) catch return error.InvalidConfig;
             self.key_len = n;
         }
-        if (self.endpoint.tls) rhttp.useCaFile(&self.http, gpa, cfg.ca_file) catch |e| {
-            self.http.deinit();
-            return e;
-        };
+        self.http = try rhttp.Client.init(gpa, if (self.endpoint.tls) cfg.tls else .{});
     }
 
     pub fn deinit(self: *AzureClient) void {

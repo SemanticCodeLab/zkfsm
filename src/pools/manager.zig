@@ -28,7 +28,57 @@ const poll_ns = 2 * std.time.ns_per_s;
 /// How long a node waits for writes that predate a drain before refusing to confirm.
 const quiesce_ms = 10_000;
 const persist_ns: i128 = 2 * std.time.ns_per_s;
-const max_idle_passes = 3;
+/// A drain gives up once no key moved for this long while some failed for reasons
+/// other than unreachable drives.
+const stall_ns: i128 = 5 * 60 * std.time.ns_per_s;
+
+/// Outcome counts of one drain pass over the pool.
+const Pass = struct {
+    kinds: [std.meta.fields(mover.Outcome).len]usize = @splat(0),
+    left: usize = 0,
+    /// Of `left`: failed for want of reachable drives.
+    unreachable_: usize = 0,
+
+    fn fail(p: *Pass, e: anyerror) void {
+        p.left += 1;
+        if (e == error.ReadQuorum or e == error.WriteQuorum) p.unreachable_ += 1;
+    }
+
+    /// Only moves and dropped duplicates are progress: keys reported gone (delete
+    /// tombstones) stay listed pass after pass.
+    fn progressed(p: Pass) bool {
+        const k = p.kinds;
+        return k[@intFromEnum(mover.Outcome.moved)] + k[@intFromEnum(mover.Outcome.dup)] + k[@intFromEnum(mover.Outcome.purged)] > 0;
+    }
+
+    fn done(p: Pass) bool {
+        return p.left == 0 and !p.progressed();
+    }
+};
+
+/// Retries passes with leftovers until they stop making progress for `limit`.
+const Stall = struct {
+    since: i128,
+    limit: i128 = stall_ns,
+    idle: u6 = 0,
+
+    fn next(s: *Stall, pass: Pass, now: i128) enum { retry, give_up } {
+        if (pass.progressed()) {
+            s.since = now;
+            s.idle = 0;
+            return .retry;
+        }
+        s.idle +|= 1;
+        // Only quorum losses left (nodes restarting): pause and retry, never fail.
+        if (pass.left == pass.unreachable_) s.since = now;
+        return if (now - s.since >= s.limit) .give_up else .retry;
+    }
+
+    /// 1 s after progress, doubling to 8 s while stuck.
+    fn backoff(s: Stall) u64 {
+        return @as(u64, std.time.ns_per_s) << @intCast(@min(s.idle, 3));
+    }
+};
 
 pub const Manager = struct {
     gpa: std.mem.Allocator,
@@ -127,7 +177,11 @@ pub const Manager = struct {
                 if (m.node.retired & m.bit(p) != 0) break :blk .retired;
                 if (mm.pool(idx)) |ps| switch (ps.decom.status) {
                     .draining => break :blk .draining,
-                    .complete => break :blk .retired,
+                    .complete => {
+                        // Every node records it on its own drives, so any one restarts without the pool.
+                        if (m.node.retired & m.bit(p) == 0) _ = m.node.markRetired(m.bit(p), true);
+                        break :blk .retired;
+                    },
                     else => {},
                 };
                 if (mm.rebalance.status == .started) if (mm.rebalPool(idx)) |rp| if (rp.source and !rp.done) break :blk .draining;
@@ -462,20 +516,18 @@ pub const Manager = struct {
         const buf = try m.gpa.alloc(u8, mover.chunk);
         defer m.gpa.free(buf);
         var prog: Progress = .{ .last_persist = std.time.nanoTimestamp() };
-        var idle: usize = 0;
         const r = m.router();
         const started = std.time.nanoTimestamp();
         var total: u64 = 0;
+        var stall: Stall = .{ .since = started };
         while (true) {
-            var left: usize = 0;
-            var moved: usize = 0;
-            var kinds: [3]usize = @splat(0);
+            var pass: Pass = .{};
             for (r.pools[p].sets) |set| for ([_]backend.KeySpace{ .data, .record, .system }) |space| {
                 var arena = std.heap.ArenaAllocator.init(m.gpa);
                 defer arena.deinit();
                 const keys = keysOf(arena.allocator(), set, space) catch |e| {
                     if (e == error.OutOfMemory) return e;
-                    left += 1;
+                    pass.fail(error.IoFailed);
                     continue;
                 };
                 for (keys) |key| {
@@ -483,38 +535,55 @@ pub const Manager = struct {
                     if (r.mode(p) != .draining) return persistQuiet(m, p, &prog);
                     if (mover.moveKey(r, m.gpa, key, p, buf)) |res| {
                         prog.add(res);
-                        moved += 1;
-                        kinds[@intFromEnum(res.outcome)] += 1;
+                        pass.kinds[@intFromEnum(res.outcome)] += 1;
                         total += res.bytes;
                         throttle(&m.stop_ev, m.decom_rate, started, total);
                     } else |e| {
                         if (e == error.OutOfMemory) return error.OutOfMemory;
-                        std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
-                        left += 1;
+                        // Unreadable with every drive answering and no active copy: leftovers of a delete.
+                        if (e == error.IoFailed and m.dropRemnant(p, key)) {
+                            pass.kinds[@intFromEnum(mover.Outcome.purged)] += 1;
+                        } else {
+                            std.log.warn("pools: cannot move {t} key {s} out of pool {d}: {t}", .{ key.space, &key.hex, p + 1, e });
+                            pass.fail(e);
+                        }
                     }
                     if (std.time.nanoTimestamp() - prog.last_persist >= persist_ns) {
                         if (try m.persistDecom(p, &prog, null) == .stop) return;
                     }
                 }
             };
-            std.log.info("pools: pool {d} pass: {d} moved, {d} gone, {d} dup, {d} left", .{ p + 1, kinds[0], kinds[1], kinds[2], left });
-            // Listed but unreadable keys are delete tombstones, purged by heal later.
-            if (left == 0 and kinds[0] == 0 and kinds[2] == 0) break;
-            idle = if (moved == 0) idle + 1 else 0;
-            if (idle >= max_idle_passes) {
-                std.log.err("pools: decommission of pool {d} failed: {d} key(s) cannot be moved", .{ p + 1, left });
-                prog.objects_failed = left;
-                _ = try m.persistDecom(p, &prog, .failed);
-                return;
+            const k = pass.kinds;
+            std.log.info("pools: pool {d} pass: {d} moved, {d} gone, {d} dup, {d} purged, {d} left ({d} unreachable)", .{ p + 1, k[0], k[1], k[2], k[3], pass.left, pass.unreachable_ });
+            if (pass.done()) break;
+            switch (stall.next(pass, std.time.nanoTimestamp())) {
+                .retry => {},
+                .give_up => {
+                    std.log.err("pools: decommission of pool {d} failed: {d} key(s) could not be moved for {d} s (listed above)", .{ p + 1, pass.left, @divTrunc(stall_ns, std.time.ns_per_s) });
+                    prog.objects_failed = pass.left;
+                    _ = try m.persistDecom(p, &prog, .failed);
+                    return;
+                },
             }
-            m.stop_ev.timedWait(std.time.ns_per_s) catch {};
+            m.stop_ev.timedWait(stall.backoff()) catch {};
             if (m.stopping()) return persistQuiet(m, p, &prog);
         }
         // Retire the pool in the drive formats before reporting it complete.
-        const failed = m.node.markRetired(m.bit(p));
-        if (failed > 0) std.log.warn("pools: {d} drive format(s) could not record pool {d} as decommissioned", .{ failed, p + 1 });
+        // Complete only once every drive records it; else the job stays draining and retries.
+        const failed = m.node.markRetired(m.bit(p), false);
+        if (failed > 0) {
+            std.log.err("pools: {d} drive format(s) could not record pool {d} as decommissioned; not complete yet", .{ failed, p + 1 });
+            persistQuiet(m, p, &prog) catch {};
+            return error.Unavailable;
+        }
         if (try m.persistDecom(p, &prog, .complete) == .go)
             std.log.info("pools: decommission of pool {d} complete; it may be removed from the endpoint list", .{p + 1});
+    }
+
+    fn dropRemnant(m: *Manager, p: usize, key: backend.PhysicalKey) bool {
+        const ps = m.node.pools[p];
+        if (ps.sets.len == 0) return false;
+        return ps.sets[Router.setIndex(&m.router().pools[p], key)].strategy.dropRemnant(key);
     }
 
     fn persistQuiet(m: *Manager, p: usize, prog: *Progress) Error!void {
@@ -720,4 +789,43 @@ pub const Manager = struct {
 test {
     _ = state;
     _ = mover;
+}
+
+test "drain passes: tombstones are no progress, leftovers retry until the stall limit" {
+    var s: Stall = .{ .since = 0, .limit = 100 };
+    // Keys gone every pass (delete tombstones) with one unmovable key: no progress.
+    var stuck: Pass = .{ .left = 1 };
+    stuck.kinds[@intFromEnum(mover.Outcome.gone)] = 44;
+    try std.testing.expect(!stuck.done());
+    try std.testing.expect(!stuck.progressed());
+    try std.testing.expectEqual(.retry, s.next(stuck, 50));
+    try std.testing.expect(s.backoff() > std.time.ns_per_s);
+    // A key moved resets the clock (the restarted node's drives came back).
+    var moved: Pass = .{ .left = 3 };
+    moved.fail(error.ReadQuorum);
+    try std.testing.expectEqual(@as(usize, 1), moved.unreachable_);
+    moved.kinds[@intFromEnum(mover.Outcome.moved)] = 1;
+    try std.testing.expectEqual(.retry, s.next(moved, 90));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), s.backoff());
+    try std.testing.expectEqual(.retry, s.next(stuck, 150));
+    try std.testing.expectEqual(.give_up, s.next(stuck, 190));
+    // Every key short of quorum (two nodes restarting): waits however long it takes.
+    var q: Stall = .{ .since = 0, .limit = 100 };
+    var down: Pass = .{};
+    for (0..5) |_| down.fail(error.ReadQuorum);
+    down.kinds[@intFromEnum(mover.Outcome.gone)] = 44;
+    for (1..20) |t| try std.testing.expectEqual(.retry, q.next(down, @intCast(t * 100)));
+    try std.testing.expectEqual(@as(u64, 8 * std.time.ns_per_s), q.backoff());
+    // Once they are back, a key that still fails counts from then on.
+    var hard: Pass = .{};
+    hard.fail(error.IoFailed);
+    try std.testing.expectEqual(.retry, q.next(hard, 1950));
+    try std.testing.expectEqual(.give_up, q.next(hard, 2000));
+    // Only tombstones left: the pool is empty.
+    var clean: Pass = .{};
+    clean.kinds[@intFromEnum(mover.Outcome.gone)] = 44;
+    try std.testing.expect(clean.done());
+    var dup: Pass = .{};
+    dup.kinds[@intFromEnum(mover.Outcome.dup)] = 1;
+    try std.testing.expect(!dup.done());
 }

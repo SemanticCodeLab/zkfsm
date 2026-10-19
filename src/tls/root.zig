@@ -12,6 +12,7 @@ pub const ClientAuth = @import("client_auth.zig").ClientAuth;
 pub const dial = @import("dial.zig");
 pub const TlsOptions = dial.TlsOptions;
 pub const https = @import("https.zig");
+pub const httpc = @import("httpc.zig");
 
 test {
     _ = @import("der.zig");
@@ -29,5 +30,6 @@ test {
     _ = @import("client_auth.zig");
     _ = @import("dial.zig");
     _ = @import("https.zig");
+    _ = @import("httpc.zig");
     _ = @import("client_test.zig");
 }
