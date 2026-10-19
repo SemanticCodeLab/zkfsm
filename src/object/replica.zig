@@ -39,6 +39,9 @@ pub const Origin = struct {
     delete_marker: bool = false,
     /// Imported by the migrator: keep the identity but record no replica status.
     migrated: bool = false,
+    /// Bucket/site replication: the target bucket must be versioned (it may be about
+    /// to be), so a versioned write is refused until it is. Batch writes store null.
+    needs_versioning: bool = false,
 };
 
 pub threadlocal var origin: ?Origin = null;

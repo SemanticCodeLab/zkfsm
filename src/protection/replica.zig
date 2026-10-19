@@ -425,12 +425,13 @@ pub const ReplicaStore = struct {
             return rep;
         };
         if (self.clustered() and !corrupt and rep.unrepaired == 0 and rep.healthy < quorum(placed.len) and
-            newest_ns != 0 and core.time.nowNs() - newest_ns > tombstone_grace_ns and !self.drives.anyFresh(placed))
+            ((newest_ns != 0 and core.time.nowNs() - newest_ns > tombstone_grace_ns and !self.drives.anyFresh(placed)) or self.drives.wasDeleted(key, false)))
         {
             // Below a write quorum with every drive answering: a delete some drive
             // missed, or a failed write. Never a live object, so remove the rest.
             std.log.warn("purging {d} leftover replica(s) of {s} (missed delete or failed write)", .{ rep.healthy, &key.hex });
             for (placed, 0..) |_, j| if (holds.lbs[j]) |lb| lb.store().delete(key) catch {};
+            _ = self.drives.wasDeleted(key, true);
             return .{ .purged = true };
         }
         for (bad[0..nbad]) |j| {
@@ -507,6 +508,7 @@ pub const ReplicaStore = struct {
         }
         if (removed + absent < quorum(placed.len)) return self.short(&holds, quorum(placed.len), worst, error.WriteQuorum);
         if (removed == 0) return error.NotFound;
+        if (key.space == .data and self.clustered() and removed + absent < placed.len) self.drives.noteDeleted(key);
     }
 
     fn putRecord(ctx: *anyopaque, key: PhysicalKey, bytes: []const u8) Error!void {
@@ -821,8 +823,11 @@ pub const ReplicaStore = struct {
         const all: [max_drives]bool = @splat(true);
         if (reads.answered() < need) reads.run(all[0..placed.len]);
         if (reads.oom) return error.OutOfMemory;
-        if (reads.answered() < need) return error.ReadQuorum;
-        const b = reads.newest() orelse return error.NotFound;
+        // A corrupt copy answered too: with every drive heard, damage is not an outage.
+        var corrupt: usize = 0;
+        for (reps[0..placed.len]) |x| corrupt += @intFromBool(x == .corrupt);
+        if (reads.answered() + corrupt < need) return error.ReadQuorum;
+        const b = reads.newest() orelse return if (corrupt > 0) error.IoFailed else error.NotFound;
         const win = reps[b].present;
         // Bring lagging replicas we read up to the winner.
         var fix: FixMany = .{ .self = self, .placed = placed, .key = key, .raw = win.raw };
@@ -1183,4 +1188,40 @@ test "cluster heal purges missed-delete leftovers and stale record copies, never
     const r3 = store.healKey(k3);
     try testing.expect(r3.purged and !r3.lost);
     try testing.expectError(error.NotFound, b.getRecord(k3, gpa));
+}
+
+test "cluster record read: corrupt copies are damage, not an outage" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+    var members: [4]placement.drives.Member = undefined;
+    var nb: [4]u8 = undefined;
+    for (&members, 0..) |*m, i| {
+        const name = try std.fmt.bufPrint(&nb, "d{d}", .{i});
+        try tmp.dir.makePath(name);
+        m.* = .{ .path = try tmp.dir.realpath(name, &bufs[i]), .node = @intCast(i) };
+    }
+    const tmpl: placement.layout.FormatV2 = .{ .deployment = @splat(1), .layout = @splat(2), .pool = 0, .set = 0, .index = 0, .set_size = 4, .profile = .{ .replica = 3 } };
+    var set = try DriveSet.openCluster(gpa, &members, tmpl, false);
+    defer set.deinit();
+    var store = ReplicaStore.init(gpa, &set);
+    const b = store.backend();
+    const k: PhysicalKey = .{ .space = .record, .hex = "44444444444444444444444444444444".* };
+    try b.putRecord(k, "intact");
+    var pbuf: [max_drives]u8 = undefined;
+    const pl = set.placed(k, &pbuf);
+    var kb: [64]u8 = undefined;
+    const rel = try iface.local.keyPath(k, @ptrCast(&kb));
+    var pb: [160]u8 = undefined;
+    // Torn copies on all but one drive: the intact one is served and spread.
+    for (pl[1..]) |d| try tmp.dir.writeFile(.{ .sub_path = try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ d, rel }), .data = "torn" });
+    const got = try b.getRecord(k, gpa);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("intact", got);
+    const again = try b.getRecord(k, gpa);
+    defer gpa.free(again);
+    // Every copy torn: lost, reported as an I/O failure rather than a quorum wait.
+    for (pl) |d| try tmp.dir.writeFile(.{ .sub_path = try std.fmt.bufPrint(&pb, "d{d}/{s}", .{ d, rel }), .data = "torn" });
+    try testing.expectError(error.IoFailed, b.getRecord(k, gpa));
 }

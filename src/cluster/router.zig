@@ -1,8 +1,10 @@
 //! Router: one StorageBackend over every pool and erasure set. A key maps to a set by
 //! hashing it within its pool; new data goes to the pool with the most room, reads and
 //! deletes find a key in whichever pool holds it. New system keys go to the first
-//! active pool; draining pools take no new keys and are searched last.
+//! active pool; draining pools take no new keys and are searched last; retired pools
+//! are never touched (their nodes may be gone).
 const std = @import("std");
+const core = @import("../core/root.zig");
 const iface = @import("../backend/root.zig");
 
 const Error = iface.Error;
@@ -100,18 +102,18 @@ pub const Router = struct {
     /// Waits until no write that started before the current modes is in flight;
     /// false after `timeout_ms`.
     pub fn quiesce(self: *Router, timeout_ms: i64) bool {
-        const until = std.time.milliTimestamp() + timeout_ms;
+        const until = core.time.monoMs() + timeout_ms;
         while (self.unguarded.load(.seq_cst) != 0) {
-            if (std.time.milliTimestamp() > until) return false;
+            if (core.time.monoMs() > until) return false;
             std.Thread.sleep(std.time.ns_per_ms);
         }
         return true;
     }
 
-    /// Pool indexes to search: active pools first, then draining, then retired.
+    /// Pool indexes to search: active pools first, then draining; never retired.
     pub fn order(self: *const Router, buf: *[max_pools]usize) []usize {
         var n: usize = 0;
-        inline for (.{ Mode.active, Mode.draining, Mode.retired }) |want| {
+        inline for (.{ Mode.active, Mode.draining }) |want| {
             for (self.pools, 0..) |*p, i| if (p.mode.load(.acquire) == want and n < max_pools) {
                 buf[n] = i;
                 n += 1;
@@ -189,6 +191,7 @@ pub const Router = struct {
         var removed = false;
         var first: Error = error.NotFound;
         for (self.pools) |*p| {
+            if (p.mode.load(.acquire) == .retired) continue;
             const b = at(p, key);
             const r = if (record) b.deleteRecord(key) else b.delete(key);
             r catch |e| {
@@ -266,7 +269,7 @@ pub const Router = struct {
         const t = target orelse if (key.space == .system) self.systemPool() else self.pickPool();
         try at(&self.pools[t], key).putRecord(key, bytes);
         for (self.pools, 0..) |*p, i| {
-            if (i == t or p.mode.load(.acquire) == .active) continue;
+            if (i == t or p.mode.load(.acquire) != .draining) continue;
             at(p, key).deleteRecord(key) catch {};
         }
     }
@@ -290,6 +293,7 @@ pub const Router = struct {
         var ok = false;
         var first: Error = error.IoFailed;
         for (self.pools) |*p| for (p.sets) |s| {
+            if (p.mode.load(.acquire) == .retired) break;
             s.list(space, cb) catch |e| {
                 if (e == error.OutOfMemory) return e;
                 first = e;
@@ -302,7 +306,10 @@ pub const Router = struct {
 
     fn sync(ctx: *anyopaque) Error!void {
         const self = cast(ctx);
-        for (self.pools) |*p| for (p.sets) |s| s.sync() catch {};
+        for (self.pools) |*p| {
+            if (p.mode.load(.acquire) == .retired) continue;
+            for (p.sets) |s| s.sync() catch {};
+        }
     }
 };
 
@@ -347,4 +354,76 @@ test "pools published at runtime take new keys" {
     try std.testing.expectEqual(@as(usize, 1), r.pickPool());
     var ob: [max_pools]usize = undefined;
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, r.order(&ob));
+}
+
+/// Test backend: empty (every key missing) or gone (every call fails like lost nodes).
+const Fake = struct {
+    gone: bool,
+    records: usize = 0,
+    calls: usize = 0,
+
+    fn self(ctx: *anyopaque) *Fake {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn fail(ctx: *anyopaque) Error {
+        const f = self(ctx);
+        f.calls += 1;
+        return if (f.gone) error.ReadQuorum else error.NotFound;
+    }
+    fn put(ctx: *anyopaque, _: PhysicalKey, _: *std.Io.Reader, _: iface.PutOptions) Error!iface.ObjectMeta {
+        return fail(ctx);
+    }
+    fn get(ctx: *anyopaque, _: PhysicalKey, _: ?iface.Range, _: *std.Io.Writer) Error!iface.ObjectMeta {
+        return fail(ctx);
+    }
+    fn stat(ctx: *anyopaque, _: PhysicalKey) Error!iface.ObjectMeta {
+        return fail(ctx);
+    }
+    fn delete(ctx: *anyopaque, _: PhysicalKey) Error!void {
+        return fail(ctx);
+    }
+    fn list(ctx: *anyopaque, _: iface.KeySpace, _: iface.ListCallback) Error!void {
+        if (self(ctx).gone) return fail(ctx);
+    }
+    fn putRecord(ctx: *anyopaque, _: PhysicalKey, _: []const u8) Error!void {
+        if (self(ctx).gone) return fail(ctx);
+        self(ctx).records += 1;
+    }
+    fn getRecord(ctx: *anyopaque, _: PhysicalKey, _: std.mem.Allocator) Error![]u8 {
+        return fail(ctx);
+    }
+    fn sync(ctx: *anyopaque) Error!void {
+        if (self(ctx).gone) return fail(ctx);
+    }
+    const vt: iface.StorageBackend.VTable = .{ .put = put, .get = get, .stat = stat, .delete = delete, .list = list, .putRecord = putRecord, .getRecord = getRecord, .deleteRecord = delete, .sync = sync };
+    fn backend(f: *Fake) iface.StorageBackend {
+        return .{ .ctx = f, .capabilities = .{}, .vtable = &vt };
+    }
+};
+
+test "retired pools are skipped for reads, writes and deletes" {
+    var live: Fake = .{ .gone = false };
+    var dead: Fake = .{ .gone = true };
+    const ls = [_]iface.StorageBackend{live.backend()};
+    const ds = [_]iface.StorageBackend{dead.backend()};
+    var pools = [_]Pool{ .{ .sets = &ds, .seed = 1 }, .{ .sets = &ls, .seed = 2 } };
+    var r: Router = .{ .gpa = std.testing.allocator, .pools = &pools };
+    r.setMode(0, .retired);
+    const b = r.backend();
+    const k: PhysicalKey = .{ .space = .record, .hex = @splat('a') };
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.NotFound, b.get(k, null, &sink.writer));
+    try std.testing.expectError(error.NotFound, b.stat(k));
+    try std.testing.expectError(error.NotFound, b.delete(k));
+    try std.testing.expectError(error.NotFound, b.deleteRecord(k));
+    try std.testing.expectError(error.NotFound, b.getRecord(k, std.testing.allocator));
+    try b.putRecord(k, "x");
+    try std.testing.expectEqual(@as(usize, 1), live.records);
+    try b.sync();
+    try b.list(.record, .{ .ctx = &live, .func = struct {
+        fn f(_: *anyopaque, _: PhysicalKey) Error!void {}
+    }.f });
+    try std.testing.expectEqual(@as(usize, 0), dead.calls);
+    var ob: [max_pools]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{1}, r.order(&ob));
 }

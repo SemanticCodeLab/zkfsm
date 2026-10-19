@@ -97,7 +97,7 @@ fn failCode(c: *Ctx, status: std.http.Status, code: []const u8, message: []const
 /// Runs the standard handling of a replica write with its source identity attached,
 /// so versions keep their ids and times and nothing is replicated back.
 fn receive(r: *engine.Replicator, c: *Ctx) ConnError!bool {
-    var origin: object.replica.Origin = .{};
+    var origin: object.replica.Origin = .{ .needs_versioning = true };
     if (try handler.param(c, "versionId")) |v| if (ov.parseVersionId(v)) |id| {
         if (!id.eql(ov.null_version_id)) origin.version = id;
     } else |_| {};

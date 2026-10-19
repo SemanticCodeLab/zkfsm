@@ -211,8 +211,19 @@ OBJS=$(ls "$WORK/obj")
 check "new objects listed via node 1" 3 "$(cli 1 s3 ls s3://clu/ | grep -c ' down')"
 
 # ---- the node returns and healing restores full redundancy ----
+seen_up() { grep -c "node 127.0.0.1:${PORT[3]} is online" "$WORK/n$1.log" || true; }
+UP0=("$(seen_up 1)" "$(seen_up 2)" "$(seen_up 4)")
 start 3
 wait_ready 3 60
+# Peers count a node restarted after kill -9 online within a few heartbeats.
+t0=$(date +%s)
+for _ in $(seq 150); do
+  [[ $(seen_up 1) -gt ${UP0[0]} && $(seen_up 2) -gt ${UP0[1]} && $(seen_up 4) -gt ${UP0[2]} ]] && break
+  sleep 0.1
+done
+check "peers see the restarted node online within 15 s" yes "$([[ $(seen_up 1) -gt ${UP0[0]} && $(seen_up 2) -gt ${UP0[1]} && $(seen_up 4) -gt ${UP0[2]} ]] && echo yes || echo no)"
+check "and keep it online" 0 "$(sleep 3; for i in 1 2 4; do tail -n 3 "$WORK/n$i.log"; done | grep -c "127.0.0.1:${PORT[3]} is offline" || true)"
+echo "     online on every peer $(($(date +%s) - t0)) s after ready"
 NOBJ=$(blobs_of)
 if wait_redundant "$NOBJ" 90; then r=yes; else r=no; fi
 check "heal restored all shards of $NOBJ objects" yes "$r"
@@ -384,6 +395,31 @@ done
 check "old objects readable after expansion" 0 "$bad"
 cget 2 pool3 "$WORK/got" >/dev/null
 check "new-pool object readable via another node" "$(md5 "$WORK/obj/pool3")" "$(md5 "$WORK/got")"
+
+# ---- damaged records never hold the key-index rebuild back ----
+# Power cut without fsync: one record keeps 2 of 6 intact copies, another none; the
+# journals and snapshots are gone, so every node rebuilds its index from the records.
+record_copies() { # key file -> its record copies (written after the marker)
+  touch "$WORK/mark"; sleep 0.05
+  [[ "$(cput 1 "$1" "$WORK/obj/$1")" == 200 ]] || echo "put $1 failed"
+  sleep 0.5
+  find "$WORK"/n*/[dp]* -path '*/record/*' -name '*.meta' -newer "$WORK/mark" -printf '%f %p\n' | sort | awk '{print $2}'
+}
+head -c 3000 /dev/urandom >"$WORK/obj/torn"
+head -c 3000 /dev/urandom >"$WORK/obj/lost"
+mapfile -t torn_copies < <(record_copies torn)
+mapfile -t lost_copies < <(record_copies lost)
+check "record has six copies" "6 6" "${#torn_copies[@]} ${#lost_copies[@]}"
+for i in 1 2 3 4; do kill9 "$i"; done
+for c in "${torn_copies[@]:0:4}" "${lost_copies[@]}"; do truncate -s $(($(stat -c %s "$c") / 2)) "$c"; done
+rm -f "$WORK"/n*/[dp]*/node/journal "$WORK"/n*/[dp]*/node/index.snap
+for i in 1 2 3 4; do start "$i"; done
+for i in 1 2 3 4; do wait_ready "$i" 90; done
+check "every node ready after rebuilding past damaged records" "200 200 200 200" "$(ready 1) $(ready 2) $(ready 3) $(ready 4)"
+cget 2 torn "$WORK/got" >/dev/null
+check "record with two intact copies reads" "$(md5 "$WORK/obj/torn")" "$(md5 "$WORK/got")"
+check "unreadable record is skipped and counted" yes "$(curl -s "$(ep 3)/metrics" | grep -qE '^zkfsm_index_rebuild_skipped_total [1-9]' && echo yes || echo no)"
+check "no rebuild retried on read quorum" 0 "$(cat "$WORK"/n*.log | grep -c 'rebuild: ReadQuorum' || true)"
 for i in 1 2 3 4; do kill9 "$i"; done
 
 # ---- TLS: node-to-node RPC over the same HTTPS port ----
