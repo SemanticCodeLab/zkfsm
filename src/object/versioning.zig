@@ -282,6 +282,9 @@ fn commitPutLocked(svc: *Svc, bucket: []const u8, rec: *Record, in: service.PutI
     defer rec.internal_meta = caller_internal;
     const origin = replica.origin;
     if (origin) |o| {
+        // A versioned replica that beats the bucket's versioning setting (site
+        // replication creates, then configures) is refused; the sender retries.
+        if (o.version != null and !o.migrated and cfg.versioning != .enabled) return error.InvalidBucketState;
         if (o.created_ns) |t| rec.created_ns = t;
         if (!o.migrated) rec.internal_meta = try statusMeta(a, rec.internal_meta, .replica);
     } else if (cfg.versioning == .enabled) if (svc.replication) |s| if (s.vtable.wants(s.ctx, bid, bucket, rec.key, rec.tags)) {
