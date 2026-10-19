@@ -3,6 +3,7 @@
 //! indices too and only ever runs its own calls, so it never waits for a busy pool
 //! or for unrelated work (that could hold locks it depends on).
 const std = @import("std");
+const trace = @import("../core/root.zig").trace;
 
 const pool_threads = 64;
 
@@ -24,6 +25,8 @@ const Job = struct {
     done: std.atomic.Value(usize) = .init(0),
     refs: std.atomic.Value(u32) = .init(1),
     finished: std.Thread.ResetEvent = .{},
+    /// The caller's trace context: calls on pool threads join its trace.
+    trace_ctx: ?trace.Context = null,
 
     /// Runs unclaimed indices until none are left.
     fn work(j: *Job) void {
@@ -40,6 +43,8 @@ const Job = struct {
     }
 
     fn task(j: *Job) void {
+        const prev = trace.adopt(j.trace_ctx);
+        defer _ = trace.adopt(prev);
         j.work();
         j.unref();
     }
@@ -57,7 +62,7 @@ pub fn run(n: usize, parallel: bool, ctx: anytype, comptime f: fn (@TypeOf(ctx),
                     f(@ptrCast(@alignCast(p)), i);
                 }
             };
-            j.* = .{ .ctx = @ptrCast(@constCast(ctx)), .call = E.call, .n = n };
+            j.* = .{ .ctx = @ptrCast(@constCast(ctx)), .call = E.call, .n = n, .trace_ctx = trace.currentContext() };
             for (1..n) |_| {
                 _ = j.refs.fetchAdd(1, .acq_rel);
                 pool.spawn(Job.task, .{j}) catch {

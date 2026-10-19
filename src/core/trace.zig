@@ -110,6 +110,14 @@ pub fn currentContext() ?Context {
     return current;
 }
 
+/// Makes `ctx` this thread's current context (work handed to another thread);
+/// returns the previous one to restore.
+pub fn adopt(ctx: ?Context) ?Context {
+    const prev = current;
+    current = ctx;
+    return prev;
+}
+
 pub const RootOptions = struct {
     /// Incoming `traceparent` header value.
     traceparent: ?[]const u8 = null,
